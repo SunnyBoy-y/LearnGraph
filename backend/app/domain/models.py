@@ -400,6 +400,17 @@ class ChatSession(Base, TimestampMixin, WorkspaceScopedMixin):
         String(64), nullable=True, index=True, unique=True
     )
 
+    @property
+    def current_node_id(self) -> str | None:
+        """Conversation-scoped graph node stored inside the extensible capsule.
+
+        Keeping the node pointer in ``context_capsule`` avoids a database-column
+        migration while still exposing one stable field through ``SessionView``.
+        """
+
+        value = (self.context_capsule or {}).get("current_node_id")
+        return value if isinstance(value, str) and value else None
+
 
 class SessionShare(Base, TimestampMixin, WorkspaceScopedMixin):
     """Immutable snapshot of a chat session's visible messages for sharing.
@@ -1285,6 +1296,11 @@ class ResearchJob(Base, TimestampMixin, WorkspaceScopedMixin):
     question: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), default="completed", index=True)
     provider_id: Mapped[str] = mapped_column(String(80), default="local_mock")
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    budget_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    estimated_cost_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actual_cost_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    legacy_billing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
     budget_cny: Mapped[float] = mapped_column(Float, default=0.0)
     estimated_cost_cny: Mapped[float] = mapped_column(Float, default=0.0)
     actual_cost_cny: Mapped[float] = mapped_column(Float, default=0.0)
@@ -1983,6 +1999,24 @@ class MemoryExtractionState(Base, TimestampMixin, WorkspaceScopedMixin):
     last_status: Mapped[str] = mapped_column(String(40), default="never_run")
     last_error: Mapped[str] = mapped_column(String(500), default="")
     extracted_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MemoryJobState(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Durable fenced background work; new table needs no legacy column rewrite."""
+    __tablename__ = "memory_job_states"
+    __table_args__ = (UniqueConstraint("workspace_id", "kind", "resource_id", name="uq_memory_job_resource"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    resource_id: Mapped[str] = mapped_column(String(36), index=True)
+    window_key: Mapped[str] = mapped_column(String(64), default="")
+    status: Mapped[str] = mapped_column(String(32), default="ready")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result_status: Mapped[str] = mapped_column(String(40), default="")
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class ProviderConfig(Base, TimestampMixin, WorkspaceScopedMixin):
@@ -2800,7 +2834,7 @@ class WorkspaceSecretReference(Base, TimestampMixin, WorkspaceScopedMixin):
 
 
 class PriceVersion(Base, TimestampMixin, WorkspaceScopedMixin):
-    """Immutable model/feature tariff version in USD."""
+    """Immutable tariff in the currency published by its pricing source."""
 
     __tablename__ = "price_versions"
     __table_args__ = (
@@ -2809,6 +2843,7 @@ class PriceVersion(Base, TimestampMixin, WorkspaceScopedMixin):
             "provider_id",
             "model_id",
             "feature",
+            "currency",
             "version",
             name="uq_price_version_scope",
         ),
@@ -2818,6 +2853,15 @@ class PriceVersion(Base, TimestampMixin, WorkspaceScopedMixin):
     model_id: Mapped[str] = mapped_column(String(160), default="*", index=True)
     feature: Mapped[str] = mapped_column(String(80), default="*", index=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
+    currency: Mapped[str] = mapped_column(String(3), default="USD", index=True)
+    input_per_million: Mapped[str] = mapped_column(Text, default="0")
+    cached_input_per_million: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cache_write_per_million: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_per_million: Mapped[str] = mapped_column(Text, default="0")
+    fixed_per_call: Mapped[str] = mapped_column(Text, default="0")
+    rates_by_unit: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    legacy_billing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    # Original columns are retained as migration evidence only.
     input_usd_per_million: Mapped[float] = mapped_column(Float, default=0.0)
     cached_input_usd_per_million: Mapped[float | None] = mapped_column(Float, nullable=True)
     cache_write_usd_per_million: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -2834,7 +2878,7 @@ class PriceVersion(Base, TimestampMixin, WorkspaceScopedMixin):
 
 
 class ExchangeRateVersion(Base, TimestampMixin, WorkspaceScopedMixin):
-    """Immutable exchange-rate version used to snapshot historical costs."""
+    """Archived exchange-rate evidence. Native billing never reads this table."""
 
     __tablename__ = "exchange_rate_versions"
     __table_args__ = (
@@ -2871,6 +2915,7 @@ class BudgetPolicy(Base, TimestampMixin, WorkspaceScopedMixin):
             "model_id",
             "feature",
             "period",
+            "currency",
             name="uq_budget_policy_scope",
         ),
     )
@@ -2880,9 +2925,11 @@ class BudgetPolicy(Base, TimestampMixin, WorkspaceScopedMixin):
     model_id: Mapped[str] = mapped_column(String(160), default="*", index=True)
     feature: Mapped[str] = mapped_column(String(80), default="*", index=True)
     period: Mapped[str] = mapped_column(String(32), default="calendar_month_utc")
-    # The soft/hard limit values are expressed in `limit_currency` (USD or CNY).
-    # The "_cny" column name is retained for schema continuity; at evaluation
-    # time a USD limit is converted to CNY by the current exchange rate.
+    currency: Mapped[str] = mapped_column(String(3), default="CNY", index=True)
+    soft_limit: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hard_limit: Mapped[str | None] = mapped_column(Text, nullable=True)
+    legacy_billing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    # Archived legacy values; no live code converts or evaluates these columns.
     soft_limit_cny: Mapped[float | None] = mapped_column(Float, nullable=True)
     hard_limit_cny: Mapped[float | None] = mapped_column(Float, nullable=True)
     limit_currency: Mapped[str] = mapped_column(String(8), default="CNY")
@@ -2913,6 +2960,12 @@ class BudgetAlert(Base, TimestampMixin, WorkspaceScopedMixin):
     feature: Mapped[str] = mapped_column(String(80))
     period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    spent_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reserved_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    projected_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    limit_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    legacy_billing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
     spent_cny: Mapped[float] = mapped_column(Float, default=0.0)
     projected_cost_cny: Mapped[float] = mapped_column(Float, default=0.0)
     limit_cny: Mapped[float] = mapped_column(Float)
@@ -2934,6 +2987,18 @@ class UsageEvent(Base, TimestampMixin, WorkspaceScopedMixin):
     reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     attempt: Mapped[int] = mapped_column(Integer, default=1)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True, index=True)
+    cost_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reserved_amount: Mapped[str | None] = mapped_column(Text, nullable=True)
+    amount_source: Mapped[str] = mapped_column(String(48), default="unknown", server_default="unknown")
+    record_stage: Mapped[str] = mapped_column(String(16), default="settled", server_default="settled", index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True, unique=True)
+    pricing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    legacy_billing_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    usage_units: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reservation_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reservation_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     cost_cny: Mapped[float] = mapped_column(Float, default=0.0)
     cost_status: Mapped[str] = mapped_column(String(32), default="unpriced")
@@ -3417,6 +3482,12 @@ class VoiceSessionRecord(Base, TimestampMixin, WorkspaceScopedMixin):
         Integer, default=0, server_default="0"
     )
     runtime_owner_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    runtime_owner_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    runtime_owner_lease_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -3515,6 +3586,18 @@ class VoiceTaskLinkRecord(Base, TimestampMixin, WorkspaceScopedMixin):
         Integer, default=0, server_default="0"
     )
     allowed_tools: Mapped[list[str]] = mapped_column(JSON, default=list)
+    capability_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    approval_status: Mapped[str] = mapped_column(
+        String(24), default="none", server_default="none", index=True
+    )
+    approval_request_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default="{}"
+    )
+    approval_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     auto_delivery: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1"
     )
@@ -3580,12 +3663,7 @@ class VoiceResultInboxRecord(Base, TimestampMixin, WorkspaceScopedMixin):
 
 
 class VoiceSpeechDeliveryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
-    """Idempotent record that a result was handed to the foreground tutor.
-
-    This is not a claim that every audio sample played. It proves the result
-    was claimed for delivery once and lets reconnect recovery distinguish a
-    ready result from one already spoken.
-    """
+    """Durable handoff and playback state for one background result speech."""
 
     __tablename__ = "voice_speech_deliveries"
     __table_args__ = (
@@ -3606,6 +3684,11 @@ class VoiceSpeechDeliveryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
     idempotency_key: Mapped[str] = mapped_column(String(160))
     speech_id: Mapped[str] = mapped_column(String(64), default=new_id)
     status: Mapped[str] = mapped_column(String(24), default="delivered")
+    # ``status`` is retained for API compatibility; playback_status is the
+    # actual foreground audio lifecycle used by reliability accounting.
+    playback_status: Mapped[str] = mapped_column(
+        String(24), default="claimed", server_default="claimed"
+    )
     claimed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
@@ -3613,6 +3696,9 @@ class VoiceSpeechDeliveryRecord(Base, TimestampMixin, WorkspaceScopedMixin):
         DateTime(timezone=True), nullable=True
     )
     interrupted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    playback_ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     failed_at: Mapped[datetime | None] = mapped_column(
@@ -3639,14 +3725,17 @@ class VoiceRelayConfig(Base, TimestampMixin):
     # Reserved for a future per-workspace override; today only "deployment".
     scope: Mapped[str] = mapped_column(String(32), default="deployment")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Both modes go through Cloudflare's ephemeral-credential API today; the
-    # column stays explicit so a static-credential provider can be added later
-    # without another schema change.
+    # cloudflare: dynamic TURN credentials; manual: credential-free STUN only.
     mode: Mapped[str] = mapped_column(String(24), default="cloudflare")
-    # Ordered ICE server URLs.  aiortc honours only the first STUN/TURN entry, so
-    # the runtime picks its transport from position 0 while browsers receive all
-    # of them and fall back on their own.
+    # Ordered Cloudflare ICE URLs; the first TURN is the server preference.
+    # The runtime deliberately excludes STUN from aiortc candidate gathering.
     urls: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    # Independent browser STUN pool, retained when switching modes. Existing
+    # deployments must explicitly opt in before these URLs supplement Cloudflare.
+    stun_urls: Mapped[list[Any]] = mapped_column(JSON, default=list, server_default="[]")
+    stun_fallback_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
     # Cloudflare TURN Key ID (not secret); the API token is sealed separately.
     key_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
     api_base: Mapped[str | None] = mapped_column(String(200), nullable=True)

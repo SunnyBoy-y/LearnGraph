@@ -21,4 +21,3 @@ GRAPH_COVER_MODEL_SETTING_KEY = "graph.cover_model"
 # image（生图模型出位图）。取值非法或未配置时一律按 svg 处理。
 GRAPH_COVER_ENGINE_SETTING_KEY = "graph.cover_engine"
 FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY = "models.functional_defaults"
-TRAJECTORY_ENABLED_SETTING_KEY = "trajectory.enabled"

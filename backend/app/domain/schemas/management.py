@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BeforeValidator, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from app.domain.schemas.common import ORMModel
+from app.core.money import amount_text, decimal_amount, input_amount_text
+
+Money = Annotated[str, BeforeValidator(amount_text)]
+MoneyInput = Annotated[str, BeforeValidator(input_amount_text)]
 
 
 class MemoryCreateRequest(BaseModel):
@@ -376,9 +380,15 @@ class MemoryProfileIntentRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4_000)
     selected_text: str | None = Field(default=None, max_length=4_000)
     selected_atom_ids: list[str] = Field(default_factory=list, max_length=50)
+    # Optional per-request override from the memory report composer.  When
+    # omitted, the workspace's configured memory extraction/summarization
+    # model remains the source of truth.
+    provider_id: str | None = Field(default=None, min_length=1, max_length=36)
+    model_id: str | None = Field(default=None, min_length=1, max_length=160)
     timezone_name: str = Field(
         default="Asia/Shanghai", min_length=1, max_length=80
     )
+    observed_at: datetime | None = None
 
 
 class MemoryProfileIntentResult(BaseModel):
@@ -387,6 +397,8 @@ class MemoryProfileIntentResult(BaseModel):
     auto_committed: int = 0
     affected_memory_ids: list[str] = Field(default_factory=list)
     profile_status: str = "stale"
+    provider_id: str | None = None
+    model_id: str | None = None
 
 
 class ContextSummaryView(ORMModel):
@@ -686,6 +698,8 @@ class ProviderBalanceQueryConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_variables(self) -> "ProviderBalanceQueryConfig":
+        # Legacy configs cannot enable client-driven automatic polling.
+        self.auto_query_interval_minutes = 0
         if len(self.variables) > 16:
             raise ValueError("At most 16 template variables are allowed")
         for name, value in self.variables.items():
@@ -744,6 +758,7 @@ class ProviderBalanceQueryExecuteRequest(BaseModel):
 
 
 class ProviderBalanceQueryExecuteView(BaseModel):
+    query_token: str
     provider_id: str
     status_code: int
     ok: bool
@@ -755,6 +770,8 @@ class ProviderBalanceQueryExecuteView(BaseModel):
 
 class ProviderBalanceQueryResultRequest(BaseModel):
     """Extractor output cached for the provider list (cc-switch fields)."""
+
+    query_token: str | None = Field(default=None, max_length=36)
 
     is_valid: bool | None = None
     invalid_message: str | None = Field(default=None, max_length=500)
@@ -810,6 +827,7 @@ class CodexDeviceLoginPollView(BaseModel):
 
 
 class ProviderUpdateRequest(BaseModel):
+    billing_currency: Literal["USD", "CNY"] | None = None
     enabled: bool | None = None
     provider_type: str | None = Field(default=None, min_length=1, max_length=80)
     base_url: str | None = Field(default=None, max_length=500)
@@ -1007,7 +1025,9 @@ class MasterKeyRotationView(BaseModel):
 
 
 class UsageSummary(BaseModel):
+    schema_version: Literal[2] = 2
     workspace_id: str
+    currency: Literal["USD", "CNY"]
     input_tokens: int
     cached_input_tokens: int
     cache_creation_input_tokens: int
@@ -1015,10 +1035,12 @@ class UsageSummary(BaseModel):
     reasoning_tokens: int
     total_tokens: int
     attempts: int
-    cost_usd: float
-    cost_cny: float
+    cost_amount: Money
+    reserved_amount: Money = "0"
     unpriced_events: int
+    unknown_currency_events: int = 0
     remote_usage_recorded: bool
+    breakdown: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
 
 
 class UsageEventView(ORMModel):
@@ -1027,6 +1049,12 @@ class UsageEventView(ORMModel):
     provider_id: str
     model_id: str
     feature: str
+    currency: Literal["USD", "CNY"] | None
+    cost_amount: Money | None
+    reserved_amount: Money | None
+    cost_status: str
+    amount_source: str
+    record_stage: str
     input_tokens: int
     cached_input_tokens: int
     cache_creation_input_tokens: int
@@ -1034,59 +1062,53 @@ class UsageEventView(ORMModel):
     reasoning_tokens: int
     total_tokens: int
     attempt: int
-    cost_usd: float
-    cost_cny: float
-    cost_status: str
     price_version_id: str | None
-    exchange_rate_version_id: str | None
-    input_usd_per_million: float
-    cached_input_usd_per_million: float
-    cache_write_usd_per_million: float
-    price_multiplier: float
-    output_usd_per_million: float
-    fixed_usd_per_call: float
-    usd_cny_rate: float
+    pricing_snapshot: dict[str, Any]
+    legacy_billing_snapshot: dict[str, Any]
+    usage_units: dict[str, Any]
+    archived_at: datetime | None
     latency_ms: int
     created_at: datetime
 
 
 class ManualPriceUpsertRequest(BaseModel):
-    """Workspace-defined list price for a model, overriding catalog defaults."""
-
+    model_config = ConfigDict(extra="forbid")
     model_id: str = Field(min_length=1, max_length=160)
-    provider_id: str = Field(default="*", min_length=1, max_length=80)
-    currency: Literal["USD", "CNY"] = "USD"
-    input_per_million: float = Field(ge=0)
-    cached_input_per_million: float | None = Field(default=None, ge=0)
-    output_per_million: float = Field(ge=0)
-    fixed_per_call: float = Field(default=0, ge=0)
+    provider_id: str = Field(min_length=1, max_length=80)
+    feature: str = Field(default="*", min_length=1, max_length=80)
+    currency: Literal["USD", "CNY"]
+    input_per_million: MoneyInput
+    cached_input_per_million: MoneyInput | None = None
+    cache_write_per_million: MoneyInput | None = None
+    output_per_million: MoneyInput
+    fixed_per_call: MoneyInput = "0"
+    rates_by_unit: dict[str, MoneyInput] = Field(default_factory=dict)
+    conditions: dict[str, Any] = Field(default_factory=dict)
 
 
-class ManualPriceView(BaseModel):
+class ManualPriceView(ManualPriceUpsertRequest):
+    input_per_million: Money
+    cached_input_per_million: Money | None = None
+    cache_write_per_million: Money | None = None
+    output_per_million: Money
+    fixed_per_call: Money = "0"
+    rates_by_unit: dict[str, Money] = Field(default_factory=dict)
     id: str
-    model_id: str
-    provider_id: str
-    currency: str
-    input_per_million: float
-    cached_input_per_million: float | None
-    output_per_million: float
-    fixed_per_call: float
     effective_at: datetime
+    version: int
 
 
 class PriceCatalogItem(BaseModel):
     catalog_id: str
     provider_key: str
     model_id: str
-    currency: str
-    native_input_per_million: float
-    native_cached_input_per_million: float | None
-    native_cache_write_per_million: float | None
-    native_output_per_million: float
-    input_usd_per_million: float
-    cached_input_usd_per_million: float | None
-    cache_write_usd_per_million: float | None
-    output_usd_per_million: float
+    currency: Literal["USD", "CNY"]
+    native_input_per_million: Money
+    native_cached_input_per_million: Money | None
+    native_cache_write_per_million: Money | None
+    native_output_per_million: Money
+    native_fixed_per_call: Money = "0"
+    rates_by_unit: dict[str, Money] = Field(default_factory=dict)
     conditions: dict[str, Any]
     source_url: str
     as_of: str
@@ -1100,18 +1122,6 @@ class ModelsDevSnapshotStatus(BaseModel):
     provider_count: int
     model_count: int
     priced_model_count: int
-
-
-class ExchangeRateInfo(BaseModel):
-    """The single currently-effective USD/CNY rate used for cost conversion."""
-
-    rate: float
-    source: str
-    effective_at: datetime
-
-
-class ExchangeRateSetRequest(BaseModel):
-    rate: float = Field(gt=0)
 
 
 class AlertEmailConfigView(BaseModel):
@@ -1143,47 +1153,39 @@ class AlertEmailTestResult(BaseModel):
 
 
 class BudgetPolicyCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=160)
     provider_id: str = Field(default="*", min_length=1, max_length=80)
     model_id: str = Field(default="*", min_length=1, max_length=160)
     feature: str = Field(default="*", min_length=1, max_length=80)
-    period: Literal["calendar_day_utc", "calendar_month_utc"] = (
-        "calendar_month_utc"
-    )
-    soft_limit_cny: float | None = Field(default=None, ge=0)
-    hard_limit_cny: float | None = Field(default=None, ge=0)
-    limit_currency: Literal["CNY", "USD"] = "CNY"
+    period: Literal["calendar_day_utc", "calendar_month_utc"] = "calendar_month_utc"
+    currency: Literal["CNY", "USD"]
+    soft_limit: MoneyInput | None = None
+    hard_limit: MoneyInput | None = None
     enabled: bool = True
 
     @model_validator(mode="after")
-    def validate_limits(self) -> "BudgetPolicyCreateRequest":
-        if self.soft_limit_cny is None and self.hard_limit_cny is None:
+    def validate_limits(self):
+        if self.soft_limit is None and self.hard_limit is None:
             raise ValueError("At least one budget limit is required")
-        if (
-            self.soft_limit_cny is not None
-            and self.hard_limit_cny is not None
-            and self.soft_limit_cny > self.hard_limit_cny
-        ):
+        if self.soft_limit is not None and self.hard_limit is not None and decimal_amount(self.soft_limit) > decimal_amount(self.hard_limit):
             raise ValueError("Soft budget limit cannot exceed hard limit")
         return self
 
 
 class BudgetPolicyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=160)
-    soft_limit_cny: float | None = Field(default=None, ge=0)
-    hard_limit_cny: float | None = Field(default=None, ge=0)
-    limit_currency: Literal["CNY", "USD"] = "CNY"
+    soft_limit: MoneyInput | None = None
+    hard_limit: MoneyInput | None = None
     enabled: bool = True
+    currency: Literal["CNY", "USD"] | None = None
 
     @model_validator(mode="after")
-    def validate_limits(self) -> "BudgetPolicyUpdateRequest":
-        if self.soft_limit_cny is None and self.hard_limit_cny is None:
+    def validate_limits(self):
+        if self.soft_limit is None and self.hard_limit is None:
             raise ValueError("At least one budget limit is required")
-        if (
-            self.soft_limit_cny is not None
-            and self.hard_limit_cny is not None
-            and self.soft_limit_cny > self.hard_limit_cny
-        ):
+        if self.soft_limit is not None and self.hard_limit is not None and decimal_amount(self.soft_limit) > decimal_amount(self.hard_limit):
             raise ValueError("Soft budget limit cannot exceed hard limit")
         return self
 
@@ -1196,9 +1198,9 @@ class BudgetPolicyView(ORMModel):
     model_id: str
     feature: str
     period: str
-    soft_limit_cny: float | None
-    hard_limit_cny: float | None
-    limit_currency: str
+    currency: Literal["CNY", "USD"]
+    soft_limit: Money | None
+    hard_limit: Money | None
     enabled: bool
     created_at: datetime
     updated_at: datetime
@@ -1211,16 +1213,17 @@ class BudgetStatusView(BaseModel):
     model_id: str
     feature: str
     period: str
+    currency: Literal["CNY", "USD"]
     period_start: datetime
     period_end: datetime
-    spent_cny: float
-    soft_limit_cny: float | None
-    hard_limit_cny: float | None
-    soft_limit_cny_effective: float | None
-    hard_limit_cny_effective: float | None
-    spent_usd: float
-    soft_limit_usd: float | None
-    hard_limit_usd: float | None
+    spent_amount: Money
+    reserved_amount: Money
+    soft_limit: Money | None
+    hard_limit: Money | None
+    remaining_amount: Money | None
+    unknown_events: int
+    status: str
+    usage_ratio: float | None
     soft_exceeded: bool
     hard_exceeded: bool
     enabled: bool
@@ -1235,11 +1238,14 @@ class BudgetAlertView(ORMModel):
     provider_id: str
     model_id: str
     feature: str
+    currency: Literal["CNY", "USD"] | None
     period_start: datetime
     period_end: datetime
-    spent_cny: float
-    projected_cost_cny: float
-    limit_cny: float
+    spent_amount: Money | None
+    reserved_amount: Money | None
+    projected_amount: Money | None
+    limit_amount: Money | None
+    legacy_billing_snapshot: dict[str, Any]
     acknowledged_at: datetime | None
     created_at: datetime
     updated_at: datetime

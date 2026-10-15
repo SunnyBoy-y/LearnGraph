@@ -37,6 +37,7 @@ class ContextEvidenceView(BaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     token_cost: int = 0
     manifest_status: str = "selected"
+    external_source: dict[str, Any] | None = None
 
 
 class ContextBuildView(BaseModel):

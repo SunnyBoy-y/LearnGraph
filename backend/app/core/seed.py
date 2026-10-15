@@ -336,8 +336,9 @@ def seed_demo_data(db: Session) -> None:
                 input_tokens=0,
                 output_tokens=0,
                 attempt=1,
-                cost_usd=0,
-                cost_cny=0,
+                currency="USD",
+                cost_amount="0",
+                amount_source="non_billable",
                 cost_status="non_billable",
                 latency_ms=0,
             )

@@ -209,6 +209,7 @@ class WorkspaceView(ORMModel):
     name: str
     description: str
     created_at: datetime
+    effective_permissions: list[str] = Field(default_factory=list)
 
 
 class WorkspaceSelectionResponse(BaseModel):

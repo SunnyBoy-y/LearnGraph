@@ -462,3 +462,13 @@ class VoiceSpeechDeliveryRepository(ScopedRepository[VoiceSpeechDeliveryRecord])
                 VoiceSpeechDeliveryRecord.idempotency_key == idempotency_key,
             )
         )
+
+    def get_by_speech_id(
+        self, speech_id: str, *, tenant_id: str
+    ) -> VoiceSpeechDeliveryRecord | None:
+        return self.db.scalar(
+            self.query().where(
+                VoiceSpeechDeliveryRecord.tenant_id == tenant_id,
+                VoiceSpeechDeliveryRecord.speech_id == speech_id,
+            )
+        )

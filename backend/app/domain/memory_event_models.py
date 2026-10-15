@@ -112,7 +112,7 @@ class MemoryEvent(Base):
         ForeignKey("memory_payload_keys.id", ondelete="SET NULL"), nullable=True, index=True
     )
     payload_hash: Mapped[str] = mapped_column(String(71))
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
     redacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -188,6 +188,11 @@ class MemorySearchDocument(Base, TimestampMixin):
     source_event_id: Mapped[str] = mapped_column(String(64), index=True)
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     projection_version: Mapped[int] = mapped_column(Integer, default=1)
+    # Provider-neutral provenance for benchmark evidence and future external
+    # sources. Normal product memories leave this empty.
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default="{}"
+    )
 
 
 class MemoryRelation(Base, TimestampMixin):

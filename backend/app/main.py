@@ -69,6 +69,10 @@ async def lifespan(app: FastAPI):
     settings.storage_root.mkdir(parents=True, exist_ok=True)
     settings.memory_root.mkdir(parents=True, exist_ok=True)
     init_database()
+    from app.core.database import SessionLocal
+    from app.services.billing import BillingService
+    with SessionLocal() as billing_db:
+        BillingService.reconcile_expired(billing_db)
     _profile_warnings = settings.profile_validate()
     if _profile_warnings:
         import logging
@@ -170,9 +174,14 @@ async def lifespan(app: FastAPI):
         voice_reaper_task = asyncio.create_task(
             voice_session_reaper_scheduler(voice_reaper_stop)
         )
+    from app.services.provider_balance_lifecycle import balance_worker
+    balance_stop = asyncio.Event()
+    balance_task = asyncio.create_task(balance_worker(balance_stop))
     try:
         yield
     finally:
+        balance_stop.set()
+        await balance_task
         await close_embedded_runtime(app)
         if durable_queue_stop is not None and durable_queue_task is not None:
             durable_queue_stop.set()
@@ -273,7 +282,7 @@ app = FastAPI(
         {"name": "evidence-mastery", "description": "证据审核、掌握度计算和复习调度。"},
         {"name": "mcp-skills", "description": "MCP Server 与 Skill 的能力发现、授权、调用和撤销。"},
         {"name": "providers", "description": "Provider 配置、能力探测、模型发现和启用状态。"},
-        {"name": "usage", "description": "Token、费用、预算、价格和汇率记录。"},
+        {"name": "usage", "description": "Token、美元/人民币原币费用、预算和价格记录。"},
         {"name": "sandbox", "description": "按工作区和会话隔离的固定文件任务、执行事实与清理。"},
     ],
     lifespan=lifespan,

@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.domain.schemas.common import ORMModel
+from app.domain.schemas.management import MoneyInput
 
 
 AgentRoleKey = Literal["research", "reason", "tool", "generic"]
@@ -46,6 +47,8 @@ class AgentTaskArtifact(BaseModel):
     change: str = ""
     sha256: str | None = None
     file_id: str | None = None
+    mime_type: str | None = None
+    size_bytes: int | None = None
     exists: bool = False
 
 
@@ -321,19 +324,30 @@ class SandboxAgentImagePublishRequest(BaseModel):
 
 class SandboxAgentFileReadRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
-    path: str = Field(min_length=1, max_length=255)
-    # Batch mode: read multiple files in one tool call. When set (1..16 paths),
-    # ``path`` is ignored and each file is read with the same start_line /
-    # end_line / max_chars applied per file. Results merge into a ``files``
-    # list and only one audit/touch/commit happens for the whole batch.
-    paths: list[str] | None = Field(default=None, max_length=16)
-    # Optional line-range view: read only lines [start_line, end_line] (1-based,
-    # inclusive). Combined with max_chars this keeps large files out of the
-    # model context. When omitted the whole file is returned.
+    path: str | None = Field(default=None, min_length=1, max_length=255)
+    # Single and batch reads are mutually exclusive. Batch paths keep their
+    # input order; duplicates are rejected rather than silently re-read.
+    paths: list[str] | None = Field(default=None, min_length=1, max_length=16)
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=1)
-    max_chars: int | None = Field(default=None, ge=1, le=1_048_576)
+    max_chars: int | None = Field(default=16384, ge=1, le=1_048_576)
+    cursor: str | None = Field(default=None, min_length=1, max_length=2048)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+    @model_validator(mode="after")
+    def validate_read_selection(self) -> "SandboxAgentFileReadRequest":
+        if (self.path is None) == (self.paths is None):
+            raise ValueError("Provide exactly one of path or paths")
+        if self.cursor is not None and self.paths is not None:
+            raise ValueError("Continue each file separately using path and its next_cursor")
+        selected = self.paths if self.paths is not None else [self.path]
+        if any(not isinstance(path, str) or not path.strip() or len(path) > 255 for path in selected):
+            raise ValueError("Each path must be a non-empty string of at most 255 characters")
+        if len(set(selected)) != len(selected):
+            raise ValueError("Duplicate paths are not allowed")
+        if self.end_line is not None and self.end_line < (self.start_line or 1):
+            raise ValueError("end_line must be greater than or equal to start_line")
+        return self
 
 
 class SandboxAgentFileGrepRequest(BaseModel):
@@ -766,6 +780,7 @@ class SandboxAgentSubagentRequest(BaseModel):
     max_tool_calls: int | None = Field(default=None, ge=1, le=200)
     max_tokens: int | None = Field(default=None, ge=1000, le=200_000)
     max_cost_usd: float | None = Field(default=None, ge=0.0, le=10.0)
+    max_cost_amounts: dict[Literal["USD", "CNY"], MoneyInput] = Field(default_factory=dict)
     write_set: list[str] | None = Field(
         default=None,
         max_length=32,

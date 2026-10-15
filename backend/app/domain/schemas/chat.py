@@ -54,6 +54,7 @@ class SessionCreateRequest(BaseModel):
     title: str = Field(default="新学习会话", min_length=1, max_length=240)
     goal_id: str | None = Field(default=None, min_length=1, max_length=36)
     graph_id: str | None = Field(default=None, min_length=1, max_length=36)
+    current_node_id: str | None = Field(default=None, min_length=1, max_length=36)
     project_id: str | None = Field(default=None, min_length=1, max_length=36)
     # Optional parent for nested side threads (e.g. 划词解释). The child is
     # listed under the parent in the sidebar, not as a peer root session.
@@ -68,6 +69,7 @@ class SessionUpdateRequest(BaseModel):
     pinned: bool | None = None
     goal_id: str | None = Field(default=None, min_length=1, max_length=36)
     graph_id: str | None = Field(default=None, min_length=1, max_length=36)
+    current_node_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
 class SessionAutoTitleRequest(BaseModel):
@@ -149,6 +151,7 @@ class SessionView(ORMModel):
     title: str
     goal_id: str | None
     graph_id: str | None
+    current_node_id: str | None
     project_id: str | None
     parent_session_id: str | None
     source_message_id: str | None
@@ -497,10 +500,9 @@ class MessageView(ORMModel):
 class MessageListPageView(BaseModel):
     """Windowed session timeline for the chat UI.
 
-    Items are chronological (oldest → newest). When ``limit`` is omitted the
-    backend still returns the full timeline, but parts / provider_trace are
-    compact by default so multi-session agent histories do not ship multi-MB
-    tool dumps on every open.
+    Items are chronological (oldest → newest). Text and Markdown/HTML source are
+    returned losslessly; compact mode only bounds nested structured tool/citation
+    metadata so a long answer is never replaced by a visible truncation marker.
     """
 
     items: list[MessageView]

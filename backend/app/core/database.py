@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Callable
 from collections.abc import Generator
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -576,7 +577,17 @@ def active_stream_count() -> int:
         return _active_stream_count
 
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+class BillingSession(Session):
+    def close(self) -> None:
+        try:
+            if self.info.get("native_pending_quotes"):
+                from app.services.billing import BillingService
+                BillingService.reconcile_session(self)
+        finally:
+            super().close()
+
+
+SessionLocal = sessionmaker(bind=engine, class_=BillingSession, autoflush=False, expire_on_commit=False)
 
 
 def _is_sqlite_locked_error(exc: OperationalError) -> bool:
@@ -743,7 +754,11 @@ def commit_with_locked_retry(
 
 def get_db() -> Generator[Session, None, None]:
     with SessionLocal() as session:
-        yield session
+        try:
+            yield session
+        finally:
+            from app.services.billing import BillingService
+            BillingService.reconcile_session(session)
 
 
 # Startup schema work is idempotent by construction (``create_all`` plus additive
@@ -845,8 +860,11 @@ def describe_pending_sqlite_migrations() -> list[str]:
         migration_models,
         models,
         learning_package_models,
+        provider_balance_models,
+        provider_import_models,
     )
     from app.core.migrations import MIGRATIONS
+    from app.core.migrations.native_billing import native_billing_shape_needs_repair
 
     pending: list[str] = []
     with engine.connect() as connection:
@@ -856,6 +874,7 @@ def describe_pending_sqlite_migrations() -> list[str]:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
+        existing_indexes = {str(row[0]) for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='index'")}
 
         for table in Base.metadata.sorted_tables:
             if table.name not in existing_tables:
@@ -870,6 +889,7 @@ def describe_pending_sqlite_migrations() -> list[str]:
             missing = [column.name for column in table.columns if column.name not in existing]
             if missing:
                 pending.append(f"add column(s) {table.name}.{', '.join(missing)}")
+            pending.extend(f"create index {index.name}" for index in table.indexes if index.name not in existing_indexes)
 
         if "schema_revisions" in existing_tables:
             applied = {
@@ -900,11 +920,8 @@ def describe_pending_sqlite_migrations() -> list[str]:
                 pending.append("prune rows from session_messages_fts")
             if _fts_projection_needs_backfill(connection):
                 pending.append("backfill session_messages_fts")
-        if "usage_events" in existing_tables:
-            if _legacy_cny_backfill_needed(connection):
-                pending.append("restore legacy CNY cost on usage_events")
-            if _legacy_local_mock_backfill_needed(connection):
-                pending.append("mark legacy local-mock usage_events as non_billable")
+        if native_billing_shape_needs_repair(connection):
+            pending.append("repair native billing columns and currency constraints")
     return pending
 
 
@@ -1042,14 +1059,45 @@ def init_database() -> None:
         migration_models,
         models,
         learning_package_models,
+        provider_balance_models,
+        provider_import_models,
     )
     from app.core.migrations import apply_schema_migrations
 
     def _run_phases() -> None:
-        Base.metadata.create_all(bind=engine)
-        _apply_sqlite_subapp_persistence_migration()
-        with engine.begin() as connection:
-            apply_schema_migrations(connection)
+        if is_sqlite:
+            # One cross-process write lock protects schema discovery, legacy
+            # baselines, native ledger upgrade and the final revision commit.
+            # FK enforcement is restored before this connection re-enters the pool.
+            with engine.connect() as connection:
+                connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                connection.commit()
+                try:
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    ensure_voice_event_type_column(connection)
+                    Base.metadata.create_all(bind=connection)
+                    _apply_sqlite_additive_migrations(connection)
+                    apply_schema_migrations(connection)
+                    from app.core.migrations.native_billing import apply_native_billing_migration, native_billing_shape_needs_repair
+                    if native_billing_shape_needs_repair(connection):
+                        apply_native_billing_migration(connection)
+                    for table in Base.metadata.sorted_tables:
+                        for index in table.indexes:
+                            index.create(bind=connection, checkfirst=True)
+                    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise RuntimeError(f"Database migration foreign key validation failed: {violations[:5]}")
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                finally:
+                    connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                    connection.commit()
+        else:
+            with engine.begin() as connection:
+                Base.metadata.create_all(bind=connection)
+                apply_schema_migrations(connection)
         _ensure_sqlite_skill_package_columns()
         _verify_schema_revisions()
 
@@ -1061,6 +1109,10 @@ def init_database() -> None:
     # 2) If nothing, the phases are pure reads — no write lock, no snapshot.
     # 3) Otherwise snapshot first, then migrate under the lock-contention retry.
     pending = describe_pending_sqlite_migrations()
+    if not pending:
+        _verify_sqlite_metadata_shape()
+        _verify_schema_revisions()
+        return
     backup: Path | None = None
     if pending:
         logger.info(
@@ -1139,8 +1191,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.10.0"
-CURRENT_SCHEMA_DESCRIPTION = "Durable AI graph cover generation jobs (svg/image engines)"
+CURRENT_SCHEMA_REVISION = "v1.15.0"
+CURRENT_SCHEMA_DESCRIPTION = "Native USD and CNY billing, exact ledger and currency-scoped budgets"
 
 
 def _compute_schema_checksum() -> str:
@@ -1475,34 +1527,7 @@ def _ensure_sqlite_skill_package_columns() -> None:
         _verify_sqlite_metadata_shape()
 
 
-# Predicates for the legacy one-shot billing backfills inside the additive
-# migration. Shared by the read-only probe and the UPDATE it gates, so a probe
-# can never drift away from the statement it guards.
-_LEGACY_CNY_BACKFILL_CONDITION = (
-    "cost_usd > 0 AND cost_cny = 0 AND cost_status = 'unpriced'"
-)
-_LEGACY_LOCAL_MOCK_BACKFILL_CONDITION = (
-    "provider_id = 'local_mock' AND cost_status = 'unpriced'"
-)
-
-
-def _legacy_cny_backfill_needed(connection: Any) -> bool:
-    """True when a pre-versioned-billing row still needs its CNY cost restored."""
-
-    return connection.exec_driver_sql(
-        f"SELECT 1 FROM usage_events WHERE {_LEGACY_CNY_BACKFILL_CONDITION} LIMIT 1"
-    ).fetchone() is not None
-
-
-def _legacy_local_mock_backfill_needed(connection: Any) -> bool:
-    """True when a local-mock usage row still carries the legacy 'unpriced'."""
-
-    return connection.exec_driver_sql(
-        f"SELECT 1 FROM usage_events WHERE {_LEGACY_LOCAL_MOCK_BACKFILL_CONDITION} LIMIT 1"
-    ).fetchone() is not None
-
-
-def _apply_sqlite_additive_migrations() -> None:
+def _apply_sqlite_additive_migrations(connection: Any = None) -> None:
     """Keep local MVP databases readable when additive fields are introduced.
 
     This is intentionally limited to nullable/defaulted columns. Destructive
@@ -1865,6 +1890,7 @@ def _apply_sqlite_additive_migrations() -> None:
         # memories participate in the same visible layering as v1 records.
         "memory_search_documents": {
             "zone": "VARCHAR(16) NOT NULL DEFAULT 'recent'",
+            "metadata_json": "JSON NOT NULL DEFAULT '{}'",
         },
         "graphs": {
             "cover_svg": "TEXT",
@@ -1878,7 +1904,7 @@ def _apply_sqlite_additive_migrations() -> None:
             "token_key_version": "INTEGER",
         },
     }
-    with engine.begin() as connection:
+    with (nullcontext(connection) if connection is not None else engine.begin()) as connection:
         for table_name, columns in additions.items():
             existing = {
                 str(row[1])
@@ -2030,26 +2056,6 @@ def _apply_sqlite_additive_migrations() -> None:
                 "chunk_id UNINDEXED, workspace_id UNINDEXED, file_id UNINDEXED, content)"
             )
         ensure_sqlite_session_search_projection(connection)
-        # Before versioned billing, the only non-zero stored cost came from
-        # Deep Research's explicit CNY amount divided by the agreed 6.77 rate.
-        # Preserve that historical meaning once, rather than presenting those
-        # rows as newly priced or silently leaving their CNY total at zero.
-        # These are one-shot legacy backfills: an UPDATE that matches no row
-        # still takes the write lock, so a read-only probe (same predicate, see
-        # the constants above the caller) gates each one and an
-        # already-backfilled database performs no write at startup.
-        if _legacy_cny_backfill_needed(connection):
-            connection.exec_driver_sql(
-                "UPDATE usage_events "
-                "SET cost_cny = cost_usd * 6.77, "
-                "usd_cny_rate = 6.77, cost_status = 'legacy_snapshot' "
-                f"WHERE {_LEGACY_CNY_BACKFILL_CONDITION}"
-            )
-        if _legacy_local_mock_backfill_needed(connection):
-            connection.exec_driver_sql(
-                "UPDATE usage_events SET cost_status = 'non_billable' "
-                f"WHERE {_LEGACY_LOCAL_MOCK_BACKFILL_CONDITION}"
-            )
 
 
 def _verify_sqlite_metadata_shape() -> None:

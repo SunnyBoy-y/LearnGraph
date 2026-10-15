@@ -6,10 +6,12 @@ from typing import Any
 
 from sqlalchemy import inspect
 from sqlalchemy.engine import Connection
+from sqlalchemy.schema import CreateColumn
 
 from app.domain.migration_models import SchemaRevision
 from app.core.migrations.voice_reliability import apply_voice_reliability_migration
 from app.domain.models import SubAppInteractionEvent, utc_now
+from app.core.migrations.native_billing import apply_native_billing_migration
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +328,66 @@ def _graph_cover_ai_jobs(connection: Connection) -> None:
     GraphCoverJob.__table__.create(bind=connection, checkfirst=True)
 
 
+def _voice_runtime_owner_and_playback(connection: Connection) -> None:
+    """Add runtime owner leases and actual playback state to existing voice rows."""
+
+    from app.domain.models import (
+        VoiceSessionRecord,
+        VoiceSpeechDeliveryRecord,
+        VoiceTaskLinkRecord,
+    )
+
+    for table in (
+        VoiceSessionRecord.__table__,
+        VoiceSpeechDeliveryRecord.__table__,
+        VoiceTaskLinkRecord.__table__,
+    ):
+        if not inspect(connection).has_table(table.name):
+            continue
+        existing = {
+            str(column["name"])
+            for column in inspect(connection).get_columns(table.name)
+        }
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            ddl = str(CreateColumn(column).compile(dialect=connection.dialect))
+            connection.exec_driver_sql(
+                f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}'
+            )
+
+
+def _memory_benchmark_source_metadata(connection: Connection) -> None:
+    """Add structured provenance for external benchmark evidence."""
+
+    from app.domain.memory_event_models import MemorySearchDocument
+
+    table = MemorySearchDocument.__table__
+    if not inspect(connection).has_table(table.name):
+        return
+    existing = {str(column["name"]) for column in inspect(connection).get_columns(table.name)}
+    column = table.c.metadata_json
+    if column.name not in existing:
+        ddl = str(CreateColumn(column).compile(dialect=connection.dialect))
+        connection.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
+
+
+def _voice_relay_stun_pool(connection: Connection) -> None:
+    """Add an opt-in browser STUN pool without changing existing relay settings."""
+
+    from app.domain.models import VoiceRelayConfig
+
+    table = VoiceRelayConfig.__table__
+    if not inspect(connection).has_table(table.name):
+        table.create(bind=connection, checkfirst=True)
+        return
+    existing = {str(column["name"]) for column in inspect(connection).get_columns(table.name)}
+    for name in ("stun_urls", "stun_fallback_enabled"):
+        if name not in existing:
+            ddl = str(CreateColumn(table.c[name]).compile(dialect=connection.dialect))
+            connection.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -395,6 +457,31 @@ MIGRATIONS = (
         "v1.10.0",
         "Durable AI graph cover generation jobs (svg/image engines)",
         _graph_cover_ai_jobs,
+    ),
+    SchemaMigration(
+        "v1.11.0",
+        "Voice runtime owner leases and actual playback delivery state",
+        _voice_runtime_owner_and_playback,
+    ),
+    SchemaMigration(
+        "v1.12.0",
+        "Structured source metadata for benchmark evidence retrieval",
+        _memory_benchmark_source_metadata,
+    ),
+    SchemaMigration(
+        "v1.13.0",
+        "Voice task capability and approval metadata",
+        _voice_runtime_owner_and_playback,
+    ),
+    SchemaMigration(
+        "v1.14.0",
+        "Independent manual STUN pool and opt-in Cloudflare fallback",
+        _voice_relay_stun_pool,
+    ),
+    SchemaMigration(
+        "v1.15.0",
+        "Native USD and CNY billing, exact ledger and currency-scoped budgets",
+        apply_native_billing_migration,
     ),
 )
 

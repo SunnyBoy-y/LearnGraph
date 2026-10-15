@@ -75,7 +75,7 @@ def default_sandboxd_url() -> str:
 # never need to edit their .env to follow a newer runner build. Setting the env
 # var still pins an explicit reference (admin lock).
 DEFAULT_SANDBOX_PREBUILT_IMAGE = (
-    "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.5"
+    "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.6"
 )
 
 
@@ -460,7 +460,7 @@ class Settings(BaseSettings):
     # serial execution. agent_parallel_tools_max_workers caps the whole
     # process; the per-batch cap is min(len(calls), max_workers).
     agent_parallel_tools_enabled: bool = True
-    agent_parallel_tools_max_workers: int = 4
+    agent_parallel_tools_max_workers: int = 10
     # Hosted 文搜图/图搜图 (Qwen Responses web_search_image / image_search)
     # provider timeout. Image search is slower than plain web search (the
     # upstream runs a real web search and may process an input_image for
@@ -567,15 +567,15 @@ class Settings(BaseSettings):
     # Per-chat cap on concurrently active sub-agents (queued + running).
     # 0 disables the cap. v1.1 transition: enforced in SubagentRegistry; the
     # unified scheduler replaces this with a four-level quota in v2.
-    sandbox_subagent_max_concurrent_chat: int = 3
+    sandbox_subagent_max_concurrent_chat: int = 10
 
     # ── Sub-agent v2 (durable tasks via the unified scheduler) ───────────
     sandbox_subagent_queue_deadline_seconds: int = 900
-    sandbox_subagent_max_concurrent_user: int = 3
-    sandbox_subagent_max_concurrent_workspace: int = 4
-    sandbox_subagent_max_concurrent_chat: int = 3
+    sandbox_subagent_max_concurrent_user: int = 10
+    sandbox_subagent_max_concurrent_workspace: int = 10
+    sandbox_subagent_max_concurrent_chat: int = 10
     sandbox_subagent_default_parallel: int = 2
-    sandbox_subagent_max_parallel: int = 4
+    sandbox_subagent_max_parallel: int = 10
     sandbox_subagent_max_auto_retries: int = 1
     sandbox_subagent_reserved_parent_ratio: float = 0.2
     sandbox_subagent_events_enabled: bool = True
@@ -809,6 +809,10 @@ class Settings(BaseSettings):
     voice_session_idle_timeout_seconds: float = 2700.0
     voice_session_reaper_interval_seconds: float = 60.0
     voice_session_reaper_enabled: bool = True
+    # Durable media-runtime owner lease. A crashed worker stops renewing the
+    # lease, so a reconnect on another instance can take over safely.
+    voice_runtime_owner_lease_seconds: float = 20.0
+    voice_runtime_owner_heartbeat_seconds: float = 5.0
     # LLM-stage retry budget. Only a generation that produced *no* text is
     # retried (see ``VoiceTurnJournal.llm_failed``), which keeps the retry
     # idempotent: there is no partial answer to duplicate and the voice pipeline

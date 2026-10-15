@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.schemas.common import ORMModel
+from app.domain.schemas.management import Money, MoneyInput
 
 
 class SearchRequest(BaseModel):
@@ -36,7 +37,9 @@ class SearchResponse(BaseModel):
 
 class ResearchRequest(BaseModel):
     question: str = Field(min_length=3, max_length=4_000)
-    budget_cny: float = Field(default=0, ge=0, le=10_000)
+    model_config = ConfigDict(extra="forbid")
+    currency: Literal["USD", "CNY"] = "USD"
+    budget_amount: MoneyInput = "0"
     source_scope: list[str] = Field(default_factory=list)
     allowed_domains: list[str] = Field(default_factory=list, max_length=50)
     approved: bool = False
@@ -48,9 +51,10 @@ class ResearchJobView(ORMModel):
     question: str
     status: str
     provider_id: str
-    budget_cny: float
-    estimated_cost_cny: float
-    actual_cost_cny: float
+    currency: Literal["USD", "CNY"] | None
+    budget_amount: Money | None
+    estimated_cost_amount: Money | None
+    actual_cost_amount: Money | None
     provider_task_id: str | None
     approval_status: str
     source_scope: list[str]
@@ -63,14 +67,16 @@ class ResearchJobView(ORMModel):
 
 class ResearchApprovalRequest(BaseModel):
     approved: bool
+    quote_id: str | None = None
 
 
 class ResearchPlanView(BaseModel):
     provider_id: str
     provider_capabilities: dict[str, Any]
     question: str
-    budget_cny: float
-    estimated_cost_cny: float
+    currency: Literal["USD", "CNY"]
+    budget_amount: Money
+    estimated_cost_amount: Money | None
     requires_approval: bool
 
 
