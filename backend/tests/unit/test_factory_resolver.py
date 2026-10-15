@@ -135,7 +135,7 @@ class TestMCPAdapterDirect:
         )
         return service
 
-    def test_http_mcp_endpoint_rewritten_to_host_docker(self) -> None:
+    def test_http_mcp_endpoint_rewritten_to_host_docker(self, docker_host_dns) -> None:
         service = self._service()
         server = SimpleNamespace(
             id="srv-test",

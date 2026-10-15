@@ -1,0 +1,1954 @@
+{
+  "description": "Sanitized diagnostic replay. Event order, relative timing and numeric fields retained; identifiers, text and network addresses replaced; absolute timestamps shifted.",
+  "rtviUserStoppedAt": [
+    "2026-01-01T00:00:11.262",
+    "2026-01-01T00:00:23.420",
+    "2026-01-01T00:00:24.630"
+  ],
+  "events": [
+    {
+      "event_id": "event_id-001",
+      "event_seq": 1,
+      "type": "session.created",
+      "turn_id": null,
+      "request_id": "request_id-001",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 1,
+      "at": "2026-01-01T00:00:00.000",
+      "payload": {},
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-002",
+      "event_seq": 2,
+      "type": "session.ready",
+      "turn_id": null,
+      "request_id": "request_id-002",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 1,
+      "at": "2026-01-01T00:00:00.009",
+      "payload": {},
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-003",
+      "event_seq": 3,
+      "type": "context.updated",
+      "turn_id": null,
+      "request_id": "request_id-003",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:00.031",
+      "payload": {
+        "reason": "context_snapshot",
+        "context_version": null,
+        "applies_to": "next_turn",
+        "applied_epoch": 2
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-004",
+      "event_seq": 4,
+      "type": "session.ready",
+      "turn_id": null,
+      "request_id": "request_id-004",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:01.692",
+      "payload": {
+        "epoch": 2
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-005",
+      "event_seq": 5,
+      "type": "session.ice",
+      "turn_id": null,
+      "request_id": "request_id-005",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:01.715",
+      "payload": {
+        "local_type": "host",
+        "remote_type": "host",
+        "local_address": "192.0.2.10",
+        "remote_address": "192.0.2.10",
+        "protocol": "udp",
+        "relayed": false,
+        "label": "fixture-value"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-006",
+      "event_seq": 6,
+      "type": "user.final",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-006",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:04.667",
+      "payload": {
+        "text": "字字",
+        "client_message_id": "client_message_id-001"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-007",
+      "event_seq": 7,
+      "type": "turn.accepted",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-007",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:04.675",
+      "payload": {
+        "client_message_id": "client_message_id-001",
+        "turn_id": "turn_id-001"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-008",
+      "event_seq": 8,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-008",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:05.512",
+      "payload": {
+        "text": "字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-009",
+      "event_seq": 9,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-009",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:05.956",
+      "payload": {
+        "text": "字字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-001",
+        "generation_id": 1,
+        "context_id": "context_id-001"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-010",
+      "event_seq": 10,
+      "type": "assistant.sentence.playback_started",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-010",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:05.965",
+      "payload": {
+        "sentence_seq": 1
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-011",
+      "event_seq": 11,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-011",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:06.700",
+      "payload": {
+        "text": "字字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-001",
+        "generation_id": 1,
+        "context_id": "context_id-001",
+        "audio_end_cursor_ms": 774
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-012",
+      "event_seq": 12,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-012",
+      "phase": "speculative",
+      "audio_cursor_ms": 774,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:06.712",
+      "payload": {
+        "text": "字字字字字字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-002",
+        "generation_id": 1,
+        "context_id": "context_id-001"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-013",
+      "event_seq": 13,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-013",
+      "phase": "speculative",
+      "audio_cursor_ms": 774,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:08.659",
+      "payload": {
+        "text": "字字字字字字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-002",
+        "generation_id": 1,
+        "context_id": "context_id-001",
+        "audio_end_cursor_ms": 2745
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-014",
+      "event_seq": 14,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-014",
+      "phase": "speculative",
+      "audio_cursor_ms": 2745,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:08.669",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-003",
+        "generation_id": 1,
+        "context_id": "context_id-001"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-015",
+      "event_seq": 15,
+      "type": "processor.notice",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-015",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:09.653",
+      "payload": {
+        "stage": "asr",
+        "code": "cloud_vad_no_final",
+        "message": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-016",
+      "event_seq": 16,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-016",
+      "phase": "speculative",
+      "audio_cursor_ms": 2745,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.060",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-003",
+        "generation_id": 1,
+        "context_id": "context_id-001",
+        "audio_end_cursor_ms": 4131
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-017",
+      "event_seq": 17,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-017",
+      "phase": "speculative",
+      "audio_cursor_ms": 4131,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.074",
+      "payload": {
+        "text": "字字字字字字字字字字字",
+        "sentence_seq": 4,
+        "segment_id": "segment_id-004",
+        "generation_id": 1,
+        "context_id": "context_id-001"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-018",
+      "event_seq": 18,
+      "type": "turn.interrupted",
+      "turn_id": "turn_id-001",
+      "request_id": "request_id-018",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.178",
+      "payload": {
+        "reason": "barge_in",
+        "turn_id": "turn_id-001",
+        "origin": "pipeline",
+        "heard_text": ""
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-019",
+      "event_seq": 19,
+      "type": "user.final",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-019",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.249",
+      "payload": {
+        "text": "字字字字字",
+        "client_message_id": null
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-020",
+      "event_seq": 20,
+      "type": "turn.accepted",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-020",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.258",
+      "payload": {
+        "client_message_id": null,
+        "turn_id": "turn_id-002"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-021",
+      "event_seq": 21,
+      "type": "user.started",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-021",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.266",
+      "payload": {},
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-022",
+      "event_seq": 22,
+      "type": "turn.interrupted",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-022",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.274",
+      "payload": {
+        "reason": "barge_in",
+        "turn_id": "turn_id-002",
+        "origin": "pipeline",
+        "heard_text": ""
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-023",
+      "event_seq": 23,
+      "type": "assistant.sentence.playback_ended",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-023",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.300",
+      "payload": {
+        "sentence_seq": 0,
+        "turn_final": true
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-024",
+      "event_seq": 24,
+      "type": "processor.notice",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-024",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:10.587",
+      "payload": {
+        "stage": "asr",
+        "code": "vad_frames_missing",
+        "message": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-025",
+      "event_seq": 25,
+      "type": "processor.notice",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-025",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:12.321",
+      "payload": {
+        "stage": "llm",
+        "code": "thinking_off_ineffective",
+        "message": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-026",
+      "event_seq": 26,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-026",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:12.326",
+      "payload": {
+        "text": "字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-027",
+      "event_seq": 27,
+      "type": "assistant.sentence.playback_started",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-027",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:12.719",
+      "payload": {
+        "sentence_seq": 0
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-028",
+      "event_seq": 28,
+      "type": "assistant.sentence.playback_ended",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-028",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:16.702",
+      "payload": {
+        "sentence_seq": 0,
+        "turn_final": true
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-029",
+      "event_seq": 29,
+      "type": "user.final",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-029",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:16.720",
+      "payload": {
+        "text": "字字字",
+        "client_message_id": "client_message_id-002"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-030",
+      "event_seq": 30,
+      "type": "turn.accepted",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-030",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:16.725",
+      "payload": {
+        "client_message_id": "client_message_id-002",
+        "turn_id": "turn_id-003"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-031",
+      "event_seq": 31,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-031",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:17.302",
+      "payload": {
+        "text": "字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-032",
+      "event_seq": 32,
+      "type": "assistant.sentence.playback_started",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-032",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:17.681",
+      "payload": {
+        "sentence_seq": 0
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-033",
+      "event_seq": 33,
+      "type": "user.interim",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-033",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:22.116",
+      "payload": {
+        "text": "字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-034",
+      "event_seq": 34,
+      "type": "user.started",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-034",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:22.124",
+      "payload": {},
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-035",
+      "event_seq": 35,
+      "type": "assistant.sentence.playback_ended",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-035",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:22.129",
+      "payload": {
+        "sentence_seq": 0,
+        "turn_final": true
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-036",
+      "event_seq": 36,
+      "type": "user.interim",
+      "turn_id": "turn_id-002",
+      "request_id": "request_id-036",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:22.135",
+      "payload": {
+        "text": "字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-037",
+      "event_seq": 37,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-037",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:23.681",
+      "payload": {
+        "text": "字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-038",
+      "event_seq": 38,
+      "type": "user.started",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-038",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:23.691",
+      "payload": {},
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-039",
+      "event_seq": 39,
+      "type": "turn.interrupted",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-039",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:23.700",
+      "payload": {
+        "reason": "barge_in",
+        "turn_id": "turn_id-003",
+        "origin": "pipeline",
+        "heard_text": ""
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-040",
+      "event_seq": 40,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-040",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:23.704",
+      "payload": {
+        "text": "字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-041",
+      "event_seq": 41,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-041",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:23.978",
+      "payload": {
+        "text": "字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-042",
+      "event_seq": 42,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-042",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:23.989",
+      "payload": {
+        "text": "字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-043",
+      "event_seq": 43,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-043",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:23.998",
+      "payload": {
+        "text": "字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-044",
+      "event_seq": 44,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-044",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:24.008",
+      "payload": {
+        "text": "字字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-045",
+      "event_seq": 45,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-045",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:24.565",
+      "payload": {
+        "text": "字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-046",
+      "event_seq": 46,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-046",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:24.574",
+      "payload": {
+        "text": "字字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-047",
+      "event_seq": 47,
+      "type": "user.interim",
+      "turn_id": "turn_id-003",
+      "request_id": "request_id-047",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:24.582",
+      "payload": {
+        "text": "字字字字字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-048",
+      "event_seq": 48,
+      "type": "user.final",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-048",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:24.615",
+      "payload": {
+        "text": "字字字字字字",
+        "client_message_id": null
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-049",
+      "event_seq": 49,
+      "type": "turn.accepted",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-049",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:24.625",
+      "payload": {
+        "client_message_id": null,
+        "turn_id": "turn_id-004"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-050",
+      "event_seq": 50,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-050",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:25.425",
+      "payload": {
+        "text": "字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-051",
+      "event_seq": 51,
+      "type": "assistant.sentence.playback_started",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-051",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:25.733",
+      "payload": {
+        "sentence_seq": 1
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-052",
+      "event_seq": 52,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-052",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:25.739",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-005",
+        "generation_id": 9,
+        "context_id": "context_id-002"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-053",
+      "event_seq": 53,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-053",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:26.891",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-005",
+        "generation_id": 9,
+        "context_id": "context_id-002",
+        "audio_end_cursor_ms": 1177
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-054",
+      "event_seq": 54,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-054",
+      "phase": "speculative",
+      "audio_cursor_ms": 1177,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:26.899",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-006",
+        "generation_id": 9,
+        "context_id": "context_id-002"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-055",
+      "event_seq": 55,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-055",
+      "phase": "speculative",
+      "audio_cursor_ms": 1177,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:28.449",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-006",
+        "generation_id": 9,
+        "context_id": "context_id-002",
+        "audio_end_cursor_ms": 2746
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-056",
+      "event_seq": 56,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-056",
+      "phase": "speculative",
+      "audio_cursor_ms": 2746,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:28.453",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-007",
+        "generation_id": 9,
+        "context_id": "context_id-002"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-057",
+      "event_seq": 57,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-057",
+      "phase": "speculative",
+      "audio_cursor_ms": 2746,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:31.892",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-007",
+        "generation_id": 9,
+        "context_id": "context_id-002",
+        "audio_end_cursor_ms": 6160
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-058",
+      "event_seq": 58,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-058",
+      "phase": "speculative",
+      "audio_cursor_ms": 6160,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:31.900",
+      "payload": {
+        "text": "字字字字字字字字字字字字字",
+        "sentence_seq": 4,
+        "segment_id": "segment_id-008",
+        "generation_id": 9,
+        "context_id": "context_id-002"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-059",
+      "event_seq": 59,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-059",
+      "phase": "speculative",
+      "audio_cursor_ms": 6160,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:34.650",
+      "payload": {
+        "text": "字字字字字字字字字字字字字",
+        "sentence_seq": 4,
+        "segment_id": "segment_id-008",
+        "generation_id": 9,
+        "context_id": "context_id-002",
+        "audio_end_cursor_ms": 8932
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-060",
+      "event_seq": 60,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-060",
+      "phase": "speculative",
+      "audio_cursor_ms": 8932,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:34.653",
+      "payload": {
+        "text": "字字字字字字字字",
+        "sentence_seq": 5,
+        "segment_id": "segment_id-009",
+        "generation_id": 9,
+        "context_id": "context_id-002"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-061",
+      "event_seq": 61,
+      "type": "turn.interrupted",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-061",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:35.004",
+      "payload": {
+        "reason": "barge_in",
+        "turn_id": "turn_id-004",
+        "origin": "pipeline",
+        "heard_text": ""
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-062",
+      "event_seq": 62,
+      "type": "user.final",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-062",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:35.013",
+      "payload": {
+        "text": "字字字字字字",
+        "client_message_id": "client_message_id-003"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-063",
+      "event_seq": 63,
+      "type": "turn.accepted",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-063",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:35.016",
+      "payload": {
+        "client_message_id": "client_message_id-003",
+        "turn_id": "turn_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-064",
+      "event_seq": 64,
+      "type": "assistant.sentence.playback_ended",
+      "turn_id": "turn_id-004",
+      "request_id": "request_id-064",
+      "phase": "speculative",
+      "audio_cursor_ms": 8932,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:35.041",
+      "payload": {
+        "sentence_seq": 5,
+        "turn_final": true
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-065",
+      "event_seq": 65,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-065",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:35.541",
+      "payload": {
+        "text": "字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-066",
+      "event_seq": 66,
+      "type": "assistant.sentence.playback_started",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-066",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:35.904",
+      "payload": {
+        "sentence_seq": 1
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-067",
+      "event_seq": 67,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-067",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:35.907",
+      "payload": {
+        "text": "字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-010",
+        "generation_id": 10,
+        "context_id": "context_id-003"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-068",
+      "event_seq": 68,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-068",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:37.061",
+      "payload": {
+        "text": "字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-010",
+        "generation_id": 10,
+        "context_id": "context_id-003",
+        "audio_end_cursor_ms": 1182
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-069",
+      "event_seq": 69,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-069",
+      "phase": "speculative",
+      "audio_cursor_ms": 1182,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:37.071",
+      "payload": {
+        "text": "字字字字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-011",
+        "generation_id": 10,
+        "context_id": "context_id-003"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-070",
+      "event_seq": 70,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-070",
+      "phase": "speculative",
+      "audio_cursor_ms": 1182,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:38.460",
+      "payload": {
+        "text": "字字字字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-011",
+        "generation_id": 10,
+        "context_id": "context_id-003",
+        "audio_end_cursor_ms": 2581
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-071",
+      "event_seq": 71,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-071",
+      "phase": "speculative",
+      "audio_cursor_ms": 2581,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:38.464",
+      "payload": {
+        "text": "字字字字字字字字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-012",
+        "generation_id": 10,
+        "context_id": "context_id-003"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-072",
+      "event_seq": 72,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-072",
+      "phase": "speculative",
+      "audio_cursor_ms": 2581,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:41.060",
+      "payload": {
+        "text": "字字字字字字字字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-012",
+        "generation_id": 10,
+        "context_id": "context_id-003",
+        "audio_end_cursor_ms": 5180
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-073",
+      "event_seq": 73,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-073",
+      "phase": "speculative",
+      "audio_cursor_ms": 5180,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:41.063",
+      "payload": {
+        "text": "字字字字字字字字字",
+        "sentence_seq": 4,
+        "segment_id": "segment_id-013",
+        "generation_id": 10,
+        "context_id": "context_id-003"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-074",
+      "event_seq": 74,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-074",
+      "phase": "speculative",
+      "audio_cursor_ms": 5180,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:42.859",
+      "payload": {
+        "text": "字字字字字字字字字",
+        "sentence_seq": 4,
+        "segment_id": "segment_id-013",
+        "generation_id": 10,
+        "context_id": "context_id-003",
+        "audio_end_cursor_ms": 6970
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-075",
+      "event_seq": 75,
+      "type": "assistant.sentence.playback_ended",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-075",
+      "phase": "speculative",
+      "audio_cursor_ms": 5180,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:45.860",
+      "payload": {
+        "sentence_seq": 4,
+        "turn_final": true
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-076",
+      "event_seq": 76,
+      "type": "turn.finalized",
+      "turn_id": "turn_id-005",
+      "request_id": "request_id-076",
+      "phase": "authoritative",
+      "audio_cursor_ms": 5180,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:45.865",
+      "payload": {
+        "role": "assistant",
+        "text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "user_text": "字字字字字字",
+        "outcome": "finalized",
+        "failure_reason": null,
+        "failed": false,
+        "retryable": false,
+        "heard_text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "acknowledged": false,
+        "interrupted": false,
+        "audio_cursor_ms": 5180
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-077",
+      "event_seq": 77,
+      "type": "user.final",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-077",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:46.617",
+      "payload": {
+        "text": "字字字字",
+        "client_message_id": "client_message_id-004"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-078",
+      "event_seq": 78,
+      "type": "turn.accepted",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-078",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:46.621",
+      "payload": {
+        "client_message_id": "client_message_id-004",
+        "turn_id": "turn_id-006"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-079",
+      "event_seq": 79,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-079",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:47.423",
+      "payload": {
+        "text": "字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-080",
+      "event_seq": 80,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-080",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:47.820",
+      "payload": {
+        "text": "字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-014",
+        "generation_id": 11,
+        "context_id": "context_id-004"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-081",
+      "event_seq": 81,
+      "type": "assistant.sentence.playback_started",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-081",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:47.822",
+      "payload": {
+        "sentence_seq": 1
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-082",
+      "event_seq": 82,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-082",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:48.570",
+      "payload": {
+        "text": "字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-014",
+        "generation_id": 11,
+        "context_id": "context_id-004",
+        "audio_end_cursor_ms": 774
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-083",
+      "event_seq": 83,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-083",
+      "phase": "speculative",
+      "audio_cursor_ms": 774,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:48.577",
+      "payload": {
+        "text": "字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-015",
+        "generation_id": 11,
+        "context_id": "context_id-004"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-084",
+      "event_seq": 84,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-084",
+      "phase": "speculative",
+      "audio_cursor_ms": 774,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:49.571",
+      "payload": {
+        "text": "字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-015",
+        "generation_id": 11,
+        "context_id": "context_id-004",
+        "audio_end_cursor_ms": 1771
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-085",
+      "event_seq": 85,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-085",
+      "phase": "speculative",
+      "audio_cursor_ms": 1771,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:49.578",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-016",
+        "generation_id": 11,
+        "context_id": "context_id-004"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-086",
+      "event_seq": 86,
+      "type": "turn.interrupted",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-086",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:49.938",
+      "payload": {
+        "reason": "barge_in",
+        "turn_id": "turn_id-006",
+        "origin": "pipeline",
+        "heard_text": ""
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-087",
+      "event_seq": 87,
+      "type": "user.final",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-087",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:49.977",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "client_message_id": "client_message_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-088",
+      "event_seq": 88,
+      "type": "turn.accepted",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-088",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:49.980",
+      "payload": {
+        "client_message_id": "client_message_id-005",
+        "turn_id": "turn_id-007"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-089",
+      "event_seq": 89,
+      "type": "assistant.sentence.playback_ended",
+      "turn_id": "turn_id-006",
+      "request_id": "request_id-089",
+      "phase": "speculative",
+      "audio_cursor_ms": 1771,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:50.016",
+      "payload": {
+        "sentence_seq": 3,
+        "turn_final": true
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-090",
+      "event_seq": 90,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-090",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:50.819",
+      "payload": {
+        "text": "字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-091",
+      "event_seq": 91,
+      "type": "assistant.llm.delta",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-091",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:51.240",
+      "payload": {
+        "text": "字字"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-092",
+      "event_seq": 92,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-092",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:51.245",
+      "payload": {
+        "text": "字字字字字字字字字字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-017",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-093",
+      "event_seq": 93,
+      "type": "assistant.sentence.playback_started",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-093",
+      "phase": "speculative",
+      "audio_cursor_ms": 0,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:51.252",
+      "payload": {
+        "sentence_seq": 1
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-094",
+      "event_seq": 94,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-094",
+      "phase": "speculative",
+      "audio_cursor_ms": null,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:53.421",
+      "payload": {
+        "text": "字字字字字字字字字字字",
+        "sentence_seq": 1,
+        "segment_id": "segment_id-017",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 2206
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-095",
+      "event_seq": 95,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-095",
+      "phase": "speculative",
+      "audio_cursor_ms": 2206,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:53.425",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-018",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-096",
+      "event_seq": 96,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-096",
+      "phase": "speculative",
+      "audio_cursor_ms": 2206,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:54.980",
+      "payload": {
+        "text": "字字字字字字",
+        "sentence_seq": 2,
+        "segment_id": "segment_id-018",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 3788
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-097",
+      "event_seq": 97,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-097",
+      "phase": "speculative",
+      "audio_cursor_ms": 3788,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:54.983",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-019",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-098",
+      "event_seq": 98,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-098",
+      "phase": "speculative",
+      "audio_cursor_ms": 3788,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:57.779",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字",
+        "sentence_seq": 3,
+        "segment_id": "segment_id-019",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 6570
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-099",
+      "event_seq": 99,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-099",
+      "phase": "speculative",
+      "audio_cursor_ms": 6570,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:00:57.782",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字字字",
+        "sentence_seq": 4,
+        "segment_id": "segment_id-020",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-100",
+      "event_seq": 100,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-100",
+      "phase": "speculative",
+      "audio_cursor_ms": 6570,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:02.379",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字字字",
+        "sentence_seq": 4,
+        "segment_id": "segment_id-020",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 11170
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-101",
+      "event_seq": 101,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-101",
+      "phase": "speculative",
+      "audio_cursor_ms": 11170,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:02.383",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "sentence_seq": 5,
+        "segment_id": "segment_id-021",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-102",
+      "event_seq": 102,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-102",
+      "phase": "speculative",
+      "audio_cursor_ms": 11170,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:09.381",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "sentence_seq": 5,
+        "segment_id": "segment_id-021",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 18173
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-103",
+      "event_seq": 103,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-103",
+      "phase": "speculative",
+      "audio_cursor_ms": 18173,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:09.387",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字",
+        "sentence_seq": 6,
+        "segment_id": "segment_id-022",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-104",
+      "event_seq": 104,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-104",
+      "phase": "speculative",
+      "audio_cursor_ms": 18173,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:12.579",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字",
+        "sentence_seq": 6,
+        "segment_id": "segment_id-022",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 21337
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-105",
+      "event_seq": 105,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-105",
+      "phase": "speculative",
+      "audio_cursor_ms": 21337,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:12.583",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字",
+        "sentence_seq": 7,
+        "segment_id": "segment_id-023",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-106",
+      "event_seq": 106,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-106",
+      "phase": "speculative",
+      "audio_cursor_ms": 21337,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:15.740",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字",
+        "sentence_seq": 7,
+        "segment_id": "segment_id-023",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 24517
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-107",
+      "event_seq": 107,
+      "type": "assistant.sentence.queued",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-107",
+      "phase": "speculative",
+      "audio_cursor_ms": 24517,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:15.744",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字字字",
+        "sentence_seq": 8,
+        "segment_id": "segment_id-024",
+        "generation_id": 12,
+        "context_id": "context_id-005"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-108",
+      "event_seq": 108,
+      "type": "assistant.sentence.ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-108",
+      "phase": "speculative",
+      "audio_cursor_ms": 24517,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:18.739",
+      "payload": {
+        "text": "字字字字字字字字字字字字字字字字字字",
+        "sentence_seq": 8,
+        "segment_id": "segment_id-024",
+        "generation_id": 12,
+        "context_id": "context_id-005",
+        "audio_end_cursor_ms": 27518
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-109",
+      "event_seq": 109,
+      "type": "assistant.sentence.playback_ended",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-109",
+      "phase": "speculative",
+      "audio_cursor_ms": 24517,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:21.740",
+      "payload": {
+        "sentence_seq": 8,
+        "turn_final": true
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-110",
+      "event_seq": 110,
+      "type": "turn.finalized",
+      "turn_id": "turn_id-007",
+      "request_id": "request_id-110",
+      "phase": "authoritative",
+      "audio_cursor_ms": 24517,
+      "session_epoch": 2,
+      "at": "2026-01-01T00:01:21.742",
+      "payload": {
+        "role": "assistant",
+        "text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "user_text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "outcome": "finalized",
+        "failure_reason": null,
+        "failed": false,
+        "retryable": false,
+        "heard_text": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字",
+        "acknowledged": false,
+        "interrupted": false,
+        "audio_cursor_ms": 24517
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-111",
+      "event_seq": 111,
+      "type": "session.closed",
+      "turn_id": null,
+      "request_id": "request_id-111",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 3,
+      "at": "2026-01-01T00:04:17.495",
+      "payload": {
+        "reason": "client_request"
+      },
+      "session_id": "session_id-001"
+    },
+    {
+      "event_id": "event_id-112",
+      "event_seq": 112,
+      "type": "session.reconnecting",
+      "turn_id": null,
+      "request_id": "request_id-112",
+      "phase": "authoritative",
+      "audio_cursor_ms": null,
+      "session_epoch": 3,
+      "at": "2026-01-01T00:04:17.514",
+      "payload": {
+        "reason": "transport_rebuilt",
+        "attempt": 1,
+        "delay_ms": 0
+      },
+      "session_id": "session_id-001"
+    }
+  ]
+}

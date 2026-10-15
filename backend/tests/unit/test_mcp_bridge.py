@@ -19,6 +19,7 @@ from app.providers.ports.mcp import MCPTransportUnavailable
 BRIDGE = "http://host.docker.internal:34115"
 
 
+@pytest.mark.usefixtures("docker_host_dns")
 class TestValidateMcpHttpEndpoint:
     def test_loopback_http_still_allowed(self) -> None:
         assert validate_mcp_http_endpoint("http://127.0.0.1:3001/mcp") == "http://127.0.0.1:3001/mcp"

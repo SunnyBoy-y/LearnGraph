@@ -1,9 +1,9 @@
 /**
- * 真机事件流回放（一次性诊断脚本，gitignore）。
+ * 脱敏事件流回放回归测试。
  *
- * 数据来源：线上会话 vs_c03d8b92cd604914ae0d5037 的 `voice_events` 全量导出
- * （frontend/test-artifacts/voicelatency-session.json），按 created_at 的相对时刻
- * 喂回 `ingestVoiceRtviMessage`，最后把面板**真实渲染出来的文字**打出来。
+ * 使用已入库的 voice-latency-replay.json：保留诊断记录的事件顺序、相对时间与
+ * 数值字段；会话标识、文本和网络地址均已替换，绝对日期已平移。
+ * 按相对时刻喂回 `ingestVoiceRtviMessage`，验证面板真实渲染结果。
  *
  * 建模口径（与线上的差异都在这里；结论以此为准）：
  *  - 账本事件：worker 进程写的经数据通道**即时**送达；控制面（API 进程）写的
@@ -15,8 +15,7 @@
  *  - RTVI：`user-stopped-speaking` 用后台日志里的真实时刻（3 次）；
  *    `bot-llm-started/text` 用该回合首个 `assistant.llm.delta` 的时刻近似。
  */
-import { readFileSync } from "node:fs";
-import path from "node:path";
+import replayFixture from "@/test/fixtures/voice-latency-replay.json";
 
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -49,19 +48,10 @@ interface Row {
   session_id: string;
 }
 
-const RAW: Row[] = JSON.parse(
-  readFileSync(
-    path.resolve(__dirname, "../../../test-artifacts/voicelatency-session.json"),
-    "utf8",
-  ),
-) as Row[];
+const RAW = replayFixture.events as Row[];
 
-/** 后台日志里 `User stopped speaking` 的真实时刻（UTC，本会话内）。 */
-const RTVI_USER_STOPPED = [
-  "2026-09-18T07:38:35.859",
-  "2026-09-18T07:38:48.017",
-  "2026-09-18T07:38:49.227",
-].map((s) => Date.parse(`${s}Z`));
+/** 与事件流同步平移的 `User stopped speaking` 时刻（UTC）。 */
+const RTVI_USER_STOPPED = replayFixture.rtviUserStoppedAt.map((s) => Date.parse(`${s}Z`));
 
 type Modules = {
   controller: typeof staticController;
@@ -221,7 +211,7 @@ function report(state: ReturnType<typeof staticStore.getVoiceLatencySnapshot>, l
   ].join("\n");
 }
 
-describe("真机事件流回放", () => {
+describe("脱敏事件流回放", () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
