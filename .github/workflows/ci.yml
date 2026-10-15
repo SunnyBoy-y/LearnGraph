@@ -41,7 +41,7 @@ jobs:
       - run: npm run cap:sync
       - name: Android local unit tests
         working-directory: mobile/android
-        run: bash ./gradlew :app:testDebugUnitTest --no-daemon
+        run: bash ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:testDebugUnitTest --no-daemon
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
