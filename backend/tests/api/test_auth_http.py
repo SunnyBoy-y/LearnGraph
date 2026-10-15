@@ -43,7 +43,7 @@ def test_missing_workspace_header_422(client, register_user):
 def test_wrong_password_401(client, register_user):
     token, _, username, _ = register_user()
     r = client.post(
-        "/api/v1/auth/login", json={"username": username, "password": "wrong-pass-123"}
+        "/api/v1/auth/login", json={"username": username, "password": "wrong"}
     )
     assert r.status_code == 401
 
@@ -54,7 +54,7 @@ def test_login_lockout_after_5_failures(client, register_user):
     for i in range(5):
         r = client.post(
             "/api/v1/auth/login",
-            json={"username": username, "password": "wrong-pass-123"},
+            json={"username": username, "password": "wrong"},
         )
         assert r.status_code == 401, f"attempt {i+1}: {r.status_code}"
     r = client.post(

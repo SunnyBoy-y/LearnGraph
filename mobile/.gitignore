@@ -5,6 +5,13 @@ dist/
 
 # 构建产物 APK 不入库（体积大，按需本地构建）
 *.apk
+*.aab
+*.aar
+*.ap_
+*.dex
+*.class
+.externalNativeBuild/
+.cxx/
 
 # Capacitor / Android 构建产物（android/ 原生壳本身入库，只忽略生成物）
 android/.gradle/

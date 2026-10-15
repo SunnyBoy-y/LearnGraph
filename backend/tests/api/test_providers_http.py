@@ -52,7 +52,7 @@ def test_provider_crud_cycle(client, register_user, auth_headers):
     r = client.post(
         f"/api/v1/providers/{pid}/rotate-secret",
         headers=headers,
-        json={"api_key": "sk-rotated-key-9876543210"},
+        json={"api_key": "test-rotated-key"},
     )
     assert r.status_code == 200, r.text
     # 删除（清理）

@@ -15,6 +15,15 @@
 .pypirc
 .netrc
 .mcp.json
+auth.json
+.aws/
+.azure/
+.ssh/
+.kube/
+.config/gcloud/
+.docker/config.json
+keystore.properties
+key.properties
 credentials/
 .credentials/
 secrets/
@@ -33,6 +42,8 @@ config.local.*
 *.secrets
 id_rsa*
 id_ed25519*
+id_ecdsa*
+id_dsa*
 *.pem
 *.key
 *.p12
@@ -107,6 +118,15 @@ logs/
 *.stderr
 *.tmp
 *.temp
+*.bak
+*.orig
+*~
+/backup*.sql
+/dump*.sql
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.dump
 tmp/
 temp/
 .cache/
@@ -145,6 +165,9 @@ temp/
 # probes and generated verification reports local; caches/output stay ignored above.
 /frontend/e2e/
 /frontend/playwright.config.*
+/frontend/link-preview.html
+/frontend/src/link-preview.tsx
+/docs/*.visual-check.*
 **/.pytest-tmp*/
 /backend/tests/regression-repairs-cases.json
 
@@ -184,6 +207,7 @@ Desktop.ini
 **/audit/
 **/audits/
 /backend/scripts/*_smoke*.*
+/backend/scripts/smoke_*.*
 /backend/scripts/*_debug*.*
 /backend/scripts/*_probe*.*
 /backend/scripts/run_*_probes*.*
@@ -202,6 +226,17 @@ backend/sandbox/.spec-test.json
 /_seed_*.py
 /tmp-*/
 /scripts-patch/
+/tools/patch_*.py
+/tools/fix_chat_final_boundary.py
+/tools/verify_chat_final_boundary.py
+
+# Retired browser diagnostics contained a session token in old commits.
+# Keep any local copies out of new commits; historical commits stay intact.
+/scripts/timeline-usage.mjs
+/scripts/run-batch.mjs
+/scripts/deep-pages.mjs
+/scripts/dump-usage.mjs
+/scripts/dump-usage2.mjs
 
 # Blog deliverables (engineering retrospective series) — generated output, kept local
 /blog-output/

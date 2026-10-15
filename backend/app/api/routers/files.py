@@ -337,7 +337,10 @@ def transcribe_file_async(
     _require_file_access(db, context, file_id, "read")
     return AudioTranscriptionView.model_validate(
         service(db, context, settings).transcribe_file_async(
-            file_id, payload, idempotency_key, max_wait_seconds=max_wait
+            file_id,
+            payload,
+            idempotency_key,
+            max_wait_seconds=max_wait,
         )
     )
 
