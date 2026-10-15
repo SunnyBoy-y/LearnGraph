@@ -19,6 +19,8 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY frontend/ ./
 # Same-origin /api/v1. Leave empty so the browser never hard-codes a backend host.
 ENV VITE_API_BASE_URL=
+ARG SOURCE_CACHE_BUST=dev
+RUN echo "LearnGraph source cache: ${SOURCE_CACHE_BUST}"
 RUN npm run build
 
 FROM python:3.12-slim-bookworm AS backend
@@ -41,6 +43,8 @@ COPY backend/pyproject.toml backend/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --no-install-project --no-dev --extra voice --frozen
 
+ARG SOURCE_CACHE_BUST=dev
+RUN echo "LearnGraph backend source cache: ${SOURCE_CACHE_BUST}"
 COPY backend/app ./app
 COPY backend/sandbox ./sandbox
 

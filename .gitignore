@@ -78,6 +78,7 @@ build/
 /tests/
 # LearnGraph runtime state and user data
 /data/
+/data/benchmarks/longmemeval/results/
 /memory/
 /storage/
 /uploads/

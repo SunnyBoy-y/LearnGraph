@@ -131,7 +131,7 @@ x-app-environment: &app-environment
   # tools (get_current_time/search_web/search_images/canvas_get_render_contract/
   # lg_goal_read) run concurrently on isolated Sessions; everything else stays serial.
   LEARNGRAPH_AGENT_PARALLEL_TOOLS_ENABLED: ${LEARNGRAPH_AGENT_PARALLEL_TOOLS_ENABLED:-true}
-  LEARNGRAPH_AGENT_PARALLEL_TOOLS_MAX_WORKERS: ${LEARNGRAPH_AGENT_PARALLEL_TOOLS_MAX_WORKERS:-4}
+  LEARNGRAPH_AGENT_PARALLEL_TOOLS_MAX_WORKERS: ${LEARNGRAPH_AGENT_PARALLEL_TOOLS_MAX_WORKERS:-10}
 
 services:
   app:
