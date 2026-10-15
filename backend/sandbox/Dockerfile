@@ -177,7 +177,7 @@ RUN chmod 0555 /opt/learngraph/runner.py /opt/learngraph/browser-smoke.js /opt/l
     && command -v catppt >/dev/null \
     && command -v 7z >/dev/null \
     && python -c "import av, bs4, docx, fitz, mammoth, markdown_it, numpy, odf, openpyxl, pandas, pdfplumber, PIL, pydub, pypdf, pptx, pyxlsb, trafilatura, xlsxwriter, learngraph_tasks" \
-    && cd /tmp && node -e "require('playwright-core'); Promise.all(['vite','vue','react','react-dom','typescript','tsx','pptxgenjs','@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile'].map((m) => import(m))).then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); })"
+    && cd /tmp && node -e "require('playwright-core'); Promise.all(['vite','vue','react','react-dom','three','typescript','tsx','pptxgenjs','@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile'].map((m) => import(m))).then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); })"
 
 USER 65532:65532
 WORKDIR /workspace

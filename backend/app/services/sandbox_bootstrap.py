@@ -1404,7 +1404,7 @@ class SandboxBootstrapService:
         """
 
         if on_progress is not None:
-            on_progress("正在冒烟检查 Python / Node / ffmpeg / 文档解析库…", 88)
+            on_progress("正在冒烟检查 Python / Node / ffmpeg / Three.js / 文档解析库…", 88)
         code_error = self._smoke_container(
             image_digest,
             settings,
@@ -1421,7 +1421,7 @@ class SandboxBootstrapService:
                 [
                     "node",
                     "-e",
-                    "Promise.all(['vite','vue','react','react-dom',"
+                    "Promise.all(['vite','vue','react','react-dom','three',"
                     "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']"
                     ".map((m) => import(m)))"
                     ".then(() => process.exit(0))"
@@ -1443,7 +1443,7 @@ class SandboxBootstrapService:
                 ["python", "--version"],
                 ["node", "-e",
                  "require('playwright-core'); "
-                 "Promise.all(['vite','vue','react','react-dom',"
+                 "Promise.all(['vite','vue','react','react-dom','three',"
                  "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']"
                  ".map((m) => import(m)))"
                  ".then(() => process.exit(0))"

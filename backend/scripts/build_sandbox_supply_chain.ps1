@@ -1,6 +1,10 @@
 param(
   [string]$Tag = "learngraph-sandbox:local",
-  [string]$ArtifactDir = ""
+  [string]$ArtifactDir = "",
+  # Leave empty for a native build. An explicit platform uses buildx and
+  # exports a single-platform image into the local daemon for inspection and
+  # SBOM generation.
+  [string]$Platform = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,8 +21,30 @@ if (-not (Test-Path $dockerfile) -or -not (Test-Path $npmLock)) {
   throw "Sandbox Dockerfile and toolchain package-lock.json are required."
 }
 
-docker build --tag $Tag $sandboxRoot
+if (-not [string]::IsNullOrWhiteSpace($Platform) -and $Platform -notin @("linux/amd64", "linux/arm64")) {
+  throw "Platform must be linux/amd64, linux/arm64, or empty (native build); received '$Platform'"
+}
+
+if ([string]::IsNullOrWhiteSpace($Platform)) {
+  $buildArgs = @("build", "--tag", $Tag, $sandboxRoot)
+}
+else {
+  $buildArgs = @("buildx", "build", "--platform", $Platform, "--load", "--tag", $Tag, $sandboxRoot)
+}
+& docker @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "docker build failed" }
+
+$imageInfo = docker image inspect $Tag --format '{{.Architecture}}|{{.Os}}'
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($imageInfo)) {
+  throw "Docker did not return the built image platform"
+}
+$architecture, $os = $imageInfo.Trim().Split('|', 2)
+if (-not [string]::IsNullOrWhiteSpace($Platform)) {
+  $expectedOs, $expectedArchitecture = $Platform.Split('/', 2)
+  if ($os -ne $expectedOs -or $architecture -ne $expectedArchitecture) {
+    throw "Built image platform is $os/$architecture, expected $Platform"
+  }
+}
 
 # Gate: sandboxd requires com.learngraph.runner-abi on the runner image
 # (sandboxd/sandboxd/config.py RUNNER_ABI_MIN/MAX). Fail the build early if
@@ -76,6 +102,9 @@ $manifest = @{
   schema = "learngraph-sandbox-supply-chain-v1"
   image_id = $imageId
   tag = $Tag
+  platform = "$os/$architecture"
+  architecture = $architecture
+  os = $os
   built_at = [DateTime]::UtcNow.ToString("o")
   inputs = $inputs
   sbom_file = if ($sbomAvailable) { [IO.Path]::GetFileName($sbom) } else { $null }

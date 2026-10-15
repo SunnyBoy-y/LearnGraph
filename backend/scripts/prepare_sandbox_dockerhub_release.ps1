@@ -9,6 +9,9 @@ param(
 
     [string]$SourceImage = "learngraph-sandbox:local",
 
+    [ValidateSet("linux/amd64", "linux/arm64")]
+    [string]$Platform = "linux/amd64",
+
     [switch]$SkipSmoke
 )
 
@@ -22,8 +25,9 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sourceInfo)) {
     throw "Source sandbox image was not found: $SourceImage"
 }
 $id, $architecture, $os = $sourceInfo.Trim().Split('|', 3)
-if ($architecture -ne 'amd64' -or $os -ne 'linux') {
-    throw "Docker Hub release preparation currently supports linux/amd64 only; source is $architecture/$os"
+$expectedOs, $expectedArchitecture = $Platform.Split('/', 2)
+if ($architecture -ne $expectedArchitecture -or $os -ne $expectedOs) {
+    throw "Source platform is $os/$architecture, but -Platform $Platform was requested"
 }
 
 # Hardened smoke via the docker CLI. The backend ships only the sandboxd control
@@ -38,9 +42,10 @@ function Invoke-RunnerCheck {
         [string]$Image,
         [string]$Seccomp,
         [string]$Shm,
-        [string[]]$Cmd
+        [string[]]$Cmd,
+        [string]$Platform
     )
-    $output = & docker run --rm --network none --read-only --user 65532:65532 `
+    $output = & docker run --rm --platform $Platform --network none --read-only --user 65532:65532 `
         --cap-drop ALL `
         --security-opt "seccomp=$Seccomp" --security-opt no-new-privileges:true `
         --memory 2g --memory-swap 2g --pids-limit 1024 --shm-size $Shm `
@@ -53,7 +58,7 @@ function Invoke-RunnerCheck {
 if (-not $SkipSmoke) {
     $codeProfile = Join-Path $sandboxRoot "seccomp_profile_code.json"
     $browserProfile = Join-Path $sandboxRoot "seccomp_profile.json"
-    $nodeToolchain = "Promise.all(['vite','vue','react','react-dom'," +
+    $nodeToolchain = "Promise.all(['vite','vue','react','react-dom','three'," +
         "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']" +
         ".map((m) => import(m))).then(() => process.exit(0))" +
         ".catch((e) => { console.error(e); process.exit(1); })"
@@ -74,7 +79,7 @@ if (-not $SkipSmoke) {
 
     Write-Output "Running hardened sandbox smoke via docker CLI (no Docker SDK dependency)..."
     foreach ($check in $checks) {
-        $result = Invoke-RunnerCheck -Image $id -Seccomp $check.Seccomp -Shm $check.Shm -Cmd $check.Cmd
+        $result = Invoke-RunnerCheck -Image $id -Seccomp $check.Seccomp -Shm $check.Shm -Cmd $check.Cmd -Platform $Platform
         if ($result.ExitCode -ne 0) {
             $detail = if ([string]::IsNullOrWhiteSpace($result.Output)) { "non-zero exit" } else { $result.Output }
             throw "Refusing to tag an image whose hardened sandbox smoke failed: $($check.Name)`n$detail"
@@ -92,7 +97,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Output "Prepared local Docker Hub release tag: $target"
-Write-Output "Architecture: linux/amd64"
+Write-Output "Platform: $Platform"
 Write-Output "Source image ID: $id"
 Write-Output ""
 Write-Output "No image was pushed and no Docker Hub login was attempted."
@@ -103,5 +108,11 @@ Write-Output "  docker buildx imagetools inspect $target"
 Write-Output ""
 Write-Output "After Docker Hub shows the RepoDigest, configure consumers with:"
 Write-Output "  LEARNGRAPH_SANDBOX_PREBUILT_IMAGE=docker.io/$Repository@sha256:<repo-digest>"
-Write-Output "A version tag also works for first-time bootstrap: the application pulls it, resolves"
-Write-Output "the resulting immutable RepoDigest, runs hardened smoke, and persists only that digest."
+if ($Platform -eq "linux/arm64") {
+    Write-Output "For ARM64, configure the pushed tag (or its digest), or a published"
+    Write-Output "multi-platform tag so Docker selects the ARM64 variant automatically."
+}
+else {
+    Write-Output "A version tag works for first-time bootstrap: the application pulls it, resolves"
+    Write-Output "the resulting immutable RepoDigest, runs hardened smoke, and persists only that digest."
+}

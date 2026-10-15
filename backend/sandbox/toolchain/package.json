@@ -1,7 +1,7 @@
 {
   "name": "learngraph-frontend-toolchain",
   "private": true,
-  "description": "Pre-installed at image root (/node_modules) so per-session workspaces resolve vite/vue/react via Node's upward lookup without downloads or disk quota.",
+  "description": "Pre-installed at image root (/node_modules) so per-session workspaces resolve vite/vue/react/three via Node's upward lookup without downloads or disk quota.",
   "dependencies": {
     "@vitejs/plugin-react": "4.3.4",
     "@vitejs/plugin-vue": "5.2.1",
@@ -9,6 +9,7 @@
     "pptxgenjs": "4.0.1",
     "react": "19.0.0",
     "react-dom": "19.0.0",
+    "three": "0.186.1",
     "tsx": "4.20.5",
     "typescript": "5.9.2",
     "vite": "6.0.7",

@@ -749,8 +749,9 @@ class SandboxToolkitMixin:
 
     # ── sandbox_subagent (v2: durable tasks via the unified scheduler) ───────
 
-    def _load_agent_task(self, subagent_id: str):
-        """Load a durable sub-agent task scoped to this workspace."""
+    def _load_agent_task(self, subagent_id: str, *, chat_session_id: str):
+        """Load a task only inside the authenticated owner's chat."""
+        self._require_chat_session(chat_session_id)
         from app.domain.models import SandboxAgentTask
 
         if not isinstance(subagent_id, str) or not subagent_id:
@@ -758,8 +759,10 @@ class SandboxToolkitMixin:
         task = self.db.scalar(
             select(SandboxAgentTask).where(
                 SandboxAgentTask.workspace_id == self.workspace_id,
+                SandboxAgentTask.owner_user_id == self.actor_id,
+                SandboxAgentTask.chat_session_id == chat_session_id,
                 SandboxAgentTask.task_id == subagent_id,
-            )
+            ).execution_options(populate_existing=True)
         )
         return task
 
@@ -828,6 +831,7 @@ class SandboxToolkitMixin:
             "max_seconds": payload.max_seconds or self.settings.sandbox_subagent_max_seconds,
             "max_tool_calls": payload.max_tool_calls,
             "max_tokens": payload.max_tokens or self.settings.sandbox_subagent_default_max_tokens,
+            "max_cost_amounts": getattr(payload, "max_cost_amounts", {}),
             "max_cost_usd": (
                 payload.max_cost_usd
                 if payload.max_cost_usd is not None
@@ -838,6 +842,7 @@ class SandboxToolkitMixin:
     def toolkit_subagent(self, payload: SandboxAgentSubagentRequest) -> dict[str, Any]:
         if not self.settings.sandbox_subagent_enabled:
             raise AppError(503, "sandbox_subagent_disabled", "Sandbox sub-agents are disabled by configuration")
+        self._require_chat_session(payload.chat_session_id)
         from app.domain.models import SandboxAgentTask
         from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
 
@@ -870,6 +875,8 @@ class SandboxToolkitMixin:
                 )
             )
             if existing is not None:
+                if existing.chat_session_id != payload.chat_session_id:
+                    raise AppError(409, "subagent_idempotency_conflict", "Idempotency key is already bound to a different chat session")
                 snapshot = self._agent_task_snapshot(existing)
                 snapshot["job_id"] = existing.latest_job_id
                 snapshot["idempotent_replay"] = True
@@ -877,6 +884,7 @@ class SandboxToolkitMixin:
         title = payload.title or "子代理任务"
         requirement_group_id = payload.requirement_group_id or task_id
         context_snapshot = {
+            **(payload.context_snapshot or {}),
             "workspace_id": self.workspace_id,
             "user_id": self.actor_id,
             "chat_session_id": payload.chat_session_id,
@@ -884,7 +892,6 @@ class SandboxToolkitMixin:
             "turn_id": payload.turn_id,
             "requirement_group_id": requirement_group_id,
             "requirement_version": payload.requirement_version,
-            **(payload.context_snapshot or {}),
         }
         task = SandboxAgentTask(
             workspace_id=self.workspace_id,
@@ -997,34 +1004,9 @@ class SandboxToolkitMixin:
         }
 
     def toolkit_subagent_status(self, payload: SandboxAgentSubagentStatusRequest) -> dict[str, Any]:
-        from app.services.sandbox_subagent import SubagentRegistry
-
-        task = self._load_agent_task(payload.subagent_id)
+        task = self._load_agent_task(payload.subagent_id, chat_session_id=payload.chat_session_id)
         if task is None:
-            # v1 in-process registry compatibility path (legacy tasks only).
-            job = SubagentRegistry.instance().get(payload.subagent_id)
-            if job is None:
-                raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
-            return {
-                "subagent_id": job.spec.subagent_id,
-                "status": job.status,
-                "error_class": job.error_class,
-                "error_message": job.error_message,
-                "rounds": job.rounds,
-                "tool_calls": job.tool_calls,
-                "result": job.result,
-                "result_complete": job.status == "completed",
-                "summary": {
-                    "type": "subagent_task",
-                    "status": job.status,
-                    "data": {
-                        "phase": job.status,
-                        "task_id": job.spec.subagent_id,
-                        "title": "子代理任务",
-                        "role_key": "generic",
-                    },
-                },
-            }
+            raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
         return self._agent_task_snapshot(
             task, include_events=True, after_seq=payload.after_event_seq
         )
@@ -1040,9 +1022,10 @@ class SandboxToolkitMixin:
         while True:
             tasks = []
             for sid in payload.subagent_ids:
-                task = self._load_agent_task(sid)
-                if task is not None:
-                    tasks.append(task)
+                task = self._load_agent_task(sid, chat_session_id=payload.chat_session_id)
+                if task is None:
+                    raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
+                tasks.append(task)
             done = [t for t in tasks if t.status in terminal]
             changed = [t for t in tasks if t.event_seq > (payload.after_event_seq or 0)]
             if payload.mode == "any":
@@ -1068,11 +1051,13 @@ class SandboxToolkitMixin:
     def toolkit_subagent_cancel(self, payload: SandboxAgentSubagentCancelRequest) -> dict[str, Any]:
         from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
 
-        task = self._load_agent_task(payload.subagent_id)
+        task = self._load_agent_task(payload.subagent_id, chat_session_id=payload.chat_session_id)
         if task is None:
             raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
         if task.status in {"SUCCEEDED", "PARTIAL", "FAILED", "TIMED_OUT", "CANCELLED", "STALE", "INTERRUPTED"}:
             return self._agent_task_snapshot(task)
+        if not task.latest_job_id:
+            raise AppError(409, "subagent_job_missing", "The active sub-agent task has no associated scheduler job")
         terminal_job = None
         if task.latest_job_id:
             scheduler = SandboxSchedulerService(self.db, self.settings)
@@ -1082,10 +1067,18 @@ class SandboxToolkitMixin:
                     workspace_id=self.workspace_id,
                     owner_user_id=self.actor_id,
                 )
+                if (
+                    job.chat_session_id != task.chat_session_id
+                    or job.kind != "subagent"
+                    or not isinstance(job.payload_json, dict)
+                    or job.payload_json.get("task_id") != task.id
+                ):
+                    raise AppError(409, "subagent_job_mismatch", "Scheduler job does not belong to this sub-agent task")
                 scheduler.cancel_job(job)
                 terminal_job = job
             except AppError:
-                pass  # job already gone; the task snapshot carries the outcome
+                self.db.rollback()
+                raise
         if terminal_job is not None and terminal_job.status == "CANCELLED":
             task.status = "CANCELLED"
             task.status_reason = "cancelled_by_user"
@@ -1111,7 +1104,7 @@ class SandboxToolkitMixin:
     def toolkit_subagent_retry(self, payload: SandboxAgentSubagentRetryRequest) -> dict[str, Any]:
         from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
 
-        task = self._load_agent_task(payload.subagent_id)
+        task = self._load_agent_task(payload.subagent_id, chat_session_id=payload.chat_session_id)
         if task is None:
             raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
         spec = task.spec_json or {}

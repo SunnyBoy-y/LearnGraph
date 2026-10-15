@@ -117,8 +117,10 @@ class TestWriteReadRoundtrip:
         assert result["content"] == "hello\nworld\n"
         assert result["total_lines"] == 2
         assert result["total_bytes"] == len("hello\nworld\n".encode("utf-8"))
-        assert result["start_line"] is None
-        assert result["end_line"] is None
+        assert result["start_line"] == 1
+        assert result["end_line"] == 2
+        assert result["has_more"] is False
+        assert result["next_cursor"] is None
         assert result["truncated"] is False
 
     def test_read_line_range(self, db: Session, service) -> None:
@@ -145,7 +147,8 @@ class TestWriteReadRoundtrip:
         _write(service, "work/lines.txt", "one\ntwo\n")
         with pytest.raises(AppError) as excinfo:
             _read(service, "work/lines.txt", start_line=3, end_line=1)
-        assert excinfo.value.code == "sandbox_file_range_invalid"
+        assert excinfo.value.code == "invalid_tool_arguments"
+        assert "end_line" in excinfo.value.message
 
     def test_read_max_chars(self, db: Session, service) -> None:
         _write(service, "work/lines.txt", "abcdefghij\n")
@@ -273,6 +276,25 @@ class TestListFiles:
 
 
 class TestEditFile:
+    def test_edit_and_append_preserve_content_beyond_the_read_page(self, db: Session, service) -> None:
+        original = "完整内容\n" * 100_000 + "target-at-end\n"
+        written = _write(service, "work/large.txt", original)
+        page = _read(service, "work/large.txt")
+        assert page["has_more"] is True
+        assert "target-at-end" not in page["content"]
+
+        edited = service.execute_agent_tool("sandbox_edit_file", {
+            "path": "work/large.txt", "old_string": "target-at-end", "new_string": "edited-at-end",
+            "expected_sha256": written["sha256"],
+        }, chat_session_id=CHAT_SESSION_ID, agent_authorized=True)
+        service.execute_agent_tool("sandbox_append_file", {
+            "path": "work/large.txt", "content": "appended\n",
+            "expected_sha256": edited["sha256"],
+        }, chat_session_id=CHAT_SESSION_ID, agent_authorized=True)
+        assert service.workspace_files.materialize_bytes(CHAT_SESSION_ID, "work/large.txt") == (
+            original.replace("target-at-end", "edited-at-end") + "appended\n"
+        ).encode("utf-8")
+
     def test_edit_unique(self, db: Session, service) -> None:
         written = _write(service, "work/code.py", "a = 1\nb = 2\n")
         result = service.execute_agent_tool(
@@ -477,6 +499,7 @@ class TestEnvInfo:
             )
         )
         assert isinstance(result.get("python_packages"), list)
+        assert "three" in result.get("node_packages", [])
         assert result["file_limit_bytes"] > 0
 
 

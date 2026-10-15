@@ -7,6 +7,9 @@ param(
 
     [string]$SourceImage = "learngraph-sandbox:local",
 
+    [ValidateSet("linux/amd64", "linux/arm64")]
+    [string]$Platform = "linux/amd64",
+
     [switch]$SkipSmoke
 )
 
@@ -20,8 +23,9 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sourceInfo)) {
     throw "Source sandbox image was not found: $SourceImage"
 }
 $id, $architecture, $os = $sourceInfo.Trim().Split('|', 3)
-if ($architecture -ne 'amd64' -or $os -ne 'linux') {
-    throw "ACR Personal Edition release preparation currently supports linux/amd64 only; source is $architecture/$os"
+$expectedOs, $expectedArchitecture = $Platform.Split('/', 2)
+if ($architecture -ne $expectedArchitecture -or $os -ne $expectedOs) {
+    throw "Source platform is $os/$architecture, but -Platform $Platform was requested"
 }
 
 # Hardened smoke via the docker CLI. The backend ships only the sandboxd control
@@ -36,9 +40,10 @@ function Invoke-RunnerCheck {
         [string]$Image,
         [string]$Seccomp,
         [string]$Shm,
-        [string[]]$Cmd
+        [string[]]$Cmd,
+        [string]$Platform
     )
-    $output = & docker run --rm --network none --read-only --user 65532:65532 `
+    $output = & docker run --rm --platform $Platform --network none --read-only --user 65532:65532 `
         --cap-drop ALL `
         --security-opt "seccomp=$Seccomp" --security-opt no-new-privileges:true `
         --memory 2g --memory-swap 2g --pids-limit 1024 --shm-size $Shm `
@@ -51,7 +56,7 @@ function Invoke-RunnerCheck {
 if (-not $SkipSmoke) {
     $codeProfile = Join-Path $sandboxRoot "seccomp_profile_code.json"
     $browserProfile = Join-Path $sandboxRoot "seccomp_profile.json"
-    $nodeToolchain = "Promise.all(['vite','vue','react','react-dom'," +
+    $nodeToolchain = "Promise.all(['vite','vue','react','react-dom','three'," +
         "'@vitejs/plugin-vue','@vitejs/plugin-react','vite-plugin-singlefile']" +
         ".map((m) => import(m))).then(() => process.exit(0))" +
         ".catch((e) => { console.error(e); process.exit(1); })"
@@ -72,7 +77,7 @@ if (-not $SkipSmoke) {
 
     Write-Output "Running hardened sandbox smoke via docker CLI (no Docker SDK dependency)..."
     foreach ($check in $checks) {
-        $result = Invoke-RunnerCheck -Image $id -Seccomp $check.Seccomp -Shm $check.Shm -Cmd $check.Cmd
+        $result = Invoke-RunnerCheck -Image $id -Seccomp $check.Seccomp -Shm $check.Shm -Cmd $check.Cmd -Platform $Platform
         if ($result.ExitCode -ne 0) {
             $detail = if ([string]::IsNullOrWhiteSpace($result.Output)) { "non-zero exit" } else { $result.Output }
             throw "Refusing to tag an image whose hardened sandbox smoke failed: $($check.Name)`n$detail"
@@ -90,25 +95,29 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Output "Prepared local ACR release tag: $target"
-Write-Output "Architecture: linux/amd64"
+Write-Output "Platform: $Platform"
 Write-Output "Source image ID: $id"
 Write-Output ""
 Write-Output "No image was pushed and no ACR login was attempted."
 Write-Output "When you are ready, run these commands yourself:"
 Write-Output "  docker login --username=<YOUR_ALIYUN_ACCOUNT> $($target.Split('/')[0])"
 Write-Output "  docker push $target"
+Write-Output "  docker buildx imagetools inspect $target"
 Write-Output ""
 Write-Output "After the push finishes, obtain the immutable RepoDigest locally:"
 Write-Output "  docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' $target"
 Write-Output "Or copy the digest shown on the ACR console (image version -> digest)."
 Write-Output ""
-Write-Output "Consumers need NO configuration: the release default lives in code"
-Write-Output "  (backend/app/core/config.py -> DEFAULT_SANDBOX_PREBUILT_IMAGE), so upgrading"
-Write-Output "  the code picks up this runner version automatically. A version tag works"
-Write-Output "  for first-time bootstrap: the application pulls it, resolves the immutable"
-Write-Output "  RepoDigest, runs hardened smoke, and persists only that digest."
-Write-Output ""
-Write-Output "Only pin a specific deployment explicitly (admin lock) via env:"
-Write-Output "  LEARNGRAPH_SANDBOX_PREBUILT_IMAGE=$target"
 $repoOnly = $target.Split(':')[0]
+if ($Platform -eq "linux/arm64") {
+    Write-Output "ARM64 deployment: use the ARM64 tag above, or the unified v0.6"
+    Write-Output "  multi-platform tag after it is published; Docker will select ARM64."
+}
+else {
+    Write-Output "For a deployment that should use this release, set the prebuilt image"
+    Write-Output "  explicitly unless DEFAULT_SANDBOX_PREBUILT_IMAGE has been updated"
+    Write-Output "  in the matching application release."
+}
+Write-Output "  LEARNGRAPH_SANDBOX_PREBUILT_IMAGE=$target"
+Write-Output "After the push, an immutable pin is also supported:"
 Write-Output "  LEARNGRAPH_SANDBOX_PREBUILT_IMAGE=${repoOnly}@sha256:<repo-digest>"

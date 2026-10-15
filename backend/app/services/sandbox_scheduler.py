@@ -801,9 +801,12 @@ class SandboxSchedulerService:
         raise AppError(422, "sandbox_job_kind_unsupported", f"Unsupported job kind: {job.kind}")
 
     def _subagent_active_count(
-        self, *, workspace_id: str | None = None, owner_user_id: str | None = None, chat_session_id: str | None = None
+        self, *, workspace_id: str | None = None, owner_user_id: str | None = None,
+        chat_session_id: str | None = None, exclude_job_id: str | None = None,
     ) -> int:
-        conditions = [SandboxJob.kind == "subagent", SandboxJob.status.in_(("QUEUED", "STARTING", "RUNNING"))]
+        conditions = [SandboxJob.kind == "subagent", SandboxJob.status.in_(("STARTING", "RUNNING"))]
+        if exclude_job_id is not None:
+            conditions.append(SandboxJob.id != exclude_job_id)
         if workspace_id is not None:
             conditions.append(SandboxJob.workspace_id == workspace_id)
         if owner_user_id is not None:
@@ -813,21 +816,21 @@ class SandboxSchedulerService:
         return int(self.db.scalar(select(func.count(SandboxJob.id)).where(*conditions)) or 0)
 
     def _subagent_quota_exceeded(self, job: SandboxJob) -> str | None:
-        """Four-level sub-agent lane quota (chat/user/workspace/plan-adjacent)."""
+        """Count other executing jobs; queued jobs do not occupy a lane."""
         settings = self.settings
         if (
             settings.sandbox_subagent_max_concurrent_chat > 0
-            and self._subagent_active_count(chat_session_id=job.chat_session_id) >= settings.sandbox_subagent_max_concurrent_chat
+            and self._subagent_active_count(chat_session_id=job.chat_session_id, exclude_job_id=job.id) >= settings.sandbox_subagent_max_concurrent_chat
         ):
             return "subagent_chat_quota"
         if (
             settings.sandbox_subagent_max_concurrent_user > 0
-            and self._subagent_active_count(owner_user_id=job.owner_user_id) >= settings.sandbox_subagent_max_concurrent_user
+            and self._subagent_active_count(owner_user_id=job.owner_user_id, exclude_job_id=job.id) >= settings.sandbox_subagent_max_concurrent_user
         ):
             return "subagent_user_quota"
         if (
             settings.sandbox_subagent_max_concurrent_workspace > 0
-            and self._subagent_active_count(workspace_id=job.workspace_id) >= settings.sandbox_subagent_max_concurrent_workspace
+            and self._subagent_active_count(workspace_id=job.workspace_id, exclude_job_id=job.id) >= settings.sandbox_subagent_max_concurrent_workspace
         ):
             return "subagent_workspace_quota"
         return None
@@ -842,7 +845,12 @@ class SandboxSchedulerService:
             self._finish(job, "FAILED", "invalid_job", "subagent payload missing task_id")
             return
         task = self.db.get(SandboxAgentTask, task_id)
-        if task is None or task.workspace_id != job.workspace_id:
+        if (
+            task is None
+            or task.workspace_id != job.workspace_id
+            or task.owner_user_id != job.owner_user_id
+            or task.chat_session_id != job.chat_session_id
+        ):
             self._finish(job, "FAILED", "invalid_job", "subagent task not found")
             return
         quota_reason = self._subagent_quota_exceeded(job)

@@ -1636,7 +1636,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     session.backend_session_ref = instance.backend_resource_ref
                     session.network_policy = desired_network_policy
                     self.db.commit()
-                    self._ensure_chat_dir(backend, handle, session.chat_session_id)
+                    self._ensure_chat_dir(backend, handle, session.chat_session_id, pooled=True)
                     return handle
                 # The workspace egress switch changed while this pooled
                 # instance was warm. Its container network is immutable, so
@@ -1714,25 +1714,99 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             session.runtime_last_used_at = utc_now()
             session.status = "ready"
             self.db.commit()
-        self._ensure_chat_dir(backend, handle, session.chat_session_id)
+        self._ensure_chat_dir(backend, handle, session.chat_session_id, pooled=True)
         return handle
 
     def _ensure_chat_dir(
-        self, backend, handle: SandboxSessionHandle, chat_session_id: str
+        self,
+        backend,
+        handle: SandboxSessionHandle,
+        chat_session_id: str,
+        *,
+        pooled: bool,
     ) -> None:
-        """Best-effort create the chat workspace dirs inside the shared instance.
+        """Create chat dirs and restore durable inputs into the runtime.
 
-        Mirrors the host-side ``_initialize_workspace`` layout (inputs/ work/
-        outputs/) so agent scripts can save directly into ``outputs/`` without a
-        manual mkdir. Binary generators (python-pptx, openpyxl, zipfile) fail
-        with FileNotFoundError when the target directory is missing.
+        Chat attachments are authoritative in ``SessionWorkspaceService``. A
+        previous best-effort seed can succeed in the database while the
+        runtime is unavailable, so every cold start/resume must reconcile the
+        durable ``inputs/`` entries back into the runtime container.
         """
         try:
-            prefix = self._container_prefix(chat_session_id)
+            prefix = self._container_prefix(chat_session_id) if pooled else ""
             for subdir in ("inputs", "work", "outputs"):
-                backend.write_agent_file(handle, f"{prefix}/{subdir}/.keep", b"")
+                path = f"{prefix}/{subdir}/.keep" if prefix else f"{subdir}/.keep"
+                backend.write_agent_file(handle, path, b"")
         except (SandboxBackendUnavailable, SandboxBackendError):
             pass
+        self._sync_chat_workspace_inputs(
+            backend, handle, chat_session_id, pooled=pooled
+        )
+
+    def _sync_chat_workspace_inputs(
+        self,
+        backend,
+        handle: SandboxSessionHandle,
+        chat_session_id: str,
+        *,
+        pooled: bool,
+    ) -> None:
+        """Reconcile durable chat inputs into the active sandbox runtime.
+
+        ``seed_chat_attachments`` intentionally tolerates a temporarily
+        unavailable backend so the durable session entry can still be saved.
+        Without this replay step, a later runtime start exposes only ``.keep``
+        files and binary attachments such as PDFs remain unreadable forever.
+        Existing files with the same size are left in place to avoid copying a
+        large attachment on every command.
+        """
+        try:
+            entries = [
+                entry
+                for entry in self.workspace_files.list_entries(chat_session_id)
+                if entry.role == "input"
+                and not entry.mime_type.casefold().startswith("video/")
+            ]
+        except Exception:  # noqa: BLE001 - reconciliation must not block startup
+            logger.exception(
+                "Failed to enumerate durable sandbox inputs for chat session %s",
+                chat_session_id,
+            )
+            return
+        if not entries:
+            return
+
+        prefix = self._container_prefix(chat_session_id) if pooled else ""
+        try:
+            existing = {
+                item.path: int(item.size_bytes)
+                for item in backend.list_files(
+                    handle, max(1000, len(entries) + 16)
+                )
+            }
+        except (SandboxBackendUnavailable, SandboxBackendError):
+            existing = {}
+
+        for entry in entries:
+            container_path = (
+                f"{prefix}/{entry.path.lstrip('/')}"
+                if prefix
+                else entry.path
+            )
+            if existing.get(container_path) == int(entry.size_bytes or 0):
+                continue
+            try:
+                data = self.workspace_files.materialize_bytes(
+                    chat_session_id, entry.path
+                )
+                backend.write(handle, container_path, data)
+            except (SandboxBackendUnavailable, SandboxBackendError, AppError):
+                logger.warning(
+                    "Failed to restore sandbox input path %s for chat session %s",
+                    entry.path,
+                    chat_session_id,
+                    exc_info=True,
+                )
 
     def _touch_session(self, session: SandboxSession) -> None:
         now = utc_now()
@@ -1782,7 +1856,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             return self._ensure_pooled_backend_session(session, backend)
         if session.backend_session_ref:
             try:
-                return backend.resume(session.id, session.backend_session_ref)
+                handle = backend.resume(session.id, session.backend_session_ref)
+                self._ensure_chat_dir(
+                    backend, handle, session.chat_session_id, pooled=False
+                )
+                return handle
             except SandboxBackendError:
                 session.backend_session_ref = None
                 session.lifecycle_state = "COLD"
@@ -1791,7 +1869,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             # completed the same cold start. Refresh under the process lock.
             self.db.refresh(session)
             if session.backend_session_ref:
-                return backend.resume(session.id, session.backend_session_ref)
+                handle = backend.resume(session.id, session.backend_session_ref)
+                self._ensure_chat_dir(
+                    backend, handle, session.chat_session_id, pooled=False
+                )
+                return handle
             self._ensure_runtime_capacity(session)
             capability = backend.probe()
             if not capability.available:
@@ -1837,6 +1919,9 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 session.backend_session_ref = None
                 self.db.commit()
                 raise
+        self._ensure_chat_dir(
+            backend, handle, session.chat_session_id, pooled=False
+        )
         return handle
 
     def _mark_session_failed(self, session: SandboxSession) -> None:
@@ -2465,15 +2550,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
     def _read_text_for_mutation(
         self, *, chat_session_id: str, path: str, sandbox_session_id: str | None
     ) -> tuple[str, str]:
-        result = self.read_file(
-            SandboxAgentFileReadRequest(
-                chat_session_id=chat_session_id,
-                path=path,
-                sandbox_session_id=sandbox_session_id,
-            )
-        )
-        content = str(result.get("content") or "")
-        return content, hashlib.sha256(content.encode("utf-8")).hexdigest()
+        # Edits need the complete source, even when agent-facing reads are
+        # paginated. A response page must never become the replacement file.
+        session = self._resolve_session(sandbox_session_id, chat_session_id)
+        _path, data, content = self._load_text_file(chat_session_id, path, session)
+        return content, hashlib.sha256(data).hexdigest()
 
     def append_file(self, payload: SandboxAgentFileAppendRequest) -> dict[str, Any]:
         path = validate_agent_workspace_path(payload.path)
@@ -2593,6 +2674,20 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         session: Any,
     ) -> dict[str, Any]:
         """Read one workspace file (shared by single-path and batch reads)."""
+        path, data, content = self._load_text_file(payload.chat_session_id, path, session)
+        from app.services.harness_contracts import text_page
+
+        page = text_page(
+            content, key=f"file:{self.workspace_id}:{self.actor_id}:{payload.chat_session_id}:{path}",
+            max_chars=payload.max_chars or 16384, cursor=payload.cursor,
+            start_line=payload.start_line, end_line=payload.end_line,
+        )
+        return {"sandbox_session_id": session.id, "path": path, "size_bytes": len(data), **page}
+
+    def _load_text_file(
+        self, chat_session_id: str, path: str, session: Any
+    ) -> tuple[str, bytes, str]:
+        """Load a complete scoped text file within the configured byte limit."""
         try:
             path = validate_agent_workspace_path(path)
         except SandboxCapabilityMismatch as exc:
@@ -2606,14 +2701,14 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         # Prefer the content-addressed session workspace so chat-seeded inputs/
         # remain readable even when Docker is unavailable or not yet synced.
         try:
-            data = self.workspace_files.materialize_bytes(payload.chat_session_id, path)
+            data = self.workspace_files.materialize_bytes(chat_session_id, path)
         except AppError:
             data = None
         if data is None:
             try:
                 handle = self._ensure_backend_session(session)
                 container_path = (
-                    self._container_path(payload.chat_session_id, path)
+                    self._container_path(chat_session_id, path)
                     if self._pooling_enabled(session)
                     else path
                 )
@@ -2632,44 +2727,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             raise AppError(422, "sandbox_file_not_text", "Sandbox Agent file is not UTF-8 text") from exc
         if len(data) > self.settings.sandbox_agent_file_bytes:
             raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
-        # Line-range view: slice by [start_line, end_line] (1-based, inclusive),
-        # then optionally cap by max_chars. Whole-file reads stay untouched.
-        lines = content.splitlines(keepends=True)
-        total_lines = len(lines)
-        lo = (payload.start_line - 1) if payload.start_line is not None else 0
-        hi = payload.end_line if payload.end_line is not None else len(lines)
-        if payload.start_line is not None and lo > len(lines):
-            raise AppError(
-                422,
-                "sandbox_file_range_out_of_bounds",
-                f"start_line {payload.start_line} is beyond the file's {total_lines} lines",
-            )
-        if hi > len(lines):
-            hi = len(lines)
-        if lo > hi:
-            raise AppError(
-                422,
-                "sandbox_file_range_invalid",
-                "end_line must be greater than or equal to start_line",
-            )
-        selected = lines[lo:hi]
-        content = "".join(selected)
-        truncated = False
-        if payload.max_chars is not None and len(content) > payload.max_chars:
-            content = content[: payload.max_chars]
-            truncated = True
-        return {
-            "sandbox_session_id": session.id,
-            "path": path,
-            "size_bytes": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "content": content,
-            "total_lines": total_lines,
-            "total_bytes": len(data),
-            "start_line": lo + 1 if payload.start_line is not None else None,
-            "end_line": hi if payload.end_line is not None else None,
-            "truncated": truncated,
-        }
+        return path, data, content
 
     def list_files(self, payload: SandboxAgentFileListRequest) -> dict[str, Any]:
         session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
@@ -2680,6 +2738,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             entry.path: {
                 "path": entry.path,
                 "size_bytes": int(entry.size_bytes or 0),
+                "mime_type": entry.mime_type,
+                "sha256": entry.blob_sha256,
                 "role": entry.role,
                 "file_id": entry.file_id,
                 "source": entry.source,
@@ -3236,7 +3296,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             output_tokens=int(result.usage.get("output_tokens") or 0),
             attempt=1,
             latency_ms=latency_ms,
-            usage_reported=bool(result.usage),
+            usage_reported=bool(result.usage), usage_units=result.usage,
         )
         self.db.commit()
         transcript = result.text or ""
@@ -3513,14 +3573,15 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Single file to read (ignored when paths is provided)."},
-                            "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16, "description": "Multiple files to read in one call (prefer over repeated single reads)."},
+                            "path": {"type": "string", "minLength": 1, "maxLength": 255, "description": "Single file; provide exactly one of path or paths."},
+                            "cursor": {"type": "string", "minLength": 1, "maxLength": 2048, "description": "Continue one path using its next_cursor; do not use with paths."},
+                            "paths": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 255}, "minItems": 1, "maxItems": 16, "uniqueItems": True, "description": "Batch read; mutually exclusive with path."},
                             "start_line": {"type": "integer", "minimum": 1, "description": "First line to return (1-based)."},
                             "end_line": {"type": "integer", "minimum": 1, "description": "Last line to return (inclusive); values beyond the file are clamped."},
-                            "max_chars": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "Optional character cap on each file's returned content (truncated=true when applied)."},
+                            "max_chars": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 16384, "description": "Character limit per page. Continue truncated reads with next_cursor."},
                             "sandbox_session_id": session_property,
                         },
-                        "required": [],
+                        "oneOf": [{"required": ["path"], "not": {"required": ["paths"]}}, {"required": ["paths"], "not": {"anyOf": [{"required": ["path"]}, {"required": ["cursor"]}]}}],
                         "additionalProperties": False,
                     },
                 },
