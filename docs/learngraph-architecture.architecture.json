@@ -1,0 +1,486 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "LearnGraph 高层架构",
+    "locale": "zh-CN",
+    "output": "learngraph-architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main-request",
+        "label": "主要请求路径",
+        "focus": [
+          "client",
+          "frontend",
+          "api",
+          "data"
+        ],
+        "note": "用户端经前端进入 FastAPI，读写 SQLite/WAL 并通过 JSON/SSE 返回结果。"
+      },
+      {
+        "id": "sandbox-boundary",
+        "label": "沙箱与出网",
+        "focus": [
+          "api",
+          "sandboxd",
+          "runtime",
+          "egress",
+          "docker"
+        ],
+        "note": "API 只调用 sandboxd 控制面；sandboxd 管理隔离运行时并通过受控代理出网。"
+      },
+      {
+        "id": "external-dependencies",
+        "label": "外部依赖",
+        "focus": [
+          "client",
+          "providers",
+          "docker"
+        ],
+        "note": "浏览器/WebView、模型与搜索服务、宿主 Docker Engine 位于应用外部。"
+      }
+    ],
+    "repository": {
+      "url": "https://github.com/SunnyBoy-y/LearnGraph",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "46f7d67c7dab4dac716d45d94d53356dd24698ce"
+    }
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "用户端",
+      "sublabel": "Web / Android WebView",
+      "pos": [
+        30,
+        300
+      ],
+      "size": [
+        120,
+        70
+      ],
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 361,
+          "end_line": 374,
+          "label": "Web 与 Android 客户端"
+        }
+      ]
+    },
+    {
+      "id": "frontend",
+      "type": "frontend",
+      "label": "LearnGraph 前端",
+      "sublabel": "React 19 + Vite",
+      "pos": [
+        195,
+        300
+      ],
+      "size": [
+        140,
+        70
+      ],
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 362,
+          "end_line": 367,
+          "label": "React/Vite 与 ApiClient"
+        },
+        {
+          "path": "frontend/src/api/client.ts",
+          "line": 159,
+          "end_line": 187,
+          "label": "Bearer 与 Workspace Header"
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "LearnGraph API",
+      "sublabel": "FastAPI / JSON / SSE",
+      "pos": [
+        365,
+        300
+      ],
+      "size": [
+        155,
+        78
+      ],
+      "tag": "认证 · 工作区 · Provider 编排",
+      "sources": [
+        {
+          "path": "backend/app/main.py",
+          "line": 245,
+          "end_line": 262,
+          "label": "FastAPI 与 Provider 边界"
+        },
+        {
+          "path": "README.md",
+          "line": 379,
+          "end_line": 391,
+          "label": "API 服务与 provider ports"
+        }
+      ]
+    },
+    {
+      "id": "data",
+      "type": "database",
+      "label": "业务事实源",
+      "sublabel": "SQLite (WAL) / data volume",
+      "pos": [
+        580,
+        140
+      ],
+      "size": [
+        155,
+        70
+      ],
+      "sources": [
+        {
+          "path": "backend/app/core/database.py",
+          "line": 36,
+          "end_line": 67,
+          "label": "SQLite engine"
+        },
+        {
+          "path": "backend/app/core/database.py",
+          "line": 86,
+          "end_line": 110,
+          "label": "WAL 配置"
+        },
+        {
+          "path": "README.md",
+          "line": 403,
+          "label": "SQLite 是规范事实源"
+        }
+      ]
+    },
+    {
+      "id": "scheduler",
+      "type": "messagebus",
+      "label": "后台任务运行器",
+      "sublabel": "durable queue / scheduler",
+      "pos": [
+        520,
+        470
+      ],
+      "size": [
+        180,
+        70
+      ],
+      "sources": [
+        {
+          "path": "backend/app/main.py",
+          "line": 83,
+          "end_line": 96,
+          "label": "durable queue worker"
+        },
+        {
+          "path": "backend/app/main.py",
+          "line": 119,
+          "end_line": 151,
+          "label": "embedded schedulers"
+        }
+      ]
+    },
+    {
+      "id": "sandboxd",
+      "type": "security",
+      "label": "Sandbox 控制面",
+      "sublabel": "sandboxd :8090",
+      "pos": [
+        730,
+        300
+      ],
+      "size": [
+        155,
+        78
+      ],
+      "tag": "唯一接触 Docker Engine",
+      "sources": [
+        {
+          "path": "docker-compose.yml",
+          "line": 309,
+          "end_line": 346,
+          "label": "控制面与 Docker socket"
+        },
+        {
+          "path": "sandboxd/sandboxd/main.py",
+          "line": 13,
+          "end_line": 18,
+          "label": "Sandbox API 与 Docker runtime"
+        }
+      ]
+    },
+    {
+      "id": "runtime",
+      "type": "security",
+      "label": "隔离运行时",
+      "sublabel": "Docker sandbox container",
+      "pos": [
+        910,
+        300
+      ],
+      "size": [
+        165,
+        78
+      ],
+      "sources": [
+        {
+          "path": "sandboxd/sandboxd/runtime/docker.py",
+          "line": 1,
+          "end_line": 6,
+          "label": "默认断网与审批准出网"
+        },
+        {
+          "path": "sandboxd/sandboxd/runtime/docker.py",
+          "line": 321,
+          "end_line": 412,
+          "label": "每沙箱网络与代理注入"
+        }
+      ]
+    },
+    {
+      "id": "egress",
+      "type": "cloud",
+      "label": "受控网络出口",
+      "sublabel": "egress-proxy :8888",
+      "pos": [
+        1110,
+        300
+      ],
+      "size": [
+        145,
+        78
+      ],
+      "tag": "allow/deny + audit",
+      "sources": [
+        {
+          "path": "docker-compose.yml",
+          "line": 262,
+          "end_line": 307,
+          "label": "唯一沙箱出网组件"
+        }
+      ]
+    },
+    {
+      "id": "providers",
+      "type": "external",
+      "label": "外部 Providers",
+      "sublabel": "LLM · 搜索 · 抓取 · ASR",
+      "pos": [
+        1010,
+        140
+      ],
+      "size": [
+        160,
+        70
+      ],
+      "sources": [
+        {
+          "path": "backend/app/main.py",
+          "line": 260,
+          "end_line": 262,
+          "label": "显式 Provider 调用"
+        },
+        {
+          "path": "README.md",
+          "line": 389,
+          "end_line": 391,
+          "label": "remote provider ports"
+        }
+      ]
+    },
+    {
+      "id": "docker",
+      "type": "external",
+      "label": "宿主 Docker Engine",
+      "sublabel": "/var/run/docker.sock",
+      "pos": [
+        730,
+        540
+      ],
+      "size": [
+        160,
+        70
+      ],
+      "sources": [
+        {
+          "path": "docker-compose.yml",
+          "line": 309,
+          "end_line": 345,
+          "label": "sandboxd 独占 socket"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "客户端信任边界",
+      "wraps": [
+        "client"
+      ],
+      "pad": 10.0
+    },
+    {
+      "kind": "security-group",
+      "label": "LearnGraph 服务边界",
+      "wraps": [
+        "frontend",
+        "api",
+        "data",
+        "scheduler"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "沙箱隔离边界",
+      "wraps": [
+        "sandboxd",
+        "runtime",
+        "egress"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "client-frontend",
+      "from": "client",
+      "to": "frontend",
+      "label": "HTTPS / WebView",
+      "variant": "emphasis",
+      "labelDy": 61
+    },
+    {
+      "id": "frontend-api",
+      "from": "frontend",
+      "to": "api",
+      "label": "REST / SSE",
+      "variant": "emphasis",
+      "labelDy": -29.0
+    },
+    {
+      "id": "api-data",
+      "from": "api",
+      "to": "data",
+      "label": "会话、消息、记忆写入",
+      "variant": "emphasis",
+      "labelDy": 30.0
+    },
+    {
+      "id": "api-scheduler",
+      "from": "api",
+      "to": "scheduler",
+      "label": "durable task / resume",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": -8
+    },
+    {
+      "id": "api-sandboxd",
+      "from": "api",
+      "to": "sandboxd",
+      "label": "Sandbox API :8090",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "api-providers",
+      "from": "api",
+      "to": "providers",
+      "label": "模型 / 搜索调用",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          442.5,
+          250
+        ],
+        [
+          1090,
+          250
+        ]
+      ],
+      "labelDy": 29.0
+    },
+    {
+      "id": "sandboxd-runtime",
+      "from": "sandboxd",
+      "to": "runtime",
+      "label": "创建 / 执行 / 回收",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -32
+    },
+    {
+      "id": "runtime-egress",
+      "from": "runtime",
+      "to": "egress",
+      "label": "仅经代理出网",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -33.0
+    },
+    {
+      "id": "egress-providers",
+      "from": "egress",
+      "to": "providers",
+      "label": "策略允许的 HTTP",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDy": 9.0
+    },
+    {
+      "id": "sandboxd-docker",
+      "from": "sandboxd",
+      "to": "docker",
+      "label": "Docker API",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 58
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "主要请求路径",
+      "items": [
+        "用户端 → React/Vite → FastAPI",
+        "API 通过 JSON/SSE 传输并把会话、消息与记忆写入 SQLite/WAL",
+        "需要执行时由 API 调用 sandboxd，再进入隔离运行时"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "信任边界",
+      "items": [
+        "服务边界内包含前端、API、SQLite 与进程内后台任务",
+        "sandboxd 是唯一触碰 Docker Engine 的控制面",
+        "沙箱默认断网，出网必须经过带策略和审计的 egress-proxy"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "外部依赖",
+      "items": [
+        "浏览器或 Android WebView",
+        "显式配置的 LLM、搜索、抓取与 ASR Provider",
+        "宿主 Docker Engine 由 sandboxd 通过 socket 管理"
+      ]
+    }
+  ]
+}

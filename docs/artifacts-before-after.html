@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>已分享卡片：修改前后预览对比</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --page: #f5f6f8;
+        --panel: #ffffff;
+        --ink: #1f2329;
+        --muted: #747b86;
+        --line: #e2e5ea;
+        --soft: #f7f8fa;
+        --before: #c9792e;
+        --after: #2d6cdf;
+        --success: #2f8a62;
+        --shadow: 0 16px 42px rgba(31, 35, 41, 0.1);
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        min-width: 320px;
+        margin: 0;
+        background: var(--page);
+        color: var(--ink);
+        font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      }
+      main { width: min(1520px, calc(100% - 40px)); margin: 0 auto; padding: 42px 0 56px; }
+      .eyebrow { margin: 0 0 8px; color: #5571a7; font-size: 12px; font-weight: 700; letter-spacing: .16em; }
+      h1 { margin: 0; font-size: clamp(26px, 3.2vw, 42px); letter-spacing: -.04em; line-height: 1.1; }
+      .intro { max-width: 760px; margin: 14px 0 28px; color: var(--muted); font-size: 15px; line-height: 1.7; }
+      .comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+      .panel { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 22px; background: var(--panel); box-shadow: var(--shadow); }
+      .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 20px 22px 16px; border-bottom: 1px solid var(--line); }
+      .panel-head h2 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
+      .panel-head p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+      .tag { flex: none; border-radius: 999px; padding: 5px 9px; font-size: 11px; font-weight: 700; }
+      .before .tag { background: #fff3e4; color: var(--before); }
+      .after .tag { background: #eaf1ff; color: var(--after); }
+      .canvas { display: block; width: 100%; height: auto; background: #fbfcfd; }
+      .panel-foot { display: flex; align-items: center; gap: 8px; min-height: 52px; padding: 12px 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.5; }
+      .panel-foot strong { color: var(--ink); }
+      .summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 24px; }
+      .summary-item { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); padding: 14px 16px; }
+      .summary-item b { display: block; margin-bottom: 4px; font-size: 13px; }
+      .summary-item span { color: var(--muted); font-size: 12px; line-height: 1.5; }
+      @media (max-width: 980px) {
+        main { width: min(760px, calc(100% - 28px)); padding-top: 28px; }
+        .comparison, .summary { grid-template-columns: 1fr; }
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          color-scheme: dark;
+          --page: #111318;
+          --panel: #1a1d24;
+          --ink: #f3f5f8;
+          --muted: #a1a8b4;
+          --line: #303641;
+          --soft: #222731;
+          --shadow: 0 16px 42px rgba(0, 0, 0, .28);
+        }
+        .canvas { background: #151820; }
+        .before .tag { background: #3b2b1e; }
+        .after .tag { background: #202f50; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">LEARNGRAPH · ARTIFACTS</p>
+      <h1>已分享页面：修改前 / 修改后</h1>
+      <p class="intro">
+        对比重点：分享记录仍保留批量操作和状态管理，但展示方式从横向列表行升级为可直接浏览冻结版本内容的预览卡片。
+      </p>
+
+      <div class="comparison">
+        <section class="panel before" aria-labelledby="before-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="before-title">修改前 · 列表行</h2>
+              <p>信息集中在一行，卡片内容需要再进入其他入口查看。</p>
+            </div>
+            <span class="tag">Before</span>
+          </div>
+          <svg class="canvas" viewBox="0 0 860 620" role="img" aria-labelledby="before-svg-title before-svg-desc">
+            <title id="before-svg-title">修改前的已分享页面列表</title>
+            <desc id="before-svg-desc">左侧是 LearnGraph 导航，右侧是三个横向分享记录行，没有内嵌卡片预览。</desc>
+            <rect width="860" height="620" fill="#fbfcfd" />
+            <rect width="166" height="620" fill="#f7f8fa" />
+            <rect x="166" width="694" height="620" fill="#ffffff" />
+            <rect x="18" y="20" width="34" height="34" rx="10" fill="#20242b" />
+            <path d="M29 38h12M35 30v17M29 34l6-4 6 4M29 42l6-4 6 4" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" />
+            <text x="63" y="42" fill="#1f2329" font-size="17" font-weight="700">LearnGraph</text>
+            <g fill="#6f7680" font-size="13">
+              <text x="31" y="102">▣　新对话</text>
+              <text x="31" y="143">⌘　图谱</text>
+              <text x="31" y="184">◫　资料</text>
+            </g>
+            <rect x="12" y="208" width="142" height="42" rx="12" fill="#e9ebef" />
+            <text x="31" y="234" fill="#30343b" font-size="13" font-weight="700">▣　产物</text>
+            <text x="31" y="280" fill="#6f7680" font-size="13">•••　更多</text>
+            <line x1="22" y1="310" x2="144" y2="310" stroke="#e0e3e8" />
+            <text x="22" y="345" fill="#30343b" font-size="13" font-weight="700">会话</text>
+            <g fill="#848b95" font-size="11">
+              <text x="28" y="378">□　操作系统原理</text>
+              <text x="28" y="412">□　数据结构与算法</text>
+              <text x="28" y="446">□　SQL 查询入门</text>
+              <text x="28" y="480">□　知识图谱</text>
+            </g>
+            <text x="196" y="40" fill="#8a919b" font-size="10" letter-spacing="2.5">ARTIFACTS</text>
+            <text x="196" y="72" fill="#1f2329" font-size="25" font-weight="800">产物与分享</text>
+            <text x="196" y="96" fill="#8a919b" font-size="12">会话中生成的交互 HTML 卡片自动聚合为草稿，可预览、跳转会话与删除。</text>
+            <rect x="196" y="119" width="92" height="32" rx="9" fill="#f4f5f7" stroke="#e1e4e9" />
+            <text x="215" y="140" fill="#6f7680" font-size="12">会话卡片</text>
+            <rect x="294" y="119" width="102" height="32" rx="9" fill="#20242b" />
+            <text x="313" y="140" fill="#ffffff" font-size="12" font-weight="700">已分享页面</text>
+            <line x1="196" y1="168" x2="832" y2="168" stroke="#e3e6eb" />
+            <text x="196" y="198" fill="#1f2329" font-size="16" font-weight="700">已分享页面</text>
+            <text x="196" y="222" fill="#8a919b" font-size="12">集中查看所有已发布卡片的分享状态。</text>
+            <rect x="196" y="244" width="636" height="1" fill="#e3e6eb" />
+            <rect x="196" y="263" width="636" height="82" rx="15" fill="#ffffff" stroke="#e1e4e9" />
+            <rect x="214" y="292" width="18" height="18" rx="4" fill="#ffffff" stroke="#cfd4dc" />
+            <text x="247" y="289" fill="#252a31" font-size="14" font-weight="700">自由驾驶 · FreeDrive Racer</text>
+            <text x="247" y="310" fill="#8a919b" font-size="11">v1 · magic_card · 未命名分享</text>
+            <text x="247" y="328" fill="#8a919b" font-size="10" font-family="ui-monospace, monospace">令牌 M8zB3undQEu… · 查看 0</text>
+            <rect x="682" y="292" width="46" height="24" rx="12" fill="#fff" stroke="#d9dde4" />
+            <text x="693" y="308" fill="#4d5662" font-size="10">有效</text>
+            <rect x="737" y="292" width="76" height="24" rx="12" fill="#fff" stroke="#d9dde4" />
+            <text x="748" y="308" fill="#4d5662" font-size="10">复制链接</text>
+            <rect x="196" y="360" width="636" height="82" rx="15" fill="#ffffff" stroke="#e1e4e9" />
+            <rect x="214" y="389" width="18" height="18" rx="4" fill="#ffffff" stroke="#cfd4dc" />
+            <text x="247" y="386" fill="#252a31" font-size="14" font-weight="700">自由驾驶 · FreeDrive Racer</text>
+            <text x="247" y="407" fill="#8a919b" font-size="11">v1 · magic_card · 未命名分享</text>
+            <text x="247" y="425" fill="#8a919b" font-size="10" font-family="ui-monospace, monospace">令牌 t+dLCwlASlC… · 查看 7</text>
+            <rect x="682" y="389" width="46" height="24" rx="12" fill="#fff" stroke="#d9dde4" />
+            <text x="693" y="405" fill="#4d5662" font-size="10">有效</text>
+            <rect x="737" y="389" width="76" height="24" rx="12" fill="#fff" stroke="#d9dde4" />
+            <text x="748" y="405" fill="#4d5662" font-size="10">复制链接</text>
+            <rect x="196" y="457" width="636" height="82" rx="15" fill="#ffffff" stroke="#e1e4e9" />
+            <rect x="214" y="486" width="18" height="18" rx="4" fill="#ffffff" stroke="#cfd4dc" />
+            <text x="247" y="483" fill="#252a31" font-size="14" font-weight="700">NEON BEAT · 动感音乐节奏游戏</text>
+            <text x="247" y="504" fill="#8a919b" font-size="11">v1 · magic_card · 未命名分享</text>
+            <text x="247" y="522" fill="#8a919b" font-size="10" font-family="ui-monospace, monospace">令牌 pYLUvX6tY7Y… · 查看 2</text>
+            <rect x="682" y="486" width="46" height="24" rx="12" fill="#fff" stroke="#d9dde4" />
+            <text x="693" y="502" fill="#4d5662" font-size="10">有效</text>
+            <rect x="737" y="486" width="76" height="24" rx="12" fill="#fff" stroke="#d9dde4" />
+            <text x="748" y="502" fill="#4d5662" font-size="10">复制链接</text>
+            <path d="M802 234h25v25" fill="none" stroke="#c9792e" stroke-width="2" stroke-linecap="round" />
+            <text x="618" y="232" fill="#c9792e" font-size="11" font-weight="700">只有记录，没有内容预览</text>
+          </svg>
+          <div class="panel-foot"><strong>问题：</strong>分享记录与卡片内容分离，浏览者无法在列表中快速比较。</div>
+        </section>
+
+        <section class="panel after" aria-labelledby="after-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="after-title">修改后 · 预览卡片</h2>
+              <p>分享版本直接在卡片内预览，同时保留原有分享管理能力。</p>
+            </div>
+            <span class="tag">After</span>
+          </div>
+          <svg class="canvas" viewBox="0 0 860 620" role="img" aria-labelledby="after-svg-title after-svg-desc">
+            <title id="after-svg-title">修改后的已分享页面预览卡片网格</title>
+            <desc id="after-svg-desc">右侧是三个带有冻结版本预览的卡片，卡片下方保留分享状态和管理操作。</desc>
+            <rect width="860" height="620" fill="#fbfcfd" />
+            <rect width="166" height="620" fill="#f7f8fa" />
+            <rect x="166" width="694" height="620" fill="#ffffff" />
+            <rect x="18" y="20" width="34" height="34" rx="10" fill="#20242b" />
+            <path d="M29 38h12M35 30v17M29 34l6-4 6 4M29 42l6-4 6 4" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" />
+            <text x="63" y="42" fill="#1f2329" font-size="17" font-weight="700">LearnGraph</text>
+            <g fill="#6f7680" font-size="13">
+              <text x="31" y="102">▣　新对话</text>
+              <text x="31" y="143">⌘　图谱</text>
+              <text x="31" y="184">◫　资料</text>
+            </g>
+            <rect x="12" y="208" width="142" height="42" rx="12" fill="#e9ebef" />
+            <text x="31" y="234" fill="#30343b" font-size="13" font-weight="700">▣　产物</text>
+            <text x="31" y="280" fill="#6f7680" font-size="13">•••　更多</text>
+            <line x1="22" y1="310" x2="144" y2="310" stroke="#e0e3e8" />
+            <text x="22" y="345" fill="#30343b" font-size="13" font-weight="700">会话</text>
+            <g fill="#848b95" font-size="11">
+              <text x="28" y="378">□　操作系统原理</text>
+              <text x="28" y="412">□　数据结构与算法</text>
+              <text x="28" y="446">□　SQL 查询入门</text>
+              <text x="28" y="480">□　知识图谱</text>
+            </g>
+            <text x="196" y="40" fill="#8a919b" font-size="10" letter-spacing="2.5">ARTIFACTS</text>
+            <text x="196" y="72" fill="#1f2329" font-size="25" font-weight="800">产物与分享</text>
+            <text x="196" y="96" fill="#8a919b" font-size="12">会话中生成的交互 HTML 卡片自动聚合为草稿，可预览、跳转会话与删除。</text>
+            <rect x="196" y="119" width="92" height="32" rx="9" fill="#f4f5f7" stroke="#e1e4e9" />
+            <text x="215" y="140" fill="#6f7680" font-size="12">会话卡片</text>
+            <rect x="294" y="119" width="102" height="32" rx="9" fill="#20242b" />
+            <text x="313" y="140" fill="#ffffff" font-size="12" font-weight="700">已分享页面</text>
+            <line x1="196" y1="168" x2="832" y2="168" stroke="#e3e6eb" />
+            <text x="196" y="198" fill="#1f2329" font-size="16" font-weight="700">已分享页面</text>
+            <text x="196" y="222" fill="#8a919b" font-size="12">集中查看所有已发布卡片的预览与分享状态。</text>
+            <rect x="196" y="244" width="636" height="1" fill="#e3e6eb" />
+
+            <g transform="translate(196 263)">
+              <rect width="300" height="176" rx="16" fill="#ffffff" stroke="#dce3ee" />
+              <rect x="14" y="13" width="70" height="21" rx="11" fill="#eaf1ff" />
+              <text x="26" y="27" fill="#2d6cdf" font-size="10" font-weight="700">已分享卡片</text>
+              <rect x="91" y="13" width="38" height="21" rx="11" fill="#eef8f2" />
+              <text x="102" y="27" fill="#2f8a62" font-size="10">有效</text>
+              <text x="14" y="55" fill="#252a31" font-size="13" font-weight="700">自由驾驶 · FreeDrive Racer</text>
+              <text x="14" y="72" fill="#8a919b" font-size="10">v1 · magic_card</text>
+              <rect x="14" y="83" width="272" height="65" rx="10" fill="#f4f7fc" stroke="#dce5f3" />
+              <rect x="25" y="94" width="250" height="9" rx="4" fill="#d6e1f5" />
+              <circle cx="40" cy="123" r="13" fill="#6f9df0" />
+              <circle cx="73" cy="123" r="13" fill="#8bb7ff" />
+              <circle cx="106" cy="123" r="13" fill="#b4cbf8" />
+              <rect x="137" y="113" width="118" height="8" rx="4" fill="#6f9df0" />
+              <rect x="137" y="128" width="86" height="7" rx="3.5" fill="#c2d2ef" />
+              <line x1="14" y1="157" x2="286" y2="157" stroke="#e6e9ee" />
+              <rect x="14" y="164" width="45" height="0" fill="none" />
+            </g>
+            <g transform="translate(516 263)">
+              <rect width="316" height="176" rx="16" fill="#ffffff" stroke="#dce3ee" />
+              <rect x="14" y="13" width="70" height="21" rx="11" fill="#eaf1ff" />
+              <text x="26" y="27" fill="#2d6cdf" font-size="10" font-weight="700">已分享卡片</text>
+              <rect x="91" y="13" width="38" height="21" rx="11" fill="#eef8f2" />
+              <text x="102" y="27" fill="#2f8a62" font-size="10">有效</text>
+              <text x="14" y="55" fill="#252a31" font-size="13" font-weight="700">自由驾驶 · FreeDrive Racer</text>
+              <text x="14" y="72" fill="#8a919b" font-size="10">v1 · magic_card</text>
+              <rect x="14" y="83" width="288" height="65" rx="10" fill="#f4faf5" stroke="#d8eadc" />
+              <rect x="25" y="94" width="260" height="9" rx="4" fill="#d3ead8" />
+              <path d="M30 130 C67 113, 98 141, 133 121 S200 110, 265 130" fill="none" stroke="#55a873" stroke-width="4" stroke-linecap="round" />
+              <circle cx="133" cy="121" r="5" fill="#2f8a62" />
+              <line x1="14" y1="157" x2="302" y2="157" stroke="#e6e9ee" />
+            </g>
+            <g transform="translate(196 458)">
+              <rect width="300" height="138" rx="16" fill="#ffffff" stroke="#dce3ee" />
+              <rect x="14" y="13" width="70" height="21" rx="11" fill="#eaf1ff" />
+              <text x="26" y="27" fill="#2d6cdf" font-size="10" font-weight="700">已分享卡片</text>
+              <rect x="91" y="13" width="62" height="21" rx="11" fill="#fff4e6" />
+              <text x="101" y="27" fill="#b26c24" font-size="10">已到期</text>
+              <text x="14" y="55" fill="#252a31" font-size="13" font-weight="700">NEON BEAT · 节奏游戏</text>
+              <text x="14" y="72" fill="#8a919b" font-size="10">v1 · magic_card · 预览仍保留</text>
+              <rect x="14" y="83" width="272" height="34" rx="9" fill="#fff8ef" stroke="#f0dfc4" />
+              <rect x="26" y="95" width="8" height="12" rx="2" fill="#df9e51" />
+              <rect x="41" y="90" width="8" height="17" rx="2" fill="#df9e51" />
+              <rect x="56" y="98" width="8" height="9" rx="2" fill="#df9e51" />
+              <rect x="71" y="87" width="8" height="20" rx="2" fill="#df9e51" />
+              <text x="101" y="104" fill="#9a754d" font-size="10">冻结版本内容可回看</text>
+            </g>
+            <path d="M803 232h24v24" fill="none" stroke="#2d6cdf" stroke-width="2" stroke-linecap="round" />
+            <text x="602" y="230" fill="#2d6cdf" font-size="11" font-weight="700">记录、状态与内容合在一张卡里</text>
+          </svg>
+          <div class="panel-foot"><strong>结果：</strong>先看内容，再决定复制、撤销或删除；不同分享版本也更容易比较。</div>
+        </section>
+      </div>
+
+      <div class="summary" aria-label="修改摘要">
+        <div class="summary-item"><b>展示方式</b><span>横向记录行 → 响应式预览卡片网格</span></div>
+        <div class="summary-item"><b>内容一致性</b><span>按分享绑定的冻结版本渲染，不读取最新草稿</span></div>
+        <div class="summary-item"><b>操作保留</b><span>批量选择、复制、撤销与删除全部保留</span></div>
+      </div>
+    </main>
+  </body>
+</html>

@@ -19,9 +19,45 @@
 - 可信组件与交互式子应用：服务器持有模板、CSP 锁死、postMessage 数据通道、interaction contract
 - Message / SSE 持久化、批量落库、心跳与断线恢复理念
 - 媒体输入管线：音频、视频、图片和全文文档的能力路由、解析、缓存与证据边界
+- 全双工语音 Agent：能力包、后台直接受理、练习判分、Evidence 关联、画布文件交付与实际播放状态
 - 安全、代码地图、扩展与验收规范
 
 页面包含无需后端的交互预览：媒体输入管线与能力渐进式披露。所有动画均支持 `prefers-reduced-motion`，不加载外部脚本、字体或图片。
+
+## Full-duplex Voice Agent
+
+语音前台 Tutor 只负责实时对话和任务受理；复杂 Agent 工作进入持久化 SubAgent 任务。服务端通过
+`GET /api/v1/voice/capabilities` 返回每个能力包的 `available`、`required_permission`、
+`blocked_by` 和 `reason`，前端不自行推断 Provider 或沙箱是否可用。
+
+当前能力包包括：
+
+- `research`：搜索、网页抓取和来源整理；
+- `learning_read`：图谱、掌握度、复习项和学习行动读取；
+- `practice_prepare`：创建持久化练习题并返回 `exercise_id`；
+- `learning_evidence`：记录待审核学习证据；
+- `graph_proposal`、`artifact_create`、`workspace_task`：后台直接受理，仍受服务端 capability、权限和沙箱隔离约束；结果显示在当前对话画布。
+
+练习的语音闭环为：
+
+```text
+voice_practice_create
+  -> Exercise
+  -> submit_voice_exercise_answer
+  -> ExerciseService.submit_answer
+  -> AnswerRecord + Evidence + Mastery/LearningState
+```
+
+后台结果交付状态以输出传输下游的账本为准：
+
+```text
+claimed -> enqueued -> speaking -> played
+                           \\-> interrupted
+```
+
+`played` 只有在真实音频已经经过 `VoiceLedgerRelay` 的服务端输出边界后才会写入；它表示服务端已把音频交给输出传输层，不等同于用户设备扬声器已经听到。用户插话会把结果保留为可重新交付状态。
+
+当前验收边界：跨进程 WebRTC 恢复仍需要部署侧的粘性路由和实际多 worker/真实媒体连接验证；ASR、TTS、浏览器 WebRTC 与 Android 真机链路尚未作为仓库静态检查的结论。能力可用性接口只读取已启用的模型、工具、权限和沙箱配置，不会触发模型或外部网络调用。
 
 ## Sandbox Network Security Model
 
