@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import hashlib
+import json
 from typing import Any
 
 from sqlalchemy import func, select
@@ -10,7 +12,7 @@ from app.core.config import Settings, get_settings
 from app.core.database import SessionLocal
 from app.core.errors import AppError
 from app.core.tasks import task_queue
-from app.domain.models import ResearchJob, ResearchJobEvent, utc_now
+from app.domain.models import ProviderConfig, ResearchJob, ResearchJobEvent, utc_now
 from app.domain.schemas.research import (
     ResearchApprovalRequest,
     ResearchJobView,
@@ -36,7 +38,8 @@ from app.providers.remote.search import (
 )
 from app.repositories.audit import AuditRepository
 from app.repositories.domain import ResearchEventRepository, ResearchRepository
-from app.services.billing import BillingQuote, BillingService, DEFAULT_USD_CNY_RATE
+from app.services.billing import BillingQuote, BillingService
+from app.core.money import amount_text, decimal_amount
 
 
 TERMINAL_RESEARCH_STATUSES = {
@@ -49,7 +52,7 @@ TERMINAL_RESEARCH_STATUSES = {
     "over_budget",
     "rejected",
 }
-ACTIVE_RESEARCH_STATUSES = {"awaiting_approval", "queued", "running", "cancel_requested"}
+ACTIVE_RESEARCH_STATUSES = {"awaiting_approval", "starting", "queued", "running", "cancel_requested"}
 
 
 class ResearchService:
@@ -123,7 +126,7 @@ class ResearchService:
             )
         allowed_domains = set(self._effective_allowed_domains(payload.allowed_domains))
         try:
-            results = self.search_provider.search(
+            results, _ = self.billing.execute_search(self.search_provider,
                 payload.query,
                 payload.max_results,
                 allowed_domains=allowed_domains or None,
@@ -168,23 +171,25 @@ class ResearchService:
                     "research_provider_unavailable",
                     "Neither DeepResearchProvider nor a real SearchProvider is configured",
                 )
+            remote_search = self.search_provider.remote_capability
+            quote = self.billing.preflight_model_call(provider_id=self.search_provider.provider_id,
+                model_id=getattr(self.search_provider, "model_id", "web-search"), feature="web_search",
+                estimated_input_tokens=0, estimated_output_tokens=0, remote_capability=remote_search,
+                estimated_units={"requests": 1, "results": 5}, reserve=False)
+            if remote_search and quote.currency is not None and quote.currency != payload.currency:
+                raise AppError(422, "research_currency_mismatch", "Choose the search supplier's native currency", {"currency": quote.currency})
             return ResearchPlanView(
-                provider_id="local_search_composer",
-                provider_capabilities={"background": False, "citations": False, "remote": False},
+                provider_id=self.search_provider.provider_id,
+                provider_capabilities={"background": False, "citations": False, "remote": remote_search},
                 question=payload.question,
-                budget_cny=payload.budget_cny,
-                estimated_cost_cny=0,
+                budget_amount=payload.budget_amount,
+                currency=payload.currency,
+                estimated_cost_amount=quote.projected_amount,
                 requires_approval=False,
             )
-        # A fully exhausted hard policy blocks before even consulting a remote
-        # research provider for capabilities or an estimate.
-        self.billing.preflight_research_call(
-            provider_id=provider.provider_id,
-            estimated_cost_cny=0,
-        )
         try:
             capabilities = provider.capabilities()
-            estimate = provider.estimate(question=payload.question, budget_cny=payload.budget_cny)
+            estimate = provider.estimate(question=payload.question, budget_amount=payload.budget_amount, currency=payload.currency)
         except DeepResearchProviderTimeout as exc:
             raise AppError(504, "research_provider_timeout", "Research provider estimate timed out") from exc
         except DeepResearchProviderError as exc:
@@ -193,8 +198,9 @@ class ResearchService:
             provider_id=provider.provider_id,
             provider_capabilities=capabilities,
             question=payload.question,
-            budget_cny=payload.budget_cny,
-            estimated_cost_cny=max(0.0, min(float(estimate), payload.budget_cny)),
+            budget_amount=payload.budget_amount,
+                currency=payload.currency,
+            estimated_cost_amount=amount_text(min(decimal_amount(estimate), decimal_amount(payload.budget_amount))),
             requires_approval=True,
         )
 
@@ -211,6 +217,9 @@ class ResearchService:
             return self._create_search_composed_research(payload)
 
         plan = self.plan_research(payload)
+        approval_quote = self.billing.preflight_research_call(provider_id=plan.provider_id,
+            currency=plan.currency, estimated_cost_amount=plan.estimated_cost_amount, reserve=False)
+        approval_quote.approval_fingerprint = self._approval_fingerprint(plan.provider_id)
         job = self.research.add(
             ResearchJob(
                 workspace_id=self.workspace_id,
@@ -218,9 +227,11 @@ class ResearchService:
                 question=payload.question,
                 status="awaiting_approval",
                 provider_id=plan.provider_id,
-                budget_cny=payload.budget_cny,
-                estimated_cost_cny=plan.estimated_cost_cny,
+                budget_amount=payload.budget_amount,
+                currency=payload.currency,
+                estimated_cost_amount=plan.estimated_cost_amount,
                 approval_status="pending",
+                billing_snapshot=approval_quote.snapshot(),
                 source_scope=list(dict.fromkeys(payload.source_scope)),
                 allowed_domains=list(dict.fromkeys(payload.allowed_domains)),
                 evidence_pack={
@@ -228,7 +239,9 @@ class ResearchService:
                     "remote_research_performed": False,
                     "plan": {
                         "provider_id": plan.provider_id,
-                        "estimated_cost_cny": plan.estimated_cost_cny,
+                        "estimated_cost_amount": plan.estimated_cost_amount,
+                        "currency": plan.currency,
+                        "budget_amount": plan.budget_amount,
                         "source_scope": list(dict.fromkeys(payload.source_scope)),
                         "allowed_domains": list(dict.fromkeys(payload.allowed_domains)),
                     },
@@ -240,17 +253,17 @@ class ResearchService:
             action="research.plan_created",
             resource_type="research_job",
             resource_id=job.id,
-            details={"provider_id": plan.provider_id, "budget_cny": payload.budget_cny},
+            details={"provider_id": plan.provider_id, "budget_amount": payload.budget_amount},
         )
         self._record_event(
             job,
             "research.plan_created",
-            {"provider_id": plan.provider_id, "budget_cny": payload.budget_cny},
+            {"provider_id": plan.provider_id, "budget_amount": payload.budget_amount},
         )
         self.db.commit()
         self.db.refresh(job)
         if payload.approved:
-            return self._start_remote(job)
+            return self._start_remote(job, quote_id=approval_quote.quote_id)
         return job
 
     def approve_research(self, job_id: str, payload: ResearchApprovalRequest) -> ResearchJob:
@@ -271,7 +284,7 @@ class ResearchService:
             self.db.commit()
             self.db.refresh(job)
             return job
-        return self._start_remote(job)
+        return self._start_remote(job, quote_id=payload.quote_id)
 
     def get_research(self, job_id: str) -> ResearchJob:
         job = self.research.require(job_id, "research job")
@@ -363,32 +376,56 @@ class ResearchService:
         query = query.order_by(ResearchJob.created_at.desc()).limit(100)
         return list(self.db.scalars(query).all())
 
-    def _start_remote(self, job: ResearchJob) -> ResearchJob:
-        if job.budget_cny <= 0:
+    def _approval_fingerprint(self, provider_id: str) -> str:
+        config = self.db.scalar(select(ProviderConfig).where(ProviderConfig.id == provider_id,
+            ProviderConfig.workspace_id == self.workspace_id))
+        if config is None:
+            raise AppError(404, "provider_not_found", "Provider is not in the current workspace")
+        binding = {"id": config.id, "type": config.provider_type, "base_url": config.base_url,
+            "capabilities": config.capabilities, "enabled": config.enabled}
+        return hashlib.sha256(json.dumps(binding, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _start_remote(self, job: ResearchJob, *, quote_id: str | None) -> ResearchJob:
+        self.billing._lock_budget()
+        self.db.refresh(job)
+        if job.status != "awaiting_approval":
+            raise AppError(409, "research_not_awaiting_approval", "Research job is already being started")
+        snapshot = dict(job.billing_snapshot or {})
+        if (snapshot.get("schema_version") != 2 or not quote_id or snapshot.get("quote_id") != quote_id
+            or snapshot.get("currency") != job.currency
+            or snapshot.get("approval_fingerprint") != self._approval_fingerprint(job.provider_id)):
+            raise AppError(409, "billing_quote_expired", "预算报价已过期；请重新生成当前币种的研究计划后确认")
+        if job.budget_amount is None or decimal_amount(job.budget_amount) <= 0:
             raise AppError(
                 409,
                 "research_budget_required",
                 "A positive budget is required before a billable deep-research task can start",
             )
         provider = self._provider_for_job(job)
-        quote = self.billing.preflight_research_call(
-            provider_id=provider.provider_id,
-            estimated_cost_cny=job.estimated_cost_cny,
-        )
+        quote = BillingQuote.from_snapshot(snapshot)
+        job.status, job.approval_status = "starting", "approved"
+        self.billing._reserve(quote)
         job.billing_snapshot = quote.snapshot()
-        # Persist the exact price/FX decision before a billable external task
+        # Persist the exact native-currency decision before a billable external task
         # exists, so a crash cannot detach the task from its billing snapshot.
         self.db.commit()
         try:
             task_id = provider.create_task(
                 question=job.question,
-                budget_cny=job.budget_cny,
+                budget_amount=job.budget_amount,
+                currency=job.currency,
                 source_scope=list(job.source_scope or []),
                 allowed_domains=list(job.allowed_domains or []),
             )
         except DeepResearchProviderTimeout as exc:
+            job.status, job.error_message = "needs_review", "Task creation timed out; provider acceptance and charge are unknown"
+            self._record_terminal_usage(job)
+            self.db.commit()
             raise AppError(504, "research_provider_timeout", "Research provider task creation timed out") from exc
         except DeepResearchProviderError as exc:
+            job.status, job.error_message = "failed", "Task creation failed; provider charge is unverified"
+            self._record_terminal_usage(job)
+            self.db.commit()
             raise AppError(502, "research_provider_failed", "Research provider task creation failed", {"provider_id": job.provider_id}) from exc
         job.provider_task_id = task_id
         job.status = "queued"
@@ -408,10 +445,11 @@ class ResearchService:
 
     def _create_search_composed_research(self, payload: ResearchRequest) -> ResearchJob:
         try:
-            results = self.search_provider.search(
+            results, charge = self.billing.execute_search(self.search_provider,
                 payload.question,
                 5,
                 allowed_domains={item.strip().casefold() for item in payload.allowed_domains if item.strip()} or None,
+                maximum_amount=(payload.currency, payload.budget_amount),
             )
         except SearchProviderTimeout as exc:
             raise AppError(504, "search_provider_timeout", "Search provider timed out") from exc
@@ -425,7 +463,10 @@ class ResearchService:
                 question=payload.question,
                 status="completed_source_collection" if remote_search else "completed_local_demo",
                 provider_id=self.search_provider.provider_id,
-                budget_cny=payload.budget_cny,
+                budget_amount=payload.budget_amount if charge.currency == payload.currency else None,
+                currency=charge.currency,
+                actual_cost_amount=charge.cost_amount,
+                billing_snapshot=charge.pricing_snapshot,
                 approval_status="not_required",
                 source_scope=list(dict.fromkeys(payload.source_scope)),
                 allowed_domains=list(dict.fromkeys(payload.allowed_domains)),
@@ -449,7 +490,8 @@ class ResearchService:
             action="research.source_collection" if remote_search else "research.local_demo",
             resource_type="research_job",
             resource_id=job.id,
-            details={"budget_cny": payload.budget_cny, "billable_call": False},
+            details={"budget_amount": payload.budget_amount, "currency": charge.currency,
+                "billable_call": remote_search, "amount_source": charge.amount_source},
         )
         self._record_event(
             job,
@@ -511,9 +553,26 @@ class ResearchService:
                     "publishable": False,
                     "partial_sources": self._json_list(result.get("sources")),
                 }
-        actual = self._number(result.get("actual_cost_cny", result.get("cost_cny", 0)))
-        job.actual_cost_cny = max(job.actual_cost_cny, actual)
-        if job.actual_cost_cny > job.budget_cny:
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        actual = result.get("actual_cost_amount", result.get("cost_amount"))
+        reported_currency = result.get("currency")
+        if usage.get("cost_amount") is not None and usage.get("currency") in {"USD", "CNY"}:
+            actual, reported_currency = usage["cost_amount"], usage["currency"]
+        elif usage.get("cost_usd") is not None:
+            actual, reported_currency = usage["cost_usd"], "USD"
+        elif result.get("actual_cost_cny") is not None or result.get("cost_cny") is not None:
+            actual, reported_currency = result.get("actual_cost_cny", result.get("cost_cny")), "CNY"
+        if actual is not None and reported_currency in {"USD", "CNY"}:
+            job.actual_cost_amount = amount_text(actual)
+            if reported_currency != job.currency:
+                job.evidence_pack = {**dict(job.evidence_pack or {}), "approved_currency": job.currency,
+                    "approved_budget_amount": job.budget_amount, "approved_estimated_cost_amount": job.estimated_cost_amount,
+                    "billing_currency_mismatch": True}
+                job.currency = reported_currency
+                job.budget_amount, job.estimated_cost_amount = None, None
+        job.evidence_pack = {**dict(job.evidence_pack or {}), "usage": usage,
+            "cost_summary": {"currency": job.currency, "cost_amount": job.actual_cost_amount}}
+        if job.actual_cost_amount is not None and job.budget_amount is not None and decimal_amount(job.actual_cost_amount) > decimal_amount(job.budget_amount):
             job.status = "over_budget"
             job.error_message = "Provider-reported cost exceeded the approved budget"
             job.evidence_pack = {**dict(job.evidence_pack or {}), "publishable": False, "partial": True}
@@ -530,7 +589,7 @@ class ResearchService:
             self._record_event(
                 job,
                 f"research.{job.status}",
-                {"provider_task_id": job.provider_task_id, "actual_cost_cny": job.actual_cost_cny},
+                {"provider_task_id": job.provider_task_id, "actual_cost_amount": job.actual_cost_amount},
             )
 
     def _normalize_evidence_pack(self, job: ResearchJob, result: dict[str, Any]) -> dict[str, Any]:
@@ -556,7 +615,7 @@ class ResearchService:
             "provider_raw_artifact_ref": raw_pack.get("provider_raw_artifact_ref") or result.get("artifact_ref"),
             "model_or_agent_version": raw_pack.get("model_or_agent_version") or result.get("model_or_agent_version"),
             "completed_at": result.get("completed_at"),
-            "cost_summary": {"cny": self._number(result.get("actual_cost_cny", result.get("cost_cny", 0)))},
+            "cost_summary": {"currency": job.currency, "cost_amount": job.actual_cost_amount},
             "publishable": False,
             "remote_research_performed": True,
         }
@@ -566,38 +625,18 @@ class ResearchService:
         if pack.get("usage_recorded"):
             return
         snapshot = dict(job.billing_snapshot or {})
-        quote = (
-            BillingQuote.from_snapshot(snapshot)
-            if snapshot
-            else BillingQuote(
-                provider_id=job.provider_id,
-                model_id="deep-research",
-                feature="deep_research",
-                remote_capability=True,
-                price_version_id=None,
-                exchange_rate_version_id=None,
-                input_usd_per_million=0,
-                cached_input_usd_per_million=0,
-                price_multiplier=1,
-                output_usd_per_million=0,
-                fixed_usd_per_call=0,
-                pricing_currency="USD",
-                input_cny_per_million=0,
-                cached_input_cny_per_million=0,
-                output_cny_per_million=0,
-                fixed_cny_per_call=0,
-                usd_cny_rate=float(DEFAULT_USD_CNY_RATE),
-                projected_cost_usd=0,
-                projected_cost_cny=0,
-                quoted_at=utc_now().isoformat(),
-            )
-        )
+        quote = (BillingQuote.from_snapshot(snapshot) if snapshot.get("schema_version") == 2 else BillingQuote(
+            provider_id=job.provider_id, model_id="deep-research", feature="deep_research", remote_capability=True,
+            currency=job.currency, workspace_id=self.workspace_id, quote_id="research:" + job.id,
+            projected_amount=job.estimated_cost_amount))
         self.billing.record_usage(
             quote,
             input_tokens=0,
             output_tokens=0,
             attempt=1,
-            provider_reported_cost_cny=job.actual_cost_cny,
+            provider_reported_cost_amount=job.actual_cost_amount,
+            provider_reported_currency=job.currency,
+            usage_reported=job.actual_cost_amount is not None,
         )
         job.evidence_pack = {**pack, "usage_recorded": True}
 

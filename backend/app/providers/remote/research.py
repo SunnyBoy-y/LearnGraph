@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from app.core.money import amount_text, decimal_amount, currency_code
 
 import httpx
 
@@ -46,27 +47,32 @@ class HTTPDeepResearchProvider:
             "citations": True,
             "cancel": True,
             "structured_output": False,
+            "billing_currency": "USD",
             **self.declared_capabilities,
         }
 
-    def estimate(self, *, question: str, budget_cny: float) -> float:
+    def estimate(self, *, question: str, budget_amount: str, currency: str) -> str:
         del question
-        configured = self.declared_capabilities.get("estimated_cost_cny")
-        if isinstance(configured, (int, float)) and configured >= 0:
-            return min(float(configured), budget_cny)
-        return budget_cny
+        expected = currency_code(str(self.declared_capabilities.get("billing_currency") or ("CNY" if getattr(self, "vendor", "") == "qwen_deep_research" else "USD")))
+        if currency != expected:
+            raise DeepResearchProviderError(f"Provider bills in {expected}; use a budget in that currency")
+        configured = self.declared_capabilities.get("estimated_cost_amount")
+        # The approved cap is a conservative quote when no native estimate exists.
+        return amount_text(min(decimal_amount(configured), decimal_amount(budget_amount))) if configured is not None else budget_amount
 
     def create_task(
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
         payload = {
             "question": question,
-            "budget_cny": budget_cny,
+            "budget_amount": budget_amount,
+            "currency": currency,
             "source_scope": source_scope,
             "allowed_domains": allowed_domains,
         }
@@ -135,9 +141,9 @@ class UnavailableDeepResearchProvider:
     def capabilities(self) -> dict[str, Any]:
         return {"background": True, "available": False}
 
-    def estimate(self, *, question: str, budget_cny: float) -> float:
-        del question
-        return budget_cny
+    def estimate(self, *, question: str, budget_amount: str, currency: str) -> str:
+        del question, currency
+        return budget_amount
 
     def create_task(self, **_: Any) -> str:
         raise DeepResearchProviderError(self.reason)

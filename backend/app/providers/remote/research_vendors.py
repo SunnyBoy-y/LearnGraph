@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import threading
 from typing import Any
+from app.core.money import amount_text, decimal_amount, currency_code
 from urllib.parse import urlsplit
 
 import httpx
@@ -33,19 +34,6 @@ from app.providers.remote.research_streaming import (
     iter_sse_json,
     streaming_research_runner,
 )
-
-# Rough per-task list prices, used only when the workspace has not declared
-# its own estimate. They bound the pre-approval quote, never the actual bill.
-_DEFAULT_ESTIMATE_CNY = {
-    "gemini_deep_research": 15.0,
-    "openai_deep_research": 20.0,
-    "perplexity_deep_research": 12.0,
-    "tavily_deep_research": 8.0,
-    "exa_deep_research": 8.0,
-    "qwen_deep_research": 6.0,
-    "jina_deep_research": 6.0,
-}
-
 
 class _HTTPResearchAdapter:
     """Shared HTTP plumbing and error mapping for vendor research APIs."""
@@ -83,15 +71,18 @@ class _HTTPResearchAdapter:
             "structured_output": False,
             "vendor": self.vendor,
             "model": self.model,
+            "billing_currency": "CNY" if self.vendor == "qwen_deep_research" else "USD",
             **self.declared_capabilities,
         }
 
-    def estimate(self, *, question: str, budget_cny: float) -> float:
+    def estimate(self, *, question: str, budget_amount: str, currency: str) -> str:
         del question
-        configured = self.declared_capabilities.get("estimated_cost_cny")
-        if isinstance(configured, (int, float)) and configured >= 0:
-            return min(float(configured), budget_cny)
-        return min(_DEFAULT_ESTIMATE_CNY.get(self.vendor, 20.0), budget_cny)
+        expected = currency_code(str(self.declared_capabilities.get("billing_currency") or ("CNY" if getattr(self, "vendor", "") == "qwen_deep_research" else "USD")))
+        if currency != expected:
+            raise DeepResearchProviderError(f"Provider bills in {expected}; use a budget in that currency")
+        configured = self.declared_capabilities.get("estimated_cost_amount")
+        # The approved cap is a conservative quote when no native estimate exists.
+        return amount_text(min(decimal_amount(configured), decimal_amount(budget_amount))) if configured is not None else budget_amount
 
     def _auth_headers(self) -> dict[str, str]:
         return {
@@ -200,11 +191,12 @@ class GeminiDeepResearchProvider(_HTTPResearchAdapter):
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
-        del budget_cny, source_scope
+        del budget_amount, currency, source_scope
         self._allowed_domains = list(allowed_domains or [])
         payload: dict[str, Any] = {
             "agent": self.model,
@@ -335,11 +327,12 @@ class OpenAIDeepResearchProvider(_HTTPResearchAdapter):
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
-        del budget_cny, source_scope
+        del budget_amount, currency, source_scope
         self._allowed_domains = list(allowed_domains or [])
         max_tool_calls = self.declared_capabilities.get("max_tool_calls")
         payload: dict[str, Any] = {
@@ -449,11 +442,12 @@ class PerplexityDeepResearchProvider(_HTTPResearchAdapter):
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
-        del budget_cny, source_scope
+        del budget_amount, currency, source_scope
         self._allowed_domains = list(allowed_domains or [])
         request: dict[str, Any] = {
             "model": self.model,
@@ -556,11 +550,12 @@ class TavilyDeepResearchProvider(_HTTPResearchAdapter):
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
-        del budget_cny, source_scope
+        del budget_amount, currency, source_scope
         self._allowed_domains = list(allowed_domains or [])
         payload: dict[str, Any] = {
             "input": question,
@@ -637,11 +632,12 @@ class ExaDeepResearchProvider(_HTTPResearchAdapter):
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
-        del budget_cny, source_scope
+        del budget_amount, currency, source_scope
         self._allowed_domains = list(allowed_domains or [])
         effort = self.declared_capabilities.get("effort")
         payload: dict[str, Any] = {
@@ -678,8 +674,8 @@ class ExaDeepResearchProvider(_HTTPResearchAdapter):
             sources=self._read_grounding(output.get("grounding")),
             artifact_ref=task_id,
         )
-        if isinstance(cost, (int, float)):
-            result["usage"] = {"cost_usd": float(cost)}
+        if isinstance(cost, (int, float, str)):
+            result["usage"] = {"cost_amount": str(cost), "currency": "USD"}
         return result
 
     @staticmethod
@@ -830,11 +826,12 @@ class QwenDeepResearchProvider(_StreamingResearchAdapter):
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
-        del budget_cny, source_scope
+        del budget_amount, currency, source_scope
         self._allowed_domains = list(allowed_domains or [])
         output_format = self.declared_capabilities.get("output_format")
         payload: dict[str, Any] = {
@@ -919,11 +916,12 @@ class JinaDeepSearchProvider(_StreamingResearchAdapter):
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str:
-        del budget_cny, source_scope
+        del budget_amount, currency, source_scope
         self._allowed_domains = list(allowed_domains or [])
         payload: dict[str, Any] = {
             "model": self.model,

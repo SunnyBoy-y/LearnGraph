@@ -11,13 +11,14 @@ class DeepResearchProviderPort(Protocol):
 
     def capabilities(self) -> dict[str, Any]: ...
 
-    def estimate(self, *, question: str, budget_cny: float) -> float: ...
+    def estimate(self, *, question: str, budget_amount: str, currency: str) -> str: ...
 
     def create_task(
         self,
         *,
         question: str,
-        budget_cny: float,
+        budget_amount: str,
+        currency: str,
         source_scope: list[str],
         allowed_domains: list[str],
     ) -> str: ...
