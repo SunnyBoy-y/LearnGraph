@@ -305,7 +305,7 @@ export function ImportProviderDialog({
         </Button>
       </DialogTrigger>
 
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden p-0 sm:max-w-2xl">
+      <DialogContent className="grid max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)] gap-0 overflow-hidden p-0 sm:max-w-2xl">
         <DialogHeader className="shrink-0 border-b px-5 pt-5 pb-4">
           <div className="flex items-center justify-between pr-8">
             <div>
