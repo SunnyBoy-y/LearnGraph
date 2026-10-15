@@ -54,4 +54,3 @@ def apply_session_title_fallback(session: object, question: str | None) -> str:
         return ""
     setattr(session, "title", candidate)
     return candidate
-

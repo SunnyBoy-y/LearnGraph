@@ -98,4 +98,3 @@ export function MemoryProcessRail({ workspaceId }: { workspaceId: string }) {
     </section>
   )
 }
-

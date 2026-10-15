@@ -240,4 +240,3 @@ export function SessionSharingPage() {
     </PageFrame>
   );
 }
-
