@@ -224,9 +224,10 @@ def notify_budget_alert(
     policy_name: str,
     level: str,
     scope: str,
-    spent_cny: float,
-    projected_cny: float,
-    limit_cny: float,
+    currency: str,
+    spent_amount: str,
+    projected_amount: str,
+    limit_amount: str,
 ) -> None:
     """Fire-and-forget alert mail; never raises into the billing path."""
 
@@ -242,9 +243,10 @@ def notify_budget_alert(
     body = (
         f"工作区预算策略「{policy_name}」已触发{level_label}。\n\n"
         f"匹配范围：{scope}\n"
-        f"周期已用：¥{spent_cny:.4f}\n"
-        f"本次调用预估：¥{projected_cny:.4f}\n"
-        f"配置限额：¥{limit_cny:.2f}\n\n"
+        f"币种：{currency}\n"
+        f"周期已用：{spent_amount} {currency}\n"
+        f"本次调用预估：{projected_amount} {currency}\n"
+        f"配置限额：{limit_amount} {currency}\n\n"
         + (
             "达到硬限额后，后续远程调用会在执行前被阻断，直到本周期结束或调高限额。\n"
             if level == "hard"

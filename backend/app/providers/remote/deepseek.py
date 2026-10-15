@@ -18,6 +18,7 @@ from app.providers.remote.openai import (
     ProviderHTTPError,
     ProviderResponseError,
     ProviderTimeoutError,
+    ProviderTransportError,
     merge_provider_request_headers,
 )
 from app.providers.remote.schema_compat import sanitize_tool_definitions
@@ -356,7 +357,8 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError("DeepSeek chat stream timed out") from exc
         except httpx.HTTPError as exc:
-            raise ProviderHTTPError(
+            self.reset_transport()
+            raise ProviderTransportError(
                 f"DeepSeek chat stream transport failed ({type(exc).__name__})"
             ) from exc
 
@@ -367,7 +369,8 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
             if finish_reason:
                 completed = True
             else:
-                raise ProviderHTTPError(
+                self.reset_transport()
+                raise ProviderTransportError(
                     "DeepSeek stream ended before completion "
                     f"(finish_reason={finish_reason!r}, output={saw_model_output})"
                 )

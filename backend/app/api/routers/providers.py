@@ -88,6 +88,25 @@ def create_provider(
     return ProviderView.model_validate(service(db, context, settings).create(payload))
 
 
+@router.get("/balance-statuses")
+def balance_statuses(db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[dict]:
+    from app.services.provider_balance_lifecycle import status_for
+    provider_service = service(db, context, settings)
+    return [status_for(provider_service, item.id) for item in provider_service.list()]
+
+
+@router.get("/{provider_id}/balance-status")
+def balance_status(provider_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> dict:
+    from app.services.provider_balance_lifecycle import status_for
+    return status_for(service(db, context, settings), provider_id)
+
+
+@router.post("/{provider_id}/balance-discovery")
+def balance_discovery(provider_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> dict:
+    from app.services.provider_balance_lifecycle import request_discovery
+    return request_discovery(service(db, context, settings), provider_id)
+
+
 @router.get("/catalog", response_model=list[ProviderTypeCatalogView])
 def provider_catalog(
     db: DB, context: CurrentWorkspace, settings: AppSettings

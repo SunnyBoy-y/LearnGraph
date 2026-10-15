@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ProviderConfigImport } from "./provider-config-import";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowRightLeft,
@@ -156,17 +157,22 @@ export function ImportProviderDialog({
   catalog = [],
 }: ImportProviderDialogProps) {
   const [open, setOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<"discover" | "flow" | "ccswitch">("discover");
+  const [activeTab, setActiveTab] = useState<"host" | "discover" | "flow" | "ccswitch">("host");
+  const [resultMessages, setResultMessages] = useState<string[]>([]);
   const queryClient = useQueryClient();
 
   const {
     data: discovered = [],
-    isLoading: isDiscovering,
+    isFetching: isDiscovering,
+    isFetched: discoveryFetched,
+    isError: discoveryFailed,
+    error: discoveryError,
     refetch: refetchDiscover,
   } = useQuery({
     queryKey: ["providers-discovered"],
     queryFn: discoverProviders,
-    enabled: open,
+    enabled: false,
+    retry: false,
     staleTime: 10_000,
   });
 
@@ -256,7 +262,10 @@ export function ImportProviderDialog({
           : `已批量流转 ${n} 个能力`,
       );
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
-      setOpen(false);
+      setResultMessages([
+        ...result.created.map((item) => `${item.display_name}：${item.enabled ? '已启用' : '已保存，待验证'}`),
+        ...result.skipped.map((item) => `${item.target_provider_type}：跳过 · ${item.reason}`),
+      ]);
     },
     onError: (err) => {
       toast.error(err instanceof Error ? err.message : "批量流转失败");
@@ -277,7 +286,10 @@ export function ImportProviderDialog({
       );
       setCcswitchText("");
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
-      setOpen(false);
+      setResultMessages([
+        ...result.created.map((item) => `${item.name}：${item.enabled ? '已启用' : '已保存，待验证'}`),
+        ...result.skipped.map((item) => `${item.name}：跳过 · ${item.reason}`),
+      ]);
     },
     onError: (err) => {
       toast.error(err instanceof Error ? err.message : "cc-switch 导入失败");
@@ -289,7 +301,7 @@ export function ImportProviderDialog({
       <DialogTrigger asChild>
         <Button size="sm" variant="outline" className="gap-1.5 shadow-sm">
           <Sparkles className="size-3.5 text-primary" />
-          智能导入与流转
+          导入配置
         </Button>
       </DialogTrigger>
 
@@ -299,15 +311,16 @@ export function ImportProviderDialog({
             <div>
               <DialogTitle className="flex items-center gap-2 text-base font-semibold">
                 <Sparkles className="size-4 text-primary" />
-                模型 Provider 智能导入与流转
+                导入模型连接
               </DialogTitle>
               <DialogDescription className="mt-1 text-xs text-muted-foreground">
-                自动识别环境服务与配置，支持平台内能力批量流转，并兼容 cc-switch 配置导入与模型探测。
+                从授权的部署机器配置导入，或复用已有连接。扫描位置、确认步骤和逐项结果都会明确展示。
               </DialogDescription>
             </div>
           </div>
 
-          <div className="mt-3 flex rounded-lg bg-muted/60 p-1 text-xs font-medium">
+          <div className="mt-3 flex flex-wrap gap-1 rounded-lg bg-muted/60 p-1 text-xs font-medium">
+            <button type="button" onClick={() => setActiveTab("host")} className={`flex-1 rounded-md px-2 py-1.5 ${activeTab === "host" ? "bg-background shadow-sm" : "text-muted-foreground"}`}>部署机器配置</button>
             <button
               type="button"
               onClick={() => setActiveTab("discover")}
@@ -318,7 +331,7 @@ export function ImportProviderDialog({
               }`}
             >
               <Search className="size-3.5" />
-              本地与环境识别
+              后端运行环境
               {discovered.length > 0 && (
                 <span className="rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                   {discovered.length}
@@ -335,7 +348,7 @@ export function ImportProviderDialog({
               }`}
             >
               <ArrowRightLeft className="size-3.5" />
-              平台内批量流转
+              复用已有连接
             </button>
             <button
               type="button"
@@ -353,11 +366,15 @@ export function ImportProviderDialog({
         </DialogHeader>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-          {/* 模式 1：无感智能探测 */}
+          {activeTab === "host" && <ProviderConfigImport />}
+          {activeTab !== "host" && resultMessages.length > 0 ? <div className="mb-4 space-y-1 rounded-lg border p-3 text-sm" aria-live="polite">
+            <p className="font-medium">上次导入结果</p>{resultMessages.map((message, index) => <p key={index}>{message}</p>)}
+          </div> : null}
+          {/* Explicit backend-environment discovery, not host filesystem scanning. */}
           {activeTab === "discover" && (
             <div className="space-y-4">
               <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>系统已自动扫描本机运行的本地模型、网关服务与环境预设：</span>
+                <span>只检测后端进程的服务与环境变量；Docker部署时检测的是容器，不是宿主机。</span>
                 <Button
                   size="xs"
                   variant="ghost"
@@ -375,12 +392,16 @@ export function ImportProviderDialog({
                   <RefreshCcw className="size-6 animate-spin text-primary" />
                   <p className="mt-2 text-xs text-muted-foreground">正在探测本地服务与环境凭据…</p>
                 </div>
+              ) : discoveryFailed ? (
+                <p role="alert" className="text-sm text-destructive">扫描失败：{discoveryError?.message}。请手动重试。</p>
+              ) : !discoveryFetched ? (
+                <p className="text-sm text-muted-foreground">尚未扫描，请点击「重新扫描」。读取宿主配置请选择「部署机器配置」。</p>
               ) : discovered.length === 0 ? (
                 <div className="rounded-xl border border-dashed p-8 text-center">
                   <Bot className="mx-auto size-8 text-muted-foreground/60" />
                   <p className="mt-2 text-sm font-medium">未发现本地运行的服务或环境变量</p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    若你已启动 Ollama (11434) 或 LM Studio (1234)，请点击右上角「重新扫描」；容器部署请先启用 Host Service Bridge。也可切换到「cc-switch 导入」或「平台内批量流转」。
+                    后端未检测到服务不代表宿主机没有配置。读取宿主机上的CC Switch/Codex++，请使用「部署机器配置」并接入只读来源。
                   </p>
                 </div>
               ) : (
@@ -490,7 +511,7 @@ export function ImportProviderDialog({
             </div>
           )}
 
-          {/* 模式 2：平台内批量流转 */}
+          {/* 模式 2：复用已有连接 */}
           {activeTab === "flow" && (
             <div className="space-y-5">
               {providers.length === 0 ? (

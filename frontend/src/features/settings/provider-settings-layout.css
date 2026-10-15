@@ -1,0 +1,32 @@
+.provider-settings-container {
+  container-type: inline-size;
+  container-name: provider-settings;
+  min-width: 0;
+}
+
+@container provider-settings (max-width: 900px) {
+  .provider-settings-table,
+  .provider-settings-table > tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .provider-settings-table > thead {
+    display: none;
+  }
+
+  .provider-settings-table > tbody > tr {
+    display: flex;
+    flex-direction: column;
+    padding: 0.5rem 0;
+  }
+
+  .provider-settings-table > tbody > tr > td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+    text-align: left;
+  }
+}

@@ -3,19 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 
-USD_CNY_REFERENCE = 6.7704
 CATALOG_AS_OF = "2026-07-25"
-
-
-def _usd_from_cny(value: float) -> float:
-    return round(value / USD_CNY_REFERENCE, 8)
 
 
 def _entry(provider: str, model: str, currency: str, input_price: float,
            output_price: float, *, cached: float | None = None,
            cache_write: float | None = None, conditions: dict[str, Any] | None = None,
            source_url: str = "") -> dict[str, Any]:
-    convert = (lambda value: value) if currency == "USD" else _usd_from_cny
     return {
         "catalog_id": f"{provider}:{model}:{len(PRICING_CATALOG) if 'PRICING_CATALOG' in globals() else 0}",
         "provider_key": provider,
@@ -25,10 +19,6 @@ def _entry(provider: str, model: str, currency: str, input_price: float,
         "native_cached_input_per_million": cached,
         "native_cache_write_per_million": cache_write,
         "native_output_per_million": output_price,
-        "input_usd_per_million": convert(input_price),
-        "cached_input_usd_per_million": convert(cached) if cached is not None else None,
-        "cache_write_usd_per_million": convert(cache_write) if cache_write is not None else None,
-        "output_usd_per_million": convert(output_price),
         "conditions": conditions or {},
         "source_url": source_url,
         "as_of": CATALOG_AS_OF,

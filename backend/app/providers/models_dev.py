@@ -4,14 +4,14 @@ from __future__ import annotations
 
 The project treats https://models.dev/api.json as the shared, vendor-neutral
 source for model defaults: context window, output limit, multimodal input
-support, reasoning availability, and USD list prices.  A pruned snapshot ships
+support, reasoning availability, and native list prices.  A pruned snapshot ships
 with the repository so the catalogue works offline; an explicit network
 refresh re-downloads the live api.json, rebuilds the same index, and persists
 it under ``backend/data`` for later starts.
 
 Matching is intentionally by model name only ("只要模型名字对上号"): the same
 model id served through any Provider instance resolves to the same models.dev
-record.  Workspace-level configuration saved for a specific Provider + model
+capability record. Prices retain their provider and currency binding. Workspace-level configuration saved for a specific Provider + model
 always wins over this snapshot (merge happens in ``model_options``).
 """
 
@@ -66,6 +66,7 @@ _KEEP_FIELDS = (
     "modalities",
     "limit",
     "cost",
+    "currency",
     "release_date",
     "last_updated",
     "knowledge",
@@ -96,6 +97,7 @@ def build_snapshot(raw: dict[str, Any], *, origin: str, fetched_at: str) -> dict
     """Collapse the per-provider api.json tree into one index keyed by model id."""
 
     index: dict[str, tuple[int, str, dict[str, Any]]] = {}
+    pricing_records: dict[str, dict[str, Any]] = {}
     provider_count = 0
     for provider_id, provider in raw.items():
         if not isinstance(provider, dict):
@@ -111,6 +113,12 @@ def build_snapshot(raw: dict[str, Any], *, origin: str, fetched_at: str) -> dict
             if not key:
                 continue
             cost = model.get("cost") or {}
+            tariff = {field: model[field] for field in _KEEP_FIELDS if field in model}
+            tariff.update(provider=provider_id, provider_name=provider.get("name", provider_id), doc=provider.get("doc"))
+            if provider.get("currency") and not tariff.get("currency"):
+                tariff["currency"] = provider["currency"]
+            if cost:
+                pricing_records[f"{provider_id}:{key}"] = tariff
             limit = model.get("limit") or {}
             score = _PREFERRED_PROVIDERS.get(provider_id, 10)
             score += 4 * bool(cost) + 2 * bool(limit.get("context"))
@@ -136,12 +144,13 @@ def build_snapshot(raw: dict[str, Any], *, origin: str, fetched_at: str) -> dict
             "model_count": len(index),
         },
         "models": {key: value[2] for key, value in sorted(index.items())},
+        "pricing_records": pricing_records,
     }
 
 
 def _read_snapshot_file(path: Path) -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"), parse_float=str)
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
@@ -188,7 +197,8 @@ def refresh_snapshot(*, timeout_seconds: float = 45.0) -> dict[str, Any]:
         headers={"Accept": "application/json"},
     )
     response.raise_for_status()
-    raw = response.json()
+    # Preserve the published decimal price before any binary-float rounding.
+    raw = response.json(parse_float=str)
     if not isinstance(raw, dict) or not raw:
         raise ValueError("models.dev returned an unexpected payload shape")
     snapshot = build_snapshot(
@@ -442,10 +452,14 @@ def _price_entry(
     conditions: dict[str, Any],
     as_of: str,
 ) -> dict[str, Any] | None:
-    def number(name: str) -> float | None:
+    def number(name: str) -> str | None:
+        from app.core.money import amount_text
         value = values.get(name)
-        if isinstance(value, (int, float)):
-            return float(value)
+        if value is not None:
+            try:
+                return amount_text(value)
+            except ValueError:
+                return None
         return None
 
     input_price = number("input")
@@ -461,18 +475,14 @@ def _price_entry(
     if isinstance(limit.get("output"), (int, float)):
         merged_conditions.setdefault("max_output_tokens", int(limit["output"]))
     return {
-        "catalog_id": f"mdev:{key}{suffix}",
+        "catalog_id": f"mdev:{record.get('provider')}:{key}{suffix}",
         "provider_key": str(record.get("provider") or "models.dev"),
         "model_id": str(record.get("id") or key),
-        "currency": "USD",
+        "currency": str(values.get("currency") or record.get("currency") or "USD").upper().replace("RMB", "CNY"),
         "native_input_per_million": input_price,
         "native_cached_input_per_million": cached,
         "native_cache_write_per_million": cache_write,
         "native_output_per_million": output_price,
-        "input_usd_per_million": input_price,
-        "cached_input_usd_per_million": cached,
-        "cache_write_usd_per_million": cache_write,
-        "output_usd_per_million": output_price,
         "conditions": merged_conditions,
         "source_url": str(record.get("doc") or MODELS_DEV_URL),
         "as_of": as_of,
@@ -536,25 +546,37 @@ def _snapshot_as_of() -> str:
 
 
 def pricing_entries() -> list[dict[str, Any]]:
-    """Every models.dev USD tariff in the local pricing-catalog item shape."""
+    """Native tariffs, retaining every supplier instead of merging their prices."""
 
     snapshot = get_snapshot()
     as_of = _snapshot_as_of()
     entries: list[dict[str, Any]] = []
-    for key, record in (snapshot.get("models") or {}).items():
+    records = snapshot.get("pricing_records") or snapshot.get("models") or {}
+    for record in records.values():
+        key = _normalize(str(record.get("id") or ""))
         entries.extend(_entries_for_record(record, key, as_of))
     return entries
 
 
-def price_entry_for_model(model_id: str, input_tokens: int) -> dict[str, Any] | None:
-    """Tier-aware tariff for one model, matched by name across providers."""
+def price_entry_for_model(model_id: str, input_tokens: int, *, provider_key: str | None = None,
+                          currency: str | None = None) -> dict[str, Any] | None:
+    """Select a native tariff only when its vendor binding is known."""
 
-    record = lookup_model(model_id)
-    if record is None:
+    canonical = lookup_model(model_id)
+    if canonical is None:
         return None
-    key = _normalize(str(record.get("id") or model_id))
+    aliases = {"qwen": {"alibaba", "alibaba-cn"}, "kimi": {"moonshotai"}, "zai": {"zhipuai"}, "xiaomi_mimo": {"xiaomi"}}
+    key = _normalize(str(canonical.get("id") or model_id))
+    snapshot = get_snapshot()
+    records = snapshot.get("pricing_records") or {key: canonical}
+    bindings = aliases.get(provider_key, {provider_key}) if provider_key else None
     matches = []
-    for entry in _entries_for_record(record, key, _snapshot_as_of()):
+    entries = [entry for record in records.values()
+        if _normalize(str(record.get("id") or "")) == key and (bindings is None or record.get("provider") in bindings)
+        for entry in _entries_for_record(record, key, _snapshot_as_of())]
+    for entry in entries:
+        if entry["currency"] not in {"USD", "CNY"} or (currency and entry["currency"] != currency.upper().replace("RMB", "CNY")):
+            continue
         conditions = entry.get("conditions") or {}
         minimum = conditions.get("min_input_tokens")
         maximum = conditions.get("max_input_tokens")
@@ -563,4 +585,6 @@ def price_entry_for_model(model_id: str, input_tokens: int) -> dict[str, Any] | 
         if maximum is not None and input_tokens > int(maximum):
             continue
         matches.append(entry)
+    if len({entry["currency"] for entry in matches}) > 1:
+        return None
     return matches[-1] if matches else None

@@ -39,6 +39,10 @@ class ProviderTimeoutError(ProviderHTTPError):
     pass
 
 
+class ProviderTransportError(ProviderHTTPError):
+    """Connection failure or an incomplete stream, rather than a rejected request."""
+
+
 class ProviderResponseError(ProviderHTTPError):
     pass
 
@@ -401,6 +405,12 @@ class _StreamingHTTPProvider:
         if self._http_client is None:
             self._http_client = _ReusableHTTPClient(self._build_http_client())
         return self._http_client
+
+    def reset_transport(self) -> None:
+        """Discard the connection pool after a failed streaming connection."""
+        client, self._http_client = self._http_client, None
+        if client is not None:
+            client.close()
 
     def _build_http_client(self) -> httpx.Client:
         return httpx.Client(
@@ -1220,11 +1230,11 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
         payload = self._apply_call_options(payload, responses=True)
         payload = self._apply_output_budget(payload, responses=True)
         response = self._post_json("responses", payload)
+        self.last_usage = self._usage_from_response(response)
         texts = [content.get("text") for item in response.get("output", []) if isinstance(item, dict) for content in item.get("content", []) if isinstance(content, dict) and content.get("type") == "output_text"]
         if len(texts) != 1 or not isinstance(texts[0], str):
             raise ProviderResponseError("Responses output contains no single structured text result")
         result = _parse_json_object_text(texts[0])
-        self.last_usage = self._usage_from_response(response)
         return self._validate_structured_result(result, schema)
 
 
@@ -1598,7 +1608,8 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError("Compatible Chat structured stream timed out") from exc
         except httpx.HTTPError as exc:
-            raise ProviderHTTPError(
+            self.reset_transport()
+            raise ProviderTransportError(
                 f"Compatible Chat stream transport failed ({type(exc).__name__})"
             ) from exc
 
@@ -1606,7 +1617,8 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             if finish_reason:
                 completed = True
             else:
-                raise ProviderHTTPError(
+                self.reset_transport()
+                raise ProviderTransportError(
                     "Compatible Chat stream ended before completion "
                     f"(finish_reason={finish_reason!r}, output={saw_model_output})"
                 )
@@ -1645,12 +1657,12 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         )
         payload = self._apply_output_budget(payload, responses=False)
         response = self._post_json("chat/completions", payload)
+        self.last_usage = self._usage_from_chat_chunk(response.get("usage")) or {}
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderResponseError("Provider response contains no chat text") from exc
         result = _parse_json_object_text(content)
-        self.last_usage = self._usage_from_chat_chunk(response.get("usage")) or {}
         return self._validate_structured_result(
             result, response_schema if response_schema is not None else wire_schema
         )
@@ -1692,6 +1704,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         }, responses=False)
         payload = self._apply_output_budget(payload, responses=False)
         response = self._post_json("chat/completions", payload)
+        self.last_usage = self._usage_from_chat_chunk(response.get("usage")) or {}
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -1700,7 +1713,6 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         # fence or prepend a short sentence even when the response_format is
         # accepted. Use the same bounded extractor as the prompted-json path so
         # those harmless wrappers do not consume all three generation retries.
-        result = _parse_json_object_text(content)
         usage = response.get("usage") or {}
         input_details = usage.get("prompt_tokens_details") or {}
         output_details = usage.get("completion_tokens_details") or {}
@@ -1710,6 +1722,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             "output_tokens": int(usage.get("completion_tokens") or 0),
             "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
         }
+        result = _parse_json_object_text(content)
         return self._validate_structured_result(result, schema)
 
 

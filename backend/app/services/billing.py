@@ -1,1566 +1,690 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
-from typing import Any, Iterable
+from decimal import Decimal, localcontext
+from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.domain.models import (
-    BudgetAlert,
-    BudgetPolicy,
-    ExchangeRateVersion,
-    PriceVersion,
-    ProviderConfig,
-    UsageEvent,
-    utc_now,
-)
+from app.core.money import amount_text, currency_code, decimal_amount, exact_money, sum_amounts
+from app.domain.models import BudgetAlert, BudgetPolicy, PriceVersion, ProviderConfig, UsageEvent, Workspace, utc_now
 from app.providers.models_dev import price_entry_for_model
 from app.services.pricing_catalog import PRICING_CATALOG
 from app.repositories.audit import AuditRepository
-from app.repositories.domain import (
-    BudgetAlertRepository,
-    BudgetPolicyRepository,
-    ExchangeRateVersionRepository,
-    PriceVersionRepository,
-    UsageRepository,
-)
-
-
-DEFAULT_USD_CNY_RATE = Decimal("6.7704")
+from app.repositories.domain import BudgetAlertRepository, BudgetPolicyRepository, PriceVersionRepository, UsageRepository
 
 MANUAL_PRICE_SOURCE = "workspace_manual"
 
-# Keyless public reference-rate endpoints, tried in order.
-_LIVE_RATE_ENDPOINTS: tuple[tuple[str, str], ...] = (
-    ("https://open.er-api.com/v6/latest/USD", "live:open.er-api.com"),
-    ("https://api.frankfurter.dev/v1/latest?base=USD&symbols=CNY", "live:frankfurter.dev"),
-)
 
-
-def fetch_live_usd_cny_rate(timeout_seconds: float = 15.0) -> tuple[float, str]:
-    """Fetch the current USD/CNY reference rate from a public endpoint."""
-
-    import httpx
-
-    last_error: Exception | None = None
-    for url, source in _LIVE_RATE_ENDPOINTS:
-        try:
-            response = httpx.get(
-                url,
-                timeout=timeout_seconds,
-                follow_redirects=True,
-                headers={"Accept": "application/json"},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            value = (payload.get("rates") or {}).get("CNY")
-            if value is not None and float(value) > 0:
-                return float(value), source
-        except Exception as exc:  # noqa: BLE001 - fall through to the next source
-            last_error = exc
-    raise AppError(
-        502,
-        "exchange_rate_refresh_failed",
-        f"Fetching the live USD/CNY rate failed: {last_error}",
-    )
-
-
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class BillingQuote:
     provider_id: str
     model_id: str
     feature: str
     remote_capability: bool
-    price_version_id: str | None
-    exchange_rate_version_id: str | None
-    input_usd_per_million: float
-    cached_input_usd_per_million: float
-    cache_write_usd_per_million: float
-    price_multiplier: float
-    output_usd_per_million: float
-    fixed_usd_per_call: float
-    pricing_currency: str
-    input_cny_per_million: float
-    cached_input_cny_per_million: float
-    cache_write_cny_per_million: float
-    output_cny_per_million: float
-    fixed_cny_per_call: float
-    usd_cny_rate: float
-    projected_cost_usd: float
-    projected_cost_cny: float
-    quoted_at: str
+    currency: str | None
+    price_version_id: str | None = None
+    input_per_million: str = "0"
+    cached_input_per_million: str = "0"
+    cache_write_per_million: str = "0"
+    output_per_million: str = "0"
+    fixed_per_call: str = "0"
+    price_multiplier: str = "1"
+    projected_amount: str | None = None
+    quoted_at: str = field(default_factory=lambda: utc_now().isoformat())
+    quote_id: str = field(default_factory=lambda: str(uuid4()))
+    reservation_id: str | None = None
+    workspace_id: str | None = None
+    rates_by_unit: dict[str, Any] = field(default_factory=dict)
+    source: str = "unknown"
+    schema_version: int = 2
+    durable_reservation: bool = False
+    approval_fingerprint: str | None = None
 
     def snapshot(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_snapshot(cls, value: dict[str, Any]) -> BillingQuote:
-        return cls(
-            provider_id=str(value.get("provider_id") or "unknown"),
-            model_id=str(value.get("model_id") or "unknown"),
-            feature=str(value.get("feature") or "unknown"),
-            remote_capability=bool(value.get("remote_capability", True)),
-            price_version_id=value.get("price_version_id"),
-            exchange_rate_version_id=value.get("exchange_rate_version_id"),
-            input_usd_per_million=float(value.get("input_usd_per_million") or 0),
-            cached_input_usd_per_million=float(value.get("cached_input_usd_per_million") or value.get("input_usd_per_million") or 0),
-            cache_write_usd_per_million=float(value.get("cache_write_usd_per_million") or value.get("input_usd_per_million") or 0),
-            price_multiplier=float(value.get("price_multiplier") or 1),
-            output_usd_per_million=float(value.get("output_usd_per_million") or 0),
-            fixed_usd_per_call=float(value.get("fixed_usd_per_call") or 0),
-            pricing_currency=str(value.get("pricing_currency") or "USD").upper(),
-            input_cny_per_million=float(value.get("input_cny_per_million") or 0),
-            cached_input_cny_per_million=float(value.get("cached_input_cny_per_million") or 0),
-            cache_write_cny_per_million=float(value.get("cache_write_cny_per_million") or value.get("input_cny_per_million") or 0),
-            output_cny_per_million=float(value.get("output_cny_per_million") or 0),
-            fixed_cny_per_call=float(value.get("fixed_cny_per_call") or 0),
-            usd_cny_rate=float(value.get("usd_cny_rate") or DEFAULT_USD_CNY_RATE),
-            projected_cost_usd=float(value.get("projected_cost_usd") or 0),
-            projected_cost_cny=float(value.get("projected_cost_cny") or 0),
-            quoted_at=str(value.get("quoted_at") or utc_now().isoformat()),
-        )
+        if value.get("schema_version") != 2:
+            raise AppError(409, "billing_quote_expired", "Historical approval must be quoted again in its native currency")
+        fields = cls.__dataclass_fields__
+        return cls(**{key: item for key, item in value.items() if key in fields})
 
 
 class BillingService:
-    """Versioned pricing, immutable usage snapshots, and pre-call budgets."""
+    """One native-currency billing pipeline for every existing provider call."""
 
-    def __init__(
-        self,
-        db: Session,
-        workspace_id: str,
-        actor_id: str = "system:billing",
-    ) -> None:
-        self.db = db
-        self.workspace_id = workspace_id
-        self.actor_id = actor_id
+    def __init__(self, db: Session, workspace_id: str, actor_id: str) -> None:
+        self.db, self.workspace_id, self.actor_id = db, workspace_id, actor_id
         self.prices = PriceVersionRepository(db, workspace_id)
-        self.rates = ExchangeRateVersionRepository(db, workspace_id)
         self.policies = BudgetPolicyRepository(db, workspace_id)
         self.alerts = BudgetAlertRepository(db, workspace_id)
         self.usage = UsageRepository(db, workspace_id)
         self.audit = AuditRepository(db, workspace_id)
 
-    def create_price(
-        self,
-        *,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        input_usd_per_million: float,
-        cached_input_usd_per_million: float | None = None,
-        cache_write_usd_per_million: float | None = None,
-        output_usd_per_million: float,
-        fixed_usd_per_call: float,
-        effective_at: datetime | None,
-        source: str,
-        conditions: dict[str, Any] | None = None,
-        currency: str = "USD",
-        input_cny_per_million: float | None = None,
-        cached_input_cny_per_million: float | None = None,
-        cache_write_cny_per_million: float | None = None,
-        output_cny_per_million: float | None = None,
-        fixed_cny_per_call: float | None = None,
-    ) -> PriceVersion:
+    def create_price(self, *, provider_id: str, model_id: str, feature: str = "*",
+                     currency: str, input_per_million: Any, output_per_million: Any,
+                     cached_input_per_million: Any = None, cache_write_per_million: Any = None,
+                     fixed_per_call: Any = "0", rates_by_unit: dict[str, Any] | None = None,
+                     effective_at: datetime | None = None, source: str = MANUAL_PRICE_SOURCE,
+                     conditions: dict[str, Any] | None = None, commit: bool = True) -> PriceVersion:
+        currency = currency_code(currency)
         scope = self._normalized_scope(provider_id, model_id, feature)
-        pricing_currency = currency.strip().upper()
-        if pricing_currency not in {"USD", "CNY"}:
-            raise AppError(422, "invalid_pricing_currency", "Pricing currency must be USD or CNY")
-        stored_conditions = dict(conditions or {})
-        stored_conditions["pricing_currency"] = pricing_currency
-        if pricing_currency == "CNY":
-            native_values = {
-                "input_cny_per_million": input_cny_per_million,
-                "cached_input_cny_per_million": cached_input_cny_per_million,
-                "cache_write_cny_per_million": cache_write_cny_per_million,
-                "output_cny_per_million": output_cny_per_million,
-                "fixed_cny_per_call": fixed_cny_per_call,
-            }
-            if native_values["input_cny_per_million"] is None or native_values[
-                "output_cny_per_million"
-            ] is None:
-                raise AppError(
-                    422,
-                    "cny_price_required",
-                    "CNY pricing requires input and output CNY rates",
-                )
-            if any(
-                value is not None and float(value) < 0
-                for value in native_values.values()
-            ):
-                raise AppError(422, "invalid_price", "CNY price rates cannot be negative")
-            stored_conditions.update(native_values)
-            # Keep the existing USD columns populated for legacy views and
-            # external exports. Billing uses the native CNY values above, so a
-            # later exchange-rate update never rewrites a provider's CNY list
-            # price.
-            input_usd_per_million = float(input_cny_per_million) / float(
-                DEFAULT_USD_CNY_RATE
-            )
-            cached_input_usd_per_million = (
-                float(cached_input_cny_per_million) / float(DEFAULT_USD_CNY_RATE)
-                if cached_input_cny_per_million is not None
-                else None
-            )
-            cache_write_usd_per_million = (
-                float(cache_write_cny_per_million) / float(DEFAULT_USD_CNY_RATE)
-                if cache_write_cny_per_million is not None
-                else None
-            )
-            output_usd_per_million = float(output_cny_per_million) / float(
-                DEFAULT_USD_CNY_RATE
-            )
-            fixed_usd_per_call = float(fixed_cny_per_call or 0) / float(
-                DEFAULT_USD_CNY_RATE
-            )
-        version = (
-            self.db.scalar(
-                select(func.max(PriceVersion.version)).where(
-                    PriceVersion.workspace_id == self.workspace_id,
-                    PriceVersion.provider_id == scope[0],
-                    PriceVersion.model_id == scope[1],
-                    PriceVersion.feature == scope[2],
-                )
-            )
-            or 0
-        ) + 1
-        price = self.prices.add(
-            PriceVersion(
-                workspace_id=self.workspace_id,
-                provider_id=scope[0],
-                model_id=scope[1],
-                feature=scope[2],
-                version=version,
-                input_usd_per_million=input_usd_per_million,
-                cached_input_usd_per_million=cached_input_usd_per_million,
-                cache_write_usd_per_million=cache_write_usd_per_million,
-                output_usd_per_million=output_usd_per_million,
-                fixed_usd_per_call=fixed_usd_per_call,
-                effective_at=self._as_utc(effective_at or utc_now()),
-                source=source,
-                conditions=stored_conditions,
-            )
-        )
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="usage.price_version.created",
-            resource_type="price_version",
-            resource_id=price.id,
-            details={"scope": list(scope), "version": version},
-        )
-        self.db.commit()
-        self.db.refresh(price)
+        if provider_id != "*":
+            self._require_provider(provider_id)
+        self._lock_budget()
+        version = (self.db.scalar(select(func.max(PriceVersion.version)).where(
+            PriceVersion.workspace_id == self.workspace_id, PriceVersion.provider_id == scope[0],
+            PriceVersion.model_id == scope[1], PriceVersion.feature == scope[2], PriceVersion.currency == currency,
+        )) or 0) + 1
+        normalized_units = {unit: amount_text(value) for unit, value in (rates_by_unit or {}).items()}
+        price = self.prices.add(PriceVersion(
+            workspace_id=self.workspace_id, provider_id=scope[0], model_id=scope[1], feature=scope[2],
+            currency=currency, version=version, input_per_million=amount_text(input_per_million),
+            cached_input_per_million=amount_text(cached_input_per_million) if cached_input_per_million is not None else None,
+            cache_write_per_million=amount_text(cache_write_per_million) if cache_write_per_million is not None else None,
+            output_per_million=amount_text(output_per_million), fixed_per_call=amount_text(fixed_per_call),
+            rates_by_unit=normalized_units, effective_at=self._as_utc(effective_at or utc_now()),
+            source=source, conditions={**(conditions or {}), "native_schema": 2},
+        ))
+        self.audit.record(actor_id=self.actor_id, action="usage.price_version.created",
+                          resource_type="price_version", resource_id=price.id,
+                          details={"scope": list(scope), "currency": currency, "source": source})
+        self.db.flush()
+        if commit:
+            self.db.commit()
+            self.db.refresh(price)
         return price
 
-    def list_manual_prices(self) -> list[dict[str, Any]]:
-        """Active workspace-manual list prices, newest per model+provider."""
+    def list_manual_prices(self, currency: str | None = None) -> list[dict[str, Any]]:
+        statement = self.prices.query().where(PriceVersion.source == MANUAL_PRICE_SOURCE, PriceVersion.retired_at.is_(None))
+        if currency:
+            statement = statement.where(PriceVersion.currency == currency_code(currency))
+        return [self._manual_price_view(price) for price in self.db.scalars(statement.order_by(PriceVersion.effective_at.desc())).all()]
 
-        items = list(
-            self.db.scalars(
-                self.prices.query()
-                .where(PriceVersion.source == MANUAL_PRICE_SOURCE)
-                .order_by(
-                    PriceVersion.effective_at.desc(),
-                    PriceVersion.version.desc(),
-                )
-            ).all()
-        )
-        latest: dict[tuple[str, str], PriceVersion] = {}
-        for item in items:
-            if item.retired_at is not None:
-                continue
-            key = (item.model_id, item.provider_id)
-            if key not in latest:
-                latest[key] = item
-        return [self._manual_price_view(item) for item in latest.values()]
-
-    def upsert_manual_price(
-        self,
-        *,
-        model_id: str,
-        provider_id: str = "*",
-        currency: str,
-        input_per_million: float,
-        cached_input_per_million: float | None,
-        output_per_million: float,
-        fixed_per_call: float = 0,
-    ) -> dict[str, Any]:
-        model = model_id.strip()
-        if not model or model == "*":
-            raise AppError(
-                422,
-                "manual_price_model_required",
-                "A concrete model id is required for manual pricing",
-            )
-        now = utc_now()
-        # Retire every currently active price for the model so the manual
-        # list price becomes the only quote source; future calls no longer
-        # re-seed catalog defaults while this override stays active.
-        actives = self.db.scalars(
-            self.prices.query().where(PriceVersion.model_id == model)
-        ).all()
-        for item in actives:
-            if item.retired_at is None:
-                item.retired_at = now
-        normalized_currency = currency.strip().upper()
-        if normalized_currency == "CNY":
-            price = self.create_price(
-                provider_id=provider_id,
-                model_id=model,
-                feature="*",
-                input_usd_per_million=0,
-                output_usd_per_million=0,
-                fixed_usd_per_call=0,
-                effective_at=now,
-                source=MANUAL_PRICE_SOURCE,
-                currency="CNY",
-                input_cny_per_million=input_per_million,
-                cached_input_cny_per_million=cached_input_per_million,
-                output_cny_per_million=output_per_million,
-                fixed_cny_per_call=fixed_per_call,
-            )
-        else:
-            price = self.create_price(
-                provider_id=provider_id,
-                model_id=model,
-                feature="*",
-                input_usd_per_million=input_per_million,
-                cached_input_usd_per_million=cached_input_per_million,
-                output_usd_per_million=output_per_million,
-                fixed_usd_per_call=fixed_per_call,
-                effective_at=now,
-                source=MANUAL_PRICE_SOURCE,
-                currency="USD",
-            )
+    def upsert_manual_price(self, *, model_id: str, provider_id: str, currency: str,
+                            input_per_million: Any, output_per_million: Any,
+                            cached_input_per_million: Any = None, cache_write_per_million: Any = None,
+                            fixed_per_call: Any = "0", feature: str = "*",
+                            conditions: dict[str, Any] | None = None,
+                            rates_by_unit: dict[str, Any] | None = None) -> dict[str, Any]:
+        if provider_id == "*":
+            raise AppError(422, "price_provider_required", "A manual price must select a workspace provider")
+        self._require_provider(provider_id)
+        currency = currency_code(currency)
+        # A binding includes its native currency and tariff tier. It never
+        # retires another provider's price or another currency's price.
+        self._lock_budget()
+        binding = dict(conditions or {})
+        for old in self.db.scalars(self.prices.query().where(
+            PriceVersion.model_id == model_id, PriceVersion.provider_id == provider_id,
+            PriceVersion.feature == feature, PriceVersion.currency == currency,
+            PriceVersion.source == MANUAL_PRICE_SOURCE, PriceVersion.retired_at.is_(None),
+        )).all():
+            old_binding = {key: value for key, value in (old.conditions or {}).items() if key != "native_schema"}
+            if old_binding == binding:
+                old.retired_at = utc_now()
+        price = self.create_price(provider_id=provider_id, model_id=model_id, feature=feature, currency=currency,
+            input_per_million=input_per_million, output_per_million=output_per_million,
+            cached_input_per_million=cached_input_per_million, cache_write_per_million=cache_write_per_million,
+            fixed_per_call=fixed_per_call, conditions=binding, rates_by_unit=rates_by_unit)
         return self._manual_price_view(price)
 
-    def remove_manual_price(self, model_id: str) -> int:
-        """Retire manual overrides so catalog defaults apply again."""
-
-        model = model_id.strip()
-        now = utc_now()
-        items = self.db.scalars(
-            self.prices.query().where(
-                PriceVersion.model_id == model,
-                PriceVersion.source == MANUAL_PRICE_SOURCE,
-            )
-        ).all()
-        removed = 0
-        for item in items:
-            if item.retired_at is None:
-                item.retired_at = now
-                removed += 1
-        if removed:
-            self.audit.record(
-                actor_id=self.actor_id,
-                action="usage.manual_price.removed",
-                resource_type="price_version",
-                resource_id=model,
-                details={"model_id": model, "removed_count": removed},
-            )
-            self.db.commit()
+    def remove_manual_price(self, price_id: str) -> int:
+        price = self.prices.require(price_id, "manual price")
+        if price.source != MANUAL_PRICE_SOURCE:
+            raise AppError(422, "not_manual_price", "Only a manual price may be removed")
+        removed = int(price.retired_at is None)
+        price.retired_at = price.retired_at or utc_now()
+        self.audit.record(actor_id=self.actor_id, action="usage.manual_price.removed", resource_type="price_version", resource_id=price.id)
+        self.db.commit()
         return removed
 
     @staticmethod
     def _manual_price_view(price: PriceVersion) -> dict[str, Any]:
-        conditions = dict(price.conditions or {})
-        currency = str(conditions.get("pricing_currency") or "USD").upper()
-        if currency == "CNY":
-            cached = conditions.get("cached_input_cny_per_million")
-            return {
-                "id": price.id,
-                "model_id": price.model_id,
-                "provider_id": price.provider_id,
-                "currency": "CNY",
-                "input_per_million": float(conditions.get("input_cny_per_million") or 0),
-                "cached_input_per_million": float(cached) if cached is not None else None,
-                "output_per_million": float(conditions.get("output_cny_per_million") or 0),
-                "fixed_per_call": float(conditions.get("fixed_cny_per_call") or 0),
-                "effective_at": price.effective_at,
-            }
-        return {
-            "id": price.id,
-            "model_id": price.model_id,
-            "provider_id": price.provider_id,
-            "currency": "USD",
-            "input_per_million": price.input_usd_per_million,
-            "cached_input_per_million": price.cached_input_usd_per_million,
-            "output_per_million": price.output_usd_per_million,
-            "fixed_per_call": price.fixed_usd_per_call,
-            "effective_at": price.effective_at,
-        }
+        return {key: getattr(price, key) for key in ("id", "provider_id", "model_id", "feature", "currency",
+            "input_per_million", "cached_input_per_million", "cache_write_per_million", "output_per_million",
+            "fixed_per_call", "rates_by_unit", "conditions", "effective_at", "version")}
 
-    def current_exchange_rate(self) -> ExchangeRateVersion:
-        rate = self._active_exchange_rate(self._as_utc(utc_now()))
-        # _active_exchange_rate may create the fallback row inside the
-        # session; persist it so repeated reads stay stable.
-        self.db.commit()
-        return rate
+    def list_budget_policies(self, currency: str | None = None) -> list[BudgetPolicy]:
+        statement = self.policies.query()
+        if currency:
+            statement = statement.where(BudgetPolicy.currency == currency_code(currency))
+        return list(self.db.scalars(statement.order_by(BudgetPolicy.created_at, BudgetPolicy.id)).all())
 
-    def set_exchange_rate(self, rate: float, *, source: str = "workspace_manual") -> ExchangeRateVersion:
-        return self.create_exchange_rate(rate=rate, effective_at=None, source=source)
-
-    def refresh_exchange_rate_from_network(self) -> ExchangeRateVersion:
-        value, source = fetch_live_usd_cny_rate()
-        return self.create_exchange_rate(rate=value, effective_at=None, source=source)
-
-    def create_exchange_rate(
-        self,
-        *,
-        rate: float,
-        effective_at: datetime | None,
-        source: str,
-        base_currency: str = "USD",
-        quote_currency: str = "CNY",
-    ) -> ExchangeRateVersion:
-        base = base_currency.strip().upper()
-        quote = quote_currency.strip().upper()
-        version = (
-            self.db.scalar(
-                select(func.max(ExchangeRateVersion.version)).where(
-                    ExchangeRateVersion.workspace_id == self.workspace_id,
-                    ExchangeRateVersion.base_currency == base,
-                    ExchangeRateVersion.quote_currency == quote,
-                )
-            )
-            or 0
-        ) + 1
-        item = self.rates.add(
-            ExchangeRateVersion(
-                workspace_id=self.workspace_id,
-                base_currency=base,
-                quote_currency=quote,
-                version=version,
-                rate=rate,
-                effective_at=self._as_utc(effective_at or utc_now()),
-                source=source,
-            )
-        )
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="usage.exchange_rate.created",
-            resource_type="exchange_rate_version",
-            resource_id=item.id,
-            details={"pair": f"{base}/{quote}", "version": version},
-        )
-        self.db.commit()
-        self.db.refresh(item)
-        return item
-
-    def list_budget_policies(self) -> list[BudgetPolicy]:
-        return list(
-            self.db.scalars(
-                self.policies.query().order_by(BudgetPolicy.created_at, BudgetPolicy.id)
-            ).all()
-        )
-
-    def create_budget_policy(
-        self,
-        *,
-        name: str,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        period: str,
-        soft_limit_cny: float | None,
-        hard_limit_cny: float | None,
-        enabled: bool,
-        limit_currency: str = "CNY",
-    ) -> BudgetPolicy:
-        self._validate_limits(soft_limit_cny, hard_limit_cny)
-        currency = (limit_currency or "CNY").strip().upper()
-        if currency not in {"USD", "CNY"}:
-            raise AppError(422, "invalid_limit_currency", "Budget currency must be USD or CNY")
+    def create_budget_policy(self, *, name: str, provider_id: str = "*", model_id: str = "*",
+                             feature: str = "*", period: str = "calendar_month_utc",
+                             soft_limit: Any = None, hard_limit: Any = None,
+                             currency: str, enabled: bool = True) -> BudgetPolicy:
+        self._validate_limits(soft_limit, hard_limit)
+        self._period_bounds(period, utc_now())
+        currency = currency_code(currency)
         scope = self._normalized_scope(provider_id, model_id, feature)
-        existing = self.db.scalar(
-            self.policies.query().where(
-                BudgetPolicy.provider_id == scope[0],
-                BudgetPolicy.model_id == scope[1],
-                BudgetPolicy.feature == scope[2],
-                BudgetPolicy.period == period,
-            )
-        )
+        if scope[0] != "*":
+            self._require_provider(scope[0])
+        self._lock_budget()
+        existing = self.db.scalar(self.policies.query().where(
+            BudgetPolicy.provider_id == scope[0], BudgetPolicy.model_id == scope[1],
+            BudgetPolicy.feature == scope[2], BudgetPolicy.period == period, BudgetPolicy.currency == currency))
         if existing is not None:
-            raise AppError(
-                409,
-                "budget_policy_scope_exists",
-                "A budget policy already exists for this scope and period",
-            )
-        policy = self.policies.add(
-            BudgetPolicy(
-                workspace_id=self.workspace_id,
-                name=name,
-                provider_id=scope[0],
-                model_id=scope[1],
-                feature=scope[2],
-                period=period,
-                soft_limit_cny=soft_limit_cny,
-                hard_limit_cny=hard_limit_cny,
-                limit_currency=currency,
-                enabled=enabled,
-            )
-        )
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="usage.budget_policy.created",
-            resource_type="budget_policy",
-            resource_id=policy.id,
-            details={"scope": list(scope), "period": period, "limit_currency": currency},
-        )
+            raise AppError(409, "budget_policy_scope_exists", "A budget already exists for this currency, scope and period")
+        policy = self.policies.add(BudgetPolicy(workspace_id=self.workspace_id, name=name, provider_id=scope[0],
+            model_id=scope[1], feature=scope[2], period=period, currency=currency,
+            soft_limit=amount_text(soft_limit) if soft_limit is not None else None,
+            hard_limit=amount_text(hard_limit) if hard_limit is not None else None, enabled=enabled))
+        self.audit.record(actor_id=self.actor_id, action="usage.budget_policy.created", resource_type="budget_policy",
+                          resource_id=policy.id, details={"scope": list(scope), "currency": currency})
         self.db.commit()
         self.db.refresh(policy)
         return policy
 
-    def update_budget_policy(
-        self,
-        policy_id: str,
-        *,
-        name: str,
-        soft_limit_cny: float | None,
-        hard_limit_cny: float | None,
-        enabled: bool,
-        limit_currency: str = "CNY",
-    ) -> BudgetPolicy:
-        self._validate_limits(soft_limit_cny, hard_limit_cny)
-        currency = (limit_currency or "CNY").strip().upper()
-        if currency not in {"USD", "CNY"}:
-            raise AppError(422, "invalid_limit_currency", "Budget currency must be USD or CNY")
+    def update_budget_policy(self, policy_id: str, *, name: str, soft_limit: Any = None,
+                             hard_limit: Any = None, enabled: bool = True, currency: str | None = None) -> BudgetPolicy:
+        self._validate_limits(soft_limit, hard_limit)
+        self._lock_budget()
         policy = self.policies.require(policy_id, "budget policy")
-        policy.name = name
-        policy.soft_limit_cny = soft_limit_cny
-        policy.hard_limit_cny = hard_limit_cny
-        policy.limit_currency = currency
-        policy.enabled = enabled
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="usage.budget_policy.updated",
-            resource_type="budget_policy",
-            resource_id=policy.id,
-        )
+        if currency and currency_code(currency) != policy.currency:
+            raise AppError(409, "budget_currency_immutable", "Create a policy in the other currency instead of relabelling its history")
+        policy.name, policy.enabled = name, enabled
+        policy.soft_limit = amount_text(soft_limit) if soft_limit is not None else None
+        policy.hard_limit = amount_text(hard_limit) if hard_limit is not None else None
+        self.audit.record(actor_id=self.actor_id, action="usage.budget_policy.updated", resource_type="budget_policy", resource_id=policy.id)
         self.db.commit()
         self.db.refresh(policy)
         return policy
 
     def delete_budget_policy(self, policy_id: str) -> None:
+        # Retain alert history and references; disable the existing policy.
         policy = self.policies.require(policy_id, "budget policy")
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="usage.budget_policy.deleted",
-            resource_type="budget_policy",
-            resource_id=policy.id,
-        )
-        self.db.delete(policy)
+        policy.enabled = False
+        self.audit.record(actor_id=self.actor_id, action="usage.budget_policy.disabled", resource_type="budget_policy", resource_id=policy.id)
         self.db.commit()
 
-    def list_alerts(self) -> list[BudgetAlert]:
-        return list(
-            self.db.scalars(
-                self.alerts.query().order_by(BudgetAlert.created_at.desc())
-            ).all()
-        )
+    def list_alerts(self, currency: str | None = None) -> list[BudgetAlert]:
+        statement = self.alerts.query()
+        if currency:
+            statement = statement.where(BudgetAlert.currency == currency_code(currency))
+        return list(self.db.scalars(statement.order_by(BudgetAlert.created_at.desc())).all())
 
     def acknowledge_alert(self, alert_id: str) -> BudgetAlert:
         alert = self.alerts.require(alert_id, "budget alert")
-        if alert.status != "acknowledged":
-            alert.status = "acknowledged"
-            alert.acknowledged_at = utc_now()
-            self.audit.record(
-                actor_id=self.actor_id,
-                action="usage.budget_alert.acknowledged",
-                resource_type="budget_alert",
-                resource_id=alert.id,
-            )
-            self.db.commit()
-            self.db.refresh(alert)
+        alert.status, alert.acknowledged_at = "acknowledged", utc_now()
+        self.audit.record(actor_id=self.actor_id, action="usage.budget_alert.acknowledged", resource_type="budget_alert", resource_id=alert.id)
+        self.db.commit()
+        self.db.refresh(alert)
         return alert
 
-    def budget_statuses(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
+    @exact_money
+    def budget_statuses(self, *, currency: str | None = None, now: datetime | None = None) -> list[dict[str, Any]]:
         current = self._as_utc(now or utc_now())
-        rate = self._active_exchange_rate(current)
-        result: list[dict[str, Any]] = []
-        for policy in self.list_budget_policies():
+        result = []
+        for policy in self.list_budget_policies(currency):
             start, end = self._period_bounds(policy.period, current)
-            spent = self._spent_for_policy(policy, start, end)
-            spent_usd = spent / rate.rate if rate.rate else 0.0
-            soft_eff, hard_eff, soft_usd, hard_usd = self._effective_limits(
-                policy, rate.rate
-            )
-            result.append(
-                {
-                    "policy_id": policy.id,
-                    "name": policy.name,
-                    "provider_id": policy.provider_id,
-                    "model_id": policy.model_id,
-                    "feature": policy.feature,
-                    "period": policy.period,
-                    "period_start": start,
-                    "period_end": end,
-                    "spent_cny": spent,
-                    "soft_limit_cny": policy.soft_limit_cny,
-                    "hard_limit_cny": policy.hard_limit_cny,
-                    "soft_limit_cny_effective": soft_eff,
-                    "hard_limit_cny_effective": hard_eff,
-                    "spent_usd": spent_usd,
-                    "soft_limit_usd": soft_usd,
-                    "hard_limit_usd": hard_usd,
-                    "soft_exceeded": bool(
-                        soft_eff is not None and spent >= soft_eff
-                    ),
-                    "hard_exceeded": bool(
-                        hard_eff is not None and spent >= hard_eff
-                    ),
-                    "enabled": policy.enabled,
-                }
-            )
+            spent, reserved, unknown = self._totals_for_policy(policy, start, end)
+            total = spent + reserved
+            hard = decimal_amount(policy.hard_limit) if policy.hard_limit is not None else None
+            soft = decimal_amount(policy.soft_limit) if policy.soft_limit is not None else None
+            result.append(dict(policy_id=policy.id, name=policy.name, provider_id=policy.provider_id,
+                model_id=policy.model_id, feature=policy.feature, period=policy.period, currency=policy.currency,
+                period_start=start, period_end=end, spent_amount=amount_text(spent), reserved_amount=amount_text(reserved),
+                soft_limit=policy.soft_limit, hard_limit=policy.hard_limit,
+                remaining_amount=amount_text(max(Decimal(0), hard-total)) if hard is not None and not unknown else None,
+                unknown_events=unknown, status="amount_unknown" if unknown else "ready",
+                soft_exceeded=soft is not None and total >= soft, hard_exceeded=hard is not None and total >= hard,
+                enabled=policy.enabled, usage_ratio=float(min(Decimal(1), total/hard)) if hard else None))
         return result
 
-    def preflight_model_call(
-        self,
-        *,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        estimated_input_tokens: int,
-        estimated_output_tokens: int,
-        remote_capability: bool,
-        now: datetime | None = None,
-    ) -> BillingQuote:
+    def preflight_model_call(self, *, provider_id: str, model_id: str, feature: str,
+                             estimated_input_tokens: int, estimated_output_tokens: int,
+                             remote_capability: bool, now: datetime | None = None,
+                             estimated_units: dict[str, Any] | None = None, reserve: bool = True,
+                             durable_reservation: bool = False) -> BillingQuote:
         current = self._as_utc(now or utc_now())
         if not remote_capability:
-            return BillingQuote(
-                provider_id=provider_id,
-                model_id=model_id,
-                feature=feature,
-                remote_capability=False,
-                price_version_id=None,
-                exchange_rate_version_id=None,
-                input_usd_per_million=0,
-                cached_input_usd_per_million=0,
-                cache_write_usd_per_million=0,
-                price_multiplier=1,
-                output_usd_per_million=0,
-                fixed_usd_per_call=0,
-                pricing_currency="USD",
-                input_cny_per_million=0,
-                cached_input_cny_per_million=0,
-                cache_write_cny_per_million=0,
-                output_cny_per_million=0,
-                fixed_cny_per_call=0,
-                usd_cny_rate=0,
-                projected_cost_usd=0,
-                projected_cost_cny=0,
-                quoted_at=current.isoformat(),
-            )
-        policies = self._matching_policies(provider_id, model_id, feature)
-        rate = self._active_exchange_rate(current)
-        self._block_if_already_exhausted(
-            policies,
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            now=current,
-            rate=rate.rate,
-        )
-        price = self._active_price(provider_id, model_id, feature, current, max(0, estimated_input_tokens))
-        if price is None:
-            price = self._seed_default_catalog_price(
-                provider_id=provider_id,
-                model_id=model_id,
-                feature=feature,
-                now=current,
-                input_tokens=max(0, estimated_input_tokens),
-            )
-        multiplier = self._price_multiplier(price, current) if price else 1.0
-        if price is None and policies:
+            return BillingQuote(provider_id, model_id, feature, False, "USD", projected_amount="0", workspace_id=self.workspace_id)
+        configured = self.db.get(ProviderConfig, provider_id)
+        if configured is not None and configured.workspace_id != self.workspace_id:
+            raise AppError(404, "provider_not_found", "Provider is not in the current workspace")
+        self._lock_budget()
+        # Some existing internal provider ports have no persisted configuration.
+        # They can produce usage, but no vendor/currency is inferred from their
+        # name. Unknown pricing is still blocked by any matching hard budget.
+        price = self._active_price(provider_id, model_id, feature, current, max(0, estimated_input_tokens)) if configured else None
+        if price is None and configured:
+            price = self._seed_default_catalog_price(provider_id=provider_id, model_id=model_id, feature=feature,
+                                                      now=current, input_tokens=max(0, estimated_input_tokens))
+        declared = (configured.capabilities or {}).get("billing_currency") if configured else None
+        native_currency = price.currency if price else (currency_code(declared) if declared else None)
+        quote = BillingQuote(provider_id, model_id, feature, True, native_currency,
+                             quoted_at=current.isoformat(), workspace_id=self.workspace_id, durable_reservation=durable_reservation)
+        if price:
+            quote.price_version_id, quote.source = price.id, price.source
+            quote.input_per_million, quote.output_per_million, quote.fixed_per_call = price.input_per_million, price.output_per_million, price.fixed_per_call
+            quote.cached_input_per_million = price.cached_input_per_million if price.cached_input_per_million is not None else price.input_per_million
+            quote.cache_write_per_million = price.cache_write_per_million if price.cache_write_per_million is not None else price.input_per_million
+            quote.price_multiplier = amount_text(self._price_multiplier(price, current))
+            quote.rates_by_unit = dict(price.rates_by_unit or {})
+            quote.projected_amount = self._cost(quote, max(0, estimated_input_tokens), max(0, estimated_output_tokens), 0, 0, estimated_units)
+        if reserve:
+            self._reserve(quote)
+        else:
             self.db.commit()
-            raise AppError(
-                409,
-                "usage_price_required",
-                "A matching price version is required before a budgeted remote call",
-                {
-                    "provider_id": provider_id,
-                    "model_id": model_id,
-                    "feature": feature,
-                },
-            )
-        pricing_currency, native_cny_rates = self._native_cny_rates(price)
-        if price is not None and pricing_currency == "CNY":
-            projected_cny = self._priced_cost_usd(
-                input_tokens=max(0, estimated_input_tokens),
-                output_tokens=max(0, estimated_output_tokens),
-                input_rate=native_cny_rates["input"],
-                output_rate=native_cny_rates["output"],
-                fixed=native_cny_rates["fixed"],
-            ) * multiplier
-            projected_usd = projected_cny / rate.rate if rate.rate else 0.0
-        else:
-            projected_usd = self._priced_cost_usd(
-                input_tokens=max(0, estimated_input_tokens),
-                output_tokens=max(0, estimated_output_tokens),
-                input_rate=price.input_usd_per_million if price else 0,
-                output_rate=price.output_usd_per_million if price else 0,
-                fixed=price.fixed_usd_per_call if price else 0,
-            ) * multiplier
-            projected_cny = projected_usd * rate.rate
-        self._evaluate_policies(
-            policies,
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            projected_cost_cny=projected_cny,
-            now=current,
-            rate=rate.rate,
-        )
-        return BillingQuote(
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            remote_capability=True,
-            price_version_id=price.id if price else None,
-            exchange_rate_version_id=rate.id,
-            input_usd_per_million=price.input_usd_per_million if price else 0,
-            cached_input_usd_per_million=(price.cached_input_usd_per_million if price and price.cached_input_usd_per_million is not None else price.input_usd_per_million if price else 0),
-            cache_write_usd_per_million=(price.cache_write_usd_per_million if price and price.cache_write_usd_per_million is not None else price.input_usd_per_million if price else 0),
-            price_multiplier=multiplier,
-            output_usd_per_million=price.output_usd_per_million if price else 0,
-            fixed_usd_per_call=price.fixed_usd_per_call if price else 0,
-            pricing_currency=pricing_currency,
-            input_cny_per_million=native_cny_rates["input"],
-            cached_input_cny_per_million=native_cny_rates["cached_input"],
-            cache_write_cny_per_million=native_cny_rates["cache_write"],
-            output_cny_per_million=native_cny_rates["output"],
-            fixed_cny_per_call=native_cny_rates["fixed"],
-            usd_cny_rate=rate.rate,
-            projected_cost_usd=projected_usd,
-            projected_cost_cny=projected_cny,
-            quoted_at=current.isoformat(),
-        )
+        return quote
 
-    def preflight_research_call(
-        self,
-        *,
-        provider_id: str,
-        estimated_cost_cny: float,
-        now: datetime | None = None,
-    ) -> BillingQuote:
-        current = self._as_utc(now or utc_now())
-        model_id = "deep-research"
-        feature = "deep_research"
-        policies = self._matching_policies(provider_id, model_id, feature)
-        rate = self._active_exchange_rate(current)
-        self._block_if_already_exhausted(
-            policies,
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            now=current,
-            rate=rate.rate,
-        )
-        price = self._active_price(provider_id, model_id, feature, current, 0)
-        projected_cny = max(0.0, estimated_cost_cny)
-        projected_usd = projected_cny / rate.rate if rate.rate else 0.0
-        self._evaluate_policies(
-            policies,
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            projected_cost_cny=projected_cny,
-            now=current,
-            rate=rate.rate,
-        )
-        return BillingQuote(
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            remote_capability=True,
-            price_version_id=price.id if price else None,
-            exchange_rate_version_id=rate.id,
-            input_usd_per_million=price.input_usd_per_million if price else 0,
-            cached_input_usd_per_million=(price.cached_input_usd_per_million if price and price.cached_input_usd_per_million is not None else price.input_usd_per_million if price else 0),
-            cache_write_usd_per_million=(price.cache_write_usd_per_million if price and price.cache_write_usd_per_million is not None else price.input_usd_per_million if price else 0),
-            price_multiplier=self._price_multiplier(price, current) if price else 1,
-            output_usd_per_million=price.output_usd_per_million if price else 0,
-            fixed_usd_per_call=price.fixed_usd_per_call if price else 0,
-            pricing_currency="USD",
-            input_cny_per_million=0,
-            cached_input_cny_per_million=0,
-            cache_write_cny_per_million=0,
-            output_cny_per_million=0,
-            fixed_cny_per_call=0,
-            usd_cny_rate=rate.rate,
-            projected_cost_usd=projected_usd,
-            projected_cost_cny=projected_cny,
-            quoted_at=current.isoformat(),
-        )
+    def preflight_research_call(self, *, provider_id: str, currency: str,
+                                estimated_cost_amount: Any, now: datetime | None = None, reserve: bool = True) -> BillingQuote:
+        self._require_provider(provider_id)
+        quote = BillingQuote(provider_id, "deep-research", "deep_research", True, currency_code(currency),
+            projected_amount=amount_text(estimated_cost_amount) if estimated_cost_amount is not None else None,
+            workspace_id=self.workspace_id, quoted_at=self._as_utc(now or utc_now()).isoformat(), source="provider_estimate", durable_reservation=True)
+        if reserve:
+            self._lock_budget()
+            self._reserve(quote)
+        return quote
 
-    def record_usage(
-        self,
-        quote: BillingQuote,
-        *,
-        input_tokens: int,
-        output_tokens: int,
-        attempt: int,
-        cached_input_tokens: int = 0,
-        cache_creation_input_tokens: int = 0,
-        reasoning_tokens: int = 0,
-        latency_ms: int = 0,
-        provider_reported_cost_cny: float | None = None,
-        usage_reported: bool = True,
-    ) -> UsageEvent:
-        normalized_input = max(0, int(input_tokens))
-        normalized_output = max(0, int(output_tokens))
-        normalized_cached = min(normalized_input, max(0, int(cached_input_tokens)))
-        normalized_created = min(
-            normalized_input - normalized_cached,
-            max(0, int(cache_creation_input_tokens)),
-        )
-        normalized_uncached = normalized_input - normalized_cached - normalized_created
-        normalized_reasoning = min(normalized_output, max(0, int(reasoning_tokens)))
+    def execute_search(self, provider: Any, query: str, max_results: int, *,
+                       allowed_domains: set[str] | None = None,
+                       maximum_amount: tuple[str, str] | None = None) -> tuple[list[Any], UsageEvent]:
+        """Meter the existing search ports through the same native ledger."""
+        quote = self.preflight_model_call(provider_id=provider.provider_id,
+            model_id=getattr(provider, "model_id", "web-search"), feature="web_search",
+            estimated_input_tokens=0, estimated_output_tokens=0,
+            estimated_units={"requests": 1, "results": max_results},
+            remote_capability=provider.remote_capability)
+        if maximum_amount and quote.remote_capability:
+            currency, limit = maximum_amount
+            if quote.currency is None or quote.projected_amount is None:
+                self.release_reservation(quote, reason="research_price_unknown")
+                raise AppError(409, "usage_price_required", "Research search budget requires a known native price")
+            if quote.currency != currency:
+                self.release_reservation(quote, reason="research_currency_mismatch")
+                raise AppError(422, "research_currency_mismatch", "Choose the search supplier's native currency", {"currency": quote.currency})
+            if decimal_amount(quote.projected_amount) > decimal_amount(limit):
+                self.release_reservation(quote, reason="research_budget_blocked")
+                raise AppError(402, "research_budget_exceeded", "Search was blocked before execution")
+        results = None
+        try:
+            results = provider.search(query, max_results, allowed_domains=allowed_domains)
+        finally:
+            usage = dict(getattr(provider, "last_usage", {}) or {}) if results is not None else {}
+            event = self.record_usage(quote, input_tokens=0, output_tokens=0, attempt=1,
+                usage_reported=False,
+                usage_units={"requests": 1, "results": len(results)} if results is not None else {},
+                provider_reported_cost_amount=usage.get("cost_amount"),
+                provider_reported_currency=usage.get("currency"))
+        return results, event
+
+    def _lock_budget(self) -> None:
+        # SQLite UPDATE acquires its single-writer lock before reading totals.
+        # Other engines serialize on the owning workspace row, across workers.
+        self.db.execute(update(Workspace).where(Workspace.id == self.workspace_id).values(id=Workspace.id))
+        self.db.flush()
+
+    @exact_money
+    def _reserve(self, quote: BillingQuote) -> None:
+        if quote.workspace_id is not None and quote.workspace_id != self.workspace_id:
+            raise AppError(403, "billing_scope_mismatch", "Quote belongs to another workspace")
+        now = self._as_utc(datetime.fromisoformat(quote.quoted_at))
+        policies = [policy for policy in self.list_budget_policies() if policy.enabled
+            and self._scope_matches(policy.provider_id, quote.provider_id)
+            and self._scope_matches(policy.model_id, quote.model_id) and self._scope_matches(policy.feature, quote.feature)
+            and (quote.currency is None or policy.currency == quote.currency)]
+        error = None
+        for policy in policies:
+            start, end = self._period_bounds(policy.period, now)
+            spent, reserved, unknown = self._totals_for_policy(policy, start, end)
+            projected = decimal_amount(quote.projected_amount) if quote.projected_amount is not None else None
+            if (projected is None or unknown) and policy.hard_limit is not None:
+                error = AppError(409, "usage_price_required", "The budget cannot authorize a call with an unknown native amount",
+                    {"currency": policy.currency, "policy_id": policy.id, "unknown_events": unknown})
+                continue
+            for level, value in (("soft", policy.soft_limit), ("hard", policy.hard_limit)):
+                if value is None or projected is None:
+                    continue
+                limit = decimal_amount(value)
+                exceeded = spent + reserved + projected >= limit if level == "soft" else spent + reserved + projected > limit
+                if exceeded:
+                    self._persist_alert(policy, level, quote, start, end, spent, reserved, projected, limit)
+                    if level == "hard":
+                        error = AppError(402, "budget_hard_limit_exceeded", "The call was blocked before execution",
+                            {"policy_id": policy.id, "currency": policy.currency, "spent_amount": amount_text(spent),
+                             "reserved_amount": amount_text(reserved), "projected_amount": quote.projected_amount, "hard_limit": policy.hard_limit})
+        if error:
+            self.db.commit()
+            raise error
+        event = self.usage.add(UsageEvent(workspace_id=self.workspace_id, provider_id=quote.provider_id,
+            model_id=quote.model_id, feature=quote.feature, currency=quote.currency, record_stage="reserved",
+            reserved_amount=quote.projected_amount, cost_status="reserved", amount_source=quote.source,
+            idempotency_key=quote.quote_id + ":1", price_version_id=quote.price_version_id,
+            reservation_expires_at=now + timedelta(hours=24), reservation_owner=self.actor_id, created_at=now))
+        self.db.flush()
+        quote.reservation_id = event.id
+        event.pricing_snapshot = quote.snapshot()
+        self.db.commit()
+        if not quote.durable_reservation:
+            self.db.info.setdefault("native_pending_quotes", {})[quote.quote_id] = (quote, self.actor_id)
+
+    def release_reservation(self, quote: BillingQuote, *, reason: str = "not_executed") -> None:
+        if not quote.reservation_id:
+            return
+        event = self.usage.require(quote.reservation_id, "usage reservation")
+        if event.record_stage == "reserved":
+            event.record_stage, event.cost_status = "released", reason
+            event.reserved_amount = None
+            self.db.commit()
+        self.db.info.get("native_pending_quotes", {}).pop(quote.quote_id, None)
+
+    @staticmethod
+    def reconcile_session(db: Session) -> None:
+        """Persist an interrupted HTTP attempt as unknown, never as a free call."""
+        pending = list(getattr(db, "info", {}).get("native_pending_quotes", {}).values())
+        if not pending:
+            return
+        db.rollback()
+        for quote, actor_id in pending:
+            billing = BillingService(db, quote.workspace_id, actor_id)
+            event = billing.usage.require(quote.reservation_id, "usage reservation")
+            if event.record_stage == "reserved":
+                billing.record_usage(quote, input_tokens=0, output_tokens=0, attempt=1, usage_reported=False)
+            db.info.get("native_pending_quotes", {}).pop(quote.quote_id, None)
+
+    @staticmethod
+    def reconcile_expired(db: Session, *, now: datetime | None = None) -> int:
+        """Recover expired attempts after process loss, retaining unknown occupancy."""
+        current = now or utc_now()
+        events = list(db.scalars(select(UsageEvent).where(UsageEvent.record_stage == "reserved",
+            UsageEvent.reservation_expires_at <= current)).all())
+        for event in events:
+            event.record_stage, event.cost_amount, event.cost_status = "settled", None, "interrupted_usage_missing"
+            event.amount_source, event.reservation_expires_at = "unknown", None
+        if events:
+            db.commit()
+        return len(events)
+
+    def record_usage(self, quote: BillingQuote, *, input_tokens: int, output_tokens: int, attempt: int,
+                     cached_input_tokens: int = 0, cache_creation_input_tokens: int = 0, reasoning_tokens: int = 0,
+                     latency_ms: int = 0, provider_reported_cost_amount: Any = None,
+                     provider_reported_currency: str | None = None, usage_reported: bool = True,
+                     usage_units: dict[str, Any] | None = None) -> UsageEvent:
+        if quote.workspace_id is not None and quote.workspace_id != self.workspace_id:
+            raise AppError(403, "billing_scope_mismatch", "Quote belongs to another workspace")
+        key = quote.quote_id + ":" + str(max(1, int(attempt)))
+        self._lock_budget()
+        event = self.db.scalar(self.usage.query().where(UsageEvent.idempotency_key == key))
+        tokens_required = any(decimal_amount(rate) for rate in (quote.input_per_million, quote.cached_input_per_million,
+            quote.cache_write_per_million, quote.output_per_million))
+        zero_tariff = not decimal_amount(quote.price_multiplier) or not any(decimal_amount(rate) for rate in (
+            quote.input_per_million, quote.cached_input_per_million, quote.cache_write_per_million,
+            quote.output_per_million, quote.fixed_per_call, *quote.rates_by_unit.values()))
+        actual_usage_available = usage_reported or zero_tariff or (bool(usage_units) and not tokens_required)
+        actual_report_available = provider_reported_cost_amount is not None or (actual_usage_available and quote.price_version_id is not None)
+        if event and event.record_stage == "settled" and (event.cost_amount is not None or not actual_report_available):
+            self.db.commit()
+            return event
+        if event is None:
+            event = self.usage.require(quote.reservation_id, "usage reservation") if quote.reservation_id else None
+            if event is None or event.record_stage != "reserved":
+                event = self.usage.add(UsageEvent(workspace_id=self.workspace_id, provider_id=quote.provider_id,
+                    model_id=quote.model_id, feature=quote.feature, idempotency_key=key, created_at=utc_now()))
+            event.idempotency_key = key
+        inp, out = max(0, int(input_tokens)), max(0, int(output_tokens))
+        cached = min(inp, max(0, int(cached_input_tokens)))
+        created = min(inp-cached, max(0, int(cache_creation_input_tokens)))
+        currency = quote.currency
         if not quote.remote_capability:
-            cost_usd = 0.0
-            cost_cny = 0.0
-            status = "non_billable"
-        elif provider_reported_cost_cny is not None:
-            cost_cny = max(0.0, float(provider_reported_cost_cny))
-            cost_usd = cost_cny / quote.usd_cny_rate if quote.usd_cny_rate else 0.0
-            status = "provider_reported"
-        elif quote.price_version_id is not None and not usage_reported:
-            # The provider omitted token usage. Preserve a clearly labelled,
-            # conservative pre-call projection so an unknown bill does not
-            # become a false zero or silently bypass the hard budget.
-            cost_usd = quote.projected_cost_usd
-            cost_cny = quote.projected_cost_cny
-            status = "estimated_usage_missing"
-        elif quote.price_version_id is not None:
-            if quote.pricing_currency == "CNY":
-                cost_cny = self._priced_cost_usd(
-                    input_tokens=normalized_uncached,
-                    output_tokens=normalized_output,
-                    input_rate=quote.input_cny_per_million,
-                    output_rate=quote.output_cny_per_million,
-                    fixed=quote.fixed_cny_per_call,
-                ) + (
-                    normalized_cached
-                    * quote.cached_input_cny_per_million
-                    / 1_000_000
-                ) + (
-                    normalized_created
-                    * quote.cache_write_cny_per_million
-                    / 1_000_000
-                )
-                cost_cny *= quote.price_multiplier
-                cost_usd = cost_cny / quote.usd_cny_rate if quote.usd_cny_rate else 0.0
-            else:
-                cost_usd = self._priced_cost_usd(
-                    input_tokens=normalized_uncached,
-                    output_tokens=normalized_output,
-                    input_rate=quote.input_usd_per_million,
-                    output_rate=quote.output_usd_per_million,
-                    fixed=quote.fixed_usd_per_call,
-                ) + normalized_cached * quote.cached_input_usd_per_million / 1_000_000 + (
-                    normalized_created * quote.cache_write_usd_per_million / 1_000_000
-                )
-                cost_usd *= quote.price_multiplier
-                cost_cny = cost_usd * quote.usd_cny_rate
-            status = "priced"
+            amount, status, source = "0", "non_billable", "non_billable"
+        elif provider_reported_cost_amount is not None:
+            if not provider_reported_currency:
+                raise AppError(422, "reported_currency_required", "Provider-reported money requires its native currency")
+            currency = currency_code(provider_reported_currency)
+            amount, status, source = amount_text(provider_reported_cost_amount), "provider_reported", "provider_reported"
+        elif quote.price_version_id and actual_usage_available:
+            amount = self._cost(quote, inp, out, cached, created, usage_units)
+            status, source = ("priced", quote.source) if amount is not None else ("unpriced_units", "unknown")
         else:
-            cost_usd = 0.0
-            cost_cny = 0.0
-            status = "unpriced"
-        return self.usage.add(
-            UsageEvent(
-                workspace_id=self.workspace_id,
-                provider_id=quote.provider_id,
-                model_id=quote.model_id,
-                feature=quote.feature,
-                input_tokens=normalized_input,
-                cached_input_tokens=normalized_cached,
-                cache_creation_input_tokens=normalized_created,
-                output_tokens=normalized_output,
-                reasoning_tokens=normalized_reasoning,
-                total_tokens=normalized_input + normalized_output,
-                attempt=max(1, int(attempt)),
-                cost_usd=cost_usd,
-                cost_cny=cost_cny,
-                cost_status=status,
-                price_version_id=quote.price_version_id,
-                exchange_rate_version_id=quote.exchange_rate_version_id,
-                input_usd_per_million=quote.input_usd_per_million,
-                cached_input_usd_per_million=quote.cached_input_usd_per_million,
-                cache_write_usd_per_million=quote.cache_write_usd_per_million,
-                price_multiplier=quote.price_multiplier,
-                output_usd_per_million=quote.output_usd_per_million,
-                fixed_usd_per_call=quote.fixed_usd_per_call,
-                usd_cny_rate=quote.usd_cny_rate,
-                latency_ms=max(0, int(latency_ms)),
-                created_at=self._as_utc(datetime.fromisoformat(quote.quoted_at)),
-            )
-        )
+            # Missing actual usage is unknown, never a fabricated zero.
+            amount, status, source = None, "usage_missing" if quote.price_version_id else "unpriced", "unknown"
+        event.currency, event.cost_amount, event.cost_status, event.amount_source = currency, amount, status, source
+        event.record_stage, event.attempt = "settled", max(1, int(attempt))
+        # Retain the conservative authorization until unknown spend is resolved.
+        event.reserved_amount = quote.projected_amount if amount is None else None
+        event.input_tokens, event.output_tokens = inp, out
+        event.cached_input_tokens, event.cache_creation_input_tokens = cached, created
+        event.reasoning_tokens, event.total_tokens = min(out, max(0, int(reasoning_tokens))), inp+out
+        event.latency_ms, event.price_version_id = max(0, int(latency_ms)), quote.price_version_id
+        event.pricing_snapshot, event.usage_units = quote.snapshot(), dict(usage_units or {})
+        event.reservation_expires_at = None
+        self.db.flush()
+        self.db.commit()
+        self.db.info.get("native_pending_quotes", {}).pop(quote.quote_id, None)
+        return event
 
-    def _active_price(
-        self,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        now: datetime,
-        input_tokens: int = 0,
-    ) -> PriceVersion | None:
-        candidates = list(
-            self.db.scalars(
-                self.prices.query().where(
-                    PriceVersion.provider_id.in_([provider_id, "*"]),
-                    PriceVersion.model_id.in_([model_id, "*"]),
-                    PriceVersion.feature.in_([feature, "*"]),
-                    PriceVersion.effective_at <= now,
-                )
-            ).all()
-        )
-        candidates = [
-            item
-            for item in candidates
-            if item.retired_at is None or self._as_utc(item.retired_at) > now
-        ]
-        candidates = [item for item in candidates if self._conditions_match(item.conditions or {}, input_tokens)]
+    @staticmethod
+    def _cost(quote: BillingQuote, inp: int, out: int, cached: int, created: int,
+              units: dict[str, Any] | None = None) -> str | None:
+        with localcontext() as context:
+            context.prec = 256
+            if not decimal_amount(quote.price_multiplier):
+                return "0"
+            value = (Decimal(inp-cached-created)*decimal_amount(quote.input_per_million)
+                + Decimal(cached)*decimal_amount(quote.cached_input_per_million)
+                + Decimal(created)*decimal_amount(quote.cache_write_per_million)
+                + Decimal(out)*decimal_amount(quote.output_per_million)) / Decimal(1000000)
+            value += decimal_amount(quote.fixed_per_call)
+            for unit, rate in quote.rates_by_unit.items():
+                if not decimal_amount(rate):
+                    continue
+                if not units or unit not in units:
+                    return None
+                value += decimal_amount(units[unit])*decimal_amount(rate)
+            try:
+                return amount_text(value*decimal_amount(quote.price_multiplier))
+            except ValueError:
+                # Preserve unsupported legacy rate evidence as unknown rather
+                # than rounding a charge or crashing after a provider call.
+                return None
+
+    def _totals_for_policy(self, policy: BudgetPolicy, start: datetime, end: datetime) -> tuple[Decimal, Decimal, int]:
+        statement = self.usage.query().where(UsageEvent.currency == policy.currency,
+            or_(UsageEvent.record_stage == "reserved", (UsageEvent.created_at >= start) & (UsageEvent.created_at < end)),
+            UsageEvent.record_stage != "released")
+        for name in ("provider_id", "model_id", "feature"):
+            value = getattr(policy, name)
+            if value != "*":
+                statement = statement.where(getattr(UsageEvent, name) == value)
+        events = self.db.scalars(statement).all()
+        spent = decimal_amount(sum_amounts(event.cost_amount for event in events if event.record_stage == "settled"))
+        reserved = decimal_amount(sum_amounts(event.reserved_amount for event in events))
+        unknown = sum((event.record_stage == "settled" and event.cost_amount is None)
+            or (event.record_stage == "reserved" and event.reserved_amount is None) for event in events)
+        # Unknown legacy currency can affect either budget. Require resolution;
+        # never silently drop historical spend out of enforcement.
+        unknown_statement = self.usage.query().where(UsageEvent.currency.is_(None),
+            or_(UsageEvent.record_stage == "reserved", (UsageEvent.created_at >= start) & (UsageEvent.created_at < end)),
+            UsageEvent.record_stage != "released", UsageEvent.cost_status != "non_billable")
+        for name in ("provider_id", "model_id", "feature"):
+            if getattr(policy, name) != "*":
+                unknown_statement = unknown_statement.where(getattr(UsageEvent, name) == getattr(policy, name))
+        unknown += len(self.db.scalars(unknown_statement).all())
+        return spent, reserved, unknown
+
+    def _persist_alert(self, policy: BudgetPolicy, level: str, quote: BillingQuote, start: datetime,
+                       end: datetime, spent: Decimal, reserved: Decimal, projected: Decimal, limit: Decimal) -> BudgetAlert:
+        alert = self.db.scalar(self.alerts.query().where(BudgetAlert.policy_id == policy.id,
+            BudgetAlert.level == level, BudgetAlert.period_start == start))
+        notify = alert is None or alert.status == "acknowledged"
+        if alert is None:
+            alert = self.alerts.add(BudgetAlert(workspace_id=self.workspace_id, policy_id=policy.id, level=level,
+                provider_id=quote.provider_id, model_id=quote.model_id, feature=quote.feature,
+                period_start=start, period_end=end, limit_cny=0))
+        alert.status, alert.acknowledged_at, alert.currency = "open", None, policy.currency
+        alert.spent_amount, alert.reserved_amount = amount_text(spent), amount_text(reserved)
+        alert.projected_amount, alert.limit_amount = amount_text(projected), amount_text(limit)
+        self.db.flush()
+        if notify:
+            from app.services.alert_email import notify_budget_alert
+            notify_budget_alert(self.db, self.workspace_id, policy_name=policy.name, level=level,
+                scope=f"{quote.provider_id} / {quote.model_id} / {quote.feature}", currency=policy.currency,
+                spent_amount=alert.spent_amount, projected_amount=alert.projected_amount, limit_amount=alert.limit_amount)
+        self.audit.record(actor_id=self.actor_id, action=f"usage.budget.{level}", resource_type="budget_policy",
+            resource_id=policy.id, outcome="blocked" if level == "hard" else "warning",
+            details={"currency": policy.currency, "spent_amount": alert.spent_amount, "reserved_amount": alert.reserved_amount,
+                     "projected_amount": alert.projected_amount, "limit_amount": alert.limit_amount})
+        return alert
+
+    def _require_provider(self, provider_id: str) -> ProviderConfig:
+        provider = self.db.scalar(select(ProviderConfig).where(ProviderConfig.workspace_id == self.workspace_id, ProviderConfig.id == provider_id))
+        if provider is None:
+            raise AppError(404, "provider_not_found", "Provider is not in the current workspace")
+        return provider
+
+    def _active_price(self, provider_id: str, model_id: str, feature: str, now: datetime, input_tokens: int = 0) -> PriceVersion | None:
+        provider = self._require_provider(provider_id)
+        candidates = [price for price in self.db.scalars(self.prices.query().where(
+            PriceVersion.provider_id == provider_id, PriceVersion.model_id.in_([model_id, "*"]),
+            PriceVersion.feature.in_([feature, "*"]), PriceVersion.effective_at <= now)).all()
+            if (price.retired_at is None or self._as_utc(price.retired_at) > now)
+            and self._conditions_match(price.conditions or {}, input_tokens, provider) and not (price.conditions or {}).get("native_unpriced")]
         if not candidates:
             return None
-        return max(
-            candidates,
-            key=lambda item: (
-                int(item.provider_id == provider_id)
-                + int(item.model_id == model_id)
-                + int(item.feature == feature),
-                self._as_utc(item.effective_at),
-                item.version,
-            ),
-        )
+        declared_currency = (provider.capabilities or {}).get("billing_currency")
+        if declared_currency:
+            candidates = [price for price in candidates if price.currency == currency_code(declared_currency)]
+        if not candidates:
+            return None
+        def rank(price: PriceVersion) -> tuple[int, ...]:
+            binding = price.conditions or {}
+            specificity = sum(binding.get(key) is not None for key in ("region", "endpoint", "billing_tier", "min_input_tokens", "max_input_tokens"))
+            return (int(price.source == MANUAL_PRICE_SOURCE), int(price.model_id == model_id),
+                int(price.feature == feature), specificity, int(binding.get("min_input_tokens") or 0))
+        best_rank = max(rank(price) for price in candidates)
+        finalists = [price for price in candidates if rank(price) == best_rank]
+        if len({price.currency for price in finalists}) > 1:
+            raise AppError(409, "pricing_currency_ambiguous", "Select the provider's billing currency before calling a model with tariffs in both currencies")
+        return max(finalists, key=lambda price: (self._as_utc(price.effective_at), price.version))
 
     @staticmethod
     def _provider_catalog_key(provider: ProviderConfig) -> str | None:
         declared = (provider.capabilities or {}).get("pricing_provider_key")
         if isinstance(declared, str) and declared.strip():
             return declared.strip().casefold()
-        if provider.provider_type == "openai_responses":
-            return "openai"
-        if provider.provider_type == "deepseek_chat":
-            return "deepseek"
-        if provider.provider_type == "qwen":
-            return "qwen"
+        kinds = {"openai_responses": "openai", "deepseek_chat": "deepseek", "qwen": "qwen"}
+        if provider.provider_type in kinds:
+            return kinds[provider.provider_type]
         try:
-            hostname = (urlparse(provider.base_url or "").hostname or "").casefold()
+            host = (urlparse(provider.base_url or "").hostname or "").casefold()
         except ValueError:
-            hostname = ""
-        if hostname == "api.openai.com":
-            return "openai"
-        if hostname == "api.deepseek.com":
-            return "deepseek"
-        if hostname.endswith("dashscope.aliyuncs.com"):
-            return "qwen"
-        if hostname.endswith("moonshot.cn") or hostname.endswith("kimi.com"):
-            return "kimi"
-        if hostname.endswith("z.ai") or hostname.endswith("bigmodel.cn"):
-            return "zai"
-        if hostname.endswith("minimax.io"):
-            return "minimax"
+            return None
+        for suffix, vendor in (("api.openai.com", "openai"), ("api.deepseek.com", "deepseek"),
+            ("dashscope.aliyuncs.com", "qwen"), ("moonshot.cn", "kimi"), ("kimi.com", "kimi"),
+            ("z.ai", "zai"), ("bigmodel.cn", "zai"), ("minimax.io", "minimax"),
+            ("generativelanguage.googleapis.com", "google"), ("api.anthropic.com", "anthropic")):
+            if host == suffix or host.endswith("." + suffix):
+                return vendor
         return None
 
     def provider_ids_for_catalog_key(self, provider_key: str) -> list[str]:
-        """Return configured provider instance IDs matching a catalog vendor."""
+        return [provider.id for provider in self.db.scalars(select(ProviderConfig).where(ProviderConfig.workspace_id == self.workspace_id)).all()
+            if self._provider_catalog_key(provider) == provider_key.strip().casefold()]
 
-        expected = provider_key.strip().casefold()
-        if not expected:
-            return []
-        providers = self.db.scalars(
-            select(ProviderConfig).where(
-                ProviderConfig.workspace_id == self.workspace_id,
-            )
-        ).all()
-        return [
-            provider.id
-            for provider in providers
-            if self._provider_catalog_key(provider) == expected
-        ]
-
-    def _seed_default_catalog_price(
-        self,
-        *,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        now: datetime,
-        input_tokens: int,
-    ) -> PriceVersion | None:
-        """Materialize a known public list price for the real provider instance.
-
-        Price catalog rows are vendor templates; usage events are scoped to a
-        workspace ProviderConfig UUID.  Persisting the selected template under
-        that UUID removes the former manual-import prerequisite without making
-        a global provider-key row silently match unrelated configurations.
-        """
-
-        provider = self.db.scalar(
-            select(ProviderConfig).where(
-                ProviderConfig.workspace_id == self.workspace_id,
-                ProviderConfig.id == provider_id,
-            )
-        )
-        if provider is None:
+    def _seed_default_catalog_price(self, *, provider_id: str, model_id: str, feature: str,
+                                   now: datetime, input_tokens: int) -> PriceVersion | None:
+        provider = self._require_provider(provider_id)
+        vendor = self._provider_catalog_key(provider)
+        if vendor is None:
             return None
-        provider_key = self._provider_catalog_key(provider)
-        matches = [
-            item
-            for item in PRICING_CATALOG
-            if provider_key is not None
-            and item.get("provider_key") == provider_key
-            and item.get("model_id") == model_id
-            and self._conditions_match(
-                dict(item.get("conditions") or {}),
-                input_tokens,
-            )
-        ]
-        # The catalog can contain context tiers. The last matching entry is
-        # deterministic and catalog ordering deliberately keeps a more
-        # specific later row after a generic one.
-        builtin = matches[-1] if matches else None
-        # models.dev is the network-refreshable tariff source and matches by
-        # model name regardless of provider. CNY-native rows stay
-        # authoritative because models.dev only carries USD list prices.
-        models_dev_item = price_entry_for_model(model_id, input_tokens)
-        if builtin is not None and str(builtin.get("currency") or "").upper() == "CNY":
-            item = builtin
-        elif models_dev_item is not None:
-            item = models_dev_item
-        elif builtin is not None:
-            item = builtin
-        else:
+        declared_currency = (provider.capabilities or {}).get("billing_currency")
+        builtin = [item for item in PRICING_CATALOG if item["provider_key"] == vendor and item["model_id"] == model_id
+                   and self._conditions_match(item.get("conditions") or {}, input_tokens, provider)
+                   and (not declared_currency or item["currency"] == currency_code(declared_currency))]
+        native_currencies = [currency_code(declared_currency)] if declared_currency else ["USD", "CNY"]
+        network_choices = [entry for currency in native_currencies
+            if (entry := price_entry_for_model(model_id, input_tokens, provider_key=vendor, currency=currency))
+            and self._conditions_match(entry.get("conditions") or {}, input_tokens, provider)]
+        choices = network_choices or builtin
+        if len({entry["currency"] for entry in choices}) > 1:
+            raise AppError(409, "pricing_currency_ambiguous", "Select the provider's native billing currency before execution")
+        # Read models.dev prices in their published currency. Official tariffs
+        # are a native fallback, never a reason to reinterpret a USD record.
+        item = choices[-1] if choices else None
+        if item is None:
             return None
-        scope = self._normalized_scope(provider_id, model_id, feature)
-        version = (
-            self.db.scalar(
-                select(func.max(PriceVersion.version)).where(
-                    PriceVersion.workspace_id == self.workspace_id,
-                    PriceVersion.provider_id == scope[0],
-                    PriceVersion.model_id == scope[1],
-                    PriceVersion.feature == scope[2],
-                )
-            )
-            or 0
-        ) + 1
-        conditions = dict(item.get("conditions") or {})
-        currency = str(item.get("currency") or "USD").upper()
-        conditions.update(
-            {
-                "pricing_currency": currency,
-                "catalog_id": item.get("catalog_id"),
-                "catalog_provider_key": provider_key or item.get("provider_key"),
-                "catalog_source": item.get("source") or "builtin",
-                "catalog_as_of": item.get("as_of"),
-                "catalog_source_url": item.get("source_url"),
-            }
-        )
-        if currency == "CNY":
-            conditions.update(
-                {
-                    "input_cny_per_million": item.get("native_input_per_million"),
-                    "cached_input_cny_per_million": item.get(
-                        "native_cached_input_per_million"
-                    ),
-                    "cache_write_cny_per_million": item.get(
-                        "native_cache_write_per_million"
-                    ),
-                    "output_cny_per_million": item.get("native_output_per_million"),
-                    "fixed_cny_per_call": 0,
-                }
-            )
-        price = self.prices.add(
-            PriceVersion(
-                workspace_id=self.workspace_id,
-                provider_id=scope[0],
-                model_id=scope[1],
-                feature=scope[2],
-                version=version,
-                input_usd_per_million=float(item.get("input_usd_per_million") or 0),
-                cached_input_usd_per_million=(
-                    float(item["cached_input_usd_per_million"])
-                    if item.get("cached_input_usd_per_million") is not None
-                    else None
-                ),
-                cache_write_usd_per_million=(
-                    float(item["cache_write_usd_per_million"])
-                    if item.get("cache_write_usd_per_million") is not None
-                    else None
-                ),
-                output_usd_per_million=float(item.get("output_usd_per_million") or 0),
-                fixed_usd_per_call=0,
-                effective_at=now,
-                source=(
-                    f"models_dev:{item.get('source_url') or 'unknown'}"
-                    if item.get("source") == "models_dev"
-                    else f"official_catalog:{item.get('source_url') or 'unknown'}"
-                ),
-                conditions=conditions,
-            )
-        )
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="usage.price_version.catalog_default_loaded",
-            resource_type="price_version",
-            resource_id=price.id,
-            details={
-                "scope": list(scope),
-                "catalog_id": item.get("catalog_id"),
-                "currency": currency,
-            },
-        )
-        self.db.flush()
-        return price
+        return self.create_price(provider_id=provider_id, model_id=model_id, feature=feature, currency=item["currency"],
+            input_per_million=item["native_input_per_million"], output_per_million=item["native_output_per_million"],
+            cached_input_per_million=item.get("native_cached_input_per_million"),
+            cache_write_per_million=item.get("native_cache_write_per_million"), fixed_per_call=item.get("native_fixed_per_call", "0"),
+            rates_by_unit=item.get("rates_by_unit"), effective_at=now, commit=False,
+            source=f"{item.get('source') or 'official_catalog'}:{item.get('source_url') or 'unknown'}",
+            conditions={**(item.get("conditions") or {}), "catalog_id": item["catalog_id"], "catalog_provider_key": vendor,
+                "catalog_as_of": item.get("as_of"), "catalog_source_url": item.get("source_url")})
 
     @staticmethod
-    def _native_cny_rates(price: PriceVersion | None) -> tuple[str, dict[str, float]]:
-        if price is None:
-            return "USD", {
-                "input": 0.0,
-                "cached_input": 0.0,
-                "cache_write": 0.0,
-                "output": 0.0,
-                "fixed": 0.0,
-            }
-        conditions = dict(price.conditions or {})
-        currency = str(conditions.get("pricing_currency") or "USD").upper()
-        if currency != "CNY":
-            return "USD", {
-                "input": 0.0,
-                "cached_input": 0.0,
-                "cache_write": 0.0,
-                "output": 0.0,
-                "fixed": 0.0,
-            }
-
-        def number(key: str, fallback: float = 0.0) -> float:
-            value = conditions.get(key, fallback)
-            try:
-                return max(0.0, float(value))
-            except (TypeError, ValueError):
-                return fallback
-
-        input_rate = number("input_cny_per_million")
-        return "CNY", {
-            "input": input_rate,
-            "cached_input": number("cached_input_cny_per_million", input_rate),
-            "cache_write": number("cache_write_cny_per_million", input_rate),
-            "output": number("output_cny_per_million"),
-            "fixed": number("fixed_cny_per_call"),
-        }
+    def _conditions_match(conditions: dict[str, Any], input_tokens: int, provider: ProviderConfig | None = None) -> bool:
+        if ((conditions.get("min_input_tokens") is not None and input_tokens < int(conditions["min_input_tokens"]))
+            or (conditions.get("max_input_tokens") is not None and input_tokens > int(conditions["max_input_tokens"]))):
+            return False
+        if provider:
+            capabilities = provider.capabilities or {}
+            for key in ("region", "endpoint", "billing_tier"):
+                expected = conditions.get(key)
+                if expected is not None:
+                    actual = provider.base_url if key == "endpoint" else capabilities.get(key)
+                    if str(expected).rstrip("/") != str(actual or "").rstrip("/"):
+                        return False
+        return True
 
     @staticmethod
-    def _conditions_match(conditions: dict[str, Any], input_tokens: int) -> bool:
-        minimum = conditions.get("min_input_tokens")
-        maximum = conditions.get("max_input_tokens")
-        return not ((minimum is not None and input_tokens < int(minimum)) or (maximum is not None and input_tokens > int(maximum)))
-
-    @staticmethod
-    def _price_multiplier(price: PriceVersion, now: datetime) -> float:
+    def _price_multiplier(price: PriceVersion, now: datetime) -> Any:
         conditions = price.conditions or {}
         windows = conditions.get("peak_windows") or []
-        if not windows:
-            return 1.0
-        zone_name = str(conditions.get("time_zone") or "UTC")
-        # Asia/Shanghai has no DST in the supported billing period.  Keeping
-        # this common tariff zone explicit also works on Windows hosts where
-        # the optional IANA tzdata package is not installed.
-        if zone_name == "Asia/Shanghai":
-            local = now.astimezone(timezone(timedelta(hours=8)))
-        else:
+        if windows:
             from zoneinfo import ZoneInfo
-            local = now.astimezone(ZoneInfo(zone_name))
-        minute = local.hour * 60 + local.minute
-        for window in windows:
-            start, end = str(window).split("-", 1)
-            sh, sm = (int(part) for part in start.split(":"))
-            eh, em = (int(part) for part in end.split(":"))
-            if sh * 60 + sm <= minute < eh * 60 + em:
-                return float(conditions.get("peak_multiplier") or 1)
-        return 1.0
-
-    def _active_exchange_rate(self, now: datetime) -> ExchangeRateVersion:
-        candidates = list(
-            self.db.scalars(
-                self.rates.query().where(
-                    ExchangeRateVersion.base_currency == "USD",
-                    ExchangeRateVersion.quote_currency == "CNY",
-                    ExchangeRateVersion.effective_at <= now,
-                )
-            ).all()
-        )
-        candidates = [
-            item
-            for item in candidates
-            if item.retired_at is None or self._as_utc(item.retired_at) > now
-        ]
-        if candidates:
-            return max(
-                candidates,
-                key=lambda item: (self._as_utc(item.effective_at), item.version),
-            )
-        version = (
-            self.db.scalar(
-                select(func.max(ExchangeRateVersion.version)).where(
-                    ExchangeRateVersion.workspace_id == self.workspace_id,
-                    ExchangeRateVersion.base_currency == "USD",
-                    ExchangeRateVersion.quote_currency == "CNY",
-                )
-            )
-            or 0
-        ) + 1
-        fallback = self.rates.add(
-            ExchangeRateVersion(
-                workspace_id=self.workspace_id,
-                base_currency="USD",
-                quote_currency="CNY",
-                version=version,
-                rate=float(DEFAULT_USD_CNY_RATE),
-                effective_at=now,
-                source="wise_reference_2026-07-14",
-            )
-        )
-        self.db.flush()
-        return fallback
-
-    def _matching_policies(
-        self,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-    ) -> list[BudgetPolicy]:
-        policies = list(
-            self.db.scalars(
-                self.policies.query().where(BudgetPolicy.enabled.is_(True))
-            ).all()
-        )
-        return [
-            policy
-            for policy in policies
-            if self._scope_matches(policy.provider_id, provider_id)
-            and self._scope_matches(policy.model_id, model_id)
-            and self._scope_matches(policy.feature, feature)
-        ]
-
-    def _block_if_already_exhausted(
-        self,
-        policies: Iterable[BudgetPolicy],
-        *,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        now: datetime,
-        rate: float,
-    ) -> None:
-        for policy in policies:
-            if policy.hard_limit_cny is None:
-                continue
-            start, end = self._period_bounds(policy.period, now)
-            spent = self._spent_for_policy(policy, start, end)
-            _, hard_eff, _, _ = self._effective_limits(policy, rate)
-            if hard_eff is not None and spent >= hard_eff:
-                self._persist_alert(
-                    policy,
-                    level="hard",
-                    provider_id=provider_id,
-                    model_id=model_id,
-                    feature=feature,
-                    start=start,
-                    end=end,
-                    spent=spent,
-                    projected=0,
-                    limit=hard_eff,
-                )
-                self.db.commit()
-                raise self._hard_limit_error(policy, spent, 0, hard_eff)
-
-    def _evaluate_policies(
-        self,
-        policies: Iterable[BudgetPolicy],
-        *,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        projected_cost_cny: float,
-        now: datetime,
-        rate: float,
-    ) -> None:
-        hard_error: AppError | None = None
-        changed = False
-        for policy in policies:
-            start, end = self._period_bounds(policy.period, now)
-            spent = self._spent_for_policy(policy, start, end)
-            soft_eff, hard_eff, _, _ = self._effective_limits(policy, rate)
-            projected_total = spent + projected_cost_cny
-            if soft_eff is not None and projected_total >= soft_eff:
-                self._persist_alert(
-                    policy,
-                    level="soft",
-                    provider_id=provider_id,
-                    model_id=model_id,
-                    feature=feature,
-                    start=start,
-                    end=end,
-                    spent=spent,
-                    projected=projected_cost_cny,
-                    limit=soft_eff,
-                )
-                changed = True
-            if hard_eff is not None and projected_total > hard_eff:
-                self._persist_alert(
-                    policy,
-                    level="hard",
-                    provider_id=provider_id,
-                    model_id=model_id,
-                    feature=feature,
-                    start=start,
-                    end=end,
-                    spent=spent,
-                    projected=projected_cost_cny,
-                    limit=hard_eff,
-                )
-                changed = True
-                hard_error = self._hard_limit_error(
-                    policy,
-                    spent,
-                    projected_cost_cny,
-                    hard_eff,
-                )
-        if changed:
-            self.db.commit()
-        if hard_error is not None:
-            raise hard_error
-
-    def _persist_alert(
-        self,
-        policy: BudgetPolicy,
-        *,
-        level: str,
-        provider_id: str,
-        model_id: str,
-        feature: str,
-        start: datetime,
-        end: datetime,
-        spent: float,
-        projected: float,
-        limit: float,
-    ) -> BudgetAlert:
-        alert = self.db.scalar(
-            self.alerts.query().where(
-                BudgetAlert.policy_id == policy.id,
-                BudgetAlert.level == level,
-                BudgetAlert.period_start == start,
-            )
-        )
-        notify = False
-        if alert is None:
-            alert = self.alerts.add(
-                BudgetAlert(
-                    workspace_id=self.workspace_id,
-                    policy_id=policy.id,
-                    level=level,
-                    status="open",
-                    provider_id=provider_id,
-                    model_id=model_id,
-                    feature=feature,
-                    period_start=start,
-                    period_end=end,
-                    spent_cny=spent,
-                    projected_cost_cny=projected,
-                    limit_cny=limit,
-                )
-            )
-            self.db.flush()
-            notify = True
-        else:
-            # Mail again only when a previously acknowledged alert re-opens,
-            # so an exhausted budget does not flood the inbox on every call.
-            notify = alert.status == "acknowledged"
-            alert.status = "open"
-            alert.acknowledged_at = None
-            alert.spent_cny = spent
-            alert.projected_cost_cny = projected
-            alert.limit_cny = limit
-        if notify:
-            from app.services.alert_email import notify_budget_alert
-
-            notify_budget_alert(
-                self.db,
-                self.workspace_id,
-                policy_name=policy.name,
-                level=level,
-                scope=f"{provider_id} / {model_id} / {feature}",
-                spent_cny=spent,
-                projected_cny=projected,
-                limit_cny=limit,
-            )
-        self.audit.record(
-            actor_id=self.actor_id,
-            action=f"usage.budget.{level}",
-            resource_type="budget_policy",
-            resource_id=policy.id,
-            outcome="blocked" if level == "hard" else "warning",
-            details={
-                "spent_cny": spent,
-                "projected_cost_cny": projected,
-                "limit_cny": limit,
-                "provider_id": provider_id,
-                "model_id": model_id,
-                "feature": feature,
-            },
-        )
-        return alert
-
-    def _spent_for_policy(
-        self,
-        policy: BudgetPolicy,
-        start: datetime,
-        end: datetime,
-    ) -> float:
-        conditions = [
-            UsageEvent.workspace_id == self.workspace_id,
-            UsageEvent.created_at >= start,
-            UsageEvent.created_at < end,
-        ]
-        if policy.provider_id != "*":
-            conditions.append(UsageEvent.provider_id == policy.provider_id)
-        if policy.model_id != "*":
-            conditions.append(UsageEvent.model_id == policy.model_id)
-        if policy.feature != "*":
-            conditions.append(UsageEvent.feature == policy.feature)
-        return float(
-            self.db.scalar(
-                select(func.coalesce(func.sum(UsageEvent.cost_cny), 0.0)).where(
-                    *conditions
-                )
-            )
-            or 0.0
-        )
-
-    @staticmethod
-    def _priced_cost_usd(
-        *,
-        input_tokens: int,
-        output_tokens: int,
-        input_rate: float,
-        output_rate: float,
-        fixed: float,
-    ) -> float:
-        value = (
-            Decimal(max(0, input_tokens))
-            * Decimal(str(max(0.0, input_rate)))
-            / Decimal(1_000_000)
-            + Decimal(max(0, output_tokens))
-            * Decimal(str(max(0.0, output_rate)))
-            / Decimal(1_000_000)
-            + Decimal(str(max(0.0, fixed)))
-        )
-        return float(value)
+            local = now.astimezone(ZoneInfo(str(conditions.get("time_zone") or "UTC")))
+            minute = local.hour*60 + local.minute
+            for window in windows:
+                start, end = str(window).split("-", 1)
+                sh, sm = map(int, start.split(":"))
+                eh, em = map(int, end.split(":"))
+                if sh*60+sm <= minute < eh*60+em:
+                    return conditions.get("peak_multiplier", "1")
+        return "1"
 
     @staticmethod
     def _period_bounds(period: str, now: datetime) -> tuple[datetime, datetime]:
+        now = BillingService._as_utc(now)
         if period == "calendar_day_utc":
             start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             return start, start + timedelta(days=1)
         if period == "calendar_month_utc":
             start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            if start.month == 12:
-                end = start.replace(year=start.year + 1, month=1)
-            else:
-                end = start.replace(month=start.month + 1)
-            return start, end
+            return start, start.replace(year=start.year+1, month=1) if start.month == 12 else start.replace(month=start.month+1)
         raise AppError(422, "invalid_budget_period", "Unsupported budget period")
 
     @staticmethod
-    def _normalized_scope(
-        provider_id: str,
-        model_id: str,
-        feature: str,
-    ) -> tuple[str, str, str]:
-        return tuple(
-            value.strip() if value.strip() else "*"
-            for value in (provider_id, model_id, feature)
-        )  # type: ignore[return-value]
+    def _normalized_scope(provider_id: str, model_id: str, feature: str) -> tuple[str, str, str]:
+        return tuple(value.strip() or "*" for value in (provider_id, model_id, feature))
 
     @staticmethod
     def _scope_matches(configured: str, actual: str) -> bool:
         return configured == "*" or configured == actual
 
     @staticmethod
-    def _validate_limits(soft: float | None, hard: float | None) -> None:
+    def _validate_limits(soft: Any, hard: Any) -> None:
         if soft is None and hard is None:
-            raise AppError(
-                422,
-                "budget_limit_required",
-                "At least one soft or hard budget limit is required",
-            )
-        if soft is not None and hard is not None and soft > hard:
-            raise AppError(
-                422,
-                "invalid_budget_limits",
-                "Soft budget limit cannot exceed the hard limit",
-            )
-
-    @staticmethod
-    def _hard_limit_error(
-        policy: BudgetPolicy,
-        spent: float,
-        projected: float,
-        effective_limit_cny: float | None = None,
-    ) -> AppError:
-        hard_limit = (
-            effective_limit_cny
-            if effective_limit_cny is not None
-            else policy.hard_limit_cny
-        )
-        return AppError(
-            402,
-            "budget_hard_limit_exceeded",
-            "The remote provider call was blocked before execution by a workspace budget",
-            {
-                "policy_id": policy.id,
-                "spent_cny": spent,
-                "projected_cost_cny": projected,
-                "hard_limit_cny": hard_limit,
-                "limit_currency": policy.limit_currency,
-            },
-        )
-
-    @staticmethod
-    def _effective_limits(
-        policy: BudgetPolicy,
-        usd_cny_rate: float,
-    ) -> tuple[float | None, float | None, float | None, float | None]:
-        """Return (soft_cny, hard_cny, soft_usd, hard_usd) for a policy.
-
-        Limits are authored in ``policy.limit_currency``. USD limits are
-        converted to their CNY equivalent using the current rate so they
-        float with the exchange rate; CNY limits are used as-authored.
-        The USD projections are kept for display and audit.
-        """
-        currency = (policy.limit_currency or "CNY").strip().upper()
-        soft_native = policy.soft_limit_cny
-        hard_native = policy.hard_limit_cny
-        if currency == "USD":
-            # A USD limit floats with the exchange rate: the effective CNY
-            # threshold scales as the rate moves. Without a usable rate the
-            # policy cannot enforce, so the limit is treated as unset.
-            soft_cny = soft_native * usd_cny_rate if soft_native is not None and usd_cny_rate else None
-            hard_cny = hard_native * usd_cny_rate if hard_native is not None and usd_cny_rate else None
-            return soft_cny, hard_cny, soft_native, hard_native
-        # CNY-native: project to USD for display only.
-        soft_usd = soft_native / usd_cny_rate if soft_native is not None and usd_cny_rate else None
-        hard_usd = hard_native / usd_cny_rate if hard_native is not None and usd_cny_rate else None
-        return soft_native, hard_native, soft_usd, hard_usd
+            raise AppError(422, "budget_limit_required", "At least one budget limit is required")
+        if soft is not None:
+            decimal_amount(soft)
+        if hard is not None:
+            decimal_amount(hard)
+        if soft is not None and hard is not None and decimal_amount(soft) > decimal_amount(hard):
+            raise AppError(422, "invalid_budget_limits", "Soft limit cannot exceed hard limit")
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)

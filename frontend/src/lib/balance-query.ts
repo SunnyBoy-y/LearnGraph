@@ -144,6 +144,7 @@ export const BALANCE_QUERY_PRESETS: BalanceQueryPreset[] = [
 /* ------------------------------------------------------------------ */
 
 export interface CustomBalanceQueryOutcome {
+  queryToken: string;
   providerId: string;
   results: BalanceExtractorResult[];
   queriedAt: string;
@@ -183,6 +184,7 @@ export async function runCustomBalanceQuery(
       providerId,
       results,
       queriedAt: response.queried_at,
+      queryToken: response.query_token,
     };
   } finally {
     runtime.dispose();
@@ -195,6 +197,7 @@ export async function persistCustomBalanceResult(
 ): Promise<void> {
   const first = outcome.results[0];
   await saveProviderBalanceQueryResult(outcome.providerId, {
+    query_token: outcome.queryToken,
     is_valid: first?.isValid ?? null,
     invalid_message: first?.invalidMessage ?? null,
     remaining: first?.remaining ?? null,

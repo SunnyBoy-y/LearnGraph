@@ -141,6 +141,7 @@ export interface CcSwitchImportResult {
 }
 
 export interface ProviderUpdateRequest {
+  billing_currency?: "USD" | "CNY" | null;
   enabled?: boolean;
   /** Catalog provider type, which determines the connection protocol. */
   provider_type?: string;
@@ -357,6 +358,7 @@ export interface ProviderBalanceQueryHttpRequest {
 }
 
 export interface ProviderBalanceQueryExecuteResponse {
+  query_token: string;
   provider_id: string;
   status_code: number;
   ok: boolean;
@@ -405,10 +407,7 @@ export function providerBalanceQueryConfig(
     script: config.script,
     timeout_seconds:
       typeof config.timeout_seconds === "number" ? config.timeout_seconds : 10,
-    auto_query_interval_minutes:
-      typeof config.auto_query_interval_minutes === "number"
-        ? config.auto_query_interval_minutes
-        : 0,
+    auto_query_interval_minutes: 0,
     variables:
       config.variables &&
       typeof config.variables === "object" &&

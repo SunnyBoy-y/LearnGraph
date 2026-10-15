@@ -34,10 +34,10 @@ import type {
   MasterKeyRotation,
 } from "@/types/providers";
 
-import { apiClient } from "./client";
+import { apiClient, type ApiRequestOptions } from "./client";
 
-export function listProviders(): Promise<Provider[]> {
-  return apiClient.get<Provider[]>("/providers");
+export function listProviders(options?: ApiRequestOptions): Promise<Provider[]> {
+  return apiClient.get<Provider[]>("/providers", options);
 }
 
 export function listProviderCatalog(): Promise<ProviderTypeCatalogItem[]> {
@@ -143,6 +143,7 @@ export function executeProviderBalanceQuery(
 export function saveProviderBalanceQueryResult(
   providerId: string,
   payload: {
+    query_token: string;
     is_valid?: boolean | null;
     invalid_message?: string | null;
     remaining?: number | null;
@@ -284,10 +285,12 @@ export function updateProviderModelState(
 export function updateProvider(
   providerId: string,
   payload: ProviderUpdateRequest,
+  options?: ApiRequestOptions,
 ): Promise<Provider> {
   return apiClient.patch<Provider, ProviderUpdateRequest>(
     `/providers/${encodeURIComponent(providerId)}`,
     payload,
+    options,
   );
 }
 

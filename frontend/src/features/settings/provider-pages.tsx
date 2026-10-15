@@ -1,3 +1,5 @@
+import "./provider-settings-layout.css";
+import { currentWorkspaceQueryKey } from "@/lib/query-keys";
 import {
   Children,
   isValidElement,
@@ -148,6 +150,8 @@ import {
   CustomBalanceDialog,
 } from "./balance-query";
 import { ImportProviderDialog } from "./import-provider-dialog";
+import { ProviderBalanceStatus } from "./provider-balance-status";
+import { parseModelIds } from "./provider-model-input";
 import type {
   CodexDeviceLoginStart,
   CopilotDeviceLoginStart,
@@ -285,14 +289,7 @@ function mergeProviderModelLists(
   provider: Provider,
 ): ProviderModelsResponse | undefined {
   const manual = manualProviderModels(provider);
-  if (!fresh) {
-    if (!manual.length) return undefined;
-    return {
-      provider_id: provider.id,
-      status: "persisted_discovery",
-      models: manual,
-    };
-  }
+  if (!fresh) return persistedProviderModels(provider);
   const known = new Set(fresh.models.map((model) => model.id));
   const additions = manual.filter((model) => !known.has(model.id));
   if (!additions.length) return fresh;
@@ -366,7 +363,7 @@ function SearchableModelSelect({
         <button
           aria-expanded={open}
           aria-label={ariaLabel ?? "默认模型"}
-          className="flex h-7 w-52 items-center justify-between gap-2 rounded-lg border border-input bg-transparent px-2.5 text-left font-mono text-xs whitespace-nowrap transition-colors outline-none hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+          className="flex h-7 w-full min-w-0 items-center justify-between gap-2 rounded-lg border border-input bg-transparent px-2.5 text-left font-mono text-xs whitespace-nowrap transition-colors outline-none hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           type="button"
         >
           <span className={value ? "truncate" : "truncate text-muted-foreground"}>
@@ -494,7 +491,8 @@ function HostBridgeHint({ status }: { status?: HostBridgeStatus }) {
 
 export function ProvidersPage() {
   const queryClient = useQueryClient();
-  const [roleFilter, setRoleFilter] = useState<ProviderRole | "all">("model");
+  const [roleFilter, setRoleFilter] = useState<ProviderRole>("model");
+  const [providerSearch, setProviderSearch] = useState("");
   // 文搜图/图搜图 tab 内的能力筛选：all | text(文搜图) | image(图搜图) | both(都支持)
   const [imageModeFilter, setImageModeFilter] = useState<
     "all" | "text" | "image" | "both"
@@ -544,6 +542,14 @@ export function ProvidersPage() {
     provider: Provider;
     modelId: string;
   } | null>(null);
+  useEffect(() => {
+    if (!capabilityTarget) return;
+    const latest = providers.data?.find((item) => item.id === capabilityTarget.provider.id);
+    if (latest && latest !== capabilityTarget.provider) {
+      setCapabilityTarget((current) => current && current.provider.id === latest.id ? { ...current, provider: latest } : current);
+    }
+  }, [providers.data, capabilityTarget]);
+
   const probe = useMutation({
     mutationFn: probeProvider,
     onSuccess: () => {
@@ -571,43 +577,7 @@ export function ProvidersPage() {
     },
     onError: (error) => toast.error(error.message),
   });
-  // cc-switch 风格的自动查询：仅在页面打开期间，按每个 Provider 配置的
-  // 间隔静默刷新缓存余额（0 表示关闭）。
-  const autoQueryInFlight = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    const data = providers.data;
-    if (!data) return;
-    const tick = () => {
-      for (const provider of data) {
-        const config = providerBalanceQueryConfig(provider);
-        if (!config?.enabled || config.auto_query_interval_minutes <= 0) {
-          continue;
-        }
-        const last = providerBalanceQueryLastResult(provider);
-        const staleMs = config.auto_query_interval_minutes * 60_000;
-        if (
-          last &&
-          Date.now() - new Date(last.queried_at).getTime() < staleMs
-        ) {
-          continue;
-        }
-        if (autoQueryInFlight.current.has(provider.id)) continue;
-        autoQueryInFlight.current.add(provider.id);
-        runCustomBalanceQuery(provider.id, config)
-          .then((outcome) => persistCustomBalanceResult(outcome))
-          .then(() =>
-            queryClient.invalidateQueries({ queryKey: ["providers"] }),
-          )
-          .catch(() => {
-            // 静默轮询失败不打扰用户；手动查询会显示具体错误。
-          })
-          .finally(() => autoQueryInFlight.current.delete(provider.id));
-      }
-    };
-    tick();
-    const timer = window.setInterval(tick, 60_000);
-    return () => window.clearInterval(timer);
-  }, [providers.data, queryClient]);
+  // Automatic remote balance requests are owned by the durable backend worker.
   const discover = useMutation({
     mutationFn: discoverProviderModels,
     onSuccess: (result) => {
@@ -718,11 +688,15 @@ export function ProvidersPage() {
         default_vision_model_id,
         provider_priority,
       }),
-    onSuccess: (provider) => {
-      toast.success(provider.enabled ? "Provider 已启用" : "Provider 已停用");
+    onSuccess: (provider, variables) => {
+      const modelChanged = Object.entries(variables).some(([key, value]) => key.startsWith("default_") && value !== undefined);
+      toast.success(modelChanged ? "默认模型已保存" : variables.provider_priority !== undefined ? "优先级已保存" : provider.enabled ? "供应商已启用" : "供应商已停用");
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
     },
-    onError: (error) => toast.error(error.message),
+    onError: (error, variables) => {
+      setDefaultModels((current) => { const next = { ...current }; delete next[variables.id]; return next; });
+      toast.error(error.message);
+    },
   });
   // ASR/转写通道「已测试支持模式」标注保存（tested_modes / untested_modes）。
   const updateTestedModes = useMutation({
@@ -837,7 +811,8 @@ export function ProvidersPage() {
       (ROLE_ORDER.indexOf(b) === -1 ? 99 : ROLE_ORDER.indexOf(b)),
   );
   const filteredProviders = providers.data.filter((provider) => {
-    if (roleFilter === "all") return true;
+    const search = providerSearch.trim().toLowerCase();
+    if (search && !`${provider.display_name} ${provider.base_url ?? ''} ${provider.provider_type}`.toLowerCase().includes(search)) return false;
     const providerRole = catalogByType.get(provider.provider_type)?.role;
     if (providerRole !== roleFilter) return false;
     if (roleFilter === "image_search" && imageModeFilter !== "all") {
@@ -863,8 +838,15 @@ export function ProvidersPage() {
                 providerCatalog.isError ? providerCatalog.error.message : undefined
               }
               catalogPending={providerCatalog.isPending}
-              initialRole={roleFilter === "all" ? undefined : roleFilter}
-              onCreate={(payload) => create.mutate(payload)}
+              initialRole={roleFilter}
+              onCreate={async (payload) => {
+                const provider = await create.mutateAsync(payload);
+                const role = catalogByType.get(provider.provider_type)?.role;
+                if (role && ["model", "vision", "embedding", "deep_research"].includes(role)) {
+                  setCapabilityTarget({ provider, modelId: providerDefaultModelId(provider) });
+                }
+                return provider;
+              }}
               secretStoreAvailable={
                 !secretStore.isPending && Boolean(secretStore.data?.available)
               }
@@ -877,7 +859,7 @@ export function ProvidersPage() {
         }
         description="配置模型、搜索、抓取与记忆服务。"
         eyebrow="Provider gateway"
-        title="Provider 管理"
+        title="模型与服务"
       />
       <HostBridgeHint status={hostBridge.data} />
       {roleFilter === "transcription" ? (
@@ -892,14 +874,14 @@ export function ProvidersPage() {
       ) : null}
       <Surface className="overflow-hidden">
         <div className="provider-list-heading border-b p-5">
-          <SectionHeading title="服务与模型" />
+          <SectionHeading title="已配置连接" />
+          <Input aria-label="搜索供应商" className="mt-3" placeholder="搜索名称、地址或协议…" value={providerSearch} onChange={(event) => setProviderSearch(event.target.value)} />
         </div>
         <div className="border-b px-5 py-3">
-          <p className="mb-2 text-xs font-medium text-muted-foreground">服务能力</p>
           <div
             className="provider-role-switch"
             role="tablist"
-            aria-label="服务能力"
+            aria-label="连接分类"
           >
             {availableRoles.map((role) => (
               <button
@@ -938,8 +920,8 @@ export function ProvidersPage() {
             </div>
           </div>
         ) : null}
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[980px] text-left text-sm">
+        <div className="provider-settings-container overflow-x-auto">
+          <table className="provider-settings-table w-full table-fixed text-left text-sm [&_td]:break-words [&_td]:px-3 [&_th]:px-3">
             <thead className="bg-muted/35 text-xs text-muted-foreground">
               <tr>
                 <th className="px-5 py-3">实例</th>
@@ -1351,7 +1333,7 @@ export function ProvidersPage() {
                         >
                           <SelectTrigger
                             aria-label={`${provider.display_name} 默认模型`}
-                            className="h-7 w-52 font-mono text-xs"
+                            className="h-7 w-full min-w-0 font-mono text-xs"
                           >
                             <SelectValue placeholder="选择已发现的模型" />
                           </SelectTrigger>
@@ -1369,15 +1351,18 @@ export function ProvidersPage() {
                           </SelectContent>
                         </SearchableModelSelect>
                       ) : hasConfigurableDefaultModel ? (
-                        <Input
-                          aria-label={`${provider.display_name} 默认模型`}
-                          className="h-7 w-52 font-mono text-xs"
-                          onChange={(event) =>
-                            setDefaultModels((current) => ({ ...current, [provider.id]: event.target.value }))
-                          }
-                          placeholder="先发现模型，或手动输入 ID"
-                          value={modelValue}
-                        />
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Input aria-label={`${provider.display_name} 默认模型`} className="h-7 min-w-0 flex-1 font-mono text-xs"
+                            onChange={(event) => setDefaultModels((current) => ({ ...current, [provider.id]: event.target.value }))}
+                            placeholder="手动输入模型 ID" value={modelValue} />
+                          <Button type="button" size="xs" variant="outline" disabled={update.isPending || !modelValue.trim()}
+                            onClick={() => update.mutate({ id: provider.id,
+                              default_model: isModelProvider || isDeepResearchProvider || isEmbeddingProvider ? modelValue.trim() : undefined,
+                              default_image_generation_model_id: isImageGenerationProvider ? modelValue.trim() : undefined,
+                              default_transcription_model_id: isTranscriptionProvider ? modelValue.trim() : undefined,
+                              default_vision_model_id: isVisionProvider ? modelValue.trim() : undefined,
+                            })}>保存默认模型</Button>
+                        </div>
                       ) : (
                         <p className="text-xs text-muted-foreground">
                           {providerSpec
@@ -1387,7 +1372,7 @@ export function ProvidersPage() {
                       )}
                     </td>
                     <td className="px-5 py-4">
-                      <div className="flex justify-end gap-2">
+                      <div className="flex flex-wrap justify-end gap-2">
                         <div className="flex items-center gap-1.5 rounded-lg border px-2 py-1">
                           <span className="text-[10px] text-muted-foreground">优先级</span>
                           <Input
@@ -1602,9 +1587,7 @@ export function ProvidersPage() {
                     className="px-5 py-10 text-center text-sm text-muted-foreground"
                     colSpan={6}
                   >
-                    {roleFilter === "all"
-                      ? "当前工作区还没有 Provider，点击右上角「新增 Provider」开始配置。"
-                      : `当前「${providerRoleLabel(roleFilter)}」分类下还没有实例。`}
+                    {`当前「${providerRoleLabel(roleFilter)}」分类下还没有实例。`}
                   </td>
                 </tr>
               ) : null}
@@ -1993,7 +1976,14 @@ export function ProvidersPage() {
                 : [],
             }
           }
-          onClose={() => setCapabilityTarget(null)}
+          onClose={() => {
+            setModels((current) => {
+              const next = { ...current };
+              delete next[capabilityTarget.provider.id];
+              return next;
+            });
+            setCapabilityTarget(null);
+          }}
           onConfigureBalance={() =>
             setBalanceQueryTarget(capabilityTarget.provider)
           }
@@ -2065,7 +2055,7 @@ export function ProvidersPage() {
                     onSetDefault={(nextModelId) => {
             const provider = capabilityTarget.provider;
             const spec = catalogByType.get(provider.provider_type);
-            update.mutate({
+            return update.mutateAsync({
               id: provider.id,
               enabled: provider.enabled,
               default_model:
@@ -2078,6 +2068,9 @@ export function ProvidersPage() {
                 spec?.role === "transcription" ? nextModelId : undefined,
               default_vision_model_id:
                 spec?.role === "vision" ? nextModelId : undefined,
+            }).then((updated) => {
+              setDefaultModels((current) => ({ ...current, [provider.id]: nextModelId }));
+              return updated;
             });
           }}
           provider={capabilityTarget.provider}
@@ -3004,9 +2997,21 @@ function ProviderDialog({
   catalogError?: string;
   catalogPending: boolean;
   initialRole?: ProviderRole;
-  onCreate: (payload: ProviderCreateRequest) => void;
+  onCreate: (payload: ProviderCreateRequest) => Promise<Provider>;
   secretStoreAvailable: boolean;
 }) {
+  const [open, setOpen] = useState(false);
+  const submitting = useRef(false);
+  async function completeCreate(payload: ProviderCreateRequest) {
+    if (busy || submitting.current) return;
+    submitting.current = true;
+    try {
+      await onCreate(payload);
+      setKey("");
+      setOpen(false);
+    } catch { /* keep input on failure; parent mutation displays the error */ }
+    finally { submitting.current = false; }
+  }
   const creatable = catalog.filter((item) => item.create_allowed);
   const ROLE_ORDER: ProviderRole[] = [
     "model",
@@ -3237,7 +3242,7 @@ function ProviderDialog({
     if (!selected) return;
     if (isSpeechRole) {
       try {
-        onCreate(buildSpeechProviderPayload(speechDraft, selectedSpeechModel));
+        void completeCreate(buildSpeechProviderPayload(speechDraft, selectedSpeechModel));
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "语音 Provider 配置不完整");
       }
@@ -3294,7 +3299,7 @@ function ProviderDialog({
       capabilities.default_model = "qwen-deep-research";
       capabilities.deep_research_model = "qwen-deep-research";
     }
-    onCreate({
+    void completeCreate({
       display_name: name.trim(),
       provider_type: selected.provider_type,
       base_url: trimmedBaseUrl || undefined,
@@ -3313,7 +3318,10 @@ function ProviderDialog({
 
   return (
     <Dialog
+      open={open}
       onOpenChange={(open) => {
+        if (busy || submitting.current) return;
+        setOpen(open);
         if (
           open &&
           initialRole &&
@@ -3326,7 +3334,7 @@ function ProviderDialog({
       <DialogTrigger asChild>
         <Button disabled={catalogPending || Boolean(catalogError)} size="sm">
           <Plus className="size-4" />
-          新增 Provider
+          添加连接
         </Button>
       </DialogTrigger>
       <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-hidden p-0 sm:max-w-2xl">
@@ -3335,11 +3343,11 @@ function ProviderDialog({
           onSubmit={submit}
         >
           <DialogHeader className="shrink-0 px-5 pt-5 pr-12">
-            <DialogTitle>新增 Provider</DialogTitle>
+            <DialogTitle>添加连接</DialogTitle>
             <DialogDescription>
               {isSpeechRole
                 ? "选择已适配的 ASR/TTS 模型，地址与运行参数会按模型能力填充。"
-                : "快捷项仅预填厂商名称、地址和协议；填入 API Key 后仍需执行真实能力探测。"}
+                : "选择厂商并填写 API Key；保存后自动验证连接，成功后继续管理模型。"}
             </DialogDescription>
           </DialogHeader>
           <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-5">
@@ -3689,7 +3697,7 @@ function ProviderDialog({
               }
               type="submit"
             >
-              {busy ? "创建中…" : "创建 Provider"}
+              {busy ? "创建中…" : "保存并连接"}
             </Button>
           </DialogFooter>
         </form>
@@ -3864,7 +3872,7 @@ function ModelCapabilitiesDialog({
   onClose: () => void;
   onConfigureBalance: () => void;
   onSaved: (snapshot: ProviderModelCapabilityView) => void;
-  onSetDefault: (modelId: string) => void;
+  onSetDefault: (modelId: string) => Promise<unknown>;
   /** Bulk model on/off switches committed; keeps the parent model cache fresh. */
   onStatesSaved: (result: ProviderModelStatesView) => void;
   provider: Provider;
@@ -3901,15 +3909,17 @@ function ModelCapabilitiesDialog({
   );
 
   const latestModels = useQuery({
+    gcTime: 0,
     queryKey: ["provider-models", "capability-dialog", provider.id],
     queryFn: () => discoverProviderModels(provider.id),
+    enabled: false,
     retry: false,
   });
   // Switches the user flipped in this dialog session are never overwritten by
   // a background refresh; everything else follows the persisted discovery.
   const touchedModelIds = useRef<Set<string>>(new Set());
   useEffect(() => {
-    const discovered = latestModels.data;
+    const discovered = latestModels.data ?? persistedProviderModels(provider);
     if (!discovered) return;
     const merged = mergeProviderModelLists(discovered, provider) ?? discovered;
     const mergedIds = new Set(merged.models.map((model) => model.id));
@@ -3937,38 +3947,18 @@ function ModelCapabilitiesDialog({
     });
   }, [latestModels.data, provider]);
   const addManualModel = useMutation({
-    mutationFn: (modelId: string) =>
-      syncProviderModelCatalogDefaults(provider.id, [modelId]),
+    mutationFn: (modelIds: string[]) => syncProviderModelCatalogDefaults(provider.id, modelIds),
     onSuccess: (result) => {
-      const snapshot = result.models[0];
-      if (!snapshot) return;
       setModelsList((current) => {
-        if (current.models.some((model) => model.id === snapshot.model_id)) {
-          return current;
-        }
-        return {
-          ...current,
-          models: [
-            ...current.models,
-            {
-              id: snapshot.model_id,
-              roles: ["llm"],
-              streaming: true,
-              remote: true,
-              enabled: true,
-              capabilities: snapshot.capabilities,
-            },
-          ],
-        };
+        const byId = new Map(current.models.map((model) => [model.id, model]));
+        for (const snapshot of result.models) byId.set(snapshot.model_id, { id: snapshot.model_id, roles: ["llm"], streaming: true, remote: true, enabled: true, capabilities: snapshot.capabilities });
+        return { ...current, models: [...byId.values()] };
       });
-      setModelStates((current) => ({ ...current, [snapshot.model_id]: true }));
+      setModelStates((current) => ({ ...current, ...Object.fromEntries(result.models.map((model) => [model.model_id, true])) }));
       setManualModelId("");
-      onSaved(snapshot);
+      for (const snapshot of result.models) onSaved(snapshot);
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
-      toast.success(`已添加模型 ${snapshot.model_id}，可继续设置上下文窗口`);
-      // Open the per-model editor immediately so the context window can be
-      // configured right away instead of hunting for the new row.
-      setEditModelId(snapshot.model_id);
+      toast.success(`已添加 ${result.models.length} 个模型，可按需编辑参数`);
     },
     onError: (error) => toast.error(error.message),
   });
@@ -3985,13 +3975,17 @@ function ModelCapabilitiesDialog({
         return next;
       });
       setDefaultModelId(result.default_model ?? "");
+      queryClient.setQueryData<ProviderModelsResponse>(
+        ["provider-models", "capability-dialog", provider.id],
+        (current) => current ? { ...current, models: current.models.filter((model) => model.id !== result.model_id) } : current,
+      );
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
       toast.success(`已删除模型 ${result.model_id}`);
     },
     onError: (error) => toast.error(error.message),
   });
   const updateConnection = useMutation({
-    mutationFn: ({ close = true }: { close?: boolean } = {}) =>
+    mutationFn: ({ close = false }: { close?: boolean } = {}) =>
       updateProvider(provider.id, {
         provider_type:
           protocolType === provider.provider_type ? undefined : protocolType,
@@ -4004,6 +3998,7 @@ function ModelCapabilitiesDialog({
           item.id === updatedProvider.id ? updatedProvider : item,
         ),
       );
+      void queryClient.invalidateQueries({ queryKey: currentWorkspaceQueryKey("provider-balance-status", provider.id) });
       toast.success("连接配置已保存");
       if (close) onClose();
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
@@ -4017,6 +4012,10 @@ function ModelCapabilitiesDialog({
         connectionDirty: input.connectionDirty,
       })),
     onSuccess: ({ result, connectionDirty }) => {
+      queryClient.setQueryData<ProviderModelsResponse>(
+        ["provider-models", "capability-dialog", provider.id],
+        (current) => current ? { ...current, models: current.models.map((model) => ({ ...model, enabled: result.states[model.id] ?? model.enabled })) } : current,
+      );
       onStatesSaved(result);
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
       if (connectionDirty) {
@@ -4032,6 +4031,7 @@ function ModelCapabilitiesDialog({
     mutationFn: () => rotateProviderSecret(provider.id, secret),
     onSuccess: () => {
       setSecret("");
+      void queryClient.invalidateQueries({ queryKey: currentWorkspaceQueryKey("provider-balance-status", provider.id) });
       toast.success("Secret 已更新");
       void queryClient.invalidateQueries({ queryKey: ["providers"] });
     },
@@ -4056,20 +4056,11 @@ function ModelCapabilitiesDialog({
   }
 
   function addManualModelHandler() {
-    const name = manualModelId.trim();
-    if (!name) {
-      toast.error("请输入模型名称");
-      return;
-    }
-    if (name.length > 160) {
-      toast.error("模型名称不能超过 160 个字符");
-      return;
-    }
-    if (modelsList.models.some((model) => model.id === name)) {
-      toast.error(`模型 ${name} 已在列表中`);
-      return;
-    }
-    addManualModel.mutate(name);
+    try {
+      const ids = parseModelIds(manualModelId, modelsList.models.map((model) => model.id));
+      if (!ids.length) { toast.error("没有新的模型ID可添加"); return; }
+      addManualModel.mutate(ids);
+    } catch (error) { toast.error(error instanceof Error ? error.message : "模型输入无效"); }
   }
 
   const overridesRaw = provider.capabilities.models;
@@ -4112,20 +4103,20 @@ function ModelCapabilitiesDialog({
           <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-5">
             <div className="space-y-5 py-5">
               <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">开关将在底部保存时统一提交。</p></div><div className="flex gap-2"><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true]))); }} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false]))); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
+                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">模型开关在底部保存；添加、删除、默认模型及连接按钮立即生效。</p></div><div className="flex gap-2"><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true]))); }} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false]))); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
                 <div className="flex items-center gap-2">
-                  <Input
-                    aria-label="手动添加模型"
-                    className="h-8 flex-1 font-mono text-xs"
+                  <Textarea
+                    aria-label="批量添加模型"
+                    className="min-h-16 min-w-0 flex-1 font-mono text-xs"
                     disabled={addManualModel.isPending}
                     onChange={(event) => setManualModelId(event.target.value)}
                     onKeyDown={(event) => {
-                      if (event.key === "Enter") {
+                      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
                         event.preventDefault();
                         addManualModelHandler();
                       }
                     }}
-                    placeholder="手动输入模型名称，例如 my-private-model-v1"
+                    placeholder="粘贴多个模型ID，每行一个；也支持逗号分隔"
                     value={manualModelId}
                   />
                   <Button
@@ -4142,6 +4133,13 @@ function ModelCapabilitiesDialog({
                 <p className="text-[11px] text-muted-foreground">
                   厂商未在列表暴露的模型（新发布型号 / 私有模型 / 中继别名）可手动添加，随后点击「编辑」设置上下文窗口。
                 </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="button" size="xs" variant="outline" disabled={latestModels.isFetching} onClick={() => void latestModels.refetch()}>
+                    {latestModels.isFetching ? "正在请求供应商…" : "刷新模型列表"}
+                  </Button>
+                  <span className="text-xs text-muted-foreground">打开面板不会自动请求供应商</span>
+                </div>
+                {latestModels.isError ? <p role="alert" className="text-xs text-destructive">模型刷新失败：{latestModels.error.message}；保留现有列表。</p> : null}
                 <Input aria-label="搜索模型" onChange={(event) => setModelSearch(event.target.value)} placeholder="模糊搜索模型名称…" value={modelSearch} />
                 {/* Radix ScrollArea 视口内层是 display:table（为横向滚动而设），会把行撑到
                     max-content，令 truncate 失效、行溢出视口被裁。这里只做纵向滚动，
@@ -4152,7 +4150,7 @@ function ModelCapabilitiesDialog({
                 >
                   <div className="divide-y">
                     {modelsList.models.length === 0 ? (
-                      <p className="px-3 py-4 text-xs text-muted-foreground">尚未发现模型。可先在上方手动添加模型名称，或返回列表「发现模型」。</p>
+                      <p className="px-3 py-4 text-xs text-muted-foreground">尚未配置模型。可批量粘贴模型ID，或点击本面板「刷新模型列表」。</p>
                     ) : visibleModels.length === 0 ? (
                       <p className="px-3 py-4 text-xs text-muted-foreground">没有匹配的模型。</p>
                     ) : null}
@@ -4177,13 +4175,11 @@ function ModelCapabilitiesDialog({
                       ) : (
                         <Button
                           disabled={removeModel.isPending}
-                          onClick={() => {
-                            const previous = defaultModelId;
-                            setDefaultModelId(model.id);
-                            onSetDefault(model.id);
-                            void queryClient
-                              .invalidateQueries({ queryKey: ["providers"] })
-                              .catch(() => setDefaultModelId(previous));
+                          onClick={async () => {
+                            try {
+                              await onSetDefault(model.id);
+                              setDefaultModelId(model.id);
+                            } catch { /* parent mutation displays the actual PATCH failure */ }
                           }}
                           size="xs"
                           type="button"
@@ -4281,17 +4277,12 @@ function ModelCapabilitiesDialog({
                 </div>
               </section>
               <section className="space-y-3 rounded-xl border p-4">
+                <ProviderBalanceStatus providerId={provider.id} />
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold">余额查询</p>
+                    <p className="text-sm font-semibold">高级：手动余额查询</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {balanceConfig?.enabled
-                        ? `自定义脚本已启用${
-                            balanceConfig.auto_query_interval_minutes > 0
-                              ? ` · 每 ${balanceConfig.auto_query_interval_minutes} 分钟自动查询`
-                              : ""
-                          }`
-                        : "当前使用官方内置方式；可切换为自定义脚本（兼容 cc-switch）。"}
+                      {balanceConfig?.enabled ? "自定义脚本仅供手动查询；不再由浏览器自动轮询。" : "后台先验证内置方法；也可手动配置并测试自定义查询。"}
                     </p>
                     {balanceLast ? (
                       <p className="mt-1 text-xs text-muted-foreground">
@@ -4325,7 +4316,7 @@ function ModelCapabilitiesDialog({
               type="button"
               variant="outline"
             >
-              取消
+              关闭（不保存开关）
             </Button>
             <Button disabled={saveModelStates.isPending} type="submit">
               {saveModelStates.isPending ? "保存中…" : "保存模型开关"}

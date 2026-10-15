@@ -229,7 +229,6 @@ export function BalanceQueryConfigDialog({
   const [templateId, setTemplateId] = useState("general");
   const [script, setScript] = useState("");
   const [timeoutSeconds, setTimeoutSeconds] = useState("10");
-  const [intervalMinutes, setIntervalMinutes] = useState("0");
   const [variablesText, setVariablesText] = useState("");
   const [testState, setTestState] = useState<TestState>({ status: "idle" });
 
@@ -246,7 +245,6 @@ export function BalanceQueryConfigDialog({
         ),
     );
     setTimeoutSeconds(String(stored?.timeout_seconds ?? 10));
-    setIntervalMinutes(String(stored?.auto_query_interval_minutes ?? 0));
     setVariablesText(stringifyVariables(stored?.variables ?? {}));
     setTestState({ status: "idle" });
   }, [target, stored]);
@@ -259,21 +257,12 @@ export function BalanceQueryConfigDialog({
     if (!Number.isFinite(timeout) || timeout < 1 || timeout > 60) {
       throw new Error("超时时间需在 1–60 秒之间");
     }
-    const interval = Number(intervalMinutes);
-    if (
-      !Number.isFinite(interval) ||
-      !Number.isInteger(interval) ||
-      interval < 0 ||
-      interval > 1440
-    ) {
-      throw new Error("自动查询间隔需为 0–1440 的整数分钟");
-    }
     return {
       enabled,
       template_id: templateId,
       script,
       timeout_seconds: timeout,
-      auto_query_interval_minutes: interval,
+      auto_query_interval_minutes: 0,
       variables: parseVariablesInput(variablesText),
     };
   };
@@ -373,17 +362,9 @@ export function BalanceQueryConfigDialog({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="balance-query-interval">
-                自动查询间隔（分钟）
-              </Label>
-              <Input
-                id="balance-query-interval"
-                inputMode="numeric"
-                onChange={(event) => setIntervalMinutes(event.target.value)}
-                value={intervalMinutes}
-              />
+              <Label>查询方式：仅手动</Label>
               <p className="text-[11px] leading-4 text-muted-foreground">
-                0 表示不自动查询；仅在应用打开时轮询
+                自定义脚本仅供手动测试；自动查询由后台已验证的方法执行，失败即暂停。旧浏览器轮询已关闭。
               </p>
             </div>
           </div>
