@@ -1,9 +1,9 @@
 # 常见失败与处理（frontend-build-preview）
 
-## 构建报 `vite` 找不到依赖
+## 构建报 `vite` / `three` 找不到依赖
 
 - 原因：依赖未预装（新包）。
-- 处理：镜像已预装 vite/vue/react/typescript/tsx 等；若仍报缺，说明该项目需要未预装依赖，**不要 `npm install`（沙箱离线）**。改用受支持模板或内联实现。
+- 处理：镜像已预装 vite/vue/react/three/typescript/tsx 等；Three.js 的扩展从 `three/addons/*` 导入。若仍报缺，说明该项目需要未预装依赖，**不要 `npm install`（沙箱离线）**。改用受支持模板或内联实现。
 
 ## 外链资源被禁用
 

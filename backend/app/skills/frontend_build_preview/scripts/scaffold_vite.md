@@ -1,6 +1,6 @@
 # `scaffold_vite.py` — 生成最小离线前端项目
 
-> 在工作区生成一个离线可构建的最小 Vite 项目（react/vue/plain-html/vite-ts）。镜像已预装 vite/vue/react/typescript，**不联网、不 `npm install`**。
+> 在工作区生成一个离线可构建的最小 Vite 项目（react/vue/plain-html/vite-ts）。镜像已预装 vite/vue/react/three/typescript，**不联网、不 `npm install`**。
 
 ## 用法
 

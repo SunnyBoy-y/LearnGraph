@@ -1,6 +1,6 @@
 ---
 name: frontend-build-preview
-description: 离线创建 Vite/React/Vue 项目、构建静态产物并渲染 PNG/PDF 预览；发布双向交互子应用（含官方 __lgSubapp SDK 埋点与数据分析契约）。
+description: 离线创建 Vite/React/Vue 项目（可直接使用 Three.js）、构建静态产物并渲染 PNG/PDF 预览；发布双向交互子应用（含官方 __lgSubapp SDK 埋点与数据分析契约）。
 ---
 
 # 前端构建与预览
@@ -138,6 +138,7 @@ dist/ + lerarngraph.subapp.json ──(宿主 sandbox_publish_web_app contract_p
 ## 安全与限制
 
 - 离线构建：不联网、不执行 `npm install`（依赖已预装进镜像的 `/node_modules`）、不下载字体/CDN。
+- Three.js 已预装在镜像中，可直接使用 `import * as THREE from 'three'` 及 `three/addons/*`；不要在沙箱内联网安装依赖。
 - 只允许构建工作区内相对路径的项目。
 - 页面不得依赖外部资源（CSP/无外链约束）；`check_static_assets` 会校验。
 - 构建产物遵守 64MB/256MB/180s 限额；超大 bundle 先精简再构建。

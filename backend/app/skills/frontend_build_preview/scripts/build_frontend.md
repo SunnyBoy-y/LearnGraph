@@ -15,7 +15,7 @@ python scripts/build_frontend.py --dir my-app
 
 ## 前置
 
-- Vite 项目需 `node_modules` 存在（镜像 `/node_modules` 提供 `vite`；项目 `package.json` 的依赖需在预装集中）。
+- Vite 项目需 `node_modules` 存在（镜像 `/node_modules` 提供 `vite`、`three` 等预装依赖；项目 `package.json` 的依赖需在预装集中）。
 - plain-html 无需构建。
 
 ## 最佳组合

@@ -2,7 +2,7 @@
 """Scaffold a minimal, offline-buildable frontend project in the workspace.
 
 Writes only inside the workspace; never downloads packages (the image's
-/node_modules already provides vite/vue/react/typescript). For plain-html the
+/node_modules already provides vite/vue/react/three/typescript). For plain-html the
 template is a single self-contained index.html.
 """
 from __future__ import annotations

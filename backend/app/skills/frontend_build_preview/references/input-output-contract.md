@@ -9,6 +9,10 @@
 | `vue` | Vite + Vue 3（`@vitejs/plugin-vue`） |
 | `vite-ts` | Vite + TypeScript（`tsx`/`typescript` 已预装） |
 
+## 预装库
+
+- `three`（含 `three/addons/*` 扩展入口）已内置在沙箱 `/node_modules`，可在上述任一 Vite 模板中直接导入。
+
 ## 路径规则
 
 - 项目路径为工作区内相对路径；拒绝绝对路径、`..`。
