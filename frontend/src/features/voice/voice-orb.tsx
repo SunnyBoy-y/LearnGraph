@@ -1,10 +1,11 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Mic, MicOff, LoaderCircle, PhoneOff } from "lucide-react";
 import { PromptInputButton } from "@/components/ai-elements/prompt-input";
 import { cn } from "@/lib/utils";
 import {
   useVoiceSession,
+  voiceSessionController,
   type VoiceSessionState,
   type VoiceTransportState,
 } from "./voice-session-controller";
@@ -599,6 +600,19 @@ function drawOrb(
   }
 }
 
+// The canvas is pointer-transparent, but its window capture listener is not.
+// Explicitly yield to modal/top-layer UI and to native/custom controls.
+function orbMustYield(target: Element | null): boolean {
+  if (target?.closest('button,a,input,textarea,select,summary,label,[contenteditable="true"],[role="button"],[role="slider"],[role="menu"],[role="listbox"],[role="dialog"],[role="alertdialog"],[data-message-content],[data-slot="dialog-overlay"],[data-slot="dialog-content"],[data-slot="alert-dialog-overlay"],[data-slot="alert-dialog-content"],[data-slot="sheet-overlay"],[data-slot="sheet-content"],[data-slot="popover-content"],[data-radix-popper-content-wrapper],dialog[open],[popover]')) return true;
+  // Modal libraries can retarget pointer events to the body; do not rely on
+  // elementFromPoint alone while the document has an active modal.
+  return Array.from(document.querySelectorAll('[aria-modal="true"],dialog[open],[data-slot="dialog-overlay"],[data-slot="alert-dialog-overlay"],[data-slot="sheet-overlay"]')).some((element) => {
+    if (element.closest('[hidden],[aria-hidden="true"]') || element.getAttribute('data-state') === 'closed') return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  });
+}
+
 function orbPrefersReducedMotion(): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return false;
@@ -658,7 +672,15 @@ export function VoiceOrb({
   } | null>(null);
   /** Set while a grab is in flight, so it cannot become a click underneath. */
   const swallowClickRef = useRef(false);
-  const reducedMotion = orbPrefersReducedMotion();
+  const [reducedMotion, setReducedMotion] = useState(orbPrefersReducedMotion);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const changed = () => setReducedMotion(media.matches);
+    changed();
+    media.addEventListener?.("change", changed);
+    return () => media.removeEventListener?.("change", changed);
+  }, []);
   // The loop reads the latest state through a ref so it never has to restart.
   const signalRef = useRef<OrbSignal>({ audioLevel, listening: isListening, speaking: isSpeaking });
   signalRef.current = { audioLevel, listening: isListening, speaking: isSpeaking };
@@ -691,20 +713,40 @@ export function VoiceOrb({
       const rect = anchor.getBoundingClientRect();
       engine.homeX = rect.left + rect.width / 2;
       engine.homeY = rect.top + rect.height / 2;
-      if (!engine.ready) {
+      if (!engine.ready || reducedMotion) {
         engine.ready = true;
         engine.x = engine.homeX;
         engine.y = engine.homeY;
+        engine.vx = 0;
+        engine.vy = 0;
       }
     };
+    engine.last = 0;
     sync();
 
-    const onViewportChange = () => sync();
+    const onViewportChange = () => {
+      sync();
+      if (reducedMotion) paintRef.current?.();
+    };
     window.addEventListener("resize", onViewportChange);
     window.addEventListener("scroll", onViewportChange, { capture: true, passive: true });
+    const observer = reducedMotion && typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(onViewportChange) : null;
+    if (observer) {
+      observer.observe(canvas);
+      for (let element: Element | null = anchor; element; element = element.parentElement) observer.observe(element);
+    }
+    // ResizeObserver does not report position-only layout shifts. Match the
+    // normal mode's slow measurement cadence without an animation loop.
+    const positionTimer = reducedMotion ? window.setInterval(() => {
+      const rect = anchor.getBoundingClientRect();
+      if (rect.left + rect.width / 2 !== engine.homeX || rect.top + rect.height / 2 !== engine.homeY) onViewportChange();
+    }, 500) : null;
     const stopListening = () => {
       window.removeEventListener("resize", onViewportChange);
       window.removeEventListener("scroll", onViewportChange, { capture: true });
+      observer?.disconnect();
+      if (positionTimer !== null) window.clearInterval(positionTimer);
     };
 
     if (reducedMotion) {
@@ -756,8 +798,13 @@ export function VoiceOrb({
 
     // Grab the sphere wherever it currently is, not only over its anchor: half the
     // point of the toy is catching it while it is still moving.
+    let swallowTimer: number | null = null;
     const onPointerDown = (event: PointerEvent) => {
-      if (!event.isPrimary || engine.dragging) return;
+      if (!event.isPrimary || engine.dragging || event.button !== 0) return;
+      swallowClickRef.current = false;
+      if (swallowTimer !== null) window.clearTimeout(swallowTimer);
+      const underlying = document.elementFromPoint(event.clientX, event.clientY);
+      if (orbMustYield(underlying) || orbMustYield(event.target instanceof Element ? event.target : null)) return;
       if (Math.hypot(event.clientX - engine.x, event.clientY - engine.y) > ORB_RADIUS * 1.6) {
         return;
       }
@@ -805,9 +852,14 @@ export function VoiceOrb({
       engine.vy = engine.vy * 0.55 + engine.pointerVY * 0.45;
       // The click that follows a press arrives late; drop the flag after it would
       // have done.
-      window.setTimeout(() => {
+      swallowTimer = window.setTimeout(() => {
         swallowClickRef.current = false;
+        swallowTimer = null;
       }, 350);
+      if (event.type === "pointercancel") {
+        swallowClickRef.current = false;
+        return;
+      }
       if (drag.moved) return;
       // A tap, not a drag: detonate the burst -- impact pulse, flash, shockwave and
       // sparks -- and spin the colour up. Repeated taps stack, so the hue can be
@@ -826,6 +878,7 @@ export function VoiceOrb({
     const onClick = (event: MouseEvent) => {
       if (!swallowClickRef.current) return;
       swallowClickRef.current = false;
+      if (orbMustYield(event.target instanceof Element ? event.target : null)) return;
       event.preventDefault();
       event.stopPropagation();
     };
@@ -836,6 +889,10 @@ export function VoiceOrb({
     window.addEventListener("pointercancel", onPointerUp);
     window.addEventListener("click", onClick, true);
     return () => {
+      if (swallowTimer !== null) window.clearTimeout(swallowTimer);
+      swallowClickRef.current = false;
+      dragRef.current = null;
+      engine.dragging = false;
       window.removeEventListener("pointerdown", onPointerDown, true);
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
@@ -854,10 +911,20 @@ export function VoiceOrb({
       <div className="chat-voice-orb-dock">
         {/* The anchor: where the sphere lives when nothing is happening to it, and
             where it can always be grabbed no matter what is underneath it. */}
-        <span className="chat-voice-orb-dock__visual" ref={anchorRef} />
-        <span aria-live="polite" className="sr-only-voice-status" role="status">
+        <span className="chat-voice-orb-dock__visual" ref={anchorRef} style={reducedMotion ? { touchAction: "auto" } : undefined} />
+        <span aria-hidden="true" className="sr-only-voice-status">
           {status}
         </span>
+        {isSpeaking ? (
+          <button
+            aria-label="停止播报"
+            className="chat-voice-stop chat-composer__stop-speaking"
+            onClick={() => void voiceSessionController.interrupt()}
+            type="button"
+          >
+            停止播报
+          </button>
+        ) : null}
       </div>
       {typeof document === "undefined"
         ? null

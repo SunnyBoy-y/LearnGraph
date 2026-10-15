@@ -120,6 +120,17 @@ DEFAULT_LANGUAGE_PROFILES: tuple[LanguageProfile, ...] = (_ZH, _EN, _JA, _KO)
 _PUNCTUATION_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
 _SPACE_RE = re.compile(r"\s+")
+# 仅匹配整句纯语气词；不包含「好/对/是」等有实际确认含义的词。
+# 分隔符仅允许空白和常见标点，不能吞掉数字、字母或其他正文。
+_ASR_FILLER_RE = re.compile(
+    r"[\s，。！？、；：,.!?;:…—~～]*"
+    r"(?:(?:嗯哼|啊哈|[嗯唔哦噢喔啊呃额])[\s，。！？、；：,.!?;:…—~～]*)+"
+)
+
+
+def is_asr_filler(text: str) -> bool:
+    """纯语气词（含重复、标点）无条件滤除，实义句子不匹配。"""
+    return bool(_ASR_FILLER_RE.fullmatch(unicodedata.normalize("NFKC", text or "")))
 
 
 class TurnIntentClassifier:

@@ -21,6 +21,7 @@ import {
   voiceTaskIsActive,
   voiceTaskSourceLabel,
   voiceTaskStatusLabel,
+  voiceTaskPlaybackLabel,
   type VoiceTask,
 } from "./voice-tasks";
 
@@ -56,24 +57,43 @@ function elapsedText(createdAt: string, now: number): string {
 function taskSummary(task: VoiceTask, now: number): string {
   const elapsed = voiceTaskIsActive(task) ? elapsedText(task.createdAt, now) : "";
   const progress = task.progress !== undefined && task.progress < 100 ? `${task.progress}%` : "";
-  return [voiceTaskStatusLabel(task), elapsed, progress].filter(Boolean).join(" · ");
+  const capability = task.capabilityId
+      ? ({
+        workspace_read: "读取工作区",
+        learning_read: "学习状态",
+        practice_prepare: "练习",
+        learning_evidence: "学习证据",
+        graph_proposal: "图谱提案",
+        artifact_create: "学习产物",
+        workspace_task: "工作区任务",
+        research: "资料研究",
+        reasoning: "深度分析",
+      } as Record<string, string>)[task.capabilityId] ?? ""
+    : "";
+  const playback = voiceTaskPlaybackLabel(task);
+  return [capability, voiceTaskStatusLabel(task), playback, elapsed, progress].filter(Boolean).join(" · ");
+}
+
+function activityTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 export interface VoiceTaskChipProps {
   tasks: VoiceTask[];
   onCancel?: (taskId: string) => void;
+  onApprove?: (taskId: string) => void;
+  onReject?: (taskId: string) => void;
+  onRetryApproval?: (taskId: string) => void;
+  busyTaskIds?: ReadonlySet<string>;
 }
 
-export function VoiceTaskChip({ tasks, onCancel }: VoiceTaskChipProps) {
+export function VoiceTaskChip({ tasks, onCancel, onApprove, onReject, onRetryApproval, busyTaskIds }: VoiceTaskChipProps) {
   const hasActive = tasks.some(voiceTaskIsActive);
   const [now, setNow] = useState(() => Date.now());
   const visibleTasks = useMemo(() => {
-    const ranked = [...tasks].sort((a, b) => {
-      const activeDifference = Number(voiceTaskIsActive(b)) - Number(voiceTaskIsActive(a));
-      if (activeDifference !== 0) return activeDifference;
-      return b.updatedAt.localeCompare(a.updatedAt);
-    });
-    return ranked.slice(0, 3);
+    return tasks.slice(0, 3);
   }, [tasks]);
 
   useEffect(() => {
@@ -143,6 +163,25 @@ export function VoiceTaskChip({ tasks, onCancel }: VoiceTaskChipProps) {
               </p>
             ) : null}
 
+            {voiceTaskPlaybackLabel(task) ? (
+              <p className="mt-2 text-xs text-muted-foreground" role="status">
+                播放状态：{voiceTaskPlaybackLabel(task)}
+                {task.playbackEndedAt ? ` · ${activityTime(task.playbackEndedAt)}` : ""}
+              </p>
+            ) : null}
+
+            {task.approvalRequestPreview ? (
+              <p className="mt-2 whitespace-pre-wrap text-xs text-muted-foreground">
+                确认内容：{task.approvalRequestPreview}
+              </p>
+            ) : null}
+
+            {task.reason ? (
+              <p className="mt-3 whitespace-pre-wrap text-xs leading-relaxed text-destructive">
+                {task.reason}
+              </p>
+            ) : null}
+
             {task.sources.length ? (
               <div className="mt-3">
                 <p className="text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">
@@ -179,6 +218,21 @@ export function VoiceTaskChip({ tasks, onCancel }: VoiceTaskChipProps) {
               </div>
             ) : null}
 
+            {task.evidenceRefs.length ? (
+              <div className="mt-3">
+                <p className="text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">
+                  学习证据
+                </p>
+                <ul className="mt-1 space-y-1">
+                  {task.evidenceRefs.slice(0, 6).map((evidenceId) => (
+                    <li className="text-xs leading-snug" key={evidenceId}>
+                      {evidenceId}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
             {task.limitations.length ? (
               <div className="mt-3">
                 <p className="text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">
@@ -198,7 +252,43 @@ export function VoiceTaskChip({ tasks, onCancel }: VoiceTaskChipProps) {
               </p>
             ) : null}
 
-            {voiceTaskIsActive(task) && onCancel ? (
+            {task.status === "waiting_approval" && (onApprove || onReject) ? (
+              <div className="mt-3 flex justify-end gap-2">
+                {task.approvalExpiresAt && new Date(task.approvalExpiresAt).getTime() <= now && onRetryApproval ? (
+                  <Button
+                    disabled={busyTaskIds?.has(task.taskId)}
+                    onClick={() => onRetryApproval(task.taskId)}
+                    size="sm"
+                    type="button"
+                  >
+                    {busyTaskIds?.has(task.taskId) ? "处理中…" : "重新提交"}
+                  </Button>
+                ) : null}
+                {onReject ? (
+                  <Button
+                    disabled={busyTaskIds?.has(task.taskId)}
+                    onClick={() => onReject(task.taskId)}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    拒绝
+                  </Button>
+                ) : null}
+                {onApprove ? (
+                  <Button
+                    disabled={busyTaskIds?.has(task.taskId) || Boolean(task.approvalExpiresAt && new Date(task.approvalExpiresAt).getTime() <= now)}
+                    onClick={() => onApprove(task.taskId)}
+                    size="sm"
+                    type="button"
+                  >
+                    {busyTaskIds?.has(task.taskId) ? "处理中…" : "确认执行"}
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+
+            {voiceTaskIsActive(task) && task.status !== "waiting_approval" && onCancel ? (
               <div className="mt-3 flex justify-end">
                 <Button
                   onClick={() => onCancel(task.taskId)}
@@ -213,6 +303,46 @@ export function VoiceTaskChip({ tasks, onCancel }: VoiceTaskChipProps) {
           </PopoverContent>
         </Popover>
       ))}
+      {visibleTasks.some((task) => (task.activities?.length ?? 0) > 0) ? (
+        <details className="basis-full rounded-lg border border-border/60 bg-background/80 text-left shadow-sm backdrop-blur">
+          <summary className="cursor-pointer list-none px-3 py-2 text-xs font-medium text-muted-foreground hover:text-foreground">
+            <span className="mr-1.5">⌄</span>
+            后台 Agent 执行详情
+            <span className="ml-1 opacity-60">（结构化进度，不显示私有思考链）</span>
+          </summary>
+          <div className="max-h-64 space-y-3 overflow-y-auto border-t border-border/50 px-3 py-3">
+            {visibleTasks.map((task) => {
+              const activities = (task.activities ?? []).slice(-24);
+              if (!activities.length) return null;
+              return (
+                <section key={`details-${task.taskId}`}>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="truncate text-xs font-medium text-foreground">{task.title}</p>
+                    <span className="shrink-0 text-[0.68rem] text-muted-foreground">
+                      {voiceTaskStatusLabel(task)}
+                    </span>
+                  </div>
+                  <ol className="mt-2 space-y-1.5 border-l border-border/70 pl-3">
+                    {activities.map((activity, index) => (
+                      <li className="relative text-xs leading-snug text-muted-foreground" key={
+                        activity.eventId ?? `${task.taskId}-${activity.eventSeq ?? index}`
+                      }>
+                        <span className="absolute -left-[0.93rem] top-1.5 size-1.5 rounded-full bg-primary/70" />
+                        <span className="text-foreground/90">{activity.text}</span>
+                        {activity.createdAt ? (
+                          <span className="ml-1 text-[0.68rem] opacity-60">
+                            {activityTime(activity.createdAt)}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+              );
+            })}
+          </div>
+        </details>
+      ) : null}
     </div>
   );
 }

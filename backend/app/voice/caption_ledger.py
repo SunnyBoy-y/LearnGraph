@@ -48,9 +48,10 @@ class VoiceLedgerRelay(FrameProcessor):
     收到账本帧即消费（不再往下推），避免把内部簿记帧漏给 assistant 聚合器。
     """
 
-    def __init__(self, *, journal: Any = None, **kwargs: Any) -> None:
+    def __init__(self, *, journal: Any = None, on_playback_ended: Any = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._journal = journal
+        self._on_playback_ended = on_playback_ended
         # token → journal 分配的句序号；句尾靠它把 ended 关到同一句上。
         self._sequences: dict[str, int] = {}
         self._pending_start: VoiceLedgerFrame | None = None
@@ -64,6 +65,14 @@ class VoiceLedgerRelay(FrameProcessor):
         if isinstance(frame, InterruptionFrame):
             self._pending_start = None
             self._sequences.clear()
+            callback = self._on_playback_ended
+            if callback is not None:
+                try:
+                    result = callback(interrupted=True)
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:
+                    logger.debug("VoiceLedgerRelay: playback interruption callback failed", exc_info=True)
         if direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, VoiceLedgerFrame):
                 if frame.kind == "start":
@@ -87,6 +96,14 @@ class VoiceLedgerRelay(FrameProcessor):
             if frame.turn_id and frame.turn_id != journal.current_turn_id():
                 return
             if frame.kind == "turn-end":
+                callback = self._on_playback_ended
+                if callback is not None:
+                    try:
+                        result = callback(interrupted=False)
+                        if hasattr(result, "__await__"):
+                            await result
+                    except Exception:
+                        logger.debug("VoiceLedgerRelay: playback completion callback failed", exc_info=True)
                 await journal.playback_ended()
                 return
             if frame.kind == "start":

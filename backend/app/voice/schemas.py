@@ -15,6 +15,10 @@ VOICE_EVENT_TYPES = (
     "processor.error", "processor.retry_scheduled", "processor.notice",
     "context.updated",
     "session.ice",
+    "task.accepted", "task.approval_required", "task.approved", "task.rejected",
+    "task.queued", "task.cancelled",
+    "result.claimed", "speech.enqueued", "speech.started",
+    "speech.finished", "speech.interrupted", "speech.failed",
 )
 
 class RTVIEventEnvelope(BaseModel):
@@ -42,12 +46,19 @@ class RTVIEventEnvelope(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 class VoiceTaskLink(BaseModel):
+    link_id: str | None = None
     voice_session_id: str
     subagent_id: str
     chat_session_id: str
     status: str = "queued"
     thinking_mode: ThinkingMode = "off"
     title: str = ""
+    prompt: str = ""
+    capability_id: str | None = None
+    approval_status: str = "none"
+    approval_request: dict[str, Any] = Field(default_factory=dict)
+    approval_request_json: dict[str, Any] = Field(default_factory=dict)
+    approval_expires_at: datetime | None = None
     delivery_status: str = "pending"
     trigger_turn_id: str | None = None
     requirement_version: int = Field(default=1, ge=1)
@@ -60,6 +71,7 @@ class VoiceTaskLink(BaseModel):
 
 class VoiceResultView(BaseModel):
     id: str
+    link_id: str | None = None
     voice_session_id: str
     subagent_id: str
     requirement_version: int = Field(ge=1)
@@ -76,12 +88,17 @@ class VoiceResultView(BaseModel):
     dismissed_at: datetime | None = None
     stale_at: datetime | None = None
     auto_speak: bool = False
+    speech_id: str | None = None
+    playback_status: str | None = None
+    playback_ended_at: datetime | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
 
 class VoiceResultDeliveryView(BaseModel):
     result: VoiceResultView
     delivery_id: str
     speech_id: str
     request_id: str
+    playback_status: str = "claimed"
     already_delivered: bool = False
 
 class VoiceResultListResponse(BaseModel):
@@ -95,6 +112,10 @@ class VoiceResultDeliveryRequest(BaseModel):
 
 class VoiceTaskCancelRequest(BaseModel):
     reason: str = Field(default="user_requested", max_length=160)
+
+
+class VoiceTaskApprovalRequest(BaseModel):
+    approved: bool = True
 
 class VoiceTaskRevisionRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=16_384)
@@ -152,6 +173,7 @@ class VoiceTaskStartRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=16_384)
     title: str = Field(default="", max_length=200)
     role_key: str = Field(default="generic", max_length=40)
+    capability_id: str | None = Field(default=None, max_length=64)
     trigger_turn_id: str | None = Field(default=None, max_length=64)
     idempotency_key: str | None = Field(default=None, min_length=8, max_length=160)
     thinking_mode: ThinkingMode | None = None
@@ -165,11 +187,19 @@ class VoiceTaskStatusRequest(BaseModel):
     after_event_seq: int | None = Field(default=None, ge=0)
 
 class VoiceTaskView(BaseModel):
+    link_id: str | None = None
     voice_session_id: str
     subagent_id: str
     status: str
     thinking_mode: ThinkingMode
     title: str = ""
+    prompt: str = ""
+    capability_id: str | None = None
+    approval_status: str = "none"
+    approval_expires_at: datetime | None = None
+    approval_request: dict[str, Any] = Field(default_factory=dict)
+    approval_request_json: dict[str, Any] = Field(default_factory=dict)
+    previous_task_id: str | None = None
     requirement_version: int = Field(default=1, ge=1)
     latest_result_version: int = Field(default=0, ge=0)
     cancel_requested_at: datetime | None = None

@@ -12,19 +12,19 @@ Cloudflare TURN credentials are *ephemeral*, so what gets stored is the
 long-lived material (TURN Key ID + API token); short-lived credentials are
 minted on demand and cached in-process until shortly before they expire.
 
-Two invariants matter more than the feature itself:
+Manual mode is a separate, credential-free browser STUN pool; it never calls
+Cloudflare. In Cloudflare mode the pool supplements normal ICE and survives
+signing failures only when the administrator explicitly enables fallback.
+The server runtime remains TURN-only to avoid unreachable STUN gathering delays.
 
-* **A relay that is still usable is never dropped.**  Every *permanent* failure
-  degrades to "no ICE servers" -- a deployment that never configured a relay,
-  or one the administrator switched off, must behave exactly like the previous
-  state of this deployment, which was "no ICE servers".  A *transient* failure
-  (the upstream credential mint timing out) must not: the credential already
-  handed out stays valid for hours, so it is served until it expires while the
-  failure is recorded on the config row.  Clearing it used to disable the relay
-  for the next call while browsers kept using a credential they had fetched
-  earlier, which made cross-network calls fail as "ICE never leaves checking".
-* **The credential never leaves the server.** The admin API returns a mask and a
-  fingerprint only; the minted short-lived credential is what clients receive.
+* Never configured, disabled or deleted means host-only: public defaults are
+  suggestions, not an implicit network policy.
+* Refresh failures retain usable old TURN credentials within their safety window.
+  Editing only STUN preserves that credential but replaces its URL list; changing
+  TURN identity, switching mode or disabling retires it.
+* STUN fallback provides mapping discovery, not guaranteed media relay.
+* The long-lived API token never leaves the server; only masked metadata and
+  minted short-lived TURN credentials are returned to the appropriate callers.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import quote
 
@@ -54,6 +54,15 @@ logger = logging.getLogger(__name__)
 
 SCOPE_DEPLOYMENT = "deployment"
 MODE_CLOUDFLARE = "cloudflare"
+MODE_MANUAL = "manual"
+
+# Public, unauthenticated candidates, not an availability/SLA guarantee. They
+# are never enabled implicitly for an existing or unconfigured deployment.
+DEFAULT_STUN_URLS: tuple[str, ...] = (
+    "stun:stun.miwifi.com:3478",
+    "stun:stun.hitv.com:3478",
+    "stun:stun.chat.bilibili.com:3478",
+)
 
 DEFAULT_API_BASE = "https://rtc.live.cloudflare.com/v1"
 DEFAULT_CREDENTIAL_TTL = 86400
@@ -171,17 +180,24 @@ _CACHE: _CacheEntry | None = None
 # therefore served until it really expires, while the config row keeps
 # recording the failure so the admin page still shows it.
 _LAST_GOOD: _CacheEntry | None = None
+_CACHE_GENERATION = 0
 
 
-def invalidate_cache() -> None:
-    """Drop the process-local cache (called after any config write)."""
+def invalidate_cache(*, retain_turn_urls: tuple[str, ...] | None = None) -> None:
+    """Invalidate resolutions; retain credentials only for a verified same TURN identity."""
 
-    global _CACHE, _LAST_GOOD
+    global _CACHE, _LAST_GOOD, _CACHE_GENERATION
+    _CACHE_GENERATION += 1
     _CACHE = None
-    # A config write (new key, new API token, disabled) must also retire the
-    # credential minted for the *previous* configuration: it is still valid as a
-    # credential, but it no longer belongs to what the administrator asked for.
-    _LAST_GOOD = None
+    if retain_turn_urls is not None and _LAST_GOOD is not None:
+        # Rebuild even when only STUN changed, so removed/disabled pools cannot
+        # leak back from the previous successful resolution. Keep original expiry.
+        _LAST_GOOD = replace(
+            _LAST_GOOD, resolved=replace(_LAST_GOOD.resolved, urls=retain_turn_urls)
+        )
+    else:
+        # Mode/key/token/TURN changes, explicit disable and deletion retire it.
+        _LAST_GOOD = None
 
 
 def _usable_last_good(now: float) -> _CacheEntry | None:
@@ -236,7 +252,9 @@ class VoiceRelayService:
 
     def get_config(self) -> VoiceRelayConfig | None:
         return self.db.scalar(
-            select(VoiceRelayConfig).where(VoiceRelayConfig.scope == SCOPE_DEPLOYMENT)
+            select(VoiceRelayConfig)
+            .where(VoiceRelayConfig.scope == SCOPE_DEPLOYMENT)
+            .execution_options(populate_existing=True)
         )
 
     def get_secret_row(self, config_id: str) -> VoiceRelaySecret | None:
@@ -245,11 +263,16 @@ class VoiceRelayService:
     def public_config(self) -> dict[str, Any]:
         config = self.get_config()
         urls = list(_dedupe_urls(config.urls)) if config else []
+        stun_urls = list(_dedupe_urls(config.stun_urls)) if config else []
         return {
-            "configured": config is not None and bool(config.secret_fingerprint),
+            "configured": config is not None and bool(
+                stun_urls if config.mode == MODE_MANUAL else config.secret_fingerprint
+            ),
             "enabled": bool(config.enabled) if config else False,
             "mode": config.mode if config else MODE_CLOUDFLARE,
             "urls": urls or list(DEFAULT_URLS),
+            "stun_urls": stun_urls,
+            "stun_fallback_enabled": bool(config and config.stun_fallback_enabled),
             "key_id": config.key_id if config else None,
             "api_base": (config.api_base if config else None) or DEFAULT_API_BASE,
             "credential_ttl_seconds": (
@@ -269,6 +292,7 @@ class VoiceRelayService:
             "defaults": {
                 "api_base": DEFAULT_API_BASE,
                 "urls": list(DEFAULT_URLS),
+                "stun_urls": list(DEFAULT_STUN_URLS),
                 "credential_ttl_seconds": DEFAULT_CREDENTIAL_TTL,
             },
         }
@@ -276,31 +300,54 @@ class VoiceRelayService:
     def save(self, payload: dict[str, Any], *, actor_id: str) -> dict[str, Any]:
         """Upsert the deployment relay. Saving is what enables it (A2-1)."""
 
-        mode = str(payload.get("mode") or MODE_CLOUDFLARE).strip().lower()
-        if mode != MODE_CLOUDFLARE:
-            raise AppError(
-                400,
-                "voice_relay_mode_unsupported",
-                "目前仅支持 Cloudflare 动态签发模式（静态凭据模式未启用）",
-            )
-        key_id = str(payload.get("key_id") or "").strip()
-        if not key_id:
-            raise AppError(400, "voice_relay_key_id_required", "需要填写 Cloudflare TURN Key ID")
-        api_base = str(payload.get("api_base") or DEFAULT_API_BASE).strip().rstrip("/")
-        self._validate_api_base(api_base)
-        urls = self._validate_urls(payload.get("urls"))
-        ttl = self._validate_ttl(payload.get("credential_ttl_seconds"))
-        secret = str(payload.get("secret") or payload.get("api_token") or "").strip()
-
         config = self.get_config()
-        secret_row = self.get_secret_row(config.id) if config is not None else None
-        if not secret and secret_row is None:
-            raise AppError(
-                400,
-                "voice_relay_secret_required",
-                "需要填写 Cloudflare API Token（留空表示沿用已保存的凭据）",
-            )
+        mode = self._validate_mode(payload.get("mode") or (config.mode if config else MODE_CLOUDFLARE))
+        fallback_enabled = payload.get(
+            "stun_fallback_enabled", bool(config and config.stun_fallback_enabled)
+        )
+        if not isinstance(fallback_enabled, bool):
+            raise AppError(400, "voice_relay_fallback_invalid", "STUN 兜底开关必须是布尔值")
+        stun_raw = payload.get("stun_urls", config.stun_urls if config else None)
+        if stun_raw is None:
+            stun_raw = list(DEFAULT_STUN_URLS) if mode == MODE_MANUAL or fallback_enabled else []
+        stun_urls = self._validate_stun_urls(
+            stun_raw, required=mode == MODE_MANUAL or fallback_enabled
+        )
+        secret = ""
+        secret_row = None
+        if mode == MODE_CLOUDFLARE:
+            key_id = str(payload.get("key_id", config.key_id if config else "") or "").strip()
+            if not key_id:
+                raise AppError(400, "voice_relay_key_id_required", "需要填写 Cloudflare TURN Key ID")
+            api_base = str(payload.get("api_base") or (config.api_base if config else None) or DEFAULT_API_BASE).strip().rstrip("/")
+            self._validate_api_base(api_base)
+            urls = self._validate_urls(payload.get("urls", config.urls if config else None))
+            ttl = self._validate_ttl(payload.get("credential_ttl_seconds", config.credential_ttl_seconds if config else None))
+            secret = str(payload.get("secret") or payload.get("api_token") or "").strip()
+            secret_row = self.get_secret_row(config.id) if config is not None else None
+            if not secret and (secret_row is None or secret_row.revoked_at is not None):
+                raise AppError(
+                    400,
+                    "voice_relay_secret_required",
+                    "需要填写 Cloudflare API Token（留空表示沿用已保存的凭据）",
+                )
+        else:
+            # Keep the optional Cloudflare setup for a later mode switch, but do
+            # not read, decrypt or change its secret in credential-free mode.
+            key_id = config.key_id if config else None
+            api_base = (config.api_base if config else None) or DEFAULT_API_BASE
+            urls = _dedupe_urls(config.urls) if config else DEFAULT_URLS
+            ttl = config.credential_ttl_seconds if config else DEFAULT_CREDENTIAL_TTL
 
+        retain_turn = bool(
+            config and config.enabled and config.mode == MODE_CLOUDFLARE
+            and mode == MODE_CLOUDFLARE and not secret
+            and config.key_id == key_id
+            and (config.api_base or DEFAULT_API_BASE).rstrip("/") == api_base
+            and config.credential_ttl_seconds == ttl
+            and tuple(url for url in _dedupe_urls(config.urls) if url.startswith(("turn:", "turns:")))
+            == tuple(url for url in urls if url.startswith(("turn:", "turns:")))
+        )
         if config is None:
             config = VoiceRelayConfig(scope=SCOPE_DEPLOYMENT)
             self.db.add(config)
@@ -313,6 +360,8 @@ class VoiceRelayService:
         config.key_id = key_id
         config.api_base = api_base
         config.urls = list(urls)
+        config.stun_urls = list(stun_urls)
+        config.stun_fallback_enabled = fallback_enabled
         config.credential_ttl_seconds = ttl
         config.updated_by_user_id = actor_id
         # "有配置就自动开": a successful save is the enable gesture.  The explicit
@@ -339,7 +388,8 @@ class VoiceRelayService:
         config.status_detail = None
         self.db.commit()
         self.db.refresh(config)
-        invalidate_cache()
+        current_urls = _dedupe_urls((*urls, *(stun_urls if fallback_enabled else ())))
+        invalidate_cache(retain_turn_urls=current_urls if retain_turn else None)
         return self.public_config()
 
     def set_enabled(self, enabled: bool, *, actor_id: str) -> dict[str, Any]:
@@ -362,6 +412,38 @@ class VoiceRelayService:
         self.db.delete(config)
         self.db.commit()
         invalidate_cache()
+
+    @staticmethod
+    def _validate_mode(raw: Any) -> str:
+        mode = str(raw).strip().lower()
+        if mode not in {MODE_CLOUDFLARE, MODE_MANUAL}:
+            raise AppError(400, "voice_relay_mode_unsupported", "仅支持 Cloudflare 或手动 STUN 模式")
+        return mode
+
+    @staticmethod
+    def _validate_stun_urls(raw: Any, *, required: bool = True) -> tuple[str, ...]:
+        if isinstance(raw, str):
+            raw = raw.replace("\r", "\n").replace(",", "\n").splitlines()
+        if not isinstance(raw, (list, tuple)) or any(not isinstance(item, str) for item in raw):
+            raise AppError(400, "voice_relay_stun_urls_invalid", "STUN 地址必须是字符串数组或逐行文本")
+        urls = _dedupe_urls(raw)
+        if not urls and required:
+            raise AppError(400, "voice_relay_stun_urls_required", "至少填写一个手动 STUN 地址")
+        if len(urls) > 16:
+            raise AppError(400, "voice_relay_stun_urls_invalid", "最多配置 16 个手动 STUN 地址")
+        for url in urls:
+            # The browser and deployment probe both support UDP STUN. Do not
+            # silently probe stuns: (TLS) as plaintext UDP, or accept TURN here.
+            if not url.startswith("stun:") or len(url) > 512 or any(ch.isspace() for ch in url):
+                raise AppError(400, "voice_relay_stun_url_invalid", "手动地址仅支持 stun:host:port（UDP，无凭据）")
+            try:
+                parsed = _parse_ice_url(url)
+                host = str(parsed.get("host") or "")
+                if not host or any(ch in host for ch in "/@?#") or not 1 <= int(parsed["port"]) <= 65535:
+                    raise ValueError("主机或端口无效")
+            except Exception as exc:
+                raise AppError(400, "voice_relay_stun_url_invalid", f"无法解析 STUN 地址：{url}") from exc
+        return urls
 
     @staticmethod
     def _validate_api_base(api_base: str) -> None:
@@ -436,8 +518,12 @@ class VoiceRelayService:
         """Return the ICE configuration to use right now (never raises)."""
 
         global _CACHE, _LAST_GOOD
+        generation = _CACHE_GENERATION
         now = time.monotonic()
-        if not force and _CACHE is not None and now < _CACHE.expires_at:
+        if (
+            not force and _CACHE is not None and now < _CACHE.expires_at
+            and (not _CACHE.resolved.credential or now < _CACHE.credential_expires_at)
+        ):
             return _CACHE.resolved
 
         try:
@@ -446,12 +532,35 @@ class VoiceRelayService:
             logger.debug("voice relay config read failed", exc_info=True)
             return self._serve_or_degrade("配置读取失败", now=now)
 
-        if config is None or not config.enabled or not config.secret_fingerprint:
-            # Explicitly off (or never configured): nothing may be served, not even
-            # the credential minted for the configuration that just went away.
+        if config is None or not config.enabled:
+            # Explicitly off (or never configured): never enable public STUN or
+            # revive credentials for the configuration that just went away.
             _LAST_GOOD = None
             _CACHE = _CacheEntry(
                 resolved=ResolvedIce(source="none"),
+                expires_at=now + CACHE_TTL_SECONDS,
+            )
+            return _CACHE.resolved
+
+        stun_urls = tuple(url for url in _dedupe_urls(config.stun_urls) if url.startswith("stun:"))
+        if config.mode == MODE_MANUAL:
+            _LAST_GOOD = None
+            _CACHE = _CacheEntry(
+                resolved=ResolvedIce(urls=stun_urls, source="manual"),
+                expires_at=now + CACHE_TTL_SECONDS,
+            )
+            self.db.commit()
+            return _CACHE.resolved
+        if config.mode != MODE_CLOUDFLARE:
+            _LAST_GOOD = None
+            return ResolvedIce(source="none", detail="不支持的语音中继模式")
+        fallback_urls = stun_urls if config.stun_fallback_enabled else ()
+        if not config.secret_fingerprint:
+            _LAST_GOOD = None
+            _CACHE = _CacheEntry(
+                resolved=self._serve_or_degrade(
+                    "尚未配置 Cloudflare 凭据", now=now, fallback_urls=fallback_urls
+                ),
                 expires_at=now + CACHE_TTL_SECONDS,
             )
             return _CACHE.resolved
@@ -470,15 +579,19 @@ class VoiceRelayService:
             self.db.commit()
         except ProviderSecretUnavailable as exc:
             self.db.rollback()
+            if generation != _CACHE_GENERATION:
+                return self.resolve(force=True)
             _CACHE = _CacheEntry(
-                resolved=self._serve_or_degrade(f"密钥不可用：{exc}", now=now),
+                resolved=self._serve_or_degrade(f"密钥不可用：{exc}", now=now, fallback_urls=fallback_urls),
                 expires_at=now + CACHE_TTL_SECONDS,
             )
             return _CACHE.resolved
         except AppError as exc:
             self.db.rollback()
+            if generation != _CACHE_GENERATION:
+                return self.resolve(force=True)
             _CACHE = _CacheEntry(
-                resolved=self._serve_or_degrade(exc.message, now=now),
+                resolved=self._serve_or_degrade(exc.message, now=now, fallback_urls=fallback_urls),
                 expires_at=now + CACHE_TTL_SECONDS,
             )
             return _CACHE.resolved
@@ -493,7 +606,10 @@ class VoiceRelayService:
                 api_token=api_token,
                 ttl=ttl,
             )
-            urls = self._merge_minted_urls(configured_urls, minted)
+            if generation != _CACHE_GENERATION:
+                self.db.rollback()
+                return self.resolve(force=True)
+            urls = _dedupe_urls((*self._merge_minted_urls(configured_urls, minted), *fallback_urls))
             resolved = ResolvedIce(
                 urls=urls,
                 username=minted.get("username"),
@@ -527,8 +643,11 @@ class VoiceRelayService:
             detail = f"{type(exc).__name__}: {exc}"
             logger.warning("voice relay credential mint failed", exc_info=True)
 
+        if generation != _CACHE_GENERATION:
+            self.db.rollback()
+            return self.resolve(force=True)
         _CACHE = _CacheEntry(
-            resolved=self._serve_or_degrade(detail, now=now),
+            resolved=self._serve_or_degrade(detail, now=now, fallback_urls=fallback_urls),
             expires_at=now + CACHE_TTL_SECONDS,
             credential_expires_at=(
                 _LAST_GOOD.credential_expires_at if _LAST_GOOD is not None else 0.0
@@ -536,7 +655,9 @@ class VoiceRelayService:
         )
         return _CACHE.resolved
 
-    def _serve_or_degrade(self, detail: str, *, now: float) -> ResolvedIce:
+    def _serve_or_degrade(
+        self, detail: str, *, now: float, fallback_urls: tuple[str, ...] = ()
+    ) -> ResolvedIce:
         """Keep relaying with the last minted credential, or degrade for real.
 
         A refresh failure is not evidence that the relay is unusable -- the
@@ -558,11 +679,18 @@ class VoiceRelayService:
             )
             self._record_failure(detail)
             return ResolvedIce(
-                urls=entry.resolved.urls,
+                urls=_dedupe_urls((*entry.resolved.urls, *fallback_urls)),
                 username=entry.resolved.username,
                 credential=entry.resolved.credential,
                 source="stale",
                 detail=detail,
+            )
+        if fallback_urls:
+            self._record_failure(detail)
+            logger.warning("Voice TURN unavailable; serving opt-in STUN fallback: %s", detail)
+            return ResolvedIce(
+                urls=fallback_urls, source="fallback",
+                detail=f"Cloudflare 不可用，已降级为手动 STUN（不提供媒体中继）：{detail}",
             )
         return self._degrade(detail, now=now)
 
@@ -614,6 +742,29 @@ class VoiceRelayService:
 
     # -------------------------------------------------------------------- test
 
+    @staticmethod
+    def _config_signature(config: VoiceRelayConfig) -> tuple[Any, ...]:
+        return (
+            config.id, config.mode, config.enabled, config.key_id, config.api_base,
+            config.credential_ttl_seconds, config.secret_fingerprint,
+            _dedupe_urls(config.urls), _dedupe_urls(config.stun_urls),
+            bool(config.stun_fallback_enabled),
+        )
+
+    def _persist_probe_status(
+        self, signature: tuple[Any, ...] | None, generation: int, *, ok: bool, detail: str
+    ) -> None:
+        if signature is None or generation != _CACHE_GENERATION:
+            return
+        fresh = self.get_config()
+        if fresh is None or self._config_signature(fresh) != signature:
+            return
+        fresh.status = "configured" if ok else "error"
+        fresh.status_detail = None if ok else detail[:400]
+        fresh.last_checked_at = datetime.datetime.now(datetime.timezone.utc)
+        self.db.commit()
+        # Diagnostic tests never invalidate a working runtime TURN credential.
+
     async def test(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Mint a credential and measure every URL from *this* machine.
 
@@ -623,6 +774,32 @@ class VoiceRelayService:
         """
 
         config = self.get_config()
+        test_generation = _CACHE_GENERATION
+        signature = self._config_signature(config) if config else None
+        mode = self._validate_mode(payload.get("mode") or (config.mode if config else MODE_CLOUDFLARE))
+        fallback_enabled = payload.get("stun_fallback_enabled", bool(config and config.stun_fallback_enabled))
+        if not isinstance(fallback_enabled, bool):
+            raise AppError(400, "voice_relay_fallback_invalid", "STUN 兜底开关必须是布尔值")
+        stun_raw = payload.get("stun_urls", config.stun_urls if config else None)
+        if stun_raw is None:
+            stun_raw = list(DEFAULT_STUN_URLS) if mode == MODE_MANUAL or fallback_enabled else []
+        stun_urls = self._validate_stun_urls(stun_raw, required=mode == MODE_MANUAL or fallback_enabled)
+        if mode == MODE_MANUAL:
+            persist_status = bool(config and config.mode == mode and tuple(config.stun_urls or ()) == stun_urls)
+            self.db.commit()
+            probes = await probe_ice_urls(stun_urls)
+            ok = any(item.get("ok") for item in probes)
+            detail = (
+                "STUN 可达；只提供公网映射，不提供 TURN 媒体中继" if ok
+                else "STUN 探测失败；这是部署服务器的测试结果，不代表所有客户端网络"
+            )
+            if persist_status:
+                self._persist_probe_status(signature, test_generation, ok=ok, detail=detail)
+            return {
+                "ok": ok, "detail": detail, "credential_masked": "无需凭据",
+                "cloudflare_urls": [], "configured_urls": list(stun_urls),
+                "probes": probes, "fallback_available": False,
+            }
         key_id = str(
             payload.get("key_id") or (config.key_id if config else "") or ""
         ).strip()
@@ -655,13 +832,36 @@ class VoiceRelayService:
         # Release the transaction before the upstream call and its probes: this
         # handler can spend tens of seconds talking to Cloudflare, and a SQLite
         # write window held open that long starves every other writer.
-        config_id = config.id if config is not None else None
-        persist_status = config is not None and not payload.get("secret") and not payload.get("api_token")
+        persist_status = bool(
+            config and config.mode == mode and not payload.get("secret") and not payload.get("api_token")
+            and key_id == config.key_id
+            and api_base == (config.api_base or DEFAULT_API_BASE).rstrip("/")
+            and ttl == config.credential_ttl_seconds and urls == _dedupe_urls(config.urls)
+            and stun_urls == _dedupe_urls(config.stun_urls)
+            and fallback_enabled == bool(config.stun_fallback_enabled)
+        )
         self.db.commit()
 
-        minted = mint_cloudflare_credentials(
-            api_base=api_base, key_id=key_id, api_token=secret, ttl=ttl
-        )
+        if fallback_enabled:
+            urls = _dedupe_urls((*urls, *stun_urls))
+        try:
+            minted = mint_cloudflare_credentials(
+                api_base=api_base, key_id=key_id, api_token=secret, ttl=ttl
+            )
+        except Exception as exc:
+            if not fallback_enabled:
+                raise
+            probes = await probe_ice_urls(stun_urls)
+            fallback_ok = any(item.get("ok") for item in probes)
+            reason = exc.message if isinstance(exc, AppError) else type(exc).__name__
+            detail = f"Cloudflare 签发失败（{reason}）；手动 STUN {'可达' if fallback_ok else '不可达'}，不代表 TURN 中继可用"
+            if persist_status:
+                self._persist_probe_status(signature, test_generation, ok=False, detail=detail)
+            return {
+                "ok": False, "detail": detail, "credential_masked": "未取得新凭据",
+                "cloudflare_urls": [], "configured_urls": list(urls),
+                "probes": probes, "fallback_available": fallback_ok,
+            }
         probes = await probe_ice_urls(
             urls,
             username=minted.get("username"),
@@ -683,14 +883,8 @@ class VoiceRelayService:
             if first and first.get("detail"):
                 detail = f"{detail}（{first['detail']}）"
 
-        if persist_status and config_id is not None:
-            fresh = self.get_config()
-            if fresh is not None:
-                fresh.status = "configured" if ok else "error"
-                fresh.status_detail = None if ok else detail[:400]
-                fresh.last_checked_at = datetime.datetime.now(datetime.timezone.utc)
-                self.db.commit()
-                invalidate_cache()
+        if persist_status:
+            self._persist_probe_status(signature, test_generation, ok=ok, detail=detail)
 
         return {
             "ok": ok,
@@ -817,7 +1011,7 @@ def _parse_ice_url(url: str) -> dict[str, Any]:
     from aiortc.rtcicetransport import parse_stun_turn_uri
 
     parsed = parse_stun_turn_uri(url)
-    if not parsed.get("port"):
+    if parsed.get("port") is None:
         parsed["port"] = 5349 if parsed["scheme"] in {"stuns", "turns"} else 3478
     return parsed
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -34,6 +36,7 @@ class VoiceRunnerHandle:
     chat_session_id: str
     owner_user_id: str
     tenant_id: str = ""
+    runtime_owner_id: str = ""
     peer_connection_id: str | None = None
     peer_generation: int = 0
     # ``stop`` closes the pipeline and its processors; ``task`` is the asyncio
@@ -52,9 +55,26 @@ class VoiceRunnerHandle:
 
 
 _REGISTRY: dict[str, VoiceRunnerHandle] = {}
+_DRAINING = False
+_RUNTIME_OWNER_ID = (
+    str(os.getenv("LEARNGRAPH_RUNTIME_INSTANCE_ID") or "").strip()
+    or f"voice-runtime:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+)
+
+
+def runtime_owner_id() -> str:
+    """Stable owner token for this API process lifetime."""
+
+    return _RUNTIME_OWNER_ID
 
 
 def register_runner(handle: VoiceRunnerHandle) -> VoiceRunnerHandle:
+    if _DRAINING:
+        # A worker in graceful shutdown must not accept a new media pipeline.
+        # The caller can retry the offer on a healthy worker after the durable
+        # lease expires; silently registering here would create an orphan that
+        # survives the drain.
+        raise RuntimeError("voice runtime is draining")
     existing = _REGISTRY.get(handle.voice_session_id)
     _REGISTRY[handle.voice_session_id] = handle
     if existing is not None and not existing.closed:
@@ -181,6 +201,27 @@ async def close_all_runners(*, reason: str = "shutdown") -> int:
     return closed
 
 
+def begin_drain() -> None:
+    """Stop accepting new local voice runners during graceful shutdown."""
+
+    global _DRAINING
+    _DRAINING = True
+
+
+def end_drain() -> None:
+    """Re-enable runner registration (primarily for tests and hot reload)."""
+
+    global _DRAINING
+    _DRAINING = False
+
+
+async def drain_runners(*, reason: str = "worker_draining") -> int:
+    """Atomically enter drain mode, then close every local pipeline."""
+
+    begin_drain()
+    return await close_all_runners(reason=reason)
+
+
 def close_local_runner(voice_session_id: str, *, reason: str = "client_request") -> None:
     """Request a local close from synchronous code (an HTTP route).
 
@@ -201,3 +242,4 @@ def close_local_runner(voice_session_id: str, *, reason: str = "client_request")
 def clear_registry() -> None:
     """Test helper: drop all handles without touching their pipelines."""
     _REGISTRY.clear()
+    end_drain()

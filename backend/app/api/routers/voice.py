@@ -8,22 +8,27 @@ from app.voice.schemas import (
     VoiceTaskView, VoiceEventReplayResponse,
     VoiceResultDeliveryRequest, VoiceResultDeliveryView, VoiceResultListResponse,
     VoiceTaskCancelRequest, VoiceTaskRevisionRequest,
+    VoiceTaskApprovalRequest,
 )
 from app.voice.service import VoiceSessionService
 from app.voice.runtime import runtime_info
+from app.voice.availability import inspect_voice_capabilities, inspect_voice_provider_status
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
 @router.get("/capabilities")
-def voice_capabilities(settings: AppSettings):
-    """Describe whether an external full-duplex audio worker is configured."""
+def voice_capabilities(settings: AppSettings, db: DB, context: CurrentWorkspace):
+    """Describe voice runtime and Agent capabilities without running a model."""
     info = runtime_info(settings)
+    provider_status = inspect_voice_provider_status(db, context, settings)
     return {
         "runtime_ready": info.ready,
         "signaling_url": info.signaling_url,
         "reason": info.reason,
         "transcription_model": "qwen3-asr-flash-realtime",
         "tts_provider": "huoshan_bidirectional_streaming",
+        **provider_status,
+        "agent_capabilities": inspect_voice_capabilities(db, context, settings),
     }
 
 def svc(db: DB, context: CurrentWorkspace, settings: AppSettings) -> VoiceSessionService:
@@ -136,6 +141,26 @@ def cancel_voice_task(voice_session_id: str, subagent_id: str, payload: VoiceTas
         voice_session_id,
         subagent_id,
         reason=(payload.reason if payload else "user_requested"),
+    )
+
+@router.post("/sessions/{voice_session_id}/tasks/{subagent_id}/approve", response_model=VoiceTaskView)
+def approve_voice_task(
+    voice_session_id: str,
+    subagent_id: str,
+    payload: VoiceTaskApprovalRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+):
+    if not payload.approved:
+        return svc(db, context, settings).reject_task(
+            voice_session_id,
+            subagent_id,
+            reason="user_rejected",
+        )
+    return svc(db, context, settings).approve_task(
+        voice_session_id,
+        subagent_id,
     )
 
 @router.post("/sessions/{voice_session_id}/tasks/{subagent_id}/revise", response_model=VoiceTaskView)

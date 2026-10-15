@@ -12,10 +12,10 @@ Design rules:
   ``event_seq`` and a monotonic ``audio_cursor_ms``.  Two sentences with equal
   text stay two sentences, and a duplicated or out-of-order TTS marker collapses
   instead of appending.
-* **The authoritative assistant text comes from the LLM stream, not from TTS
-  markers.**  A lost, duplicated or reordered marker can therefore never change,
-  duplicate or drop the final message: markers only drive the speculative
-  layer.
+* **Only playback-authorized text may become visible or durable.**  Raw LLM
+  frames remain process-local generation context; sentence/playback markers own
+  the canvas, transcript and final assistant message.  A response with no
+  playback evidence fails retryably instead of exposing an unheard draft.
 * **Journal writes never block the audio loop.**  Every database call is
   dispatched to a worker thread.
 * **A processor failure degrades, it does not end the call.**  Errors are
@@ -47,6 +47,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -62,8 +63,8 @@ STAGE_LLM = "llm"
 STAGE_TTS = "tts"
 STAGE_NETWORK = "network"
 
-# A turn with no audio at all (TTS down) must still be finalized, otherwise the
-# user's utterance would never reach the transcript or memory.
+# A turn with no audio at all (TTS down) must still reach a terminal, retryable
+# failure so the user's utterance remains auditable without publishing the draft.
 FINALIZE_GRACE_SECS = 6.0
 # Idle ceiling for the assistant half of a turn. A provider error or a hang
 # produces no text, no TTS and therefore no speaking frames, so nothing else
@@ -76,7 +77,8 @@ MAX_PLAYBACK_REARMS = 6
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BASE_DELAY = 1.0
 DEFAULT_RETRY_MAX_DELAY = 8.0
-# ``assistant.llm.delta`` is a caption stream, not an audit log: coalesce writes.
+# Kept for compatibility with older tests/callers; raw LLM deltas are no longer
+# emitted or persisted because playback markers are the transcript authority.
 LLM_DELTA_MIN_INTERVAL_SECS = 0.4
 # A turn opened by the control plane that no worker ever acknowledged is closed
 # by the aging sweep after this long (see ``reconcile_stale_turns``). Generous on
@@ -319,7 +321,7 @@ class VoiceTurnJournal:
             state.turn_id,
             self._idle_timeout_secs,
         )
-        if state.assistant_text.strip():
+        if self._spoken_assistant_text(state).strip():
             await self.assistant_completed(degraded_reason="turn_idle_timeout")
         else:
             await self.assistant_completed(
@@ -377,7 +379,16 @@ class VoiceTurnJournal:
             logger.warning("voice journal user-text hook failed", exc_info=True)
 
     async def user_started(self) -> None:
-        """VAD signals that the user started speaking."""
+        """VAD signals speech onset, including pauses within one question."""
+        state = self._turn
+        if (state is not None and not state.finalized
+                and not state.assistant_text and not state.sentence_texts
+                and not state.playback_observed):
+            # A cloud-ASR question can contain several local VAD bursts. While
+            # its finals are still being merged, these are continuations of the
+            # same question, not new latency rounds. The first onset was already
+            # emitted before this turn was accepted.
+            return
         await self._emit(
             "user.started",
             payload={},
@@ -730,12 +741,11 @@ class VoiceTurnJournal:
         return len(closed)
 
     def note_assistant_text(self, text: str) -> None:
-        """Accumulate the authoritative assistant text (sync; no IO).
+        """Accumulate process-local generation context (sync; no IO).
 
-        This is the single source of the final message.  It is fed by the LLM's
-        text frames, so it is independent of TTS markers: if the browser never
-        receives a single caption marker, the finalized message is still
-        complete and unique.
+        LLM text is useful for retry decisions and TTS context, but it is not
+        visible or durable.  Only the playback ledger may supply the transcript
+        and final assistant message.
         """
         if not text:
             return
@@ -745,35 +755,17 @@ class VoiceTurnJournal:
         self._touch_turn()
 
     async def assistant_delta(self, text: str, *, force: bool = False) -> None:
-        """Coalesce text frames without dropping characters from the draft."""
-        loop = asyncio.get_running_loop()
-        now = loop.time()
+        """Compatibility no-op: raw LLM text never enters events or storage."""
+        del text, force
         async with self._lock:
-            state = self._turn
-            if state is None or state.finalized:
-                return
-            self._pending_delta_text += text
-            if (
-                not force
-                and now - self._last_delta_at < LLM_DELTA_MIN_INTERVAL_SECS
-            ):
-                return
-            delta_text = self._pending_delta_text
-            if not delta_text:
+            if self._turn is None or self._turn.finalized:
                 return
             self._pending_delta_text = ""
-            self._last_delta_at = now
-            await self._emit_assistant_delta(delta_text, state.turn_id)
 
     async def _emit_assistant_delta(self, text: str, turn_id: str) -> None:
-        if not text:
-            return
-        await self._emit(
-            "assistant.llm.delta",
-            payload={"text": text},
-            turn_id=turn_id,
-            phase="speculative",
-        )
+        """Legacy guard: speculative model text must never be published."""
+        del text, turn_id
+        return
 
     def current_turn_id(self) -> str | None:
         """当前未 finalize 的持久 turn id，没有则 None。同步、无 IO。
@@ -1167,7 +1159,9 @@ class VoiceTurnJournal:
             self._turn.turn_id,
         )
         await self.assistant_completed(
-            degraded_reason="no_playback_frames"
+            outcome=turn_api.TURN_FAILED,
+            failure_reason="no_playback_frames",
+            degraded_reason="no_playback_frames",
         )
 
     async def assistant_completed(
@@ -1191,18 +1185,18 @@ class VoiceTurnJournal:
             state = self._turn
             if state is None or state.finalized:
                 return
-            pending_delta = self._pending_delta_text
+            # Speculative model text is process-local only.  Drop any legacy
+            # buffer instead of publishing its unheard tail during completion.
             self._pending_delta_text = ""
             state.finalized = True
             self._cancel_recovery_timers()
-        if pending_delta:
-            await self._emit_assistant_delta(pending_delta, state.turn_id)
         spoken = self._spoken_assistant_text(state)
-        # What the user heard is the whole answer. The LLM's output is only used
-        # when no sentence was ever spoken at all *and* the turn still succeeded
-        # -- the degraded "audio never played, fall back to text" path, where the
-        # page hands the answer over as text on purpose. A failed or interrupted
-        # turn with nothing spoken has nothing the user heard, so it stays empty.
+        if not spoken and outcome == turn_api.TURN_FINALIZED:
+            # Every successful assistant completion needs playback evidence.
+            # This guard covers direct/legacy callers as well as grace/idle paths.
+            outcome = turn_api.TURN_FAILED
+            failure_reason = failure_reason or "no_playback_frames"
+            degraded_reason = degraded_reason or "no_playback_frames"
         # A generated LLM draft is not an answer the user heard. The media
         # ledger is the sole authority for transcript, context and statistics.
         assistant_text = spoken
@@ -1216,11 +1210,17 @@ class VoiceTurnJournal:
             await self._emit(
                 "processor.error",
                 payload={
-                    "stage": STAGE_LLM if outcome != turn_api.TURN_FINALIZED else STAGE_TTS,
+                    "stage": (
+                        STAGE_TTS
+                        if degraded_reason == "no_playback_frames"
+                        else STAGE_LLM if outcome != turn_api.TURN_FINALIZED else STAGE_TTS
+                    ),
                     "message": (
-                        "模型未能生成回答，已保留你的问题，可以重试"
+                        "音频未播报，回答未保存，可以重试"
+                        if degraded_reason == "no_playback_frames"
+                        else "模型未能生成回答，已保留你的问题，可以重试"
                         if outcome != turn_api.TURN_FINALIZED
-                        else "音频未播报，已按文本收尾"
+                        else "音频播放未正常结束，已保留实际播报内容"
                     ),
                     "degraded": True,
                     "reason": degraded_reason,
@@ -1393,7 +1393,13 @@ class VoiceTurnJournal:
                 degraded_reason="llm_error",
             )
 
-    async def turn_interrupted(self, *, reason: str = "barge_in") -> None:
+    async def turn_interrupted(
+        self,
+        *,
+        reason: str = "barge_in",
+        require_assistant_activity: bool = False,
+        turn_id: str | None = None,
+    ) -> None:
         """Abandon the open turn, keeping only what the user actually heard.
 
         The sentences whose playback had started are written to the transcript so
@@ -1406,12 +1412,20 @@ class VoiceTurnJournal:
             state = self._turn
             if state is None or state.finalized:
                 return
-            pending_delta = self._pending_delta_text
+            if turn_id is not None and state.turn_id != turn_id:
+                return
+            # ASR finals are accepted before the aggregator handles them. Its
+            # automatic interruption flushes the OLD response, while this journal
+            # already owns the NEW turn. Preserve a fresh question with no reply;
+            # explicit control interrupts use the unrestricted default path.
+            if require_assistant_activity and not (
+                state.assistant_text or state.sentence_texts or state.playback_observed
+            ):
+                return
+            # Never publish the unplayed generation tail while handling barge-in.
             self._pending_delta_text = ""
             state.finalized = True
             self._cancel_recovery_timers()
-        if pending_delta:
-            await self._emit_assistant_delta(pending_delta, state.turn_id)
         heard_text = self._spoken_assistant_text(state)
         self._update_playback_context(state, heard_text)
         await self._publish_live(
@@ -1429,10 +1443,6 @@ class VoiceTurnJournal:
                 interrupt_kwargs["heard_text"] = heard_text
             await self._persist_offloop(
                 turn_api.interrupt_turn, self.voice_session_id, **interrupt_kwargs
-            )
-            await self._emit_turn_finalized(
-                state, outcome=turn_api.TURN_INTERRUPTED, failure_reason=None,
-                spoken=heard_text, assistant_text=heard_text,
             )
             await self._persist_offloop(
                 turn_api.finalize_turn, self.voice_session_id, state.turn_id,
@@ -1678,6 +1688,7 @@ class VoiceJournalProcessor(FrameProcessor):
         super().__init__()
         self._journal = journal
         self._role = role
+        self._observes_vad_onset = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -1720,9 +1731,24 @@ class VoiceJournalProcessor(FrameProcessor):
                     or result.get("event_id")
                     or ""
                 )
-            await self._journal.user_final(frame.text, source_id=source_id or None)
-        elif isinstance(frame, UserStartedSpeakingFrame):
+            try:
+                await self._journal.user_final(frame.text, source_id=source_id or None)
+            except TypeError as exc:
+                # Keep lightweight test/legacy journal doubles compatible with
+                # the enriched source identity contract.
+                if "source_id" not in str(exc):
+                    raise
+                await self._journal.user_final(frame.text)
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            # The final-only strategy confirms a turn AFTER ASR final. That
+            # UserStartedSpeakingFrame is not the user's physical onset and
+            # would split an already identified latency turn into two rows.
+            self._observes_vad_onset = True
             await self._journal.user_started()
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # Retain a fallback for transports without a VAD onset stream.
+            if not self._observes_vad_onset:
+                await self._journal.user_started()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             await self._journal.user_stopped()
 
@@ -1742,22 +1768,28 @@ class VoiceJournalProcessor(FrameProcessor):
             frame, (TranscriptionFrame, InterimTranscriptionFrame)
         ):
             # Downstream only: the upstream copy is the echo of a spoken frame.
+            # Generated text stays process-local until playback authorizes it.
             if direction == FrameDirection.DOWNSTREAM:
                 self._journal.note_assistant_text(frame.text)
-                await self._journal.assistant_delta(frame.text)
             return
         if isinstance(frame, LLMFullResponseEndFrame):
-            await self._journal.assistant_delta("", force=True)
             self._journal.llm_closed()
             return
         if isinstance(frame, BotStartedSpeakingFrame):
             await self._journal.playback_started()
             return
         if isinstance(frame, BotStoppedSpeakingFrame):
-            await self._journal.playback_ended(turn_final=False)
+            try:
+                await self._journal.playback_ended(turn_final=False)
+            except TypeError as exc:
+                if "turn_final" not in str(exc):
+                    raise
+                await self._journal.playback_ended()
             return
         if isinstance(frame, InterruptionFrame):
-            await self._journal.turn_interrupted(reason="barge_in")
+            await self._journal.turn_interrupted(
+                reason="barge_in", require_assistant_activity=True
+            )
             return
         if isinstance(frame, ErrorFrame):
             processor = getattr(frame, "processor", None)
@@ -1802,13 +1834,16 @@ class VoiceControlWatchdog:
     on_interrupt: Callable[[dict[str, Any]], Awaitable[None]]
     on_model_changed: Callable[[dict[str, Any]], Awaitable[None]]
     on_close: Callable[[str], Awaitable[None]]
+    on_heartbeat: Callable[[], Awaitable[bool]] | None = None
     # Aging sweep for turns nobody acknowledged. Optional so the watchdog stays
     # usable (and testable) without a journal bound to a session.
     on_reconcile: Callable[[], Awaitable[int]] | None = None
     interval_secs: float = 1.0
+    heartbeat_interval_secs: float = 5.0
     _cursor: int = 0
     _task: asyncio.Task[Any] | None = field(default=None, init=False)
     _stopped: bool = field(default=False, init=False)
+    _last_heartbeat_at: float = field(default=0.0, init=False)
 
     async def _initial_cursor(self) -> None:
         try:
@@ -1839,6 +1874,14 @@ class VoiceControlWatchdog:
                 logger.debug("voice control watchdog tick failed", exc_info=True)
 
     async def tick(self) -> None:
+        if self.on_heartbeat is not None:
+            now = asyncio.get_running_loop().time()
+            if now - self._last_heartbeat_at >= max(1.0, self.heartbeat_interval_secs):
+                self._last_heartbeat_at = now
+                owned = await self.on_heartbeat()
+                if not owned:
+                    await self.on_close("runtime_owner_lost")
+                    return
         events = await asyncio.to_thread(
             _read_control, self.voice_session_id, self._cursor
         )

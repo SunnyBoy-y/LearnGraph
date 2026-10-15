@@ -105,7 +105,7 @@ from pipecat.utils.time import time_now_iso8601
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from app.voice.embedded_timeline import timeline_mark
-from app.voice.embedded_turn_intent import is_backchannel
+from app.voice.embedded_turn_intent import is_asr_filler, is_backchannel
 
 
 # interim 字幕单条长度上限：partial 的 ``text`` 是整段单调增长的假设文本，
@@ -1002,24 +1002,23 @@ class DashScopeSTTService(STTService):
             return False
 
     def _is_backchannel_filler(self, text: str) -> bool:
-        """整句都是背声词（「嗯。」「哦。」「对。」…）且助手正在作答 → 不入管线。
+        """在转录进入账本、字幕和回合管线前过滤整句背声词。
 
-        背声词是"我在听"的回应，不是一次发言。放它过去会做三件错事：起一个用户
-        回合、把正在播的回答打断（实测 ``嗯。`` 13ms 后 turn.interrupted，随后这
-        句背声词还被当成一个问题回答）、并污染下一轮的用户消息。因此在文本出生的
-        这一层就掐掉：账本、上屏（RTVI ``user-transcription``）、聚合器、记忆都
-        不会再看到它。
-
-        反过来，"助手在作答时才算"是刻意的：助手没在作答、回合也已落定时，孤零零
-        一个「嗯」很可能**就是**回答（"听懂了吗？"→"嗯"），那种情况必须照常放行。
+        正则全文匹配的纯语气词（「嗯。」「哦……」「嗯，啊。」等）无条件
+        丢弃，避免云端幻觉在助手未出声时开启新回合。包含实义内容的句子
+        （「嗯，我想问一下」）不会匹配，后续增长的 partial 仍可正常通过。
+        「好的」「是的」等确认回复沿用原策略：只在助手正在作答时过滤。
         """
-        if not text or not is_backchannel(text):
+        if not text:
             return False
-        if not self._assistant_reply_in_flight():
+        pure_filler = is_asr_filler(text)
+        if not pure_filler and not (
+            is_backchannel(text) and self._assistant_reply_in_flight()
+        ):
             return False
         self._suppressed_backchannels += 1
         logger.debug(
-            f"{self}: suppressed backchannel while assistant is replying"
+            f"{self}: suppressed {'ASR filler' if pure_filler else 'backchannel while assistant is replying'}"
             f" (text_len={len(text)}, total={self._suppressed_backchannels})"
         )
         timeline_mark("stt", "背声词滤除", f"text_len={len(text)}")

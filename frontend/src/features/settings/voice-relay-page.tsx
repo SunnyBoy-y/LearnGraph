@@ -40,7 +40,7 @@ const STUN_URL = "stun:stun.cloudflare.com:3478";
 const TRANSPORT_URL: Record<Transport, string> = {
   udp: "turn:turn.cloudflare.com:3478?transport=udp",
   tcp: "turn:turn.cloudflare.com:3478?transport=tcp",
-  tls: "turns:turn.cloudflare.com:5349?transport=tcp",
+  tls: "turns:turn.cloudflare.com:443?transport=tcp",
 };
 const TRANSPORT_LABEL: Record<Transport, string> = {
   udp: "UDP（延迟最低）",
@@ -57,12 +57,20 @@ function transportOf(url: string): Transport | null {
 }
 
 /** Server order matters: aiortc uses the first TURN entry it is given. */
-function buildUrls(useStun: boolean, transports: Transport[], preferred: Transport): string[] {
+function buildUrls(useStun: boolean, transports: Transport[], preferred: Transport, existing: string[]): string[] {
   const ordered = [preferred, ...transports.filter((item) => item !== preferred)];
-  return [
-    ...(useStun ? [STUN_URL] : []),
-    ...ordered.map((item) => TRANSPORT_URL[item]),
-  ];
+  const savedStun = existing.filter((url) => transportOf(url) === null);
+  return [...new Set([
+    ...(useStun ? (savedStun.length ? savedStun : [STUN_URL]) : []),
+    ...ordered.flatMap((item) => {
+      const saved = existing.filter((url) => transportOf(url) === item);
+      return saved.length ? saved : [TRANSPORT_URL[item]];
+    }),
+  ])];
+}
+
+function parseStunText(value: string): string[] {
+  return [...new Set(value.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean))];
 }
 
 function statusBadge(status: string, enabled: boolean) {
@@ -84,6 +92,10 @@ export function VoiceRelayPage() {
     enabled: isAdmin,
   });
 
+  const [mode, setMode] = useState<"cloudflare" | "manual">("cloudflare");
+  const [stunText, setStunText] = useState("");
+  const [stunFallback, setStunFallback] = useState(false);
+  const [savedUrls, setSavedUrls] = useState<string[]>([]);
   const [keyId, setKeyId] = useState("");
   const [apiBase, setApiBase] = useState("");
   const [token, setToken] = useState("");
@@ -97,6 +109,10 @@ export function VoiceRelayPage() {
   useEffect(() => {
     const data = relay.data;
     if (!data) return;
+    setMode(data.mode === "manual" ? "manual" : "cloudflare");
+    setStunText((data.stun_urls?.length ? data.stun_urls : data.defaults.stun_urls ?? []).join("\n"));
+    setStunFallback(Boolean(data.stun_fallback_enabled));
+    setSavedUrls(data.urls?.length ? data.urls : data.defaults.urls);
     setKeyId(data.key_id ?? "");
     setApiBase(data.api_base || data.defaults.api_base);
     setTtlHours(Math.max(1, Math.round((data.credential_ttl_seconds || 86400) / 3600)));
@@ -105,39 +121,54 @@ export function VoiceRelayPage() {
     const found = urls
       .map(transportOf)
       .filter((item): item is Transport => item !== null);
-    setTransports(found.length ? found : ["udp"]);
+    setTransports(found.length ? [...new Set(found)] : ["tcp"]);
     const firstTurn = urls.find((url) => transportOf(url) !== null);
     setPreferred((firstTurn && transportOf(firstTurn)) || "udp");
   }, [relay.data]);
 
+  const stunUrls = useMemo(() => parseStunText(stunText), [stunText]);
   const payload = useMemo<VoiceRelaySaveWire>(
     () => ({
-      mode: "cloudflare",
-      key_id: keyId.trim(),
-      api_base: apiBase.trim(),
-      urls: buildUrls(useStun, transports, preferred),
-      credential_ttl_seconds: Math.round(ttlHours * 3600),
-      ...(token.trim() ? { secret: token.trim() } : {}),
+      mode,
+      stun_urls: stunUrls,
+      stun_fallback_enabled: stunFallback,
+      ...(mode === "cloudflare" ? {
+        key_id: keyId.trim(),
+        api_base: apiBase.trim(),
+        urls: buildUrls(useStun, transports, preferred, savedUrls),
+        credential_ttl_seconds: Math.round(ttlHours * 3600),
+        ...(token.trim() ? { secret: token.trim() } : {}),
+      } : {}),
     }),
-    [apiBase, keyId, preferred, token, transports, ttlHours, useStun],
+    [apiBase, keyId, preferred, token, transports, ttlHours, useStun, mode, stunUrls, stunFallback, savedUrls],
   );
 
-  const canSubmit =
+  const validStunPool = stunUrls.length > 0 && stunUrls.length <= 16 && stunUrls.every((url) => url.startsWith("stun:"));
+  const canSubmit = mode === "manual" ? validStunPool : (
     keyId.trim().length > 0 &&
     transports.length > 0 &&
-    (token.trim().length > 0 || Boolean(relay.data?.secret_configured));
+    (!stunFallback || validStunPool) &&
+    (token.trim().length > 0 || Boolean(relay.data?.secret_configured))
+  );
 
   const saveAndTest = useMutation({
     mutationFn: async () => {
-      await saveVoiceRelay(payload);
-      return testVoiceRelay(payload);
+      const saved = await saveVoiceRelay(payload);
+      queryClient.setQueryData(["voice-relay"], saved);
+      setToken("");
+      setResult(null);
+      try {
+        return await testVoiceRelay({ ...payload, secret: undefined });
+      } catch (error) {
+        throw new Error(`配置已保存，但测试未完成：${error instanceof Error ? error.message : String(error)}`);
+      }
     },
     onSuccess: (tested) => {
       setResult(tested);
       setToken("");
       void queryClient.invalidateQueries({ queryKey: ["voice-relay"] });
       if (tested.ok) {
-        toast.success("语音中继已保存，并已对所有用户生效");
+        toast.success("连接配置已保存并通过测试，后续新通话使用新配置（当前通话不断开）");
       } else {
         toast.warning(`配置已保存，但中继暂不可用：${tested.detail}`);
       }
@@ -214,6 +245,54 @@ export function VoiceRelayPage() {
       ) : null}
 
       <section className="space-y-4 rounded-md border p-4">
+        <div className="space-y-2">
+          <Label>连接配置模式</Label>
+          <RadioGroup value={mode} onValueChange={(value) => { setMode(value as typeof mode); setResult(null); }}>
+            <div className="flex items-center gap-2">
+              <RadioGroupItem id="voice-relay-mode-cloudflare" value="cloudflare" />
+              <Label htmlFor="voice-relay-mode-cloudflare">Cloudflare TURN（可启用独立 STUN 兜底）</Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <RadioGroupItem id="voice-relay-mode-manual" value="manual" />
+              <Label htmlFor="voice-relay-mode-manual">仅手动 STUN（不依赖 Cloudflare，无需凭据）</Label>
+            </div>
+          </RadioGroup>
+        </div>
+
+        {mode === "cloudflare" ? (
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <Label htmlFor="voice-relay-stun-fallback">启用独立 STUN 备选与兜底</Label>
+              <p className="text-xs text-muted-foreground">
+                正常时同时下发地址池；Cloudflare 签发失败时继续使用它，并保留仍有效的旧 TURN 凭据。
+              </p>
+            </div>
+            <Switch id="voice-relay-stun-fallback" checked={stunFallback} onCheckedChange={setStunFallback} />
+          </div>
+        ) : null}
+
+        {mode === "manual" || stunFallback ? (
+          <div className="space-y-2 rounded-md border p-3">
+            <Label htmlFor="voice-relay-stun-urls">手动 STUN 地址池</Label>
+            <textarea
+              id="voice-relay-stun-urls"
+              className="min-h-28 w-full rounded-md border bg-transparent px-3 py-2 font-mono text-xs"
+              rows={4}
+              value={stunText}
+              onChange={(event) => setStunText(event.target.value)}
+              placeholder="stun:stun.miwifi.com:3478"
+            />
+            <Button type="button" variant="outline" size="sm" onClick={() => setStunText((relay.data?.defaults.stun_urls ?? []).join("\n"))}>
+              填入国内候选（小米 / 芒果 / B 站）
+            </Button>
+            <p className="text-xs text-muted-foreground">
+              每行一个 stun:host:port（UDP），最多 16 个，保存时去重。公开地址无可用性保证，请在实际网络验证。
+              STUN 只帮助发现公网映射，不转发媒体，不能替代 TURN；该地址池只下发浏览器，后端保留 TURN 优先的延迟保护。
+            </p>
+          </div>
+        ) : null}
+
+        {mode === "cloudflare" ? <div className="space-y-4">
         <div className="space-y-2">
           <Label htmlFor="voice-relay-key-id">Cloudflare TURN Key ID</Label>
           <Input
@@ -349,6 +428,7 @@ export function VoiceRelayPage() {
             </div>
           </div>
         </details>
+        </div> : null}
 
         <div className="flex flex-wrap items-center gap-2">
           <Button disabled={!canSubmit || busy} onClick={() => saveAndTest.mutate()} type="button">

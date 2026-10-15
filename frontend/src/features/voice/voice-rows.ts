@@ -125,11 +125,11 @@ export function voiceActionsVisible(row: Pick<Message, "provider_trace" | "statu
 export function mergeAdjacentVoiceUserMessages(rows: readonly Message[]): Message[] {
   const result: Message[] = [];
   for (const row of rows) {
-    if (isVoice(row) && row.role === "assistant" && !row.content?.trim() &&
-        !row.parts?.some((p) => p.content?.trim())) continue;
     const previous = result[result.length - 1];
     if (previous?.role !== "user" || row.role !== "user" ||
-        !isVoice(previous) || !isVoice(row) || previous.session_id !== row.session_id) {
+        !isVoice(previous) || !isVoice(row) || previous.session_id !== row.session_id ||
+        previous.provider_trace?.client_message_id || row.provider_trace?.client_message_id ||
+        previous.status === "failed" || row.status === "failed") {
       result.push(row);
       continue;
     }

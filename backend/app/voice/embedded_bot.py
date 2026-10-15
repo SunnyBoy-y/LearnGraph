@@ -17,10 +17,11 @@
 
 import asyncio
 import contextlib
+import json
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -73,6 +74,7 @@ from app.voice.embedded_delegation import (
     DelegationKind,
     DelegationRequest,
     TaskControlRequest,
+    VoiceExerciseAnswerRequest,
     VoiceDelegationPort,
     dispatch_artifact_list,
     dispatch_delegation,
@@ -100,6 +102,7 @@ from app.services.provider_capabilities import record_thinking_off_observation
 from app.voice.policy import resolve_llm_thinking_off
 from app.voice.runner_registry import (
     VoiceRunnerHandle,
+    runtime_owner_id,
     get_runner,
     register_runner,
     unregister_runner,
@@ -115,11 +118,7 @@ VOICE_INTERRUPT_MESSAGE = "learngraph-interrupt"
 VOICE_PLAYBACK_MESSAGE = "learngraph-playback"
 
 
-# 口语回答预算（F08）。语音回答的成本主要在"听"：一段 60 秒的朗读会把用户锁在
-# 麦克风外，而文字可以扫读。所以预算约束的是**默认详略**，不是内容完整性——它说明
-# "什么时候该短"，任何情况下都不允许为了守住预算而截断事实、数字或必要的长代码。
-DEFAULT_SPEECH_BUDGET_SENTENCES = "2-3"
-DEFAULT_SPEECH_BUDGET_SECONDS = "15-25"
+# 口语表达以信息传达有效性为准，不设置固定句数或时长预算。
 
 # 前台实时回合恒为「关闭思考」。当某个 Provider 方言/模型根本表达不出关闭（自定义
 # 网关、能力快照缺失等）时，通话照常但代价必须可见：这条文案经 ``processor.notice``
@@ -145,31 +144,44 @@ ThinkingOffReporter = Callable[[ThinkingOffVerdict], Awaitable[None]]
 
 
 def speech_budget_instruction() -> str:
-    """口语回答预算说明；句数与秒数可用环境变量覆盖（默认 2–3 句 / 15–25 秒）。"""
-    sentences = (
-        os.getenv("VOICE_SPEECH_BUDGET_SENTENCES", "").strip()
-        or DEFAULT_SPEECH_BUDGET_SENTENCES
-    )
-    seconds = (
-        os.getenv("VOICE_SPEECH_BUDGET_SECONDS", "").strip()
-        or DEFAULT_SPEECH_BUDGET_SECONDS
-    )
+    """口语表达准则：按信息传达有效性决定详略，不设句数或时长预算。"""
     return (
-        f"默认把口头回答控制在 {sentences} 句、大约 {seconds} 秒以内；"
-        "用户明确要求深入讲解时不受这个预算限制，继续展开。"
-        "任何情况下都不得为了控制长度而省略关键事实、数字、结论，"
-        "也不得截断必要的事实陈述或长代码——预算只约束默认详略，"
-        "不约束内容的完整与正确。"
+        "\n\n表达标准：以用户能否理解结论、作出判断或继续行动为准，不以句数或时长控制回答。"
+        "先说重点；只补充会影响理解、判断或行动的信息，必要信息讲清楚后就停止。"
+        "不要复述用户原话、重复结论或计划，也不要用客套话和无关背景填充。"
+        "任务受理后说明真实状态和预期产物即可；仅在影响用户判断时说明所用假设或限制。"
+        "解释、教学或复杂问题按理解所需展开，不必等用户明确要求详细；避免堆砌用户已知的信息。"
+        "澄清只围绕阻碍执行的信息，不重复确认已明确的需求，不为延长对话强加追问或下一步。"
+        "不得为了简短而省略影响结论的事实、数字、风险、限制或真实完成状态。"
+        "代码、文件和完整过程在画布展示；语音仍须讲清用户所问的结论及必要依据，不能只让用户去看画布。"
     )
 
 
 _BASE_SYSTEM_INSTRUCTION = (
-    "你是一个友好的中文语音导师。你的回答会被直接朗读出来，所以请使用自然、"
-    "口语化的中文，避免 emoji、特殊符号、列表、Markdown 等无法朗读的内容。"
-    "回答要简洁、亲切，像真人对话一样。遇到需要联网研究、深度分析或工具执行的"
-    "请求时，调用相应的后台任务工具，先快速确认受理，然后继续和用户实时对话；"
-    "不要等待后台任务完成，也不要把后台原始结果逐字念出。"
+    "你是前台中文全双工语音 Tutor，也是任务协调器，不是代码执行器。回答会被直接朗读，"
+    "所以使用自然、精准、信息充分且不重复的中文，不使用 emoji、特殊符号、列表或 Markdown。"
+    "先判断用户本轮的主要意图，只按一个主分类处理；若同时存在彼此独立的任务，可以并行创建。"
+    "\n\n意图一，直接回答：适用于简单事实、解释、建议和闲聊。先给结论，只补充理解结论所必需的信息。"
+    "不要复述问题，不要先声明准备怎么回答，不要主动扩展用户未要求的背景。"
+    "\n\n意图二，立即委派：适用于需要联网研究、深度分析、读取工作区、写代码、修改文件、执行命令、"
+    "制作练习、图谱、产物或其他后台工作的请求。只要目标、对象和期望结果足以启动，就立即调用对应工具创建任务，"
+    "不得先反复询问风格、格式、细节或让用户重新描述。未指定的次要细节采用安全、常见、可修改的默认值，"
+    "并写入任务说明；创建后只简短告知任务已受理和将产出什么。联网资料用 delegate_research，深度分析用"
+    "delegate_reasoning；其余学习或工作区任务用 delegate_tool_task 和对应 capability。"
+    "\n\n意图三，必要澄清：只有缺少的信息会改变任务对象、核心目标、数据来源、权限边界，"
+    "或使任务无法安全启动时才提问。一次只问一个最关键问题，给出具体选项；得到答案后立即创建任务。"
+    "不要询问可由合理默认值解决的偏好，不要连续确认已经明确的内容。"
+    "\n\n意图四，任务控制：查询状态用 get_background_task，取消用 cancel_background_task，"
+    "修改需求用 revise_background_task，自动播报用 set_background_delivery，用户明确要求听取完成结果时"
+    "才用 get_ready_results。不要反复轮询。"
+    "\n\n意图五，结果播报：accepted 或 queued 只表示已受理，不能说已经完成。"
+    "任务完成时先说最终结论或产物，仅补充影响理解或使用的必要依据、限制和行动；无须行动时不强加下一步。详细来源、过程、文件和代码留在画布任务卡中。"
+    "\n\n执行边界：前台不得直接写代码、修改文件、执行 shell、调用补丁工具、读取或解析源码或网页代码；"
+    "这些工作必须委派后台 Agent。委派必须快速返回，不等待后台结束，用户继续说话时保持可打断。"
+    "不得臆造工具结果、文件内容、来源、状态或完成时间。"
 )
+from pipecat.adapters.schemas.direct_function import tool_options
+from pipecat.adapters.schemas.function_schema import FunctionSchema
 
 SYSTEM_INSTRUCTION = _BASE_SYSTEM_INSTRUCTION + speech_budget_instruction()
 
@@ -195,6 +207,8 @@ def _resolve_voice_provider_config(session_id: str) -> _VoiceProviderConfig:
     """Resolve same workspace providers without request-scoped objects."""
     if not session_id:
         return _VoiceProviderConfig()
+
+
     try:
         from app.core.config import get_settings
         from app.core.database import SessionLocal
@@ -257,6 +271,115 @@ def _resolve_voice_provider_config(session_id: str) -> _VoiceProviderConfig:
             "Failed to resolve workspace Providers for voice session %s", session_id
         )
         return _VoiceProviderConfig()
+
+def _foreground_text_tool_schemas(
+    session: object | None,
+    settings: object,
+) -> list[FunctionSchema]:
+    """Expose the same authorized Agent tool graph used by text mode.
+
+    Pipecat's decorated Tutor tools cover voice-specific delegation. The text
+    Agent graph is added as FunctionSchema handlers backed by a fresh DB/runtime
+    per call, so the foreground voice Agent gets the normal tool range without
+    sharing a SQLAlchemy session with the audio loop.
+    """
+    workspace_id = str(getattr(session, "workspace_id", "") or "")
+    actor_id = str(getattr(session, "owner_user_id", "") or "")
+    chat_session_id = str(getattr(session, "chat_session_id", "") or "")
+    if not workspace_id or not actor_id or not chat_session_id:
+        return []
+    try:
+        from app.core.database import SessionLocal
+        from app.services.chat_service_factory import build_background_agent_tool_runtime
+
+        with SessionLocal() as db:
+            runtime = build_background_agent_tool_runtime(
+                db,
+                workspace_id=workspace_id,
+                actor_id=actor_id,
+                settings=settings,
+            )
+            definitions = runtime.definitions(
+                agent_mode_enabled=True,
+                web_search_enabled=True,
+                memory_enabled=True,
+            )
+    except Exception:
+        logger.warning("foreground voice Agent tool graph unavailable", exc_info=True)
+        return []
+
+    disclosed_names = {
+        str(item.get("function", {}).get("name"))
+        for item in definitions
+        if isinstance(item, dict) and isinstance(item.get("function"), dict)
+    }
+
+    def handler_for(name: str):
+        @tool_options(cancel_on_interruption=False, timeout_secs=30)
+        async def handler(params: FunctionCallParams) -> None:
+            arguments = dict(params.arguments or {})
+
+            def execute() -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+                from app.core.database import SessionLocal
+                from app.services.chat_service_factory import build_background_agent_tool_runtime
+
+                with SessionLocal() as db:
+                    runtime = build_background_agent_tool_runtime(
+                        db,
+                        workspace_id=workspace_id,
+                        actor_id=actor_id,
+                        settings=settings,
+                    )
+                    return runtime.execute(
+                        {
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(arguments, ensure_ascii=False),
+                            }
+                        },
+                        allowed_domains=[],
+                        chat_session_id=chat_session_id,
+                        disclosed_tool_names=disclosed_names,
+                    )
+
+            try:
+                text, metadata, sources = await asyncio.to_thread(execute)
+                await params.result_callback(
+                    {
+                        "status": "completed",
+                        "tool_name": name,
+                        "text": text,
+                        "metadata": metadata,
+                        "sources": sources,
+                    }
+                )
+            except Exception as exc:
+                logger.debug("foreground voice Agent tool failed: %s", name, exc_info=True)
+                await params.result_callback(
+                    {"status": "failed", "tool_name": name, "error": str(exc)[:500]}
+                )
+
+        return handler
+
+    schemas: list[FunctionSchema] = []
+    for item in definitions:
+        function = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        parameters = function.get("parameters")
+        if not name or not isinstance(parameters, dict):
+            continue
+        schemas.append(
+            FunctionSchema(
+                name=name,
+                description=str(function.get("description") or "")[:4_000],
+                properties=dict(parameters.get("properties") or {}),
+                required=[str(value) for value in parameters.get("required") or []],
+                handler=handler_for(name),
+            )
+        )
+    return schemas
 
 
 def context_change_report(
@@ -479,11 +602,26 @@ class TutorAgent(LLMWorker):
             return []
         return super().build_tools()
 
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def get_agent_runtime_status(self, params: FunctionCallParams) -> None:
+        """Return the current foreground Tutor and background Agent status."""
+        await params.result_callback(
+            {
+                "status": "ready",
+                "agent": "foreground_voice_tutor",
+                "voice_session_id": self._voice_session_id,
+                "delegation_available": self._delegation_port is not None,
+                "tool_mode": "text_agent_tools_plus_voice_delegation",
+                "tool_call_active": bool(getattr(self, "tool_call_active", False)),
+            }
+        )
+
     async def _delegate(
         self,
         params: FunctionCallParams,
         *,
         kind: DelegationKind,
+        capability_id: str,
         query: str,
         purpose: str = "",
         context: str = "",
@@ -493,9 +631,15 @@ class TutorAgent(LLMWorker):
             DelegationRequest(
                 kind=kind,
                 query=str(query or "").strip(),
+                capability_id=capability_id,
                 purpose=str(purpose or "").strip(),
-                context=str(context or "").strip(),
+                context={"user_context": str(context or "").strip()},
                 voice_session_id=self._voice_session_id,
+                metadata={
+                    "execution_lane": "background_agent",
+                    "parallel_allowed": True,
+                    "foreground_must_not_wait": True,
+                },
             ),
         )
         await params.result_callback(result)
@@ -512,6 +656,7 @@ class TutorAgent(LLMWorker):
         await self._delegate(
             params,
             kind=DelegationKind.RESEARCH,
+            capability_id="research",
             query=query,
             purpose=purpose,
             context=context,
@@ -529,6 +674,7 @@ class TutorAgent(LLMWorker):
         await self._delegate(
             params,
             kind=DelegationKind.REASONING,
+            capability_id="reasoning",
             query=query,
             purpose=purpose,
             context=context,
@@ -541,11 +687,25 @@ class TutorAgent(LLMWorker):
         query: str,
         purpose: str = "",
         context: str = "",
+        capability_id: Literal[
+            "workspace_read",
+            "learning_read",
+            "practice_prepare",
+            "learning_evidence",
+            "graph_proposal",
+            "artifact_create",
+            "workspace_task",
+        ] = "workspace_read",
     ) -> None:
-        """Queue an authorized tool task and return immediately."""
+        """Queue a server-approved learning or workspace capability.
+
+        ``capability_id`` is an intent-level name.  The coordinator resolves it
+        to the actual Agent tool allow-list and rejects unknown values.
+        """
         await self._delegate(
             params,
             kind=DelegationKind.TOOL,
+            capability_id=capability_id,
             query=query,
             purpose=purpose,
             context=context,
@@ -635,6 +795,46 @@ class TutorAgent(LLMWorker):
             task_id=task_id,
             instruction="auto" if auto_report else "manual",
         )
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def confirm_background_task(
+        self,
+        params: FunctionCallParams,
+        task_id: str,
+        approved: bool = True,
+    ) -> None:
+        """Approve or reject a pending write-capability task.
+
+        Call this only after the user has explicitly confirmed the proposed
+        action in the current conversation.
+        """
+        await self._control(
+            params,
+            operation="confirm",
+            task_id=task_id,
+            instruction="approve" if approved else "reject",
+        )
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def submit_voice_exercise_answer(
+        self,
+        params: FunctionCallParams,
+        exercise_id: str,
+        answer: str,
+        attempt_index: int = 1,
+    ) -> None:
+        """Grade a spoken answer through the shared Exercise/Evidence path."""
+        if self._delegation_port is None:
+            await params.result_callback({"status": "unavailable"})
+            return
+        result = await self._delegation_port.submit_exercise_answer(
+            VoiceExerciseAnswerRequest(
+                exercise_id=str(exercise_id or "").strip(),
+                answer=str(answer or "").strip(),
+                attempt_index=max(1, min(int(attempt_index or 1), 20)),
+            )
+        )
+        await params.result_callback(dict(result or {}))
 
     @tool(cancel_on_interruption=False, timeout_secs=5)
     async def revise_background_task(
@@ -769,7 +969,19 @@ def bind_journal_to_tap(
                 FrameDirection.DOWNSTREAM,
             )
         except Exception:
-            logger.debug("voice event publish failed", exc_info=True)
+            # A live playback marker is the only authorization for assistant
+            # captions. Keep failures visible in the server log so a call that
+            # still produces audio cannot silently lose its queued/ended text;
+            # the durable journal remains the bounded recovery path.
+            payload = envelope.get("payload")
+            live_event_id = payload.get("live_event_id") if isinstance(payload, dict) else None
+            logger.warning(
+                "voice live playback event publish failed session={} type={} live_event_id={}",
+                envelope.get("session_id"),
+                envelope.get("type"),
+                live_event_id,
+                exc_info=True,
+            )
 
     async def _rerun_generation() -> None:
         """Re-run the LLM on the existing context after a failed attempt."""
@@ -902,6 +1114,10 @@ async def handle_learngraph_client_message(
         logger.debug("Duplicate barge-in ignored: interruptId={}", interrupt_id)
         return
     logger.info("Client requested barge-in over RTVI; interrupting the bot")
+    if journal is not None:
+        # A button interrupt is explicit even during pre-token model latency.
+        # Pipeline flush frames alone no longer close a fresh accepted question.
+        await journal.turn_interrupted(reason="client_interrupt")
     generation_gate.invalidate()
     await interrupt_bot()
 
@@ -1003,6 +1219,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         )
 
     session_id = str(getattr(runner_args, "session_id", "") or "")
+    owner_id = runtime_owner_id()
+    runner_body = getattr(runner_args, "body", None)
+    runtime_session_epoch = None
+    runtime_peer_generation = None
+    if isinstance(runner_body, dict) and runner_body.get("runtime_session_epoch") is not None:
+        try:
+            runtime_session_epoch = int(runner_body["runtime_session_epoch"])
+        except (TypeError, ValueError):
+            runtime_session_epoch = None
+    if isinstance(runner_body, dict) and runner_body.get("runtime_peer_generation") is not None:
+        try:
+            runtime_peer_generation = int(runner_body["runtime_peer_generation"])
+        except (TypeError, ValueError):
+            runtime_peer_generation = None
     providers = _resolve_voice_provider_config(session_id)
     asr_provider = providers.asr if getattr(providers.asr, "available", False) else None
     llm_provider = providers.llm if getattr(providers.llm, "available", False) else None
@@ -1011,6 +1241,27 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     from app.core.config import get_settings
 
     settings = get_settings()
+    if runtime_session_epoch is None:
+        runtime_session_epoch = int(
+            getattr(providers.session, "session_epoch", 0) or 0
+        ) or None
+    # session_epoch also advances for model/context revisions. Once a peer
+    # generation is available, use that stable fencing value for the media
+    # runtime owner and leave session_epoch for control/reconnect events.
+    owner_expected_epoch = runtime_session_epoch if runtime_peer_generation is None else None
+    if session_id:
+        from app.voice.events import claim_runtime_owner
+
+        claimed = await asyncio.to_thread(
+            claim_runtime_owner,
+            session_id,
+            owner_id,
+            lease_seconds=settings.voice_runtime_owner_lease_seconds,
+            expected_session_epoch=owner_expected_epoch,
+            expected_peer_generation=runtime_peer_generation,
+        )
+        if not claimed:
+            raise RuntimeError("voice runtime ownership was lost before pipeline start")
     journal = (
         VoiceTurnJournal(
             session_id,
@@ -1310,6 +1561,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         voice_session_id=session_id,
         delegation_port=delegation_port,
     )
+    foreground_text_tools = _foreground_text_tool_schemas(providers.session, settings)
+    if foreground_text_tools:
+        # Keep voice-specific delegation tools registered by TutorAgent while
+        # adding the full authorized text-mode Agent tool graph to this context.
+        context.set_tools(foreground_text_tools)
     result_delivery = (
         VoiceResultDeliveryProcessor(agent=agent, result_port=delegation_port)
         if delegation_port is not None
@@ -1335,7 +1591,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         assistant_aggregator=assistant_aggregator,
         # 句级账本的写入者：坐在输出传输下游，只在"这一句的音频真的写出去了"之后
         # 才落账（未听到的文本因此进不了账本、转录与记忆）。
-        ledger_relay=VoiceLedgerRelay(journal=journal) if journal is not None else None,
+        ledger_relay=(
+            VoiceLedgerRelay(
+                journal=journal,
+                on_playback_ended=(
+                    result_delivery.playback_ended
+                    if result_delivery is not None
+                    else None
+                ),
+            )
+            if journal is not None
+            else None
+        ),
         context_playback_guard=playback_context,
     )
     pipeline = Pipeline(insert_timeline_probes(pipeline_steps))
@@ -1376,6 +1643,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         voice_session_id=session_id,
         chat_session_id=str(getattr(providers.session, "chat_session_id", "") or ""),
         owner_user_id=str(getattr(providers.session, "owner_user_id", "") or ""),
+        runtime_owner_id=owner_id,
         processors=[stt, tts, generation_gate, worker, agent] + ([result_delivery] if result_delivery is not None else []),
         transports=[transport],
         task=current_task,
@@ -1424,6 +1692,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     if journal is not None and session_id:
 
         async def _on_interrupt(_event: Mapping[str, Any]) -> None:
+            # The HTTP control plane may interrupt before the first model token.
+            # Scope its journal closure to the event's turn; a delayed old request
+            # must not close the replacement question already accepted by ASR.
+            target_turn = _event.get("turn_id")
+            if target_turn:
+                await journal.turn_interrupted(
+                    reason="client_interrupt", turn_id=str(target_turn)
+                )
             generation_gate.invalidate()
             if memory_bridge is not None:
                 # The turn this recall belonged to is over; drop it rather than
@@ -1509,6 +1785,18 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                         STAGE_LLM, "thinking_off_unavailable", notice
                     )
 
+        async def _on_heartbeat() -> bool:
+            from app.voice.events import heartbeat_runtime_owner
+
+            return await asyncio.to_thread(
+                heartbeat_runtime_owner,
+                session_id,
+                owner_id,
+                lease_seconds=settings.voice_runtime_owner_lease_seconds,
+                expected_session_epoch=owner_expected_epoch,
+                expected_peer_generation=runtime_peer_generation,
+            )
+
 
         async def _on_close(reason: str) -> None:
             nonlocal close_reason
@@ -1529,6 +1817,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             on_interrupt=_on_interrupt,
             on_model_changed=_on_model_changed,
             on_close=_on_close,
+            on_heartbeat=_on_heartbeat,
+            heartbeat_interval_secs=settings.voice_runtime_owner_heartbeat_seconds,
             on_reconcile=(
                 journal.reconcile_stale_turns if journal is not None else None
             ),
@@ -1574,7 +1864,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             try:
                 from app.voice.events import mark_session_reconnecting
 
-                await asyncio.to_thread(mark_session_reconnecting, session_id)
+                await asyncio.to_thread(
+                    mark_session_reconnecting,
+                    session_id,
+                    owner_id,
+                    expected_session_epoch=owner_expected_epoch,
+                    expected_peer_generation=runtime_peer_generation,
+                )
                 await journal.session_reconnecting(attempt=1, delay_ms=0)
             except Exception:
                 logger.debug("voice reconnect marker failed", exc_info=True)
@@ -1593,6 +1889,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             await watchdog.stop()
         if session_id and get_runner(session_id) is handle:
             unregister_runner(session_id)
+        if session_id:
+            from app.voice.events import release_runtime_owner
+
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    release_runtime_owner,
+                    session_id,
+                    owner_id,
+                    expected_session_epoch=owner_expected_epoch,
+                    expected_peer_generation=runtime_peer_generation,
+                )
         if journal is not None:
             await journal.drain_persistence()
         if journal is not None and session_id:

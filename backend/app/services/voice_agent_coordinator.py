@@ -21,7 +21,7 @@ from typing import Any, Mapping
 from sqlalchemy import select
 
 from app.core.errors import AppError
-from app.domain.models import SandboxAgentTask, utc_now
+from app.domain.models import Message, SandboxAgentTask, VoiceTaskLinkRecord, utc_now
 from app.domain.schemas.sandbox import (
     AgentTaskResult,
     SandboxAgentSubagentCancelRequest,
@@ -35,6 +35,7 @@ from app.services.agent_execution_profiles import (
     resolve_agent_execution_profile,
 )
 from app.services.sandbox_scheduler import append_agent_event
+from app.voice.capabilities import resolve_voice_capability
 
 
 CONTEXT_MAX_CHARS = 24_000
@@ -161,19 +162,30 @@ class VoiceAgentCoordinator:
             )
         return self._task_service
 
-    def _require_workspace_manage(self) -> None:
+    def _require_capability_permission(self, capability_id: str | None) -> None:
         if self.permissions is None:
             raise AppError(
                 403,
                 "voice_agent_permission_unverified",
                 "A server-verified permission set is required to delegate a background Agent task",
             )
-        if "workspace.manage" not in self.permissions:
+        required = "workspace.manage"
+        if capability_id:
+            try:
+                required = resolve_voice_capability(capability_id).required_permission
+            except ValueError as exc:
+                raise AppError(422, "invalid_voice_capability", str(exc)) from exc
+        if required not in self.permissions and "workspace.manage" not in self.permissions:
             raise AppError(
                 403,
                 "voice_agent_permission_denied",
-                "Workspace management permission is required to delegate a background Agent task",
+                f"Permission '{required}' is required to delegate this voice Agent task",
             )
+
+    # Compatibility shim for callers that used the old private guard while
+    # the voice coordinator still had one workspace.manage gate.
+    def _require_workspace_manage(self) -> None:
+        self._require_capability_permission(None)
 
     def _load_task(self, task_id: str) -> SandboxAgentTask:
         task = self.db.scalar(
@@ -262,6 +274,9 @@ class VoiceAgentCoordinator:
             "job_id": task.latest_job_id,
             "title": task.title,
             "role_key": task.role_key,
+            "capability_id": spec.get("capability_id"),
+            "approval_status": spec.get("approval_status"),
+            "approval_expires_at": spec.get("approval_expires_at"),
             "status": task.status.casefold(),
             "status_reason": task.status_reason,
             "result_text": task.result_text,
@@ -283,6 +298,7 @@ class VoiceAgentCoordinator:
         self,
         *,
         role_key: str,
+        capability_id: str | None = None,
         prompt: str | None = None,
         objective: str | None = None,
         chat_session_id: str,
@@ -291,6 +307,7 @@ class VoiceAgentCoordinator:
         tools: list[str] | tuple[str, ...] | None = None,
         skills: list[str] | None = None,
         write_set: list[str] | None = None,
+        output_contract: Mapping[str, Any] | None = None,
         voice_session_id: str | None = None,
         turn_id: str | None = None,
         session_epoch: int | None = None,
@@ -304,13 +321,14 @@ class VoiceAgentCoordinator:
         This method only performs bounded JSON/database work.  It never waits
         for the background Agent to finish and never invokes TTS.
         """
-        self._require_workspace_manage()
+        self._require_capability_permission(capability_id)
         request_text = str(objective or prompt or "").strip()
         if not request_text:
             raise AppError(422, "voice_agent_prompt_required", "Delegation requires a non-empty objective")
         profile = resolve_agent_execution_profile(role_key, tools=list(tools) if tools is not None else None)
         requested_thinking = str(thinking_mode or profile.default_thinking_mode).strip().casefold()
         normalized_tools = _tools_value(profile)
+        capability_tools = list(profile.tools)
         group_digest_payload = {
             "workspace_id": self.workspace_id,
             "actor_id": self.actor_id,
@@ -318,6 +336,7 @@ class VoiceAgentCoordinator:
             "turn_id": turn_id,
             "chat_session_id": chat_session_id,
             "role": profile.role.value,
+            "capability_id": capability_id,
             "prompt": request_text,
             "requirement_version": int(requirement_version),
         }
@@ -330,6 +349,8 @@ class VoiceAgentCoordinator:
         supplied_context = _bounded_context(dict(context or {}))
         context_snapshot = {
             "context": supplied_context,
+            "capability_id": capability_id,
+            "capability_tools": capability_tools,
             "context_version": context_version,
             "session_epoch": session_epoch,
         }
@@ -348,6 +369,7 @@ class VoiceAgentCoordinator:
             tools=normalized_tools,
             skills=skills,
             write_set=write_set,
+            output_contract=dict(output_contract or {}),
             thinking_mode=requested_thinking,
             voice_session_id=voice_session_id,
             turn_id=turn_id,
@@ -373,6 +395,8 @@ class VoiceAgentCoordinator:
                     "context_version": context_version,
                 },
                 "requirement_group_id": requirement_group_id,
+                "capability_id": capability_id,
+                "capability_tools": capability_tools,
                 "requirement_version": int(requirement_version),
                 "current_requirement_version": int(requirement_version),
                 "delivery_state": "pending",
@@ -386,6 +410,7 @@ class VoiceAgentCoordinator:
             "job_id": task.latest_job_id,
             "status": "accepted",
             "role_key": profile.role.value,
+            "capability_id": capability_id,
             "title": task.title,
             "chat_session_id": chat_session_id,
             "voice_session_id": voice_session_id,
@@ -398,6 +423,75 @@ class VoiceAgentCoordinator:
             "accepted_at": _utc_iso(),
             "idempotent_replay": bool(created.get("idempotent_replay")),
         }
+
+    def approve_pending_voice_task(self, link: VoiceTaskLinkRecord) -> dict[str, Any]:
+        """Start a previously prepared voice task after explicit approval."""
+
+        if link.status != "waiting_approval":
+            raise AppError(
+                409,
+                "voice_task_not_awaiting_approval",
+                "Voice task is not awaiting approval",
+            )
+        request = dict(link.approval_request_json or {})
+        capability_id = str(link.capability_id or request.get("capability_id") or "") or None
+        prompt = str(request.get("query") or link.current_prompt or "").strip()
+        if not prompt:
+            raise AppError(422, "voice_agent_prompt_required", "Approved voice task has no prompt")
+        context = (
+            dict(request.get("context"))
+            if isinstance(request.get("context"), Mapping)
+            else {}
+        )
+        if capability_id == "learning_evidence":
+            source_message_id = self._voice_source_message_id(link)
+            if source_message_id:
+                context["voice_evidence_source"] = {
+                    "source_type": "conversation",
+                    "source_id": source_message_id,
+                    "voice_turn_id": link.trigger_turn_id,
+                }
+        return self.delegate(
+            role_key=str(request.get("role_key") or "tool"),
+            capability_id=capability_id,
+            objective=prompt,
+            chat_session_id=link.chat_session_id,
+            title=str(request.get("title") or link.title or prompt[:80]),
+            thinking_mode=str(request.get("thinking_mode") or "medium"),
+            tools=request.get("tools"),
+            skills=request.get("skills"),
+            write_set=request.get("write_set"),
+            output_contract=request.get("output_contract"),
+            voice_session_id=link.voice_session_id,
+            turn_id=link.trigger_turn_id,
+            session_epoch=request.get("session_epoch"),
+            context_version=request.get("context_version"),
+            context=context,
+            requirement_group_id=f"approval:{link.id}",
+            requirement_version=int(link.requirement_version or 1),
+        )
+
+    def _voice_source_message_id(self, link: VoiceTaskLinkRecord) -> str | None:
+        """Resolve the finalized user Message for a voice-triggered evidence task."""
+
+        turn_id = str(link.trigger_turn_id or "").strip()
+        if not turn_id:
+            return None
+        rows = self.db.scalars(
+            select(Message)
+            .where(
+                Message.workspace_id == self.workspace_id,
+                Message.session_id == link.chat_session_id,
+                Message.role == "user",
+            )
+            .order_by(Message.created_at.desc())
+            .limit(80)
+        ).all()
+        for message in rows:
+            trace = message.provider_trace if isinstance(message.provider_trace, dict) else {}
+            if str(trace.get("voice_turn_id") or "") == turn_id:
+                return str(message.id)
+        return None
 
     def get_task(self, task_id: str, *, after_event_seq: int | None = None) -> dict[str, Any]:
         task = self._load_task(task_id)
@@ -478,6 +572,7 @@ class VoiceAgentCoordinator:
         self.db.commit()
         new_task = self.delegate(
             role_key=str(spec.get("role_key") or "generic"),
+            capability_id=str(spec.get("capability_id") or "") or None,
             objective=revised_request,
             chat_session_id=current.chat_session_id,
             title=current.title,
@@ -485,6 +580,7 @@ class VoiceAgentCoordinator:
             tools=spec.get("tool_profile"),
             skills=spec.get("skill_profile"),
             write_set=spec.get("write_set"),
+            output_contract=spec.get("output_contract"),
             voice_session_id=(
                 (spec.get("association") or {}).get("voice_session_id")
                 if isinstance(spec.get("association"), dict)
@@ -561,6 +657,7 @@ class VoiceAgentCoordinator:
             objective = f"{objective}\n\nPurpose: {purpose.strip()}"
         return self.delegate(
             role_key=AgentRole.RESEARCH.value,
+            capability_id="research",
             objective=objective,
             chat_session_id=chat_session_id,
             title="Research",
@@ -585,6 +682,7 @@ class VoiceAgentCoordinator:
     ) -> dict[str, Any]:
         return self.delegate(
             role_key=AgentRole.REASON.value,
+            capability_id="reasoning",
             objective=question,
             chat_session_id=chat_session_id,
             title="Reasoning",
@@ -611,6 +709,7 @@ class VoiceAgentCoordinator:
             raise AgentProfileError("ToolAgent requires a non-empty server-approved tool allow-list")
         return self.delegate(
             role_key=AgentRole.TOOL.value,
+            capability_id="workspace_read",
             objective=goal,
             chat_session_id=chat_session_id,
             title="Tool task",

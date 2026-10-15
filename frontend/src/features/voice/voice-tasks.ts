@@ -29,11 +29,20 @@ export type VoiceTaskDeliveryStatus =
   | "delivered"
   | "obsolete";
 
+export type VoiceTaskPlaybackStatus =
+  | "claimed"
+  | "enqueued"
+  | "speaking"
+  | "played"
+  | "interrupted"
+  | "failed";
+
 export type VoiceTaskKind = "research" | "reasoning" | "tool" | "unknown";
 
 export interface VoiceTaskSource {
   id: string;
   title: string;
+  prompt?: string;
   domain?: string;
   snippet?: string;
   retrievedAt?: string;
@@ -43,21 +52,39 @@ export interface VoiceTaskArtifact {
   id: string;
   name: string;
   kind?: string;
+  path?: string;
+  fileId?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  sha256?: string;
   exists?: boolean;
   verified?: boolean;
 }
 
 export interface VoiceTask {
   taskId: string;
+  linkId?: string;
+  resultId?: string;
+  speechId?: string;
+  capabilityId?: string;
+  reason?: string;
+  approvalStatus?: string;
+  approvalExpiresAt?: string;
+  approvalRequestPreview?: string;
+  activities?: VoiceTaskActivity[];
   status: VoiceTaskStatus;
   kind: VoiceTaskKind;
   title: string;
+  prompt?: string;
   summary?: string;
   progress?: number;
   createdAt: string;
   updatedAt: string;
   requirementVersion: number;
   deliveryStatus: VoiceTaskDeliveryStatus;
+  playbackStatus?: VoiceTaskPlaybackStatus | null;
+  playbackEndedAt?: string;
+  evidenceRefs: string[];
   sources: VoiceTaskSource[];
   artifacts: VoiceTaskArtifact[];
   limitations: string[];
@@ -69,6 +96,8 @@ export interface VoiceTaskActivity {
   taskId: string;
   eventId?: string;
   eventSeq?: number;
+  eventType?: string;
+  toolName?: string;
   text: string;
   createdAt: string;
 }
@@ -91,6 +120,7 @@ export type VoiceTaskPatch = Partial<Omit<VoiceTask, "taskId">> & {
 };
 
 const MAX_SEEN_TASK_EVENTS = 2000;
+const MAX_TASK_ACTIVITIES = 80;
 const TERMINAL_STATUSES = new Set<VoiceTaskStatus>([
   "ready",
   "partial",
@@ -328,10 +358,16 @@ function parseArtifact(value: unknown, index: number): VoiceTaskArtifact | null 
   const name = normalizedText(rawName, 240);
   if (!name) return null;
   const displayName = name.split(/[\\/]/).filter(Boolean).at(-1) ?? name;
+  const rawSize = firstNumber(value.size_bytes, value.sizeBytes, value.size);
   return {
     id: firstString(value.id, value.artifact_id, value.file_id, value.path, displayName) ?? `artifact-${index}`,
     name: displayName,
     kind: normalizedText(value.kind, 80) ?? normalizedText(value.type, 80) ?? normalizedText(value.mime_type, 80),
+    path: normalizedText(value.path, 500),
+    fileId: firstString(value.file_id, value.fileId),
+    mimeType: normalizedText(value.mime_type, 160) ?? normalizedText(value.mimeType, 160),
+    sizeBytes: rawSize,
+    sha256: firstString(value.sha256, value.blob_sha256),
     exists: booleanValue(value.exists),
     verified: booleanValue(value.verified),
   };
@@ -454,6 +490,26 @@ function normalizeDeliveryStatus(value: unknown): VoiceTaskDeliveryStatus | unde
   return aliases[normalized];
 }
 
+function normalizePlaybackStatus(value: unknown): VoiceTaskPlaybackStatus | null | undefined {
+  if (value === null) return null;
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!normalized) return undefined;
+  const aliases: Record<string, VoiceTaskPlaybackStatus> = {
+    claimed: "claimed",
+    enqueued: "enqueued",
+    queued: "enqueued",
+    speaking: "speaking",
+    started: "speaking",
+    played: "played",
+    delivered: "played",
+    finished: "played",
+    interrupted: "interrupted",
+    failed: "failed",
+    error: "failed",
+  };
+  return aliases[normalized];
+}
+
 function statusFromEvent(eventType: string, rawStatus: unknown): VoiceTaskStatus | undefined {
   const explicit = firstString(rawStatus);
   if (explicit) return normalizeVoiceTaskStatus(explicit);
@@ -463,6 +519,11 @@ function statusFromEvent(eventType: string, rawStatus: unknown): VoiceTaskStatus
       return "queued";
     case "task.progress":
     case "task.running":
+    case "started":
+    case "progress":
+    case "tool_started":
+    case "tool_call":
+    case "network_policy":
       return "running";
     case "task.approval_required":
     case "task.blocked":
@@ -471,19 +532,25 @@ function statusFromEvent(eventType: string, rawStatus: unknown): VoiceTaskStatus
       return "finalizing";
     case "task.result_ready":
     case "result.ready":
+    case "succeeded":
       return "ready";
     case "task.partial":
+    case "partial":
       return "partial";
     case "task.failed":
+    case "failed":
       return "failed";
     case "task.cancel_requested":
       return "cancel_requested";
     case "task.cancelled":
+    case "cancelled":
       return "cancelled";
     case "task.interrupted":
+    case "interrupted":
       return "interrupted";
     case "task.stale":
     case "task.obsolete":
+    case "stale":
       return "stale";
     case "task.requirement_revised":
     case "requirement.revised":
@@ -491,6 +558,64 @@ function statusFromEvent(eventType: string, rawStatus: unknown): VoiceTaskStatus
     default:
       return undefined;
   }
+}
+
+function taskActivityFromEvent(
+  raw: Record<string, unknown>,
+  eventType: string,
+  task: VoiceTask,
+): VoiceTaskActivity | undefined {
+  const payload = payloadOf(raw);
+  const normalizedType = eventType.toLowerCase();
+  const toolName = firstString(
+    raw.tool_name,
+    raw.toolName,
+    payload.tool_name,
+    payload.toolName,
+  );
+  const progressSummary = normalizedText(
+    payload.progress_summary ?? payload.progressSummary ?? raw.progress_summary,
+    320,
+  );
+  let text: string | undefined;
+  if (toolName) {
+    text = normalizedType === "tool_started"
+      ? `正在调用工具：${toolName}`
+      : normalizedType === "tool_call"
+        ? `已完成工具调用：${toolName}`
+        : `工具 ${toolName}：${normalizedType}`;
+  } else if (progressSummary) {
+    text = `后台执行摘要：${progressSummary}`;
+  } else {
+    const labels: Record<string, string> = {
+      created: "任务已创建",
+      queued: "任务已进入队列",
+      started: "后台 Agent 已开始执行",
+      network_policy: "已应用网络访问策略",
+      progress: "后台 Agent 正在处理",
+      partial: "已生成部分结果",
+      succeeded: "后台 Agent 已完成",
+      failed: "后台 Agent 执行失败",
+      cancelled: "后台 Agent 已取消",
+      interrupted: "后台 Agent 被中断",
+      stale: "任务需求已更新，旧执行已过期",
+      approval_requested: "等待用户确认后执行",
+      "task.approval_required": "等待用户确认后执行",
+    };
+    text = labels[normalizedType] ?? voiceTaskActivityText(task, eventType);
+  }
+  if (!text) return undefined;
+  return {
+    taskId: task.taskId,
+    eventId: eventIdOf(raw),
+    eventSeq: eventSeqOf(raw),
+    eventType,
+    toolName,
+    text,
+    createdAt:
+      timeValue(raw, payload, "created_at", "createdAt", "timestamp", "finished_at") ??
+      task.updatedAt,
+  };
 }
 
 function deliveryFromEvent(eventType: string, incoming: VoiceTaskDeliveryStatus | undefined): VoiceTaskDeliveryStatus | undefined {
@@ -511,6 +636,30 @@ function deliveryFromEvent(eventType: string, incoming: VoiceTaskDeliveryStatus 
     case "task.stale":
     case "task.obsolete":
       return "obsolete";
+    default:
+      return incoming;
+  }
+}
+
+function playbackFromEvent(
+  eventType: string,
+  incoming: VoiceTaskPlaybackStatus | null | undefined,
+): VoiceTaskPlaybackStatus | null | undefined {
+  switch (eventType.toLowerCase()) {
+    case "result.claimed":
+      return "claimed";
+    case "result.queued":
+    case "speech.enqueued":
+      return "enqueued";
+    case "speech.started":
+      return "speaking";
+    case "speech.finished":
+    case "speech.ended":
+      return "played";
+    case "speech.interrupted":
+      return "interrupted";
+    case "speech.failed":
+      return "failed";
     default:
       return incoming;
   }
@@ -557,11 +706,25 @@ function normalizeTask(
   const incomingRevision = requirementVersionOf(raw, payload, result);
   const currentRevision = Math.max(existing?.requirementVersion ?? 1, incomingRevision ?? 1);
   const explicitStatus = statusFromEvent(eventType, raw.status);
-  let status = explicitStatus ?? normalizeVoiceTaskStatus(raw.status ?? payload.status);
+  const incomingStatus = raw.status ?? payload.status;
+  let status =
+    explicitStatus ??
+    (incomingStatus !== undefined
+      ? normalizeVoiceTaskStatus(incomingStatus)
+      : existing?.status ?? "queued");
   let deliveryStatus =
     deliveryFromEvent(eventType, normalizeDeliveryStatus(raw.delivery_status ?? raw.deliveryStatus ?? payload.delivery_status ?? payload.deliveryStatus)) ??
     existing?.deliveryStatus ??
     "pending_validation";
+  const incomingPlaybackStatus = playbackFromEvent(
+    eventType,
+    normalizePlaybackStatus(
+      raw.playback_status ?? raw.playbackStatus ?? payload.playback_status ?? payload.playbackStatus ?? result.playback_status ?? result.playbackStatus,
+    ),
+  );
+  const playbackStatus = incomingPlaybackStatus === undefined
+    ? existing?.playbackStatus
+    : incomingPlaybackStatus;
   let resultAvailable =
     booleanValue(raw.result_available ?? raw.resultAvailable ?? payload.result_available ?? payload.resultAvailable) ??
     Boolean(summaryOf(raw, payload, result) || Object.keys(result).length > 0);
@@ -599,12 +762,75 @@ function normalizeTask(
   const artifacts = parseArtifacts(raw, payload, result);
   const limitations = parseLimitations(raw, payload, result);
   const summary = summaryOf(raw, payload, result) ?? existing?.summary;
+  const approvalRequest = recordOrEmpty(
+    raw.approval_request ?? raw.approvalRequest ?? raw.approval_request_json ?? raw.approvalRequestJson ?? payload.approval_request ?? payload.approvalRequest ?? payload.approval_request_json ?? payload.approvalRequestJson,
+  );
+  const approvalRequestPreview =
+    normalizedText(
+      approvalRequest.summary ?? approvalRequest.preview ?? approvalRequest.title ??
+        raw.approval_request_preview ?? payload.approval_request_preview,
+      500,
+    ) ?? existing?.approvalRequestPreview;
+  const evidenceRefs = dedupeBy(
+    [
+      ...arrayValue(raw.evidence_refs ?? raw.evidenceRefs),
+      ...arrayValue(payload.evidence_refs ?? payload.evidenceRefs),
+      ...arrayValue(result.evidence_refs ?? result.evidenceRefs),
+    ]
+      .map((value) => firstString(value, isRecord(value) ? value.id : undefined))
+      .filter((value): value is string => Boolean(value)),
+    (value) => value,
+  );
 
   return {
     taskId,
+    linkId:
+      firstString(raw.link_id, raw.linkId, payload.link_id, payload.linkId, result.link_id, result.linkId) ?? existing?.linkId,
+    resultId:
+      firstString(raw.result_id, raw.resultId, payload.result_id, payload.resultId, result.result_id, result.resultId) ?? existing?.resultId,
+    speechId:
+      firstString(raw.speech_id, raw.speechId, payload.speech_id, payload.speechId, result.speech_id, result.speechId) ?? existing?.speechId,
+    capabilityId:
+      firstString(
+        raw.capability_id,
+        raw.capabilityId,
+        payload.capability_id,
+        payload.capabilityId,
+        result.capability_id,
+        result.capabilityId,
+      ) ?? existing?.capabilityId,
+    reason:
+      firstString(
+        raw.status_reason,
+        raw.statusReason,
+        raw.safe_error,
+        raw.reason,
+        payload.status_reason,
+        payload.statusReason,
+        payload.safe_error,
+        payload.reason,
+        result.status_reason,
+        result.safe_error,
+        result.reason,
+        recordOrEmpty(result.error).message,
+      ) ?? existing?.reason,
+    approvalStatus:
+      firstString(
+        raw.approval_status,
+        raw.approvalStatus,
+        payload.approval_status,
+        payload.approvalStatus,
+      ) ?? existing?.approvalStatus,
+    approvalExpiresAt:
+      timeValue(raw, payload, "approval_expires_at", "approvalExpiresAt") ??
+      existing?.approvalExpiresAt,
+    approvalRequestPreview,
+    activities: existing?.activities ?? [],
     status,
     kind: normalizeKind(raw, payload) === "unknown" ? existing?.kind ?? "unknown" : normalizeKind(raw, payload),
     title: safeTitle(raw.title ?? raw.display_title ?? payload.title ?? existing?.title),
+    prompt:
+      firstString(raw.prompt, payload.prompt, result.prompt, approvalRequest.prompt) ?? existing?.prompt,
     summary,
     progress: normalizeProgress(raw.progress ?? payload.progress) ?? existing?.progress,
     createdAt:
@@ -616,6 +842,11 @@ function normalizeTask(
       now,
     requirementVersion: currentRevision,
     deliveryStatus,
+    playbackStatus,
+    playbackEndedAt:
+      timeValue(raw, payload, "playback_ended_at", "playbackEndedAt", "delivered_at", "deliveredAt") ??
+      existing?.playbackEndedAt,
+    evidenceRefs: mergeUnique(existing?.evidenceRefs ?? [], evidenceRefs, (value) => value),
     sources: mergeUnique(existing?.sources ?? [], sources, sourceKey),
     artifacts: mergeUnique(existing?.artifacts ?? [], artifacts, artifactKey),
     limitations: mergeUnique(existing?.limitations ?? [], limitations, (value) => value),
@@ -654,6 +885,19 @@ export function voiceTaskActivityText(task: VoiceTask, eventType = ""): string {
     case "partial":
       return "已有部分结果，仍有内容待确认。";
     case "failed":
+      if (task.reason) {
+        const reason = task.reason.toLowerCase();
+        if (reason.includes("permission") || reason.includes("权限")) {
+          return "当前账号没有执行这项语音 Agent 能力的权限。";
+        }
+        if (reason.includes("provider") || reason.includes("unavailable") || reason.includes("不可用")) {
+          return `当前能力暂不可用：${task.reason}`;
+        }
+        if (reason.includes("sandbox") || reason.includes("沙箱")) {
+          return `沙箱任务未能启动：${task.reason}`;
+        }
+        return `任务未完成：${task.reason}`;
+      }
       return "任务未完成，可以重试。";
     case "cancel_requested":
       return "正在取消后台任务…";
@@ -663,6 +907,25 @@ export function voiceTaskActivityText(task: VoiceTask, eventType = ""): string {
       return "后台任务已中断。";
     case "stale":
       return "需求已更新，旧结果已标记为过期。";
+  }
+}
+
+export function voiceTaskPlaybackLabel(task: VoiceTask): string | null {
+  switch (task.playbackStatus) {
+    case "claimed":
+      return "已领取，等待播报";
+    case "enqueued":
+      return "已排入播报队列";
+    case "speaking":
+      return "正在播报";
+    case "played":
+      return "服务端已播放完成";
+    case "interrupted":
+      return "播报被打断，等待重播";
+    case "failed":
+      return "播报失败，可重试";
+    default:
+      return null;
   }
 }
 
@@ -705,10 +968,13 @@ export function voiceTaskIsActive(task: VoiceTask): boolean {
 
 export function voiceTaskHasDetail(task: VoiceTask): boolean {
   return Boolean(
+    task.reason ||
     task.summary ||
       task.sources.length ||
       task.artifacts.length ||
+      task.evidenceRefs.length ||
       task.limitations.length ||
+      task.playbackStatus ||
       task.status === "failed",
   );
 }
@@ -766,13 +1032,31 @@ export function reduceVoiceTaskEvent(
     rawRevision < existing.requirementVersion;
   const nextTask = incomingBeforeCurrent && existing ? existing : normalized;
 
+  const eventActivity = taskActivityFromEvent(raw, eventType, nextTask);
+  const activityKey = eventActivity
+    ? `${eventActivity.eventId ?? ""}:${eventActivity.eventSeq ?? ""}:${eventActivity.text}`
+    : "";
+  const hasActivity = Boolean(
+    eventActivity &&
+      !(nextTask.activities ?? []).some(
+        (item) => `${item.eventId ?? ""}:${item.eventSeq ?? ""}:${item.text}` === activityKey,
+      ),
+  );
+  const taskWithActivity =
+    hasActivity && eventActivity
+      ? {
+          ...nextTask,
+          activities: [...(nextTask.activities ?? []), eventActivity].slice(-MAX_TASK_ACTIVITIES),
+        }
+      : nextTask;
+
   let next: VoiceTaskState = rememberTaskEvent(state, eventId);
-  const changedTask = !existing || !sameTask(existing, nextTask);
+  const changedTask = !existing || !sameTask(existing, taskWithActivity);
   next = {
     ...next,
     tasks: existing
-      ? next.tasks.map((task) => (task.taskId === taskId ? nextTask : task))
-      : [...next.tasks, nextTask],
+      ? next.tasks.map((task) => (task.taskId === taskId ? taskWithActivity : task))
+      : [...next.tasks, taskWithActivity],
     cursorByTask: {
       ...next.cursorByTask,
       [taskId]: Math.max(previousCursor, eventSeq ?? previousCursor),
@@ -781,7 +1065,7 @@ export function reduceVoiceTaskEvent(
 
   const activityText = incomingBeforeCurrent
     ? "需求已更新，旧结果已标记为过期。"
-    : voiceTaskActivityText(nextTask, eventType);
+    : eventActivity?.text ?? voiceTaskActivityText(taskWithActivity, eventType);
   const changedActivity = next.activityByTask[taskId] !== activityText;
   if (changedActivity) {
     next = {
@@ -801,7 +1085,7 @@ export function reduceVoiceTaskEvent(
             eventId,
             eventSeq,
             text: activityText,
-            createdAt: nextTask.updatedAt,
+            createdAt: eventActivity?.createdAt ?? taskWithActivity.updatedAt,
           }
         : undefined,
   };
@@ -829,7 +1113,17 @@ export function mergeVoiceTaskSnapshots(
       ? tasks.map((task) => (task.taskId === taskId ? next : task))
       : [...tasks, next];
   }
-  return { ...state, tasks };
+  let nextState: VoiceTaskState = { ...state, tasks };
+  for (const raw of rawTasks) {
+    const taskId = taskIdOf(raw);
+    const events = Array.isArray(raw.events) ? raw.events : [];
+    if (!taskId || !events.length) continue;
+    for (const event of events) {
+      if (!isRecord(event)) continue;
+      nextState = reduceVoiceTaskEvent(nextState, event, taskId).state;
+    }
+  }
+  return nextState;
 }
 
 export function mergeVoiceTaskResults(
@@ -857,8 +1151,13 @@ export function mergeVoiceTaskResults(
       return {
         task_id: result.subagent_id ?? result.task_id,
         subagent_id: result.subagent_id ?? result.task_id,
+        link_id: result.link_id ?? result.linkId,
+        result_id: result.result_id ?? result.id,
+        speech_id: result.speech_id ?? result.speechId ?? resultPayload.speech_id ?? resultPayload.speechId,
         status,
         delivery_status: deliveryStatus,
+        playback_status: result.playback_status ?? result.playbackStatus ?? resultPayload.playback_status ?? resultPayload.playbackStatus,
+        playback_ended_at: result.playback_ended_at ?? result.playbackEndedAt ?? resultPayload.playback_ended_at ?? resultPayload.playbackEndedAt,
         requirement_version: result.requirement_version,
         result_version: result.result_version,
         latest_result_version: result.result_version,
@@ -866,6 +1165,7 @@ export function mergeVoiceTaskResults(
         result: agentResult,
         deliverables: resultPayload,
         source_count: result.source_count,
+        evidence_refs: result.evidence_refs ?? result.evidenceRefs ?? resultPayload.evidence_refs ?? resultPayload.evidenceRefs,
         updated_at: result.available_at ?? result.captured_at,
       };
     });

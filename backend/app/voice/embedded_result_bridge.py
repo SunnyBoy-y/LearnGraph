@@ -9,6 +9,7 @@ pipeline, so the user always experiences one speaking agent.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from typing import Any
 
@@ -18,6 +19,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    InterruptionFrame,
     LLMMessagesAppendFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
@@ -47,6 +49,8 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
         self._seen_task_ids: set[str] = set()
         self._initialized = False
         self._cooldown_until = 0.0
+        self._active_speech_id: str | None = None
+        self._active_task_id: str | None = None
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -61,7 +65,8 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
                 if not isinstance(item, dict):
                     continue
                 task_id = str(item.get("task_id") or item.get("subagent_id") or "")
-                if task_id:
+                playback_status = str(item.get("playback_status") or "").casefold()
+                if task_id and playback_status not in {"interrupted", "failed"}:
                     self._seen_task_ids.add(task_id)
         except Exception:
             logger.debug("initial voice result snapshot failed", exc_info=True)
@@ -70,6 +75,7 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
 
     async def stop(self) -> None:
         self._stopping.set()
+        await self._finish_active_speech(interrupted=True)
         task, self._task = self._task, None
         if task is not None and not task.done():
             task.cancel()
@@ -86,9 +92,55 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
             self._user_speaking = False
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
+            await self._mark_active_speech("started")
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
+        elif isinstance(frame, InterruptionFrame):
+            await self._finish_active_speech(interrupted=True)
         await self.push_frame(frame, direction)
+
+    async def _mark_active_speech(self, state: str) -> None:
+        speech_id = self._active_speech_id
+        if not speech_id:
+            return
+        try:
+            await self._update_speech_delivery(speech_id, state)
+        except Exception:
+            logger.debug("voice speech delivery state update failed", exc_info=True)
+
+    async def _finish_active_speech(self, *, interrupted: bool) -> None:
+        speech_id, self._active_speech_id = self._active_speech_id, None
+        task_id, self._active_task_id = self._active_task_id, None
+        if not speech_id:
+            return
+        try:
+            await self._update_speech_delivery(
+                speech_id, "interrupted" if interrupted else "played"
+            )
+            if interrupted and task_id:
+                # The coordinator makes an interrupted delivery ready again.
+                # Remove the local seen marker so the next poll can claim it.
+                self._seen_task_ids.discard(task_id)
+        except Exception:
+            logger.debug("voice speech delivery finish update failed", exc_info=True)
+            if interrupted and task_id:
+                with contextlib.suppress(Exception):
+                    await self._result_port.acknowledge_result(
+                        task_id,
+                        delivery_state="released",
+                    )
+                self._seen_task_ids.discard(task_id)
+
+    async def _update_speech_delivery(self, speech_id: str, state: str) -> None:
+        method = getattr(self._result_port, "update_speech_delivery", None)
+        if not callable(method):
+            return
+        await method(speech_id, state)
+
+    async def playback_ended(self, *, interrupted: bool = False) -> None:
+        """Called by the transport-downstream ledger at the real audio boundary."""
+
+        await self._finish_active_speech(interrupted=interrupted)
 
     async def _poll_ready_results(self) -> None:
         while not self._stopping.is_set():
@@ -159,6 +211,13 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
                     await self._agent.queue_frame(
                         LLMMessagesAppendFrame(messages=[message], run_llm=True)
                     )
+                    self._active_speech_id = str(claim.get("speech_id") or "") or None
+                    self._active_task_id = task_id if self._active_speech_id else None
+                    if self._active_speech_id:
+                        await self._update_speech_delivery(
+                            self._active_speech_id,
+                            "enqueued",
+                        )
                 except Exception:
                     # The Tutor never received the result. Release the claim so a
                     # later poll can retry rather than silently losing it.

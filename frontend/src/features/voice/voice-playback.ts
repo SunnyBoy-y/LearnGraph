@@ -44,7 +44,9 @@ export class VoicePlaybackTranscript {
       const interrupted = event.type === "turn.interrupted" || payload.interrupted === true || payload.outcome === "interrupted";
       const text = event.type === "turn.finalized"
         ? String(payload.text ?? "")
-        : String(payload.heard_text || local);
+        : typeof payload.heard_text === "string"
+          ? payload.heard_text
+          : local;
       turn.terminal = true;
       return {
         id: `assistant-playback-${turnId}`, role: "assistant", turnId,
@@ -58,10 +60,13 @@ export class VoicePlaybackTranscript {
     const seq = Number(payload.sentence_seq);
     const text = String(payload.text ?? "");
     if (!Number.isInteger(seq) || seq < 1 || !text) return null;
+    // Sentence identity wins when the queued marker exists. If a queued marker
+    // was lost and the end marker carries a different sequence, fall back to
+    // text only for that missing identity; this keeps duplicate sentences apart.
     const matching = ends
       ? [...turn.parts.entries()].find(([, part]) => part.text === text)?.[0]
       : undefined;
-    const effectiveSeq = matching ?? seq;
+    const effectiveSeq = turn.parts.has(seq) ? seq : (matching ?? seq);
     const previous = turn.parts.get(effectiveSeq);
     if (previous && (previous.status === "completed" || starts)) return null;
     // The next audio start proves all preceding segments have drained, even

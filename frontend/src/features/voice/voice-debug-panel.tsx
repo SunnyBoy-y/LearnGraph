@@ -2,7 +2,7 @@
  * 右侧栏「语音延迟」栏目（语音调试面板）。
  *
  * 只在设置里的「语音调试面板」开关打开时渲染（见 workspace-shell 的 ChatGraphRail），
- * 关掉时整块不挂载 —— 与同栏的「轨迹」标签页同一个模式。
+ * 关掉时整块不挂载，避免在未启用排障功能时占用右侧栏。
  *
  * 展示口径照参考实现 `demo-voice2o2/frontend/index.html` 的时序图：
  * 顶部一个总耗时（用户说完 → 导师出声），下面是本轮各环节的「累计 ms · Δ 每段」，
@@ -32,6 +32,12 @@ function voiceTransportLabel(transport: string, state: string): string {
   if (transport === "connecting") return "接通中";
   if (transport === "reconnecting") return "重连中";
   return state === "speaking" ? "导师在说话" : state === "thinking" ? "思考中" : "聆听中";
+}
+
+function deliveryTimeLabel(value: string | null): string {
+  if (!value) return "暂无";
+  const time = new Date(value);
+  return Number.isNaN(time.getTime()) ? "未知" : time.toLocaleTimeString();
 }
 
 export function VoiceLatencyRail() {
@@ -85,6 +91,33 @@ export function VoiceLatencyRail() {
         全双工各环节耗时，全部按本机收到的时刻计（刷新即清空）。每条记号按服务端回合身份
         归位：身份比信号后到（打字回合就是这样）也会补记，不会被扔掉或算错轮。
       </p>
+
+      <section
+        aria-label="已播字幕实时投递"
+        className="rounded-xl border bg-card p-2"
+        data-role="realtime-sentence-delivery"
+      >
+        <div className="flex items-baseline justify-between gap-2">
+          <p className="text-[11px] font-medium">已播字幕实时投递</p>
+          <span className="text-[10px] text-muted-foreground">只认播放账本</span>
+        </div>
+        <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+          queued {voice.realtimeDelivery.queued} · ended {voice.realtimeDelivery.ended} ·
+          实时接受 {voice.realtimeDelivery.accepted}
+        </p>
+        <p className="text-[11px] leading-4 text-muted-foreground">
+          收到 {voice.realtimeDelivery.received} · 去重 {voice.realtimeDelivery.duplicates} ·
+          补投 {voice.realtimeDelivery.replayed}
+        </p>
+        <p className="text-[10px] leading-4 text-muted-foreground">
+          最近接受：{voice.realtimeDelivery.lastAcceptedType ?? "暂无"} · {deliveryTimeLabel(voice.realtimeDelivery.lastAcceptedAt)}
+        </p>
+        {voice.realtimeDelivery.lastDropReason ? (
+          <p className="mt-1 text-[10px] leading-4 text-destructive">
+            最近丢弃：{voice.realtimeDelivery.lastDropReason} · {deliveryTimeLabel(voice.realtimeDelivery.lastDropAt)}
+          </p>
+        ) : null}
+      </section>
 
       {latency.dropped > 0 || held > 0 ? (
         <p

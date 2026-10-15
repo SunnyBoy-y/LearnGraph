@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -11,12 +11,14 @@ from app.core.errors import AppError
 from app.domain.models import (
     ChatSession,
     VoiceResultInboxRecord,
+    VoiceSpeechDeliveryRecord,
     VoiceSessionRecord,
     VoiceTaskLinkRecord,
     VoiceTurnRecord,
 )
 from app.services.authorization import AuthorizationService
 from app.services.sandbox import SandboxAgentWorkspaceService
+from app.services.voice_agent_coordinator import VoiceAgentCoordinator
 from app.domain.schemas.sandbox import (
     SandboxAgentSubagentCancelRequest,
     SandboxAgentSubagentRequest,
@@ -29,10 +31,14 @@ from .coordinator import (
     resolve_voice_tool_policy,
     resolve_voice_write_policy,
 )
+from .capabilities import capability_id_for_tools, resolve_voice_capability
 from .events import (
     VoiceEventSink,
+    claim_runtime_owner,
     close_session_record,
+    heartbeat_runtime_owner,
     replay_events,
+    release_runtime_owner,
 )
 from .policy import clip_thinking_mode
 from .runtime import runtime_info
@@ -61,6 +67,9 @@ def envelope_to_schema(envelope: dict[str, Any]) -> RTVIEventEnvelope:
         session_id=str(payload.get("session_id") or ""),
         session_epoch=int(payload.get("session_epoch") or 1),
         turn_id=payload.get("turn_id"),
+        generation_id=payload.get("generation_id"),
+        segment_id=payload.get("segment_id"),
+        context_id=payload.get("context_id"),
         phase=str(payload.get("phase") or "authoritative"),
         causality=dict(payload.get("causality") or {}),
         audio_cursor_ms=payload.get("audio_cursor_ms"),
@@ -84,10 +93,32 @@ class VoiceSessionService:
             tenant_id=self.context.principal.tenant_id,
         )
 
-    @staticmethod
-    def _result_view(record: Any) -> VoiceResultView:
+    def _result_view(self, record: Any) -> VoiceResultView:
+        delivery = self.db.scalar(
+            select(VoiceSpeechDeliveryRecord).where(
+                VoiceSpeechDeliveryRecord.result_id == record.id,
+                VoiceSpeechDeliveryRecord.workspace_id == record.workspace_id,
+                VoiceSpeechDeliveryRecord.tenant_id == record.tenant_id,
+            )
+        )
+        payload = dict(record.payload_json or {})
+        raw_evidence = payload.get("evidence_refs") or payload.get("evidence") or []
+        if not raw_evidence:
+            agent_result = payload.get("agent_result")
+            if isinstance(agent_result, dict):
+                raw_evidence = agent_result.get("evidence_refs") or agent_result.get("evidence") or []
+        evidence_refs: list[str] = []
+        if isinstance(raw_evidence, list):
+            for item in raw_evidence:
+                if isinstance(item, dict):
+                    value = item.get("id") or item.get("evidence_id") or item.get("ref")
+                else:
+                    value = item
+                if isinstance(value, str) and value.strip() and value.strip() not in evidence_refs:
+                    evidence_refs.append(value.strip())
         return VoiceResultView(
             id=record.id,
+            link_id=record.task_link_id,
             voice_session_id=record.voice_session_id,
             subagent_id=record.subagent_id,
             requirement_version=record.requirement_version,
@@ -95,7 +126,7 @@ class VoiceSessionService:
             status=record.status,
             result_type=record.result_type,
             summary=record.summary or "",
-            payload=dict(record.payload_json or {}),
+            payload=payload,
             source_count=int(record.source_count or 0),
             safe_error=record.safe_error or "",
             captured_at=record.captured_at,
@@ -104,6 +135,15 @@ class VoiceSessionService:
             dismissed_at=record.dismissed_at,
             stale_at=record.stale_at,
             auto_speak=False,
+            speech_id=delivery.speech_id if delivery is not None else None,
+            playback_status=(
+                delivery.playback_status
+                or str((delivery.snapshot or {}).get("playback_state") or "claimed")
+                if delivery is not None
+                else None
+            ),
+            playback_ended_at=delivery.playback_ended_at if delivery is not None else None,
+            evidence_refs=evidence_refs,
         )
 
     def _chat(self, chat_session_id: str, *, write: bool = False) -> ChatSession:
@@ -185,12 +225,19 @@ class VoiceSessionService:
             context_snapshot=row.context_snapshot or {},
             tasks=[
                 VoiceTaskLink(
+                    link_id=x.id,
                     voice_session_id=x.voice_session_id,
                     subagent_id=x.subagent_id,
                     chat_session_id=x.chat_session_id,
                     status=x.status,
                     thinking_mode=x.thinking_mode,
                     title=x.title,
+                    prompt=x.current_prompt or x.original_prompt,
+                    capability_id=capability_id_for_tools(x.allowed_tools),
+                    approval_status=x.approval_status,
+                    approval_request=dict(x.approval_request_json or {}),
+                    approval_request_json=dict(x.approval_request_json or {}),
+                    approval_expires_at=x.approval_expires_at,
                     trigger_turn_id=x.trigger_turn_id,
                     requirement_version=x.requirement_version,
                     latest_result_version=x.latest_result_version,
@@ -309,6 +356,7 @@ class VoiceSessionService:
         voice_session_id: str,
         *,
         peer_connection_id: str | None = None,
+        runtime_owner_id: str | None = None,
     ) -> VoiceSessionRecord:
         row = self.db.scalar(
             select(VoiceSessionRecord).where(
@@ -325,27 +373,102 @@ class VoiceSessionService:
             and row.peer_connection_id != peer_connection_id
         ):
             raise AppError(409, "voice_peer_mismatch", "Voice peer is not bound to this session")
+        if runtime_owner_id and row.runtime_owner_id not in {None, runtime_owner_id}:
+            raise AppError(
+                409,
+                "voice_runtime_owned_elsewhere",
+                "Voice runtime is owned by another instance",
+            )
         return row
 
     def bind_peer(
-        self, voice_session_id: str, peer_connection_id: str
+        self, voice_session_id: str, peer_connection_id: str,
+        *, owner_id: str | None = None,
     ) -> VoiceSession:
         row = self.require_runtime_access(voice_session_id)
+        if owner_id is not None and row.runtime_owner_id not in {None, owner_id}:
+            raise AppError(409, "voice_runtime_owned_elsewhere", "Voice runtime is owned by another instance")
         row.peer_connection_id = peer_connection_id
         row.peer_generation = int(row.peer_generation or 0) + 1
         self.db.commit()
         self.db.refresh(row)
         return self._to_schema(row)
 
+    def claim_runtime_owner(
+        self,
+        voice_session_id: str,
+        owner_id: str,
+        *,
+        force: bool = False,
+        expected_session_epoch: int | None = None,
+        expected_peer_generation: int | None = None,
+    ) -> bool:
+        self.require_runtime_access(voice_session_id)
+        return claim_runtime_owner(
+            voice_session_id,
+            owner_id,
+            lease_seconds=self.settings.voice_runtime_owner_lease_seconds,
+            force=force,
+            expected_session_epoch=expected_session_epoch,
+            expected_peer_generation=expected_peer_generation,
+        )
+
+    def heartbeat_runtime_owner(
+        self,
+        voice_session_id: str,
+        owner_id: str,
+        *,
+        expected_session_epoch: int | None = None,
+        expected_peer_generation: int | None = None,
+    ) -> bool:
+        return heartbeat_runtime_owner(
+            voice_session_id,
+            owner_id,
+            lease_seconds=self.settings.voice_runtime_owner_lease_seconds,
+            expected_session_epoch=expected_session_epoch,
+            expected_peer_generation=expected_peer_generation,
+        )
+
+    def release_runtime_owner(
+        self,
+        voice_session_id: str,
+        owner_id: str,
+        *,
+        expected_session_epoch: int | None = None,
+        expected_peer_generation: int | None = None,
+    ) -> bool:
+        return release_runtime_owner(
+            voice_session_id,
+            owner_id,
+            expected_session_epoch=expected_session_epoch,
+            expected_peer_generation=expected_peer_generation,
+        )
+
     def start_task(
         self, voice_session_id: str, request: VoiceTaskStartRequest
     ) -> VoiceTaskView:
         session = self.get_session(voice_session_id, write=True)
-        self.context.require_permission("workspace.manage")
         mode = clip_thinking_mode(request.thinking_mode, session.max_thinking_mode)
-        role = normalize_voice_role(request.role_key)
-        tools = resolve_voice_tool_policy(role, request.tools)
-        write_set = resolve_voice_write_policy(role, request.write_set)
+        try:
+            capability = (
+                resolve_voice_capability(request.capability_id)
+                if request.capability_id
+                else None
+            )
+        except ValueError as exc:
+            raise AppError(422, "invalid_voice_capability", str(exc)) from exc
+        self.context.require_permission(
+            capability.required_permission if capability else "workspace.manage"
+        )
+        role = normalize_voice_role(capability.role_key if capability else request.role_key)
+        tools = resolve_voice_tool_policy(
+            role,
+            list(capability.tools) if capability else request.tools,
+        )
+        write_set = resolve_voice_write_policy(
+            role,
+            list(capability.write_set) if capability else request.write_set,
+        )
         if request.trigger_turn_id:
             turn = self.db.scalar(
                 select(VoiceTurnRecord).where(
@@ -358,6 +481,31 @@ class VoiceSessionService:
             if turn is None:
                 raise AppError(404, "voice_turn_not_found", "Voice turn was not found")
         coordinator = self._coordinator()
+        requires_approval = bool(capability and capability.requires_confirmation)
+        idempotency_key = request.idempotency_key or (
+            f"voice-approval:{session.id}:{uuid4().hex}"
+            if requires_approval
+            else None
+        )
+        approval_request = {
+            "prompt": request.prompt,
+            "title": request.title,
+            "capability_id": capability.capability_id if capability else None,
+            "role_key": role,
+            "tools": tools,
+            "skills": (
+                request.skills
+                if request.skills is not None and role == "tool"
+                else list(capability.skills) if capability else []
+            ),
+            "write_set": write_set,
+            "output_contract": request.output_contract or (
+                dict(capability.output_contract) if capability else None
+            ),
+            "sandbox_session_id": request.sandbox_session_id,
+            "thinking_mode": mode,
+            "trigger_turn_id": request.trigger_turn_id,
+        }
         link, created = coordinator.reserve_link(
             voice_session_id=session.id,
             chat_session_id=session.chat_session_id,
@@ -366,20 +514,53 @@ class VoiceSessionService:
             role_key=role,
             thinking_mode=mode,
             trigger_turn_id=request.trigger_turn_id,
-            idempotency_key=request.idempotency_key,
+            idempotency_key=idempotency_key,
+            allowed_tools=tools,
+            capability_id=capability.capability_id if capability else None,
+            status="waiting_approval" if requires_approval else "creating",
+            approval_status="pending" if requires_approval else "none",
+            approval_request=approval_request if requires_approval else None,
+            approval_expires_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=10)
+                if requires_approval
+                else None
+            ),
         )
         if not created:
             return self._task_view(link)
+        if requires_approval:
+            return self._task_view(
+                link,
+                {
+                    "status": "waiting_approval",
+                    "capability_id": capability.capability_id,
+                    "approval_status": "pending",
+                    "title": request.title or capability.capability_id,
+                },
+            )
         payload = SandboxAgentSubagentRequest(
             chat_session_id=session.chat_session_id,
             prompt=request.prompt,
             title=request.title,
             role_key=role,
             tools=tools,
-            skills=request.skills if role == "tool" else [],
+            skills=(
+                request.skills
+                if request.skills is not None and role == "tool"
+                else list(capability.skills) if capability else []
+            ),
             write_set=write_set,
-            output_contract=request.output_contract,
+            output_contract=request.output_contract or (
+                dict(capability.output_contract) if capability else None
+            ),
             sandbox_session_id=request.sandbox_session_id,
+            voice_session_id=session.id,
+            turn_id=request.trigger_turn_id,
+            context_snapshot={
+                "voice_session_id": session.id,
+                "turn_id": request.trigger_turn_id,
+                "capability_id": capability.capability_id if capability else None,
+            },
         )
         try:
             result = SandboxAgentWorkspaceService(
@@ -420,11 +601,36 @@ class VoiceSessionService:
             if item.subagent_id == link.subagent_id
         ]
         return VoiceTaskView(
+            link_id=link.id,
             voice_session_id=link.voice_session_id,
             subagent_id=link.subagent_id,
             status=str(snapshot.get("status") or link.status or "queued"),
             thinking_mode=link.thinking_mode,
             title=str(snapshot.get("title") or link.title or ""),
+            prompt=str(snapshot.get("prompt") or link.current_prompt or link.original_prompt or ""),
+            capability_id=(
+                str(snapshot.get("capability_id") or "")
+                or capability_id_for_tools(link.allowed_tools)
+            ),
+            approval_status=str(snapshot.get("approval_status") or link.approval_status or "none"),
+            approval_expires_at=(
+                snapshot.get("approval_expires_at") or link.approval_expires_at
+            ),
+            approval_request=dict(
+                snapshot.get("approval_request")
+                or snapshot.get("approval_request_json")
+                or link.approval_request_json
+                or {}
+            ),
+            approval_request_json=dict(
+                snapshot.get("approval_request_json")
+                or snapshot.get("approval_request")
+                or link.approval_request_json
+                or {}
+            ),
+            previous_task_id=(
+                str(snapshot.get("previous_task_id") or "") or None
+            ),
             requirement_version=int(link.requirement_version or 1),
             latest_result_version=int(link.latest_result_version or 0),
             cancel_requested_at=link.cancel_requested_at,
@@ -473,9 +679,25 @@ class VoiceSessionService:
         reason: str = "user_requested",
     ) -> VoiceTaskView:
         session = self.get_session(voice_session_id, write=True)
-        self.context.require_permission("workspace.manage")
         coordinator = self._coordinator()
         link = coordinator.required_link(voice_session_id, subagent_id)
+        capability = resolve_voice_capability(link.capability_id) if link.capability_id else None
+        self.context.require_permission(
+            capability.required_permission if capability else "workspace.manage"
+        )
+        if link.status == "waiting_approval":
+            link = coordinator.reject_link(link, reason=reason)
+            self.envelope(
+                voice_session_id,
+                "task.rejected",
+                {
+                    "task_id": link.subagent_id,
+                    "status": "cancelled",
+                    "approval_status": link.approval_status,
+                },
+                turn_id=link.trigger_turn_id,
+            )
+            return self._task_view(link)
         coordinator.request_cancel(link, reason=reason)
         if link.subagent_id.startswith("pending_"):
             return self._task_view(link)
@@ -496,6 +718,96 @@ class VoiceSessionService:
         link = coordinator.required_link(voice_session_id, subagent_id)
         return self._task_view(link, snapshot)
 
+    def approve_task(
+        self,
+        voice_session_id: str,
+        subagent_id: str,
+    ) -> VoiceTaskView:
+        self.get_session(voice_session_id, write=True)
+        coordinator = self._coordinator()
+        link = coordinator.required_link(voice_session_id, subagent_id)
+        capability = resolve_voice_capability(link.capability_id) if link.capability_id else None
+        self.context.require_permission(
+            capability.required_permission if capability else "workspace.manage"
+        )
+        coordinator.approve_link(link)
+        agent = VoiceAgentCoordinator(
+            self.db,
+            self.settings,
+            workspace_id=self.context.workspace_id,
+            actor_id=self.context.principal.user_id,
+            permissions=self.context.permissions,
+        )
+        try:
+            result = agent.approve_pending_voice_task(link)
+            task_id = str(result.get("task_id") or result.get("subagent_id") or "")
+            if not task_id:
+                raise AppError(502, "voice_task_bridge_invalid", "Approved voice task returned no task id")
+            coordinator.complete_link(
+                link,
+                subagent_id=task_id,
+                job_id=str(result.get("job_id") or "") or None,
+                status=str(result.get("status") or "queued"),
+            )
+            link.approval_status = "approved"
+            self.db.commit()
+            self.envelope(
+                voice_session_id,
+                "task.approved",
+                {
+                    "task_id": task_id,
+                    "previous_task_id": subagent_id,
+                    "status": str(result.get("status") or "queued"),
+                    "capability_id": link.capability_id,
+                    "approval_status": "approved",
+                },
+                turn_id=link.trigger_turn_id,
+            )
+        except Exception:
+            link.status = "FAILED"
+            link.approval_status = "failed"
+            self.db.commit()
+            raise
+        return self._task_view(
+            link,
+            {
+                **dict(result),
+                "approval_status": "approved",
+                "previous_task_id": subagent_id,
+            },
+        )
+
+    def reject_task(
+        self,
+        voice_session_id: str,
+        subagent_id: str,
+        *,
+        reason: str = "user_rejected",
+    ) -> VoiceTaskView:
+        self.get_session(voice_session_id, write=True)
+        task_coordinator = self._coordinator()
+        link = task_coordinator.required_link(voice_session_id, subagent_id)
+        capability = (
+            resolve_voice_capability(link.capability_id)
+            if link.capability_id
+            else None
+        )
+        self.context.require_permission(
+            capability.required_permission if capability else "workspace.manage"
+        )
+        link = task_coordinator.reject_link(link, reason=reason)
+        self.envelope(
+            voice_session_id,
+            "task.rejected",
+            {
+                "task_id": link.subagent_id,
+                "status": "cancelled",
+                "approval_status": link.approval_status,
+            },
+            turn_id=link.trigger_turn_id,
+        )
+        return self._task_view(link)
+
     def revise_task(
         self,
         voice_session_id: str,
@@ -507,9 +819,12 @@ class VoiceSessionService:
         idempotency_key: str,
     ) -> VoiceTaskView:
         session = self.get_session(voice_session_id, write=True)
-        self.context.require_permission("workspace.manage")
         coordinator = self._coordinator()
         link = coordinator.required_link(voice_session_id, subagent_id)
+        capability = resolve_voice_capability(link.capability_id) if link.capability_id else None
+        self.context.require_permission(
+            capability.required_permission if capability else "workspace.manage"
+        )
         coordinator.revise_requirement(
             link, prompt=prompt, title=title, note=note
         )
@@ -579,6 +894,8 @@ class VoiceSessionService:
             delivery_id=delivery.id,
             speech_id=delivery.speech_id,
             request_id=request_id,
+            playback_status=delivery.playback_status
+            or str((delivery.snapshot or {}).get("playback_state") or "claimed"),
             already_delivered=not created,
         )
 

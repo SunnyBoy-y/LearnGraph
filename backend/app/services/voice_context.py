@@ -111,6 +111,8 @@ class VoiceContextService:
             # its agent from the scope, so without this a spoken recall and a
             # typed one are the same row in ``memory_retrieval_traces``.
             agent_id=VOICE_MEMORY_AGENT_ID,
+            include_memory=False,
+            include_history=False,
         )
         history = [
             {"id": item.id, "role": item.role, "content": item.content,
@@ -122,30 +124,9 @@ class VoiceContextService:
         learning: list[dict[str, Any]] = []
         task_state: dict[str, Any] | None = None
         telemetry: dict[str, Any] = {}
-        try:
-            # In events mode this is the exact ContextBuilder package injected
-            # by _build_model_prompt; in legacy/shadow mode it is still useful
-            # telemetry and leaves legacy authorization untouched.
-            #
-            # The package comes back with the build it already paid for, so the
-            # structured memories/learning_states do not cost a second
-            # retrieval: this used to run the whole ContextBuilder path a third
-            # time just to read the view off it.
-            _block, telemetry, built = self.chat._build_v2_memory_package(
-                chat_session_id,
-                effective_query,
-                node_ids=node_ids,
-                task_id=task_id,
-                agent_id=VOICE_MEMORY_AGENT_ID,
-            )
-            context_build_id = telemetry.get("context_build_id")
-            if built is not None:
-                context_build_id = built.view.context_build_id
-                memories = [item.model_dump(mode="json") for item in built.view.memories]
-                learning = list(built.view.learning_states or [])
-                task_state = built.view.task_state
-        except Exception:
-            telemetry = {}
+        # Long-term memory is ephemeral per-turn input, never pinned in a
+        # reconnect snapshot. This also avoids duplicate startup retrieval.
+        telemetry = {"stage": "per_turn_recall", "request_sent": False}
         # Keep the snapshot transport-safe and useful to the UI/reconnect path.
         # Detailed evidence remains in the ContextBuilder event/telemetry rows.
         return VoiceContextSnapshot(
@@ -222,6 +203,15 @@ class VoiceContextService:
             if commit and "assistant" in existing:
                 self._record_message_completion(existing["assistant"])
             return existing["user"], existing.get("assistant")
+
+        # Voice persistence bypasses the ordinary chat stream, so apply the
+        # same immediate question-prefix title before the first turn is saved.
+        # Keep the guard for lightweight test doubles that predate this helper.
+        apply_title_fallback = getattr(
+            self.chat, "_apply_first_message_title_fallback", None
+        )
+        if callable(apply_title_fallback):
+            apply_title_fallback(session, user_text)
 
         # Stable ids make a retry safe even when two workers race before either
         # can observe the first transaction.  The database primary key then

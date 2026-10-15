@@ -1,10 +1,10 @@
 """Adaptive user turn start strategy with multilingual barge-in handling.
 
-The strategy inserts a short decision window only while the tutor is speaking.
-Explicit interruption words stop output immediately; short backchannels are
-swallowed so an acknowledgement does not cut off the tutor.  The actual
-classifier lives in ``embedded_turn_intent`` and supports additional language
-profiles without changing this state machine.
+VAD and interim hypotheses never cancel the current answer. Only meaningful
+final ASR text can yield the turn; noise or a withdrawn hypothesis leaves the
+original audio/generation running, without replay or a replacement LLM answer.
+Manual button interrupts use a separate control path and remain immediate.
+The classifier lives in ``embedded_turn_intent``.
 """
 
 from __future__ import annotations
@@ -32,7 +32,8 @@ from app.voice.embedded_turn_intent import (
     DEFAULT_TURN_INTENT_CLASSIFIER,
     TurnIntent,
     TurnIntentClassifier,
-    merge_transcript_segments,
+    is_asr_filler,
+    normalize_transcript,
 )
 
 _DECISION_WINDOW = 0.5
@@ -95,20 +96,9 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
         if not self._pending or self._decision_token != token:
             return
 
-        intent = self._classifier.classify(self._pending_text)
-        if intent is TurnIntent.BACKCHANNEL:
-            await self._suppress_backchannel()
-            return
-        if not self._pending_text.strip():
-            # A window that expired without a single recognised word is noise --
-            # a cough, a chair, or the tutor's own audio bleeding into the mic --
-            # not a barge-in.  Interrupting on it cut the turn off *before* it had
-            # answered anything, which is how an answer the user did hear ended up
-            # recorded against whatever they said next.  An explicit stop is still
-            # acted on immediately, because that path needs the word recognised.
-            await self._suppress_backchannel()
-            return
-        await self._trigger_interrupt_turn()
+        # VAD / interim hypotheses alone must never destroy the current answer.
+        # A meaningful final can still start a turn after this window closes.
+        await self._suppress_backchannel()
 
     def _is_backchannel(self, text: str) -> bool:
         """整句都是背声词/填充词（「嗯。」「哦。」「对。」…）时才为真。"""
@@ -133,19 +123,6 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
     async def _suppress_backchannel(self) -> None:
         self._clear_pending()
 
-    async def _evaluate_pending(self) -> None:
-        intent = self._classifier.classify(self._pending_text)
-        if intent is TurnIntent.INTERRUPTION:
-            await self._trigger_interrupt_turn()
-        elif intent is TurnIntent.BACKCHANNEL:
-            await self._suppress_backchannel()
-        elif not self._pending_text.strip():
-            # Speech ended before anything was recognised: same rule as the
-            # decision window -- noise is not a barge-in, so the turn stands.
-            await self._suppress_backchannel()
-        else:
-            await self._trigger_interrupt_turn()
-
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         if isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
@@ -153,17 +130,12 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
 
         if isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
-            if self._pending:
-                await self._cancel_decision()
-                intent = self._classifier.classify(self._pending_text)
-                if intent is TurnIntent.BACKCHANNEL:
-                    await self._suppress_backchannel()
-                else:
-                    await self._trigger_normal_turn()
+            # Playback gaps/end are not evidence that the user said anything.
             return ProcessFrameResult.CONTINUE
 
         if isinstance(frame, VADUserStartedSpeakingFrame):
-            if self._bot_speaking and not self._pending:
+            # Also guard generation/TTFB and gaps between spoken sentences.
+            if not self._pending:
                 await self._cancel_decision()
                 self._pending = True
                 self._pending_text = ""
@@ -172,28 +144,24 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
                     self._decision_timeout(token)
                 )
                 return ProcessFrameResult.STOP
-            if not self._pending:
-                await self._cancel_decision()
-                await self._trigger_normal_turn()
             return ProcessFrameResult.STOP
 
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             if self._pending:
                 await self._cancel_decision()
-                await self._evaluate_pending()
+                await self._suppress_backchannel()
             return ProcessFrameResult.STOP
 
         if isinstance(frame, (InterimTranscriptionFrame, TranscriptionFrame)):
             text = str(getattr(frame, "text", "") or "").strip()
-            if self._pending:
-                self._pending_text = merge_transcript_segments(
-                    self._pending_text, text
-                )
-                # Explicit interruption words are acted on immediately; no need
-                # to wait out the decision window.
-                if self._classifier.classify(self._pending_text) is TurnIntent.INTERRUPTION:
-                    await self._cancel_decision()
-                    await self._trigger_interrupt_turn()
+            # Interim hypotheses can be retracted or replaced by an empty/filler
+            # final. Never irreversibly cancel TTS/LLM based on a hypothesis.
+            # Button interrupts bypass this strategy entirely.
+            if isinstance(frame, InterimTranscriptionFrame):
+                return ProcessFrameResult.STOP
+            if not normalize_transcript(text) or is_asr_filler(text):
+                await self._cancel_decision()
+                await self._suppress_backchannel()
                 return ProcessFrameResult.STOP
             # 决策窗口之外的转录。两条路都会走到这里：
             #   * 窗口已按"什么都没听清"关掉（决策超时 / VAD 停止），随后 ASR

@@ -32,6 +32,7 @@ def install_embedded_runtime(app: Any) -> bool:
         from app.api.deps import AppSettings, DB, VoiceWorkspaceContext
         from app.voice import embedded_bot
         from app.voice.embedded_ice import install_ice_compat
+        from app.voice.runner_registry import runtime_owner_id
         from app.voice.service import VoiceSessionService
     except (ImportError, ModuleNotFoundError):
         return False
@@ -73,6 +74,7 @@ def install_embedded_runtime(app: Any) -> bool:
         # allocating a peer or audio pipeline.
         service = VoiceSessionService(db, context, settings)
         service.require_runtime_access(session_id)
+        session_state = service.get_session(session_id)
         try:
             parsed_request = SmallWebRTCRequest.from_dict(dict(request))
         except (TypeError, ValueError) as exc:
@@ -85,6 +87,18 @@ def install_embedded_runtime(app: Any) -> bool:
         request_voice_session_id = str(request_data.get("voice_session_id") or "")
         if request_voice_session_id and request_voice_session_id != session_id:
             raise HTTPException(status_code=409, detail="Voice session mismatch")
+        owner_id = runtime_owner_id()
+        reconnecting = bool(request_data.get("reconnecting"))
+        if not service.claim_runtime_owner(
+            session_id,
+            owner_id,
+            force=reconnecting,
+            expected_session_epoch=session_state.session_epoch,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Voice runtime is owned by another instance; retry after reconnect lease expires",
+            )
 
         # Deployment-wide TURN/STUN, configured by the instance administrator.
         # It is applied to the *handler*, not to this connection, because pipecat
@@ -122,10 +136,21 @@ def install_embedded_runtime(app: Any) -> bool:
         except Exception:
             logger.debug("voice relay injection failed", exc_info=True)
 
+        runner_body_ref: dict[str, Any] | None = None
+
         async def on_connection(connection: SmallWebRTCConnection):
+            nonlocal runner_body_ref
+            body = dict(parsed_request.request_data or {})
+            body["runtime_session_epoch"] = session_state.session_epoch
+            body["runtime_owner_id"] = owner_id
+            # The peer generation is assigned by bind_peer after the offer
+            # handler returns. Keep the same mutable body object so the
+            # background bot receives the fencing value before it starts.
+            body["runtime_peer_generation"] = None
+            runner_body_ref = body
             args = SmallWebRTCRunnerArguments(
                 webrtc_connection=connection,
-                body=parsed_request.request_data,
+                body=body,
                 session_id=session_id or str(uuid.uuid4()),
             )
             # The bot registers itself in app.voice.runner_registry, which is what
@@ -133,13 +158,28 @@ def install_embedded_runtime(app: Any) -> bool:
             # replace it) instead of leaving an orphan worker behind.
             background_tasks.add_task(embedded_bot.bot, args)
 
-        response = await handler.handle_web_request(
-            request=parsed_request, webrtc_connection_callback=on_connection
-        )
+        try:
+            response = await handler.handle_web_request(
+                request=parsed_request, webrtc_connection_callback=on_connection
+            )
+        except Exception:
+            service.release_runtime_owner(
+                session_id,
+                owner_id,
+                expected_session_epoch=session_state.session_epoch,
+            )
+            raise
         pc_id = _response_pc_id(response)
         if not pc_id:
+            service.release_runtime_owner(
+                session_id,
+                owner_id,
+                expected_session_epoch=session_state.session_epoch,
+            )
             raise HTTPException(status_code=502, detail="Voice peer id was not allocated")
-        service.bind_peer(session_id, pc_id)
+        bound_session = service.bind_peer(session_id, pc_id, owner_id=owner_id)
+        if runner_body_ref is not None:
+            runner_body_ref["runtime_peer_generation"] = bound_session.peer_generation
         return response
 
     @app.patch("/api/v1/voice/sessions/{session_id}/api/offer")
@@ -150,6 +190,8 @@ def install_embedded_runtime(app: Any) -> bool:
         context: VoiceWorkspaceContext,
         settings: AppSettings,
     ):
+        from app.voice.runner_registry import runtime_owner_id
+
         try:
             # ``SmallWebRTCPatchRequest`` and ``IceCandidate`` are plain dataclasses
             # in pipecat 1.9 (see ``pipecat/runner/run.py``), so unpacking the JSON
@@ -179,6 +221,7 @@ def install_embedded_runtime(app: Any) -> bool:
         VoiceSessionService(db, context, settings).require_runtime_access(
             session_id,
             peer_connection_id=parsed_request.pc_id,
+            runtime_owner_id=runtime_owner_id(),
         )
         await handler.handle_patch_request(parsed_request)
         return {"status": "success"}
@@ -189,10 +232,14 @@ def install_embedded_runtime(app: Any) -> bool:
 
 async def close_embedded_runtime(app: Any) -> None:
     """Shutdown hook: stop every local voice pipeline and its upstream sockets."""
-    from app.voice.runner_registry import close_all_runners
+    from app.voice.runner_registry import drain_runners
 
     try:
-        await close_all_runners(reason="app_shutdown")
+        # Enter drain mode before closing existing runners so a request racing
+        # application shutdown cannot register a fresh pipeline after the
+        # shutdown sweep has started.  The durable owner lease then expires and
+        # another worker can accept the next offer.
+        await drain_runners(reason="app_shutdown")
     except Exception:
         pass
     handler = getattr(app.state, "learn_graph_voice_runtime", None)

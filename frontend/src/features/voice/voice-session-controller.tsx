@@ -8,12 +8,17 @@ import {
 } from "react";
 import { apiClient, ApiError } from "@/api/client";
 import { createUuid } from "@/lib/uuid";
+import { loadIceServers } from "./voice-ice";
 import {
   cancelVoiceTask as requestVoiceTaskCancel,
-  getVoiceIceServers,
+  approveVoiceTask as requestVoiceTaskApproval,
+  deliverVoiceResult as requestVoiceResultDelivery,
+  getVoiceCapabilities,
+  reviseVoiceTask as requestVoiceTaskRevision,
   getVoiceSession as requestVoiceSession,
   getVoiceTask as requestVoiceTask,
   startVoiceTask as requestVoiceTaskStart,
+  type VoiceCapabilityWire,
 } from "@/api/voice";
 import { clearVoiceSessionResumable, markVoiceSessionResumable, setVoiceSessionActive } from "./voice-session-markers";
 import {
@@ -42,7 +47,11 @@ import {
   type VoiceTaskPatch,
   type VoiceTaskState,
 } from "./voice-tasks";
-import type { VoiceBotOutputPart } from "./voice-bot-output";
+import {
+  applyBotOutput,
+  captionText,
+  type VoiceBotOutputPart,
+} from "./voice-bot-output";
 import { markVoiceLatency, resetVoiceLatency } from "./voice-latency-store";
 import { VoicePlaybackTranscript } from "./voice-playback";
 import { VoiceUserTranscript } from "./voice-user-transcript";
@@ -67,8 +76,6 @@ export interface VoiceRenderUpdate extends Omit<Partial<TranscriptEntry>, "role"
   text: string;
   final: boolean;
   createdAt: string;
-  /** Full LLM draft currently available for the canvas typewriter. */
-  streamingText?: string;
   /**
    * Row ids this update retires from the conversation.
    *
@@ -126,6 +133,28 @@ export interface VoiceModelPin {
 export interface VoiceEventEnvelope { event_id: string; session_id: string; session_epoch: number; turn_id?: string | null; event_seq: number; request_id?: string | null; phase: string; causality?: Record<string, unknown>; timestamp?: string | null; audio_cursor_ms?: number | null; type?: string; payload: Record<string, unknown> }
 /** 与 Pipecat `SmallWebRTCPatchRequest.candidates[].IceCandidate` 一一对应（snake_case）。 */
 export interface VoiceIceCandidate { candidate: string; sdp_mid: string; sdp_mline_index: number }
+/**
+ * Real-time delivery health for the playback ledger.
+ *
+ * This deliberately counts only `assistant.sentence.queued/ended`. LLM draft
+ * deltas are not part of the caption path: the canvas remains authorized by
+ * playback ledger events only.
+ */
+export interface VoiceRealtimeDeliveryStats {
+  received: number;
+  accepted: number;
+  replayed: number;
+  duplicates: number;
+  dropped: number;
+  queued: number;
+  ended: number;
+  lastSeenType: string | null;
+  lastSeenAt: string | null;
+  lastAcceptedType: string | null;
+  lastAcceptedAt: string | null;
+  lastDropReason: string | null;
+  lastDropAt: string | null;
+}
 export interface VoiceSessionSnapshot {
   workspaceId: string; sessionId: string; transport: VoiceTransportState; state: VoiceSessionState;
   thinkingLimit: ThinkingLimit; transcript: VoiceTranscript[]; tasks: VoiceTask[]; error: string | null;
@@ -145,6 +174,8 @@ export interface VoiceSessionSnapshot {
   audioSource: VoiceAudioSource;
   lastEventSeq: number;
   sessionEpoch: number;
+  /** Live `assistant.sentence.*` delivery counters for the voice debug panel. */
+  realtimeDelivery: VoiceRealtimeDeliveryStats;
   /** The model this call is actually using (differs from modelId while a switch is pending). */
   effectiveModelId: string | null;
   /** Null until the user changes the model during a live call. */
@@ -185,6 +216,14 @@ export interface VoiceSessionSnapshot {
    * `play()`), otherwise the page looks connected and stays silent.
    */
   playbackBlocked: boolean;
+  /** Server-owned Agent capability availability; empty until the first load. */
+  agentCapabilities: VoiceCapabilityWire[];
+  capabilitiesLoaded: boolean;
+  capabilitiesError: string | null;
+  voiceProviderReady: boolean | null;
+  voiceProviderReason: string | null;
+  /** IDs with an in-flight approval/rejection/revision request. */
+  busyTaskIds: string[];
 }
 
 /** Which ICE candidate pair a live call is using (from the ``session.ice`` event). */
@@ -205,54 +244,6 @@ const REMOTE_SESSION_STORAGE_KEY = "learngraph.voice.remote-sessions.v1";
  * 提示的价值就是告诉用户"每轮首字变慢是已知原因，不是服务坏了"。
  */
 const THINKING_OFF_UNAVAILABLE_NOTICE_CODE = "thinking_off_unavailable";
-
-/**
- * Deployment-wide ICE servers (STUN/TURN) configured by the instance
- * administrator.
- *
- * Cached for a few minutes rather than per dial: the credential the server hands
- * out lives for hours, and a call must not wait on a settings round-trip. Any
- * failure -- offline, expired session, relay misconfigured -- degrades to an
- * empty list, i.e. exactly the behaviour of a deployment that never configured a
- * relay, so a broken relay can never make calling impossible.
- *
- * Degrading is not the same as failing silently, though. The empty result is
- * cached for a much shorter time than a real one, and the error is reported: a
- * single transient failure used to pin `[]` for the full five minutes, which for
- * a remote caller meant five minutes of relay-less calls that could not connect,
- * with nothing anywhere saying why.
- */
-const ICE_SERVERS_TTL_MS = 5 * 60_000;
-const ICE_SERVERS_FAILURE_TTL_MS = 15_000;
-let iceServersCache: { at: number; servers: RTCIceServer[]; ttlMs: number } | null = null;
-
-async function loadIceServers(): Promise<RTCIceServer[]> {
-  const now = Date.now();
-  if (iceServersCache && now - iceServersCache.at < iceServersCache.ttlMs) {
-    return iceServersCache.servers;
-  }
-  try {
-    const config = await getVoiceIceServers();
-    const servers = (config.iceServers ?? [])
-      .filter((item) =>
-        Array.isArray(item.urls) ? item.urls.length > 0 : Boolean(item.urls),
-      )
-      .map((item) => ({
-        urls: item.urls,
-        username: item.username ?? undefined,
-        credential: item.credential ?? undefined,
-      })) as RTCIceServer[];
-    iceServersCache = { at: now, servers, ttlMs: ICE_SERVERS_TTL_MS };
-    return servers;
-  } catch (error) {
-    console.warn(
-      "[voice] ICE servers unavailable; dialing without STUN/TURN (a direct path can still connect, a remote one cannot)",
-      error,
-    );
-    iceServersCache = { at: now, servers: [], ttlMs: ICE_SERVERS_FAILURE_TTL_MS };
-    return [];
-  }
-}
 
 function readPersistedRemoteSession(workspaceId: string, sessionId: string): string | null {
   if (!workspaceId || !sessionId || typeof window === "undefined") return null;
@@ -284,7 +275,22 @@ function forgetRemoteSession(workspaceId: string, sessionId: string) {
     window.localStorage.setItem(REMOTE_SESSION_STORAGE_KEY, JSON.stringify(stored));
   } catch { /* storage is optional */ }
 }
-const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, pipelineNotice: null, textFallback: false, icePath: null, playbackBlocked: false };
+const defaultRealtimeDelivery: VoiceRealtimeDeliveryStats = {
+  received: 0,
+  accepted: 0,
+  replayed: 0,
+  duplicates: 0,
+  dropped: 0,
+  queued: 0,
+  ended: 0,
+  lastSeenType: null,
+  lastSeenAt: null,
+  lastAcceptedType: null,
+  lastAcceptedAt: null,
+  lastDropReason: null,
+  lastDropAt: null,
+};
+const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, realtimeDelivery: defaultRealtimeDelivery, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, pipelineNotice: null, textFallback: false, icePath: null, playbackBlocked: false, agentCapabilities: [], capabilitiesLoaded: false, capabilitiesError: null, voiceProviderReady: null, voiceProviderReason: null, busyTaskIds: [] };
 let snapshot: VoiceSessionSnapshot = { ...defaultSnapshot };
 const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
@@ -292,6 +298,120 @@ let abortController: AbortController | null = null;
 let peerConnection: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 let dataChannel: RTCDataChannel | null = null;
+// Every async continuation belongs to one connection, not the mutable singleton.
+let connectionGeneration = 0;
+let eventPollGeneration = 0;
+let taskPollGeneration = 0;
+let capabilitiesGeneration = 0;
+let iceRecoveryTimer: number | null = null;
+let connectingRemoteId: string | null = null;
+let connectingRemoteCloser: (() => void) | null = null;
+
+type RealtimeDeliveryStatus = "received" | "accepted" | "replayed" | "duplicate" | "dropped";
+
+function isPlaybackSentenceEvent(type: string): type is "assistant.sentence.queued" | "assistant.sentence.ended" {
+  return type === "assistant.sentence.queued" || type === "assistant.sentence.ended";
+}
+
+function noteRealtimeDelivery(
+  type: string,
+  status: RealtimeDeliveryStatus,
+  turnId?: string,
+  reason?: string,
+) {
+  if (!isPlaybackSentenceEvent(type)) return;
+  const now = new Date().toISOString();
+  const current = snapshot.realtimeDelivery;
+  const next: VoiceRealtimeDeliveryStats = { ...current };
+  if (status === "received") {
+    next.received += 1;
+    next.lastSeenType = type;
+    next.lastSeenAt = now;
+  } else if (status === "accepted") {
+    next.accepted += 1;
+    if (type === "assistant.sentence.queued") next.queued += 1;
+    if (type === "assistant.sentence.ended") next.ended += 1;
+    next.lastAcceptedType = type;
+    next.lastAcceptedAt = now;
+  } else if (status === "replayed") {
+    next.replayed += 1;
+  } else if (status === "duplicate") {
+    next.duplicates += 1;
+  } else {
+    next.dropped += 1;
+    next.lastDropReason = reason || "unrecognized";
+    next.lastDropAt = now;
+  }
+  // Keep the turn id out of the persisted snapshot: the counters are a small
+  // transport monitor, while the authoritative turn identity lives in the
+  // playback transcript and journal. The optional argument is retained at the
+  // call sites to make the diagnostic boundary explicit.
+  void turnId;
+  update({ realtimeDelivery: next });
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isVoicePlaybackEventType(type: unknown): boolean {
+  return typeof type === "string" && (
+    type.startsWith("assistant.") ||
+    type.startsWith("user.") ||
+    type === "turn.finalized" ||
+    type === "turn.interrupted"
+  );
+}
+
+/** Find a voice event through the server-message/data wrappers used by RTVI. */
+function findVoiceEventCandidate(value: unknown, depth = 0): Record<string, unknown> | null {
+  if (depth > 4) return null;
+  const record = asRecord(value);
+  if (!record) return null;
+  if (isVoicePlaybackEventType(record.type)
+    || ((record.event_id || record.eventId)
+      && (record.event_seq !== undefined || record.eventSeq !== undefined))) return record;
+  for (const key of ["event", "payload", "data"]) {
+    const nested = findVoiceEventCandidate(record[key], depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function captureVoiceOwner() {
+  const generation = connectionGeneration;
+  const { workspaceId, sessionId, sessionIdRemote } = snapshot;
+  return () => generation === connectionGeneration
+    && workspaceId === snapshot.workspaceId && sessionId === snapshot.sessionId
+    && sessionIdRemote === snapshot.sessionIdRemote;
+}
+
+function invalidateVoiceConnection() {
+  connectionGeneration += 1;
+  capabilitiesGeneration += 1;
+  capabilitiesRequest = null;
+  abortController?.abort();
+  abortController = null;
+  cancellingTaskIds.clear();
+  busyTaskIds.clear();
+  update({ busyTaskIds: [] });
+  eventCatchUpInFlight = false;
+  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
+  iceRecoveryTimer = null;
+}
 
 /** Pipecat's RTVI wire constants (label is fixed by the protocol). */
 const RTVI_LABEL = "rtvi-ai";
@@ -332,13 +452,12 @@ const seenEventIds = new Set<string>();
 const renderedLiveEventIds = new Set<string>();
 const pendingTyped = new Map<string, { text: string; turnId?: string }>();
 const turnAudioCursors = new Map<string, number>();
-/**
- * LLM text arrives before the sentence/audio ledger. Keep the streamed
- * fragments per server turn so the conversation canvas can render a live
- * typewriter bubble instead of waiting for TTS playback markers.
- */
-const assistantDraftText = new Map<string, string>();
-const assistantDraftTerminalTurns = new Set<string>();
+// RTVI `bot-output` is the text path used by providers that do not emit the
+// durable sentence ledger. Keep it per turn so a live text update can be
+// rendered immediately and later playback markers can reuse the same row.
+const botOutputParts = new Map<string, VoiceBotOutputPart[]>();
+const playbackCaptionTurns = new Set<string>();
+let lastPlaybackCaptionTurnId: string | null = null;
 
 /**
  * Authoritative + speculative transcript state, reduced from durable events.
@@ -352,6 +471,8 @@ let taskState: VoiceTaskState = emptyVoiceTaskState();
 let taskPollTimer: number | null = null;
 let taskPollDelayMs = 2000;
 const cancellingTaskIds = new Set<string>();
+const busyTaskIds = new Set<string>();
+let capabilitiesRequest: Promise<void> | null = null;
 /** Catch-up polling for the durable cursor (keeps `lastEventSeq` advancing). */
 let eventPollTimer: number | null = null;
 let eventPollDelayMs = 1500;
@@ -371,15 +492,62 @@ function syncTranscriptFromState() {
 function resetTaskState() {
   taskState = emptyVoiceTaskState();
   cancellingTaskIds.clear();
+  busyTaskIds.clear();
+  update({ busyTaskIds: [] });
+}
+
+function loadVoiceCapabilities(force = false): Promise<void> {
+  if (capabilitiesRequest && !force) return capabilitiesRequest;
+  const generation = ++capabilitiesGeneration;
+  const workspaceId = snapshot.workspaceId;
+  const sessionId = snapshot.sessionId;
+  const current = () => generation === capabilitiesGeneration
+    && workspaceId === snapshot.workspaceId && sessionId === snapshot.sessionId;
+  capabilitiesRequest = getVoiceCapabilities()
+    .then((result) => {
+      if (!current()) return;
+      update({
+        agentCapabilities: Array.isArray(result?.agent_capabilities) ? result.agent_capabilities : [],
+        capabilitiesLoaded: true,
+        capabilitiesError: null,
+        voiceProviderReady: typeof result?.voice_provider_ready === "boolean" ? result.voice_provider_ready : null,
+        voiceProviderReason: result?.voice_provider_reason || null,
+      });
+    })
+    .catch((error) => {
+      if (!current()) return;
+      // Discovery is advisory.  Leave the call usable when the endpoint is
+      // missing on an older backend; known capability blocking starts only
+      // after a successful load.
+      update({
+        capabilitiesLoaded: false,
+        capabilitiesError: error instanceof Error ? error.message : "语音 Agent 能力暂时无法读取",
+        voiceProviderReady: null,
+        voiceProviderReason: null,
+      });
+    })
+    .finally(() => {
+      if (current()) capabilitiesRequest = null;
+    });
+  return capabilitiesRequest;
+}
+
+function capabilityAvailability(capabilityId: string | undefined): VoiceCapabilityWire | undefined {
+  if (!capabilityId || !snapshot.capabilitiesLoaded) return undefined;
+  return snapshot.agentCapabilities.find((item) => item.id === capabilityId);
+}
+
+function setTaskBusy(taskId: string, busy: boolean) {
+  if (!taskId) return;
+  if (busy) busyTaskIds.add(taskId);
+  else busyTaskIds.delete(taskId);
+  update({ busyTaskIds: Array.from(busyTaskIds) });
 }
 
 function syncTaskState() {
-  const tasks = [...taskState.tasks]
-    .sort((a, b) => {
-      const activeDifference = Number(voiceTaskIsActive(b)) - Number(voiceTaskIsActive(a));
-      return activeDifference || b.updatedAt.localeCompare(a.updatedAt);
-    })
-    .slice(0, 20);
+  // Keep insertion order stable. Sorting by updatedAt made every progress event
+  // move a card to the top of the canvas, so the user's open card visibly jumped.
+  const tasks = taskState.tasks.slice(0, 20);
   update({ tasks });
 }
 
@@ -410,8 +578,9 @@ function resetTranscriptState() {
   seenEventIds.clear();
   renderedLiveEventIds.clear();
   turnAudioCursors.clear();
-  assistantDraftText.clear();
-  assistantDraftTerminalTurns.clear();
+  botOutputParts.clear();
+  playbackCaptionTurns.clear();
+  lastPlaybackCaptionTurnId = null;
 }
 
 /** Fold a durable event into the transcript projection. */
@@ -438,16 +607,17 @@ let durableEventCount = 0;
  * 身份对不上也没关系：这一轮在服务端可能由 worker 先建（那时应答给回的就是 worker
  * 那个 id）—— 这里用的始终是服务端应答里的真值，不是客户端猜的 id。
  */
-function persistAcceptedTurn(turnId: string, userText: string, clientMessageId?: string) {
+function persistAcceptedTurn(userText: string, clientMessageId: string) {
+  const current = captureVoiceOwner();
   const remote = snapshot.sessionIdRemote;
   if (!remote || !userText.trim()) return;
   void apiClient
     .post<{ turn_id?: string; turnId?: string }>(`/voice/sessions/${remote}/turns/accept`, {
-      turn_id: turnId,
       text: userText.trim(),
       client_message_id: clientMessageId,
     })
     .then((accepted) => {
+      if (!current()) return;
       const confirmed = String(accepted?.turn_id ?? accepted?.turnId ?? "").trim();
       if (!confirmed) return;
       // 认领身份：这一轮随后的账本记号（含已经先到的）都会归到它自己名下。
@@ -537,23 +707,28 @@ export function advanceDurableCursor(
  */
 let eventCatchUpInFlight = false;
 function requestEventCatchUp() {
-  if (eventCatchUpInFlight) return;
-  if (!snapshot.sessionIdRemote) return;
+  if (eventCatchUpInFlight || !snapshot.sessionIdRemote) return;
+  const current = captureVoiceOwner();
   eventCatchUpInFlight = true;
   void pollVoiceEvents().finally(() => {
-    eventCatchUpInFlight = false;
+    if (current()) eventCatchUpInFlight = false;
   });
 }
 
 /** Fetch and fold durable events newer than the local cursor. */
 async function pollVoiceEvents(): Promise<boolean> {
   const remote = snapshot.sessionIdRemote;
+  const current = captureVoiceOwner();
   if (!remote) return false;
   try {
     const replay = await apiClient.get<{ events?: Array<Record<string, unknown>> }>(
       `/voice/sessions/${remote}/events?after_event_seq=${snapshot.lastEventSeq}`,
     );
+    if (!current()) return false;
     for (const rawEvent of replay.events ?? []) {
+      if (!current()) return false;
+      const eventSession = rawEvent.session_id ?? rawEvent.sessionId;
+      if (eventSession && String(eventSession) !== remote) continue;
       const normalized = normalizeVoiceEvent({
         ...rawEvent,
         event_seq: rawEvent.event_seq ?? rawEvent.seq,
@@ -585,28 +760,27 @@ async function pollVoiceEvents(): Promise<boolean> {
  */
 function startEventPolling() {
   stopEventPolling();
-  stopTaskPolling();
+  const generation = eventPollGeneration;
+  const owner = captureVoiceOwner();
+  const current = () => generation === eventPollGeneration && owner();
   const tick = async () => {
-    if (snapshot.transport !== "connected" || !snapshot.sessionIdRemote) {
-      eventPollTimer = null;
-      return;
-    }
+    if (!current()) return;
+    eventPollTimer = null;
+    if (snapshot.transport !== "connected" || !snapshot.sessionIdRemote) return;
     const ok = await pollVoiceEvents();
+    if (!current()) return;
     eventPollDelayMs = ok ? 1500 : Math.min(15_000, Math.round(eventPollDelayMs * 1.8));
     if (snapshot.transport === "connected" && snapshot.sessionIdRemote) {
       eventPollTimer = window.setTimeout(() => { void tick(); }, eventPollDelayMs);
-    } else {
-      eventPollTimer = null;
     }
   };
   eventPollTimer = window.setTimeout(() => { void tick(); }, eventPollDelayMs);
 }
 
 function stopEventPolling() {
-  if (eventPollTimer !== null) {
-    window.clearTimeout(eventPollTimer);
-    eventPollTimer = null;
-  }
+  eventPollGeneration += 1;
+  if (eventPollTimer !== null) window.clearTimeout(eventPollTimer);
+  eventPollTimer = null;
   eventPollDelayMs = 1500;
 }
 
@@ -615,6 +789,7 @@ function stopEventPolling() {
  * reconnect. This only restores UI state: it never replays old task audio.
  */
 async function recoverVoiceSessionState(): Promise<void> {
+  const current = captureVoiceOwner();
   const remote = snapshot.sessionIdRemote;
   if (!remote) return;
   const [transcriptResult, sessionResult] = await Promise.all([
@@ -625,6 +800,7 @@ async function recoverVoiceSessionState(): Promise<void> {
       .catch(() => null),
     requestVoiceSession(remote).catch(() => null),
   ]);
+  if (!current()) return;
   if (transcriptResult?.turns?.length) {
     transcriptState = seedFromServerTurns(transcriptState, transcriptResult.turns);
     syncTranscriptFromState();
@@ -649,9 +825,10 @@ async function recoverVoiceSessionState(): Promise<void> {
 }
 
 async function pollVoiceTasks(): Promise<boolean> {
+  const current = captureVoiceOwner();
   const remote = snapshot.sessionIdRemote;
   if (!remote) return false;
-  const activeTasks = taskState.tasks.filter(voiceTaskIsActive).slice(0, 4);
+  const activeTasks = taskState.tasks.filter(voiceTaskIsActive);
   if (!activeTasks.length) return true;
   const results = await Promise.all(
     activeTasks.map(async (task) => {
@@ -669,8 +846,10 @@ async function pollVoiceTasks(): Promise<boolean> {
       }
     }),
   );
+  if (!current()) return false;
   let allSucceeded = true;
   for (const result of results) {
+    if (!current()) return false;
     if (!result) {
       allSucceeded = false;
       continue;
@@ -696,33 +875,27 @@ async function pollVoiceTasks(): Promise<boolean> {
 
 function startTaskPolling() {
   stopTaskPolling();
+  const generation = taskPollGeneration;
+  const owner = captureVoiceOwner();
+  const current = () => generation === taskPollGeneration && owner();
   const tick = async () => {
-    if (snapshot.transport !== "connected" || !snapshot.sessionIdRemote) {
-      taskPollTimer = null;
-      return;
-    }
+    if (!current()) return;
+    taskPollTimer = null;
+    if (snapshot.transport !== "connected" || !snapshot.sessionIdRemote) return;
     const ok = await pollVoiceTasks();
-    taskPollDelayMs = ok
-      ? 1800
-      : Math.min(12_000, Math.round(taskPollDelayMs * 1.8));
+    if (!current()) return;
+    taskPollDelayMs = ok ? 1800 : Math.min(12_000, Math.round(taskPollDelayMs * 1.8));
     if (snapshot.transport === "connected" && snapshot.sessionIdRemote) {
-      taskPollTimer = window.setTimeout(() => {
-        void tick();
-      }, taskPollDelayMs);
-    } else {
-      taskPollTimer = null;
+      taskPollTimer = window.setTimeout(() => { void tick(); }, taskPollDelayMs);
     }
   };
-  taskPollTimer = window.setTimeout(() => {
-    void tick();
-  }, 800);
+  taskPollTimer = window.setTimeout(() => { void tick(); }, 800);
 }
 
 function stopTaskPolling() {
-  if (taskPollTimer !== null) {
-    window.clearTimeout(taskPollTimer);
-    taskPollTimer = null;
-  }
+  taskPollGeneration += 1;
+  if (taskPollTimer !== null) window.clearTimeout(taskPollTimer);
+  taskPollTimer = null;
   taskPollDelayMs = 2000;
 }
 
@@ -748,8 +921,11 @@ function flushPendingUserFinal() {
 }
 
 function renderPlaybackEvent(event: Parameters<VoicePlaybackTranscript["apply"]>[0]) {
-  const rendered = playbackTranscript.apply(event);
+  const effectiveTurnId = event.turn_id || activeUserTurnId || "live";
+  const rendered = playbackTranscript.apply({ ...event, turn_id: effectiveTurnId });
   if (!rendered) return;
+  playbackCaptionTurns.add(effectiveTurnId);
+  lastPlaybackCaptionTurnId = effectiveTurnId;
   if (!rendered.final) {
     if (rendered.captionParts?.length === 1 && rendered.captionParts[0].status !== "completed") {
       userTranscript.answerStarted();
@@ -758,24 +934,64 @@ function renderPlaybackEvent(event: Parameters<VoicePlaybackTranscript["apply"]>
   } else {
     update({ streamingAssistantText: "" });
   }
-  const draftText = rendered.turnId ? assistantDraftText.get(rendered.turnId) : undefined;
-  const removes = [
-    ...(rendered.removes ?? []),
-    ...(rendered.final && !rendered.text.trim() && rendered.turnId
-      ? [`assistant-stream-${rendered.turnId}`]
-      : []),
-  ];
+  const removes = [...(rendered.removes ?? [])];
+  if (botOutputParts.has(effectiveTurnId)) removes.push(`assistant-live-${effectiveTurnId}`);
+  if (botOutputParts.has("live") && (!activeUserTurnId || activeUserTurnId === effectiveTurnId)) {
+    removes.push("assistant-live-live");
+  }
   dispatchVoiceRender({
     ...rendered,
     ...(removes.length ? { removes } : {}),
-    ...(draftText ? { streamingText: draftText } : {}),
   });
+}
+
+function renderBotOutput(data: Record<string, unknown>) {
+  const payload = asRecord(data.data) ?? data;
+  const text = String(
+    payload.text ?? payload.aggregated_text ?? payload.aggregatedText ??
+      payload.content ?? payload.transcript ?? "",
+  ).trim();
+  if (!text) return;
+  const serverTurnId = String(
+    payload.turn_id ?? payload.turnId ?? data.turn_id ?? data.turnId ?? "",
+  ).trim();
+  const turnId = serverTurnId || activeUserTurnId || lastPlaybackCaptionTurnId || "live";
+  const parts = applyBotOutput(botOutputParts.get(turnId) ?? [], {
+    text,
+    aggregatedBy: typeof payload.aggregated_by === "string" ? payload.aggregated_by : undefined,
+    spokenStatus: typeof payload.spoken_status === "string"
+      ? payload.spoken_status
+      : typeof payload.spokenStatus === "string" ? payload.spokenStatus : undefined,
+    willBeSpoken: payload.will_be_spoken !== false && payload.willBeSpoken !== false,
+    accumulatedText: typeof payload.spoken_progress === "object" && payload.spoken_progress
+      ? String((payload.spoken_progress as Record<string, unknown>).accumulated_text ?? "")
+      : typeof payload.accumulated_text === "string" ? payload.accumulated_text : undefined,
+    remainingText: typeof payload.spoken_progress === "object" && payload.spoken_progress
+      ? String((payload.spoken_progress as Record<string, unknown>).remaining_text ?? "")
+      : typeof payload.remaining_text === "string" ? payload.remaining_text : undefined,
+    segmentId: Number.isFinite(Number(payload.segment_id)) ? Number(payload.segment_id) : null,
+  });
+  botOutputParts.set(turnId, parts);
+  // Once this turn has playback evidence, the ledger owns visible text and
+  // progress. Urgent provider updates can run well ahead of audible output.
+  if (playbackCaptionTurns.has(turnId)) return;
+  dispatchVoiceRender({
+    id: `assistant-live-${turnId}`,
+    role: "assistant",
+    turnId,
+    text: captionText(parts),
+    captionParts: parts,
+    final: false,
+    createdAt: new Date().toISOString(),
+  });
+  update({ streamingAssistantText: captionText(parts) });
 }
 
 function normalizeVoiceEvent(input: Record<string, unknown>): VoiceEventEnvelope | null {
   const eventId = String(input.event_id ?? input.eventId ?? "");
   const seq = Number(input.event_seq ?? input.eventSeq ?? 0);
   if (!eventId || !Number.isFinite(seq)) return null;
+  const payload = asRecord(input.payload) ?? input;
   return {
     event_id: eventId,
     session_id: String(input.session_id ?? input.sessionId ?? snapshot.sessionIdRemote ?? ""),
@@ -788,7 +1004,7 @@ function normalizeVoiceEvent(input: Record<string, unknown>): VoiceEventEnvelope
     timestamp: input.timestamp == null ? null : String(input.timestamp),
     audio_cursor_ms: input.audio_cursor_ms == null ? null : Number(input.audio_cursor_ms),
     type: String(input.type ?? input.event_type ?? input.phase ?? ""),
-    payload: (input.payload as Record<string, unknown>) ?? input,
+    payload,
   };
 }
 
@@ -819,16 +1035,65 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
     payload,
   });
   const liveId = String(payload.live_event_id || "");
-  if (liveId) {
+  const playbackSentence = isPlaybackSentenceEvent(type);
+  const hadLivePlayback = !live && playbackSentence && liveId
+    ? renderedLiveEventIds.has(liveId)
+    : false;
+  if (live && playbackSentence) {
+    // The live envelope normally carries `payload.live_event_id`. Fall back to
+    // the normalized event id for older workers so a repeated data-channel
+    // frame cannot duplicate a caption row.
+    const dedupeId = liveId || `event:${event.event_id}`;
+    if (renderedLiveEventIds.has(dedupeId)) {
+      noteRealtimeDelivery(type, "duplicate", turnId);
+      return;
+    }
+    renderedLiveEventIds.add(dedupeId);
+    if (renderedLiveEventIds.size > 2000) renderedLiveEventIds.delete(renderedLiveEventIds.values().next().value!);
+    noteRealtimeDelivery(type, "accepted", turnId);
+  } else if (liveId) {
     if (renderedLiveEventIds.has(liveId)) return;
     renderedLiveEventIds.add(liveId);
     if (renderedLiveEventIds.size > 2000) renderedLiveEventIds.delete(renderedLiveEventIds.values().next().value!);
   }
+  if (!live && playbackSentence && liveId && !hadLivePlayback) {
+    // The durable copy is the bounded recovery path when a live frame was
+    // lost. It still represents already-played audio, so it is safe to render
+    // under the same strict played-only policy.
+    noteRealtimeDelivery(type, "replayed", turnId);
+  }
   if (isVoiceTaskEventType(type)) {
+    const previousTaskId = String(payload.previous_task_id ?? payload.previousTaskId ?? "");
+    const currentTaskId = String(payload.task_id ?? payload.taskId ?? payload.subagent_id ?? payload.subagentId ?? "");
+    if (previousTaskId && currentTaskId && previousTaskId !== currentTaskId) {
+      applyTaskEvent({
+        task_id: previousTaskId,
+        status: "cancelled",
+        event_id: `${event.event_id}:previous`,
+        type: "task.cancelled",
+      }, previousTaskId);
+    }
+    // ``event.event_seq`` belongs to the voice-session journal.  Background
+    // Agent progress has its own per-task cursor (``seq``), so copying the
+    // session cursor here makes the first task poll ask for
+    // ``after_event_seq=<voice session seq>`` and silently skip the task's
+    // queued/started/tool/progress events.  Only a task-owned cursor may
+    // advance ``VoiceTaskState.cursorByTask``; the accepted/approval/playback
+    // notifications remain deduplicated by their voice event id.
+    const taskEventSeq = Number(
+      payload.task_event_seq ?? payload.taskEventSeq ?? NaN,
+    );
+    // A task payload may be assembled from a replay envelope and carry an
+    // ``event_seq`` field for unrelated reasons.  Never let that ambiguous
+    // name advance the per-task cursor; only the explicit task-owned field
+    // above is safe here.
+    const taskPayload = { ...payload };
+    delete taskPayload.event_seq;
+    delete taskPayload.eventSeq;
     applyTaskEvent({
-      ...payload,
+      ...taskPayload,
       event_id: event.event_id,
-      event_seq: event.event_seq,
+      ...(Number.isFinite(taskEventSeq) ? { event_seq: taskEventSeq } : {}),
       type,
     });
     return;
@@ -844,15 +1109,20 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       // 产物，必须清掉，否则会挂在新通话上误导用户。
       update({ state: "ready", error: null, pipelineNotice: null });
       return;
-    case "session.ready":
-      // A rebuilt pipeline re-resolves every stage, so a previous degradation is
-      // no longer a statement about the current one.  The ICE path belongs to the
-      // *connection*, not the pipeline, so it survives a pipeline rebuild.
+    case "session.ready": {
+      // Pipeline readiness cannot certify recovery of a disconnected peer.
+      const broken = peerConnection && (["failed", "disconnected"].includes(peerConnection.connectionState)
+        || ["failed", "disconnected"].includes(peerConnection.iceConnectionState));
       update({
-        transport: "connected", state: "listening", error: null,
+        ...(!broken ? { transport: "connected" as const, state: "listening" as const, error: null } : {}),
         degradedStages: [], degradedNotice: null, textFallback: false,
       });
+      if (!broken && snapshot.sessionIdRemote) {
+        startEventPolling();
+        startTaskPolling();
+      }
       return;
+    }
     case "session.ice": {
       // Which candidate pair the connection settled on. Kept in the snapshot so
       // the call can say "relayed" or "direct" out loud -- otherwise a deployment
@@ -872,8 +1142,10 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       update({ transport: "reconnecting", error: null });
       return;
     case "session.closed":
-      forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId);
-      update({ transport: "idle", state: "closed", sessionIdRemote: null, pipelineNotice: null });
+      // The server already closed it: release local media without another DELETE.
+      closedRemoteSession = snapshot.sessionIdRemote ?? connectingRemoteId;
+      voiceSessionController.disconnect({ preserveLatency: true });
+      update({ pipelineNotice: null });
       return;
     case "user.started":
       // The journal may still be pointing at the previous turn when speech
@@ -931,6 +1203,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
     }
     case "turn.accepted": {
       markVoiceLatency({ stage: "turnAccepted", source: "ledger", turnId });
+      if (turnId) activeUserTurnId = turnId;
       const clientId = String(payload.client_message_id ?? payload.clientMessageId ?? "");
       if (clientId && pendingTyped.has(clientId)) {
         const pending = pendingTyped.get(clientId)!;
@@ -954,47 +1227,23 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       if (String(payload.role ?? "") === "user") {
         renderAuthoritativeUserTurn(turnId || ensureUserTurnId(), text);
       } else {
-        if (turnId) {
-          assistantDraftTerminalTurns.add(turnId);
-          assistantDraftText.delete(turnId);
-        }
         if (turnId && typeof payload.user_text === "string" && payload.user_text.trim()) {
           renderAuthoritativeUserTurn(turnId, payload.user_text);
         }
         renderPlaybackEvent(event);
+        update({ state: "listening" });
         markVoiceLatency({ stage: "answerDone", source: "ledger", turnId });
       }
       return;
     case "turn.interrupted":
-      if (turnId) {
-        assistantDraftTerminalTurns.add(turnId);
-        assistantDraftText.delete(turnId);
-      }
       renderPlaybackEvent(event);
+      update({ state: "listening" });
       markVoiceLatency({ stage: "answerDone", source: "barge-in", turnId });
       return;
     case "assistant.llm.delta":
+      // Raw LLM output is process-local draft text. The central canvas only
+      // renders playback-ledger events, so unheard text never flashes onscreen.
       markVoiceLatency({ stage: "llmFirst", source: "ledger", turnId });
-      if (snapshot.state !== "speaking") update({ state: "thinking" });
-      if (turnId && text && !assistantDraftTerminalTurns.has(turnId)) {
-        // VoiceJournal coalesces adjacent Pipecat TextFrame chunks into each
-        // payload.text while preserving their order. Append each emitted batch;
-        // event ids are de-duplicated before this switch, so replay cannot
-        // duplicate a batch.
-        const nextText = `${assistantDraftText.get(turnId) ?? ""}${text}`;
-        assistantDraftText.set(turnId, nextText);
-        update({ streamingAssistantText: nextText });
-        dispatchVoiceRender({
-          id: `assistant-stream-${turnId}`,
-          role: "assistant",
-          turnId,
-          text: nextText,
-          streamingText: nextText,
-          final: false,
-          createdAt: event.timestamp || new Date().toISOString(),
-          eventId: event.event_id,
-        });
-      }
       return;
     case "assistant.sentence.queued":
       flushPendingUserFinal();
@@ -1031,6 +1280,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
         degradedStages: stages,
         degradedNotice: degradedNotice(stages),
         textFallback,
+        ...(stages.includes("tts") ? { state: "listening" as const } : {}),
       });
       if (textFallback && !snapshot.muted) {
         // Stop streaming the microphone into an ASR that cannot answer: left
@@ -1080,24 +1330,45 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
 
 /** Row id of the live (still-speaking) assistant bubble of one turn. */
 function handleRtviMessage(raw: string) {
-  type RtviEnvelope = { label?: string; type?: string; data?: Record<string, unknown> };
+  type RtviEnvelope = { label?: string; type?: string; data?: unknown };
   let payload: RtviEnvelope | null = null;
   try { payload = JSON.parse(raw) as RtviEnvelope; } catch { return; }
   if (!payload || payload.label !== RTVI_LABEL) return;
-  const data = payload.data ?? {};
-  // New durable event envelopes may arrive wrapped in an RTVI server-message
-  // or directly as `data.event`. Apply them before legacy observer messages.
-  const candidate = (data.event ?? data.payload ?? data.data ?? data) as Record<string, unknown>;
+  const data = asRecord(payload.data) ?? {};
+  // New durable/live event envelopes have appeared in all of these forms in
+  // the wild: `data.event`, `server-message.data.event`, and a JSON-string
+  // nested in `data`. Walk those wrappers, but leave observer messages (such
+  // as `bot-output`) untouched for the legacy branch below.
+  const candidate = findVoiceEventCandidate(data);
   const livePlayback = candidate &&
     String(candidate.delivery ?? "") === "live" &&
-    typeof candidate.type === "string" &&
-    (String(candidate.type).startsWith("assistant.") || String(candidate.type).startsWith("user.") || candidate.type === "turn.finalized" || candidate.type === "turn.interrupted");
-  if (candidate && ((candidate.event_id || candidate.eventId) && (candidate.event_seq !== undefined || candidate.eventSeq !== undefined) || livePlayback)) {
+    isVoicePlaybackEventType(candidate.type);
+  const candidateType = String(candidate?.type ?? "");
+  const candidatePayload = asRecord(candidate?.payload) ?? {};
+  const candidateTurnId = String(
+    candidate?.turn_id ?? candidate?.turnId ?? candidatePayload.turn_id ?? candidatePayload.turnId ?? "",
+  ).trim();
+  const isLiveSentence = Boolean(livePlayback && isPlaybackSentenceEvent(candidateType));
+  if (isLiveSentence) noteRealtimeDelivery(candidateType, "received", candidateTurnId || undefined);
+  if (candidate && (
+    ((candidate.event_id || candidate.eventId) && (candidate.event_seq !== undefined || candidate.eventSeq !== undefined))
+    || livePlayback
+  )) {
     const event = normalizeVoiceEvent({
       ...candidate,
-      event_id: candidate.event_id ?? candidate.eventId ?? `live:${candidate.type}:${candidate.turn_id}:${String((candidate.payload as Record<string, unknown> | undefined)?.sentence_seq ?? "")}`,
+      event_id: candidate.event_id ?? candidate.eventId ?? `live:${candidate.type}:${candidate.turn_id}:${String(candidatePayload.sentence_seq ?? "")}:${String(candidatePayload.live_event_id ?? "")}`,
       event_seq: candidate.event_seq ?? candidate.eventSeq ?? snapshot.lastEventSeq,
     });
+    const expectedSession = snapshot.sessionIdRemote ?? connectingRemoteId;
+    if (event?.session_id && expectedSession && event.session_id !== expectedSession) {
+      if (isLiveSentence) noteRealtimeDelivery(candidateType, "dropped", candidateTurnId || undefined, "session_mismatch");
+      return;
+    }
+    if (isLiveSentence && (!event || !candidateTurnId || !String(candidatePayload.text ?? "").trim()
+      || !Number.isInteger(Number(candidatePayload.sentence_seq)) || Number(candidatePayload.sentence_seq) < 1)) {
+      noteRealtimeDelivery(candidateType, "dropped", candidateTurnId || undefined, "malformed_sentence");
+      return;
+    }
     if (livePlayback && event) {
       processVoiceEvent(event, true);
       return;
@@ -1131,12 +1402,45 @@ function handleRtviMessage(raw: string) {
     });
     return;
   }
-  switch (payload.type) {
-    case "user-transcription":
-      // Durable user events own row identity. Observer messages may precede
-      // them, but must not create another row or overwrite a confirmed segment.
-      update({ interimUserText: data.final ? "" : String(data.text ?? "") });
+  // Some RTVI transports put observer messages inside a ``server-message``
+  // envelope (`data.type` + optional `data.data`), while others send the
+  // observer type at the top level. Normalize both shapes before handling the
+  // low-latency transcription path.
+  const nestedType = typeof data.type === "string" ? data.type : "";
+  const observerTypes = new Set([
+    "user-transcription",
+    "user-stopped-speaking",
+    "bot-llm-started",
+    "bot-llm-text",
+    "bot-llm-stopped",
+    "bot-output",
+    "bot-tts-text",
+  ]);
+  const observerType = observerTypes.has(nestedType)
+    ? nestedType
+    : String(payload.type ?? "");
+  const observerData =
+    observerTypes.has(nestedType) && data.data && typeof data.data === "object"
+      ? (data.data as Record<string, unknown>)
+      : data;
+  switch (observerType) {
+    case "user-transcription": {
+      // RTVI's observer message is the low-latency path used by some STT
+      // providers.  It used to update only the hidden snapshot field, so the
+      // recognized words were absent from the conversation canvas until the
+      // final durable event arrived.  Feed the same live row used by the
+      // durable ``user.interim`` event; the final durable event still owns
+      // identity and persistence, so this cannot create a second bubble.
+      const legacyText = String(observerData.text ?? observerData.transcript ?? "").trim();
+      const isFinal = observerData.final === true || observerData.is_final === true;
+      activeUserTurnId = activeUserTurnId || createUuid();
+      update({ interimUserText: isFinal ? "" : legacyText });
+      if (!isFinal && legacyText) {
+        const userLive = userTranscript.interim(legacyText);
+        if (userLive) dispatchVoiceRender(userLive);
+      }
       return;
+    }
     case "user-stopped-speaking":
       markVoiceLatency({ stage: "userDone", source: "rtvi" });
       flushPendingUserFinal();
@@ -1151,9 +1455,12 @@ function handleRtviMessage(raw: string) {
       return;
     case "bot-llm-stopped":
     case "server-message":
+      return;
     case "bot-output":
-      // These messages can run ahead of audio. Text is rendered exclusively
-      // from the media ledger, whose events carry turn and sentence identity.
+      // Providers without the durable sentence ledger still deliver the
+      // assistant text through RTVI. Render it immediately; sentence events,
+      // when available, will update the same turn row with playback state.
+      renderBotOutput(observerData);
       return;
     case "bot-tts-text":
       // 排障旁路（后端 `bot_tts_enabled=False`），不参与渲染。
@@ -1218,8 +1525,32 @@ function describeMicrophoneError(error: unknown): string | null {
       return null;
   }
 }
+
+function describeVoiceApiError(error: unknown): string | null {
+  if (!(error instanceof ApiError) || error.status !== 404) return null;
+  const url = error.url || "";
+  if (/\/voice\/sessions\/[^/]+\/api\/offer(?:\?|$)/.test(url)) {
+    return "SmallWebRTC 信令接口返回 404：当前后端没有挂载语音 offer 路由。请确认后端使用了 voice 依赖并已重启，且前端代理指向同一个后端。";
+  }
+  if (/\/voice\/sessions(?:\/|\?|$)/.test(url)) {
+    return "语音 API 路由返回 404：前端请求没有到达当前 LearnGraph 后端，请检查 Vite/API 代理地址或后端版本。";
+  }
+  return "语音连接接口返回 404：请检查前端 API 地址和后端部署版本。";
+}
+
+function isRuntimeOwnerConflict(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.code === "voice_runtime_owned_elsewhere" ||
+      (error.status === 409 && /runtime.*owner/i.test(error.message)))
+  );
+}
 function cleanupAudioTransport() {
+  stopTaskPolling();
+  if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
+  iceRecoveryTimer = null;
   if (peerConnection) {
+    peerConnection.ontrack = null;
     peerConnection.onicecandidate = null;
     peerConnection.onconnectionstatechange = null;
     peerConnection.oniceconnectionstatechange = null;
@@ -1416,9 +1747,12 @@ export const voiceSessionController = {
   open(workspaceId: string, sessionId: string, modelId?: string | null, providerId?: string | null) {
     const same = snapshot.workspaceId === workspaceId && snapshot.sessionId === sessionId;
     if (!same) {
+      if (snapshot.sessionId) voiceSessionController.disconnect();
+      else invalidateVoiceConnection();
       playbackTranscript.reset();
       userTranscript.reset();
-      if (snapshot.sessionId) sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, snapshot);
+      resetTranscriptState();
+      pendingTyped.clear();
       taskState = emptyVoiceTaskState();
       syncTaskState();
       const cached = sessionCache.get(`${workspaceId}:${sessionId}`);
@@ -1440,10 +1774,16 @@ export const voiceSessionController = {
       const changed = nextModel !== snapshot.modelId || nextProvider !== snapshot.providerId;
       update({ modelId: nextModel, providerId: nextProvider });
       if (snapshot.sessionIdRemote && snapshot.transport === "connected" && changed) {
+        const current = captureVoiceOwner();
         void apiClient.patch(`/voice/sessions/${snapshot.sessionIdRemote}/model`, { model_id: nextModel, provider_id: nextProvider })
-          .catch((error) => update({ error: error instanceof Error ? `模型切换失败：${error.message}` : "模型切换失败" }));
+          .catch((error) => {
+            if (current() && snapshot.modelId === nextModel && snapshot.providerId === nextProvider) {
+              update({ error: error instanceof Error ? `模型切换失败：${error.message}` : "模型切换失败" });
+            }
+          });
       }
     }
+    void loadVoiceCapabilities();
   },
   setThinkingLimit(value: ThinkingLimit) { persistLimit(value); update({ thinkingLimit: value }); },
   setMuted(value: boolean) { update({ muted: value }); applyMutedToLocalStream(); },
@@ -1456,26 +1796,70 @@ export const voiceSessionController = {
    */
   async resumeRemoteAudio(): Promise<boolean> {
     const audio = remoteAudio;
+    const current = captureVoiceOwner();
     if (!audio) return false;
     try {
       await audio.play();
+      if (!current() || remoteAudio !== audio) return false;
       remoteAudioBlocked = false;
       update({ playbackBlocked: false });
       return true;
     } catch {
-      remoteAudioBlocked = true;
-      update({ playbackBlocked: true });
+      if (current() && remoteAudio === audio) {
+        remoteAudioBlocked = true;
+        update({ playbackBlocked: true });
+      }
       return false;
     }
   },
   async connect() {
     if (!snapshot.sessionId || snapshot.transport === "connecting" || snapshot.transport === "connected") return;
-    if (snapshot.transport === "reconnecting") cleanupAudioTransport();
-    abortController?.abort();
+    // Lock and establish ownership BEFORE the first await (including discovery).
+    invalidateVoiceConnection();
+    cleanupAudioTransport();
+    const generation = connectionGeneration;
+    const { workspaceId, sessionId } = snapshot;
     const connectionController = new AbortController();
     abortController = connectionController;
+    const current = () => generation === connectionGeneration
+      && !connectionController.signal.aborted
+      && workspaceId === snapshot.workspaceId && sessionId === snapshot.sessionId;
+    const checkCurrent = () => {
+      if (!current()) throw new DOMException("Connection superseded", "AbortError");
+    };
+    let remoteId: string | null = snapshot.sessionIdRemote;
+    let remoteCloseRequested = false;
+    const closeOwnedRemote = (abandoned = false) => {
+      if (!remoteId || remoteCloseRequested) return;
+      remoteCloseRequested = true;
+      // A newer call can reuse an active server session after DELETE failed.
+      if (abandoned && (snapshot.sessionIdRemote === remoteId || connectingRemoteId === remoteId)) return;
+      closeRemoteSession(remoteId);
+    };
+    connectingRemoteCloser = () => closeOwnedRemote();
+    let ownedPeer: RTCPeerConnection | null = null;
+    let ownedStream: MediaStream | null = null;
+    const releaseOwned = () => {
+      ownedStream?.getTracks().forEach((track) => track.stop());
+      if (ownedPeer) {
+        ownedPeer.ontrack = null;
+        ownedPeer.onicecandidate = null;
+        ownedPeer.onconnectionstatechange = null;
+        ownedPeer.oniceconnectionstatechange = null;
+        ownedPeer.close();
+      }
+    };
+    update({ transport: "connecting", state: "ready", error: null });
+    await loadVoiceCapabilities(true);
+    if (!current()) return;
+    if (snapshot.capabilitiesLoaded && snapshot.voiceProviderReady === false) {
+      const reason = snapshot.voiceProviderReason || "ASR、TTS 或语音模型 Provider 未配置";
+      update({ transport: "error", state: "error", error: `语音服务未就绪：${reason}`, degradedNotice: `语音服务未就绪：${reason}`, textFallback: true });
+      return;
+    }
     let reconnectingExistingSession = Boolean(snapshot.sessionIdRemote);
     if (!reconnectingExistingSession) {
+      update({ lastEventSeq: 0, sessionEpoch: 0 });
       pendingUserFinal = "";
       activeUserTurnId = "";
       playbackTranscript.reset();
@@ -1488,7 +1872,6 @@ export const voiceSessionController = {
       resetVoiceLatency();
     }
     update({ transport: "connecting", state: "ready", error: null, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", playbackBlocked: false });
-    let remoteId: string | null = snapshot.sessionIdRemote;
     try {
       // The endpoint is intentionally explicit: until the backend voice contract
       // is deployed, the UI reports the unavailable service instead of faking a call.
@@ -1502,18 +1885,32 @@ export const voiceSessionController = {
         try {
           result = await apiClient.get<{ id?: string; session_id?: string; sessionId?: string; runtime_ready?: boolean; signaling_url?: string | null; reason?: string; session_epoch?: number; tasks?: Array<Record<string, unknown>>; results?: Array<Record<string, unknown>> }>(`/voice/sessions/${snapshot.sessionIdRemote}`);
         } catch (error) {
+          checkCurrent();
           if (!(error instanceof ApiError) || ![403, 404].includes(error.status)) throw error;
           forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId);
-          update({ sessionIdRemote: null });
+          update({ sessionIdRemote: null, lastEventSeq: 0, sessionEpoch: 0 });
           remoteId = null;
           reconnectingExistingSession = false;
+          pendingUserFinal = "";
+          activeUserTurnId = "";
+          playbackTranscript.reset();
+          userTranscript.reset();
+          resetTranscriptState();
+          resetTaskState();
+          durableEventCount = 0;
+          resetVoiceLatency();
           result = await createSession();
         }
       } else {
         result = await createSession();
       }
       remoteId = result?.id || result?.session_id || result?.sessionId || null;
-      if (remoteId) persistRemoteSession(snapshot.workspaceId, snapshot.sessionId, remoteId);
+      if (!current()) {
+        if (!reconnectingExistingSession) closeOwnedRemote(true);
+        return;
+      }
+      connectingRemoteId = remoteId;
+      if (remoteId) persistRemoteSession(workspaceId, sessionId, remoteId);
       if (Array.isArray(result?.tasks)) {
         taskState = mergeVoiceTaskSnapshots(taskState, result.tasks);
         syncTaskState();
@@ -1547,37 +1944,66 @@ export const voiceSessionController = {
       // Resolved before the peer connection exists; failures degrade to an empty
       // list so a broken relay cannot stop a call that could still go direct.
       const iceServers = await loadIceServers();
-      peerConnection = new RTCPeerConnection({ iceServers });
+      checkCurrent();
+      const pc = new RTCPeerConnection({ iceServers });
+      ownedPeer = pc;
+      peerConnection = pc;
+      let negotiated = false;
       iceRestartAttempted = false;
       const handleTransportDrop = () => {
-        const state = peerConnection?.connectionState;
-        const iceState = peerConnection?.iceConnectionState;
+        if (!current() || peerConnection !== pc) return;
+        const state = pc.connectionState;
+        const iceState = pc.iceConnectionState;
         const broken = state === "failed" || state === "disconnected" || iceState === "failed" || iceState === "disconnected";
-        if (!broken) return;
-        // Prefer an ICE restart over a full re-offer: it keeps the peer
-        // connection, the data channel and the durable cursor intact, and it is
-        // the correct response to a momentary network blip (treating a first
-        // `disconnected` as fatal used to tear down a healthy call).
-        if (!iceRestartAttempted && state !== "failed" && iceState !== "failed") {
-          iceRestartAttempted = true;
-          try {
-            peerConnection?.restartIce();
-            update({ transport: "reconnecting", error: "网络抖动，正在尝试恢复语音连接…" });
-            return;
-          } catch { /* fall through to a full reconnect */ }
+        const recovered = !broken && (state === "connected" || iceState === "connected" || iceState === "completed");
+        if (recovered) {
+          if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
+          iceRecoveryTimer = null;
+          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+          iceRestartAttempted = false;
+          if (negotiated) {
+            reconnectAttempt = 0;
+            if (snapshot.transport === "reconnecting") update({ transport: "connected", state: "listening", error: null });
+            startEventPolling();
+            startTaskPolling();
+          }
+          return;
         }
-        scheduleReconnect();
+        if (!broken) return;
+        stopEventPolling();
+        stopTaskPolling();
+        if (state === "failed" || iceState === "failed") {
+          if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
+          iceRecoveryTimer = null;
+          scheduleReconnect();
+          return;
+        }
+        // Give a transient disconnect time to recover; restartIce alone does
+        // not negotiate an offer, so always retain a bounded full-reoffer path.
+        if (iceRecoveryTimer !== null) return;
+        update({ transport: "reconnecting", error: "网络抖动，正在尝试恢复语音连接…" });
+        if (!iceRestartAttempted) {
+          iceRestartAttempted = true;
+          try { pc.restartIce(); } catch { /* bounded re-offer below */ }
+        }
+        iceRecoveryTimer = window.setTimeout(() => {
+          iceRecoveryTimer = null;
+          if (current() && peerConnection === pc) scheduleReconnect();
+        }, 5000);
       };
-      peerConnection.onconnectionstatechange = handleTransportDrop;
-      peerConnection.oniceconnectionstatechange = handleTransportDrop;
+      pc.onconnectionstatechange = handleTransportDrop;
+      pc.oniceconnectionstatechange = handleTransportDrop;
       // RTVI data channel. It must exist before the offer so the SDP carries the
       // m-line; the backend drops every message when the client never opens one
       // (it warns "Data channel not established within 10s"). Opening it is what
       // turns the call from a black box into a captioned, text-drivable session:
       // the bot broadcasts user/assistant transcripts here and accepts typed
       // turns (`send-text`) and custom control messages.
-      dataChannel = peerConnection.createDataChannel("chat");
-      dataChannel.onopen = () => {
+      const channel = pc.createDataChannel("chat");
+      dataChannel = channel;
+      channel.onopen = () => {
+        if (!current() || dataChannel !== channel) return;
         sendRtvi({
           type: "client-ready",
           data: {
@@ -1586,8 +2012,8 @@ export const voiceSessionController = {
           },
         });
       };
-      dataChannel.onmessage = (event) => {
-        if (typeof event.data === "string") handleRtviMessage(event.data);
+      channel.onmessage = (event) => {
+        if (current() && dataChannel === channel && typeof event.data === "string") handleRtviMessage(event.data);
       };
       // Trickle ICE：候选地址边收集边 PATCH 给后端 SmallWebRTC handler
       // （Pipecat 的 handle_patch_request）。必须在 setLocalDescription 之前
@@ -1604,9 +2030,12 @@ export const voiceSessionController = {
             pc_id: remotePcId,
             candidates,
           })
-          .catch(() => undefined);
+          .catch((error) => {
+            if (current() && isRuntimeOwnerConflict(error)) scheduleReconnect();
+          });
       };
-      peerConnection.onicecandidate = (event) => {
+      pc.onicecandidate = (event) => {
+        if (!current()) return;
         // 空 candidate 字符串是 RFC 8840 的 end-of-candidates 标记，
         // Pipecat 侧明确支持（映射为 aiortc 的 None）。
         pendingCandidates.push({
@@ -1616,11 +2045,15 @@ export const voiceSessionController = {
         });
         flushIceCandidates();
       };
-      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      localStream.getTracks().forEach((track) => peerConnection?.addTrack(track, localStream!));
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      ownedStream = stream;
+      checkCurrent();
+      localStream = stream;
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
       applyMutedToLocalStream();
-      startUserAudioLevelMonitor(localStream);
-      peerConnection.ontrack = (event) => {
+      startUserAudioLevelMonitor(stream);
+      pc.ontrack = (event) => {
+        if (!current() || peerConnection !== pc) return;
         // Retain the element: releasing `srcObject` and pausing on teardown is
         // the only reliable way to stop the bot's audio when the PC closes.
         const audio = remoteAudio ?? new Audio();
@@ -1632,6 +2065,7 @@ export const voiceSessionController = {
         // gesture. Surface it instead of swallowing it, and clear it when playback
         // does start (either from the gesture-triggered retry or a later frame).
         const markPlayback = (blocked: boolean) => {
+          if (!current() || remoteAudio !== audio) return;
           if (remoteAudioBlocked === blocked) return;
           remoteAudioBlocked = blocked;
           update({ playbackBlocked: blocked });
@@ -1640,10 +2074,17 @@ export const voiceSessionController = {
         void audio.play().then(() => markPlayback(false)).catch(() => markPlayback(true));
         if (event.streams[0]) startBotAudioLevelMonitor(event.streams[0]);
       };
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
-      const answer = await apiClient.post<{ sdp: string; type: RTCSdpType; pc_id?: string }>(offerPath, { sdp: offer.sdp, type: offer.type, request_data: { voice_session_id: remoteId } });
-      await peerConnection.setRemoteDescription(answer);
+      const offer = await pc.createOffer();
+      checkCurrent();
+      await pc.setLocalDescription(offer);
+      checkCurrent();
+      const answer = await apiClient.post<{ sdp: string; type: RTCSdpType; pc_id?: string }>(offerPath, { sdp: offer.sdp, type: offer.type, request_data: { voice_session_id: remoteId, reconnecting: reconnectingExistingSession } }, { signal: connectionController.signal });
+      checkCurrent();
+      await pc.setRemoteDescription(answer);
+      checkCurrent();
+      negotiated = true;
+      connectingRemoteId = null;
+      connectingRemoteCloser = null;
       // 拿到 pc_id 后补发缓冲中的候选，并放行后续候选。
       remotePcId = answer?.pc_id ?? null;
       flushIceCandidates();
@@ -1667,33 +2108,85 @@ export const voiceSessionController = {
       // Recover the authoritative transcript (refresh / reconnect) and then
       // catch up on durable events emitted while the channel was down.
       if (remoteId) {
-        void recoverVoiceSessionState().then(() => Promise.all([pollVoiceEvents(), pollVoiceTasks()]));
+        void recoverVoiceSessionState().then(() => {
+          if (current()) return Promise.all([pollVoiceEvents(), pollVoiceTasks()]);
+        });
         startEventPolling();
         startTaskPolling();
       }
+      handleTransportDrop();
       playVoiceCue(880);
     } catch (error) {
+      if (!current()) {
+        releaseOwned();
+        if (remoteId && !reconnectingExistingSession) closeOwnedRemote(true);
+        return;
+      }
+      invalidateVoiceConnection();
+      connectingRemoteId = null;
+      connectingRemoteCloser = null;
       cleanupAudioTransport();
       if (remoteId && !reconnectingExistingSession) {
         forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId);
-        void apiClient.delete(`/voice/sessions/${remoteId}`).catch(() => undefined);
+        closeOwnedRemote();
       }
       if (error instanceof DOMException && error.name === "AbortError") return;
-      const message = describeMicrophoneError(error) ?? (error instanceof ApiError && error.status === 404 ? "语音服务尚未启用，请先部署 SmallWebRTC 语音服务。" : error instanceof Error ? error.message : "语音连接失败");
+      if (isRuntimeOwnerConflict(error)) {
+        update({
+          transport: "reconnecting",
+          state: "ready",
+          error: "语音运行时正在由其它实例接管，稍后自动重试…",
+        });
+        scheduleReconnect();
+        return;
+      }
+      const message = describeMicrophoneError(error) ?? describeVoiceApiError(error) ?? (error instanceof Error ? error.message : "语音连接失败");
       update({ transport: "error", state: "error", error: message });
     }
   },
-  disconnect() { const remote = snapshot.sessionIdRemote; const wasConnected = snapshot.transport === "connected" || snapshot.transport === "connecting" || snapshot.transport === "reconnecting"; if (reconnectTimer !== null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; } abortController?.abort(); abortController = null; pendingUserFinal = ""; activeUserTurnId = ""; resetVoiceLatency(); for (const clientId of Array.from(typedAcceptTimers.keys())) clearTypedAcceptTimer(clientId); cleanupAudioTransport(); forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId); closeRemoteSession(remote); setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false); clearVoiceSessionResumable(snapshot.workspaceId, snapshot.sessionId); const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, playbackBlocked: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const }; sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next); update(next); if (wasConnected) playVoiceCue(440); },
+  disconnect({ preserveLatency = false }: { preserveLatency?: boolean } = {}) {
+    const remote = snapshot.sessionIdRemote ?? connectingRemoteId;
+    const pendingRemote = connectingRemoteId;
+    const closePendingRemote = connectingRemoteCloser;
+    connectingRemoteCloser = null;
+    closePendingRemote?.();
+    const wasConnected = ["connected", "connecting", "reconnecting"].includes(snapshot.transport);
+    invalidateVoiceConnection();
+    connectingRemoteId = null;
+    reconnectAttempt = 0;
+    pendingUserFinal = "";
+    activeUserTurnId = "";
+    if (!preserveLatency) resetVoiceLatency();
+    for (const clientId of Array.from(typedAcceptTimers.keys())) {
+      const pending = pendingTyped.get(clientId);
+      if (pending) dispatchVoiceRender({ id: userEntryId(undefined, clientId), role: "user", text: pending.text, final: false, pending: true, deliveryStatus: "failed", clientMessageId: clientId, createdAt: new Date().toISOString() });
+      clearTypedAcceptTimer(clientId);
+    }
+    cleanupAudioTransport();
+    cancellingTaskIds.clear();
+    busyTaskIds.clear();
+    forgetRemoteSession(snapshot.workspaceId, snapshot.sessionId);
+    closeRemoteSession(remote);
+    if (pendingRemote !== remote) closeRemoteSession(pendingRemote);
+    setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false);
+    clearVoiceSessionResumable(snapshot.workspaceId, snapshot.sessionId);
+    const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, playbackBlocked: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const, busyTaskIds: [] };
+    sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next);
+    update(next);
+    if (wasConnected) playVoiceCue(440);
+  },
   async interrupt() {
     // Durable first: the interrupt must reach the worker even when this page is
     // the one that lost its data channel. The RTVI path stays as a faster copy
     // on the same pipeline (identical to an automatic barge-in).
     const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
     let delivered = false;
     if (remote) {
       try { await apiClient.post(`/voice/sessions/${remote}/interrupt`, {}); delivered = true; }
-      catch (error) { update({ error: error instanceof Error ? error.message : "语音打断失败" }); }
+      catch (error) { if (current()) update({ error: error instanceof Error ? error.message : "语音打断失败" }); }
     }
+    if (!current()) return false;
     if (sendRtvi({ type: "client-message", data: { t: VOICE_INTERRUPT_MESSAGE, d: null } })) delivered = true;
     if (delivered) update({ state: "ready" });
     return delivered;
@@ -1735,11 +2228,11 @@ export const voiceSessionController = {
     // Create the durable idempotent turn record up front.  The worker attaches
     // to this same turn (it is idempotent on `client_message_id`), so a typed
     // message can never become two turns.
-    persistAcceptedTurn(clientMessageId, content, clientMessageId);
+    persistAcceptedTurn(content, clientMessageId);
     // Show a speculative pending bubble. It is promoted to authoritative when
     // the durable `turn.accepted` event echoes this idempotency key, and marked
     // failed (with a retry that reuses the same key) if that never arrives.
-    dispatchVoiceRender({ id: userEntryId(undefined, clientMessageId), role: "user", text: content, final: false, pending: true, clientMessageId, deliveryStatus: "pending", createdAt: new Date().toISOString() });
+    dispatchVoiceRender(userTranscript.startTyped(clientMessageId, content));
     armTypedAcceptTimer(clientMessageId);
     return true;
   },
@@ -1763,6 +2256,8 @@ export const voiceSessionController = {
     title = "",
     options: {
       roleKey?: string;
+      capabilityId?: string;
+      idempotencyKey?: string;
       tools?: string[];
       skills?: string[];
       writeSet?: string[];
@@ -1771,12 +2266,28 @@ export const voiceSessionController = {
     } = {},
   ) {
     const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
     if (!remote || !prompt.trim()) return null;
+    if (options.capabilityId && !snapshot.capabilitiesLoaded) {
+      await loadVoiceCapabilities();
+      if (!current()) return null;
+    }
+    if (options.capabilityId && snapshot.capabilitiesLoaded) {
+      const capability = capabilityAvailability(options.capabilityId);
+      if (capability && !capability.available) {
+        const reason = capability.reason || "当前能力暂不可用";
+        update({ error: `${capability.description || options.capabilityId}：${reason}` });
+        return null;
+      }
+    }
     try {
       const task = await requestVoiceTaskStart(remote, {
         prompt: prompt.trim(),
         title: title.trim() || undefined,
         role_key: options.roleKey,
+        capability_id: options.capabilityId,
+        idempotency_key:
+          options.idempotencyKey ?? `voice-task:${remote}:${createUuid()}`,
         thinking_mode: snapshot.thinkingLimit,
         tools: options.tools,
         skills: options.skills,
@@ -1784,6 +2295,7 @@ export const voiceSessionController = {
         output_contract: options.outputContract,
         sandbox_session_id: options.sandboxSessionId,
       });
+      if (!current()) return null;
       const taskId = String(task.task_id ?? task.subagent_id ?? task.id ?? "");
       applyTaskEvent({
         ...task,
@@ -1792,28 +2304,98 @@ export const voiceSessionController = {
       }, taskId || undefined);
       return task;
     } catch (error) {
-      update({ error: error instanceof Error ? error.message : "任务启动失败" });
+      if (current()) update({ error: error instanceof Error ? error.message : "任务启动失败" });
       return null;
     }
   },
   async cancelTask(taskId: string): Promise<boolean> {
     const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
     if (!remote || !taskId || cancellingTaskIds.has(taskId)) return false;
     cancellingTaskIds.add(taskId);
     try {
       const task = await requestVoiceTaskCancel(remote, taskId);
+      if (!current()) return false;
+      applyTaskEvent({ ...task, task_id: task.task_id ?? taskId, event_id: `task-cancel:${taskId}:${String(task.event_seq ?? Date.now())}`, type: "task.cancel_requested" }, taskId);
+      return true;
+    } catch (error) {
+      if (current()) update({ error: error instanceof Error ? error.message : "任务取消失败" });
+      return false;
+    } finally {
+      if (current()) cancellingTaskIds.delete(taskId);
+    }
+  },
+  async approveTask(taskId: string, approved = true): Promise<boolean> {
+    const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
+    if (!remote || !taskId || busyTaskIds.has(taskId)) return false;
+    setTaskBusy(taskId, true);
+    try {
+      const task = await requestVoiceTaskApproval(remote, taskId, approved);
+      if (!current()) return false;
+      const returnedTaskId = String(task.task_id ?? task.subagent_id ?? task.id ?? taskId);
+      const previousTaskId = String(task.previous_task_id ?? task.previousTaskId ?? "");
+      const replacedTaskId = previousTaskId && previousTaskId !== returnedTaskId ? previousTaskId : returnedTaskId !== taskId ? taskId : "";
+      if (replacedTaskId && replacedTaskId !== returnedTaskId) {
+        applyTaskEvent({ task_id: replacedTaskId, status: "cancelled", event_id: `task-approval-replaced:${replacedTaskId}:${String(task.event_seq ?? Date.now())}`, type: "task.cancelled" }, replacedTaskId);
+      }
+      applyTaskEvent({ ...task, task_id: returnedTaskId, event_id: `task-approval:${taskId}:${String(task.event_seq ?? Date.now())}`, type: approved ? "task.approved" : "task.rejected" }, returnedTaskId);
+      return true;
+    } catch (error) {
+      if (current()) update({ error: error instanceof Error ? error.message : "任务确认失败" });
+      return false;
+    } finally {
+      if (current()) setTaskBusy(taskId, false);
+    }
+  },
+  async retryApproval(taskId: string): Promise<boolean> {
+    const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
+    const task = snapshot.tasks.find((item) => item.taskId === taskId);
+    if (!remote || !task || !taskId || busyTaskIds.has(taskId)) return false;
+    setTaskBusy(taskId, true);
+    try {
+      const revised = await requestVoiceTaskRevision(remote, taskId, {
+        prompt: task.prompt || task.summary || task.title, title: task.title,
+        note: "用户重新提交已过期的语音 Agent 审批",
+        idempotency_key: `voice-reapproval:${task.linkId || taskId}:${Date.now()}`,
+      });
+      if (!current()) return false;
+      const returnedTaskId = String(revised.task_id ?? revised.subagent_id ?? revised.id ?? taskId);
+      if (returnedTaskId !== taskId) {
+        applyTaskEvent({ task_id: taskId, status: "stale", type: "task.stale", event_id: `task-revised:${taskId}:${Date.now()}` }, taskId);
+      }
+      applyTaskEvent({ ...revised, task_id: returnedTaskId, type: "task.approval_required", event_id: `task-reapproval:${returnedTaskId}:${Date.now()}` }, returnedTaskId);
+      return true;
+    } catch (error) {
+      if (current()) update({ error: error instanceof Error ? error.message : "审批重新提交失败" });
+      return false;
+    } finally {
+      if (current()) setTaskBusy(taskId, false);
+    }
+  },
+  async retryPlayback(taskId: string): Promise<boolean> {
+    const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
+    const task = snapshot.tasks.find((item) => item.taskId === taskId);
+    if (!remote || !task?.resultId || busyTaskIds.has(taskId)) return false;
+    setTaskBusy(taskId, true);
+    try {
+      const delivery = await requestVoiceResultDelivery(remote, task.resultId, `voice-playback-retry:${task.resultId}:${createUuid()}`);
+      if (!current()) return false;
+      const result = delivery.result ?? {};
       applyTaskEvent({
-        ...task,
-        task_id: task.task_id ?? taskId,
-        event_id: `task-cancel:${taskId}:${String(task.event_seq ?? Date.now())}`,
-        type: "task.cancel_requested",
+        ...result, task_id: result.subagent_id ?? taskId, result_id: result.id ?? task.resultId,
+        speech_id: delivery.speech_id, playback_status: delivery.playback_status,
+        status: "ready", delivery_status: "delivered",
+        event_id: `result-retry:${task.resultId}:${Date.now()}`, type: "result.claimed",
       }, taskId);
       return true;
     } catch (error) {
-      update({ error: error instanceof Error ? error.message : "任务取消失败" });
+      if (current()) update({ error: error instanceof Error ? error.message : "播报重试失败" });
       return false;
     } finally {
-      cancellingTaskIds.delete(taskId);
+      if (current()) setTaskBusy(taskId, false);
     }
   },
   appendTranscript(item: VoiceTranscript) {
@@ -1852,5 +2434,5 @@ export function useVoiceSession(workspaceId?: string, sessionId?: string, modelI
   const controller = useContext(VoiceSessionContext);
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   useEffect(() => { if (workspaceId && sessionId) controller.open(workspaceId, sessionId, modelId, providerId); }, [controller, sessionId, workspaceId, modelId, providerId]);
-  return useMemo(() => ({ ...state, connect: controller.connect, disconnect: controller.disconnect, interrupt: controller.interrupt, setThinkingLimit: controller.setThinkingLimit, setMuted: controller.setMuted, appendTranscript: controller.appendTranscript, upsertTask: controller.upsertTask, sendText: controller.sendText, retryText: controller.retryText, sendTurn: controller.sendTurn, startTask: controller.startTask, cancelTask: controller.cancelTask }), [controller, state]);
+  return useMemo(() => ({ ...state, connect: controller.connect, disconnect: controller.disconnect, interrupt: controller.interrupt, setThinkingLimit: controller.setThinkingLimit, setMuted: controller.setMuted, appendTranscript: controller.appendTranscript, upsertTask: controller.upsertTask, sendText: controller.sendText, retryText: controller.retryText, sendTurn: controller.sendTurn, startTask: controller.startTask, cancelTask: controller.cancelTask, approveTask: controller.approveTask, retryApproval: controller.retryApproval, retryPlayback: controller.retryPlayback }), [controller, state]);
 }

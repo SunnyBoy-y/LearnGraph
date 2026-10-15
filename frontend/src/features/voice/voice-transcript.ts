@@ -232,21 +232,9 @@ export function reduceVoiceEvent(state: TranscriptState, event: VoiceEventLike):
         eventId,
       });
     }
-    case "assistant.llm.delta": {
-      const draftTurn = turnId ?? "live";
-      const draftId = `assistant-draft-${draftTurn}`;
-      const previousDraft = next.entries.find((entry) => entry.id === draftId);
-      return upsert(next, {
-        id: draftId,
-        role: "assistant",
-        text: `${previousDraft?.text ?? ""}${text}`,
-        final: false,
-        createdAt: now,
-        phase: "speculative",
-        turnId,
-        eventId,
-      });
-    }
+    case "assistant.llm.delta":
+      // LLM 草稿只用于服务端回合状态，不进入中央画布或字幕记录。
+      return next;
     case "assistant.sentence.queued":
     case "assistant.sentence.playback_started": {
       if (!turnId) return next;

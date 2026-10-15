@@ -514,7 +514,7 @@ class DictationService:
             output_tokens=int(result.usage.get("output_tokens") or 0),
             attempt=1,
             latency_ms=latency_ms,
-            usage_reported=bool(result.usage),
+            usage_reported=bool(result.usage), usage_units=result.usage,
         )
         self.db.commit()
         return {

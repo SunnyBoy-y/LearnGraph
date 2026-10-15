@@ -29,10 +29,15 @@ class DelegationRequest:
 
     kind: DelegationKind
     query: str
+    # Intent-level selection.  The server resolves this to a frozen tool
+    # allow-list; the foreground model never gets to invent tool names.
+    capability_id: str = ""
     purpose: str = ""
-    context: str = ""
+    context: Mapping[str, Any] | str = field(default_factory=dict)
     voice_session_id: str = ""
     trigger_turn_id: str | None = None
+    context_version: str | None = None
+    session_epoch: int | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -41,6 +46,13 @@ class TaskControlRequest:
     task_id: str
 
     instruction: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceExerciseAnswerRequest:
+    exercise_id: str
+    answer: str
+    attempt_index: int = 1
 
 
 class VoiceDelegationPort(Protocol):
@@ -61,10 +73,20 @@ class VoiceDelegationPort(Protocol):
 
     async def set_task_delivery(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
 
+    async def confirm_task(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
+
+    async def submit_exercise_answer(
+        self, request: VoiceExerciseAnswerRequest
+    ) -> Mapping[str, Any]: ...
+
     async def ready_results(self, *, limit: int = 10) -> list[dict[str, Any]]: ...
 
     async def acknowledge_result(
         self, task_id: str, *, delivery_state: str = "delivered"
+    ) -> Mapping[str, Any]: ...
+
+    async def update_speech_delivery(
+        self, speech_id: str, state: str
     ) -> Mapping[str, Any]: ...
 
     async def search_memory(self, query: str, *, limit: int = 5) -> Mapping[str, Any]:
@@ -116,7 +138,7 @@ async def dispatch_delegation(
     port: VoiceDelegationPort | None,
     request: DelegationRequest,
     *,
-    timeout_secs: float = 2.0,
+    timeout_secs: float = 0.75,
 ) -> dict[str, Any]:
     """Invoke the coordinator with a hard latency bound.
 
@@ -169,6 +191,7 @@ async def dispatch_task_control(
         "cancel": port.cancel_task,
         "revise": port.revise_task,
         "delivery": port.set_task_delivery,
+        "confirm": port.confirm_task,
     }.get(operation)
     if method is None:
         return {
@@ -206,7 +229,7 @@ async def dispatch_memory_search(
     query: str,
     *,
     limit: int = 5,
-    timeout_secs: float = 3.0,
+    timeout_secs: float = 0.8,
 ) -> dict[str, Any]:
     """Run the tutor's memory lookup with a hard bound.
 
@@ -245,7 +268,7 @@ async def dispatch_artifact_list(
     query: str = "",
     *,
     limit: int = 5,
-    timeout_secs: float = 3.0,
+    timeout_secs: float = 0.8,
 ) -> dict[str, Any]:
     """List the workspace's artifacts for the tutor, bounded like the lookup."""
 

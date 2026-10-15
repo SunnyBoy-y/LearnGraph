@@ -23,11 +23,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import SessionLocal
@@ -71,6 +71,18 @@ VOICE_EVENT_TYPES: tuple[str, ...] = (
     "processor.notice",
     "context.updated",
     "session.ice",
+    "task.accepted",
+    "task.approval_required",
+    "task.approved",
+    "task.rejected",
+    "task.queued",
+    "task.cancelled",
+    "result.claimed",
+    "speech.enqueued",
+    "speech.started",
+    "speech.finished",
+    "speech.interrupted",
+    "speech.failed",
 )
 
 PHASE_SPECULATIVE = "speculative"
@@ -113,6 +125,9 @@ class VoiceSessionHandle:
     event_seq: int
     session_epoch: int
     peer_generation: int
+    runtime_owner_id: str | None
+    runtime_owner_heartbeat_at: datetime | None
+    runtime_owner_lease_until: datetime | None
     model_id: str | None
     provider_id: str | None
     max_thinking_mode: str
@@ -141,6 +156,161 @@ def is_session_active(voice_session_id: str) -> bool:
     return bool(handle and handle.active)
 
 
+def claim_runtime_owner(
+    voice_session_id: str,
+    owner_id: str,
+    *,
+    lease_seconds: float = 20.0,
+    force: bool = False,
+    expected_session_epoch: int | None = None,
+    expected_peer_generation: int | None = None,
+) -> bool:
+    """Atomically claim or renew the durable media runtime owner.
+
+    The compare-and-swap is intentionally done in SQL rather than as a
+    read/modify/commit sequence.  Two API workers can receive the same offer at
+    the same time; only one UPDATE may match an unexpired lease.  ``force`` is
+    retained for API compatibility, but it never steals a live lease: a
+    reconnect may take over only after the previous lease has expired.
+
+    The optional epoch/generation predicates protect a stale reconnect from the
+    same process.  The process token is stable by design, so owner id alone
+    cannot distinguish an old pipeline from the replacement pipeline.
+    """
+
+    owner = str(owner_id or "").strip()
+    if not owner:
+        return False
+    now = utc_now()
+    lease_until = now + timedelta(seconds=max(5.0, float(lease_seconds)))
+    with SessionLocal() as db:
+        predicates = [
+            VoiceSessionRecord.id == voice_session_id,
+            VoiceSessionRecord.status == "active",
+            # A live lease is never force-stolen.  The ``force`` argument is
+            # deliberately unused in this predicate; callers may pass it to
+            # describe a reconnect, while the database remains authoritative.
+            or_(
+                VoiceSessionRecord.runtime_owner_id.is_(None),
+                VoiceSessionRecord.runtime_owner_id == owner,
+                VoiceSessionRecord.runtime_owner_lease_until.is_(None),
+                VoiceSessionRecord.runtime_owner_lease_until <= now,
+            ),
+        ]
+        if expected_session_epoch is not None:
+            predicates.append(
+                VoiceSessionRecord.session_epoch == int(expected_session_epoch)
+            )
+        if expected_peer_generation is not None:
+            predicates.append(
+                VoiceSessionRecord.peer_generation == int(expected_peer_generation)
+            )
+        result = db.execute(
+            update(VoiceSessionRecord)
+            .where(and_(*predicates))
+            .values(
+                runtime_owner_id=owner,
+                runtime_owner_heartbeat_at=now,
+                runtime_owner_lease_until=lease_until,
+            )
+        )
+        claimed = bool(result.rowcount)
+        db.commit()
+        return claimed
+
+
+def heartbeat_runtime_owner(
+    voice_session_id: str,
+    owner_id: str,
+    *,
+    lease_seconds: float = 20.0,
+    expected_session_epoch: int | None = None,
+    expected_peer_generation: int | None = None,
+) -> bool:
+    """Renew an owner lease only while this process still owns the session."""
+
+    owner = str(owner_id or "").strip()
+    if not owner:
+        return False
+    now = utc_now()
+    with SessionLocal() as db:
+        predicates = [
+            VoiceSessionRecord.id == voice_session_id,
+            VoiceSessionRecord.status == "active",
+            VoiceSessionRecord.runtime_owner_id == owner,
+            # A stale worker must not resurrect an already expired lease while
+            # another worker is claiming it.
+            or_(
+                VoiceSessionRecord.runtime_owner_lease_until.is_(None),
+                VoiceSessionRecord.runtime_owner_lease_until > now,
+            ),
+        ]
+        if expected_session_epoch is not None:
+            predicates.append(
+                VoiceSessionRecord.session_epoch == int(expected_session_epoch)
+            )
+        if expected_peer_generation is not None:
+            predicates.append(
+                VoiceSessionRecord.peer_generation == int(expected_peer_generation)
+            )
+        result = db.execute(
+            update(VoiceSessionRecord)
+            .where(and_(*predicates))
+            .values(
+                runtime_owner_heartbeat_at=now,
+                runtime_owner_lease_until=now
+                + timedelta(seconds=max(5.0, float(lease_seconds))),
+            )
+        )
+        renewed = bool(result.rowcount)
+        db.commit()
+        return renewed
+
+
+def release_runtime_owner(
+    voice_session_id: str,
+    owner_id: str,
+    *,
+    expected_session_epoch: int | None = None,
+    expected_peer_generation: int | None = None,
+) -> bool:
+    """Release only this process's lease; never clear a newer owner.
+
+    Epoch/generation predicates are important on reconnect: the old runner and
+    its replacement intentionally share the process owner token, so owner id by
+    itself cannot prevent the old runner's finally block from releasing the new
+    lease.
+    """
+
+    owner = str(owner_id or "").strip()
+    if not owner:
+        return False
+    with SessionLocal() as db:
+        predicates = [
+            VoiceSessionRecord.id == voice_session_id,
+            VoiceSessionRecord.runtime_owner_id == owner,
+        ]
+        if expected_session_epoch is not None:
+            predicates.append(
+                VoiceSessionRecord.session_epoch == int(expected_session_epoch)
+            )
+        if expected_peer_generation is not None:
+            predicates.append(
+                VoiceSessionRecord.peer_generation == int(expected_peer_generation)
+            )
+        result = db.execute(
+            update(VoiceSessionRecord).where(and_(*predicates))
+            .values(
+                runtime_owner_id=None,
+                runtime_owner_heartbeat_at=None,
+                runtime_owner_lease_until=None,
+            )
+        )
+        released = bool(result.rowcount)
+        db.commit()
+        return released
+
+
 def _to_handle(row: VoiceSessionRecord) -> VoiceSessionHandle:
     return VoiceSessionHandle(
         id=row.id,
@@ -152,6 +322,9 @@ def _to_handle(row: VoiceSessionRecord) -> VoiceSessionHandle:
         event_seq=int(row.event_seq or 0),
         session_epoch=int(row.session_epoch or 1),
         peer_generation=int(row.peer_generation or 0),
+        runtime_owner_id=row.runtime_owner_id,
+        runtime_owner_heartbeat_at=row.runtime_owner_heartbeat_at,
+        runtime_owner_lease_until=row.runtime_owner_lease_until,
         model_id=row.model_id,
         provider_id=row.provider_id,
         max_thinking_mode=row.max_thinking_mode or "high",
@@ -394,6 +567,9 @@ def close_session_record(voice_session_id: str) -> bool:
         row.status = "ended"
         row.closed_at = utc_now()
         row.session_epoch = int(row.session_epoch or 1) + 1
+        row.runtime_owner_id = None
+        row.runtime_owner_heartbeat_at = None
+        row.runtime_owner_lease_until = None
         db.commit()
         return True
 
@@ -425,15 +601,53 @@ def is_reconnect(voice_session_id: str) -> bool:
     return count_events(voice_session_id, "session.ready") > 0
 
 
-def mark_session_reconnecting(voice_session_id: str) -> int:
-    """Bump the epoch when a transport is torn down and will be rebuilt."""
+def mark_session_reconnecting(
+    voice_session_id: str,
+    owner_id: str | None = None,
+    *,
+    expected_session_epoch: int | None = None,
+    expected_peer_generation: int | None = None,
+) -> int:
+    """Bump the epoch and release this worker's lease for a reconnect.
+
+    With an owner token this is a compare-and-swap: a stale pipeline cannot bump
+    the epoch or clear the replacement pipeline's lease after a reconnect has
+    already been claimed by another worker.
+    """
     with SessionLocal() as db:
+        predicates = [VoiceSessionRecord.id == voice_session_id]
+        values: dict[str, Any] = {
+            "session_epoch": VoiceSessionRecord.session_epoch + 1,
+        }
+        if owner_id:
+            predicates.append(VoiceSessionRecord.runtime_owner_id == str(owner_id))
+            values.update(
+                runtime_owner_id=None,
+                runtime_owner_heartbeat_at=None,
+                runtime_owner_lease_until=None,
+            )
+        if expected_session_epoch is not None:
+            predicates.append(
+                VoiceSessionRecord.session_epoch == int(expected_session_epoch)
+            )
+        if expected_peer_generation is not None:
+            predicates.append(
+                VoiceSessionRecord.peer_generation == int(expected_peer_generation)
+            )
+        result = db.execute(
+            update(VoiceSessionRecord).where(and_(*predicates)).values(**values)
+        )
+        if not result.rowcount:
+            row = db.get(VoiceSessionRecord, voice_session_id)
+            if row is None:
+                raise VoiceSessionMissing(voice_session_id)
+            db.rollback()
+            return int(row.session_epoch or 1)
+        db.commit()
         row = db.get(VoiceSessionRecord, voice_session_id)
         if row is None:
             raise VoiceSessionMissing(voice_session_id)
-        row.session_epoch = int(row.session_epoch or 1) + 1
-        db.commit()
-        return int(row.session_epoch)
+        return int(row.session_epoch or 1)
 
 
 def iter_session_ids() -> Iterable[str]:

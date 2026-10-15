@@ -58,6 +58,7 @@ VOICE_ROLE_TOOL_POLICY: dict[str, tuple[str, ...]] = {
 }
 KNOWN_VOICE_TOOLS = frozenset(
     {
+        "get_current_time",
         "search_web",
         "fetch_web_page",
         "parallel_web_research",
@@ -77,6 +78,22 @@ KNOWN_VOICE_TOOLS = frozenset(
         "sandbox_git",
         "sandbox_skill_list",
         "sandbox_skill_read",
+        # First-party learning and trusted-canvas tools exposed through the
+        # ordinary Agent runtime.  Voice selects these through a capability
+        # bundle; it never accepts arbitrary names from the browser.
+        "lg_graph_read",
+        "lg_graph_create",
+        "lg_graph_propose_change",
+        "lg_learning_mastery_read",
+        "lg_learning_evidence_record",
+        "voice_practice_create",
+        "lg_review_list_due",
+        "lg_roadmap_read",
+        "lg_schedule_list",
+        "canvas_get_render_contract",
+        "canvas_emit_trusted_component",
+        "sandbox_publish_file",
+        "sandbox_publish_image",
     }
 )
 
@@ -282,6 +299,12 @@ class VoiceTaskCoordinator:
         trigger_turn_id: str | None,
         idempotency_key: str | None,
         requirement_version: int = 1,
+        allowed_tools: list[str] | None = None,
+        capability_id: str | None = None,
+        status: str = "creating",
+        approval_status: str = "none",
+        approval_request: dict[str, Any] | None = None,
+        approval_expires_at: datetime | None = None,
     ) -> tuple[VoiceTaskLinkRecord, bool]:
         existing = self.links.get_by_idempotency_key(
             idempotency_key or "", tenant_id=self.tenant_id
@@ -297,14 +320,22 @@ class VoiceTaskCoordinator:
             trigger_turn_id=trigger_turn_id,
             subagent_id=f"pending_{uuid4().hex[:20]}",
             idempotency_key=idempotency_key,
-            status="creating",
+            status=status,
             thinking_mode=thinking_mode,
             title=title,
             original_prompt=prompt,
             current_prompt=prompt,
             requirement_version=max(1, int(requirement_version)),
             latest_result_version=0,
-            allowed_tools=resolve_voice_tool_policy(role_key, None),
+            allowed_tools=(
+                resolve_voice_tool_policy(role_key, allowed_tools)
+                if allowed_tools is not None
+                else resolve_voice_tool_policy(role_key, None)
+            ),
+            capability_id=capability_id,
+            approval_status=approval_status,
+            approval_request_json=dict(approval_request or {}),
+            approval_expires_at=approval_expires_at,
             auto_delivery=True,
         )
         self.db.add(link)
@@ -320,6 +351,49 @@ class VoiceTaskCoordinator:
                 raise
             return existing, False
         return link, True
+
+    def approve_link(self, link: VoiceTaskLinkRecord) -> VoiceTaskLinkRecord:
+        if link.status != "waiting_approval":
+            raise AppError(
+                409,
+                "voice_task_not_awaiting_approval",
+                "Voice task is not awaiting approval",
+            )
+        expiry = link.approval_expires_at
+        if expiry is not None and expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry is not None and expiry <= utc_now():
+            link.status = "CANCELLED"
+            link.approval_status = "expired"
+            self.db.commit()
+            raise AppError(
+                409,
+                "voice_task_approval_expired",
+                "Voice task approval has expired",
+            )
+        link.approval_status = "approved"
+        self.db.commit()
+        self.db.refresh(link)
+        return link
+
+    def reject_link(self, link: VoiceTaskLinkRecord, *, reason: str = "user_rejected") -> VoiceTaskLinkRecord:
+        if link.status != "waiting_approval":
+            raise AppError(
+                409,
+                "voice_task_not_awaiting_approval",
+                "Voice task is not awaiting approval",
+            )
+        link.status = "CANCELLED"
+        link.approval_status = "rejected"
+        link.cancel_checkpoint_json = {
+            **dict(link.cancel_checkpoint_json or {}),
+            "phase": "approval_rejected",
+            "reason": str(reason or "user_rejected")[:160],
+            "rejected_at": utc_now().isoformat(),
+        }
+        self.db.commit()
+        self.db.refresh(link)
+        return link
 
     def complete_link(
         self,
@@ -524,6 +598,51 @@ class VoiceTaskCoordinator:
             raise AppError(404, "voice_result_not_found", "Voice result was not found")
         return result
 
+    @staticmethod
+    def _playback_event_type(state: str) -> str:
+        return {
+            "claimed": "result.claimed",
+            "enqueued": "speech.enqueued",
+            "speaking": "speech.started",
+            "played": "speech.finished",
+            "interrupted": "speech.interrupted",
+            "failed": "speech.failed",
+        }.get(state, "speech.failed")
+
+    def _emit_playback_event(
+        self,
+        result: VoiceResultInboxRecord,
+        delivery: VoiceSpeechDeliveryRecord,
+        state: str,
+    ) -> None:
+        """Publish committed playback state for an already connected client.
+
+        The delivery row remains authoritative for reconnects. Event emission
+        is best effort so a transient journal write cannot break the audio path.
+        """
+        try:
+            from .events import VoiceEventSink
+
+            VoiceEventSink(result.voice_session_id).emit(
+                self._playback_event_type(state),
+                {
+                    "task_id": result.subagent_id,
+                    "subagent_id": result.subagent_id,
+                    "link_id": result.task_link_id,
+                    "result_id": result.id,
+                    "speech_id": delivery.speech_id,
+                    "playback_status": state,
+                    "playback_ended_at": (
+                        delivery.playback_ended_at.isoformat()
+                        if delivery.playback_ended_at is not None
+                        else None
+                    ),
+                },
+                request_id=f"voice-playback:{delivery.speech_id}:{state}",
+            )
+        except Exception:
+            return
+
     def deliver_result(
         self,
         *,
@@ -542,7 +661,12 @@ class VoiceTaskCoordinator:
                     "voice_delivery_idempotency_conflict",
                     "Delivery idempotency key was already used for another result",
                 )
-            return result, existing, False
+            if existing.playback_status != "interrupted" and existing.status != "interrupted" and str(
+                (existing.snapshot or {}).get("playback_state") or ""
+            ) != "interrupted":
+                return result, existing, False
+            self.db.delete(existing)
+            self.db.flush()
         if result.status == "stale":
             raise AppError(409, "voice_result_stale", "Voice result is stale")
         if result.status == "dismissed":
@@ -551,7 +675,12 @@ class VoiceTaskCoordinator:
             result.id, tenant_id=self.tenant_id
         )
         if delivered is not None:
-            return result, delivered, False
+            if delivered.playback_status != "interrupted" and delivered.status != "interrupted" and str(
+                (delivered.snapshot or {}).get("playback_state") or ""
+            ) != "interrupted":
+                return result, delivered, False
+            self.db.delete(delivered)
+            self.db.flush()
         link = self.db.get(VoiceTaskLinkRecord, result.task_link_id)
         if link is not None and int(result.requirement_version) < int(
             link.requirement_version or 1
@@ -572,22 +701,77 @@ class VoiceTaskCoordinator:
             idempotency_key=request_id,
             speech_id=f"speech_{uuid4().hex[:24]}",
             status="delivered",
+            playback_status="claimed",
             claimed_at=now,
             completed_at=now,
             snapshot={
                 "summary": result.summary[:1_000],
                 "source_count": result.source_count,
                 "result_status_before_delivery": result.status,
+                "playback_state": "claimed",
             },
         )
-        if result.status != "failed":
-            result.status = "delivered"
-        result.delivered_at = now
         self.db.add(delivery)
+        # Preserve the existing result-inbox contract: ``delivered`` means the
+        # result was claimed for the foreground Tutor.  Actual audio progress
+        # is tracked separately on VoiceSpeechDeliveryRecord and only reaches
+        # ``played`` after VoiceLedgerRelay observes transport output.
+        if result.status not in {"failed", "stale"}:
+            result.status = "delivered"
+        result.delivered_at = result.delivered_at or now
         self.db.commit()
         self.db.refresh(result)
         self.db.refresh(delivery)
+        self._emit_playback_event(result, delivery, "claimed")
         return result, delivery, True
+
+    def update_speech_delivery(
+        self,
+        *,
+        voice_session_id: str,
+        speech_id: str,
+        state: str,
+    ) -> dict[str, Any]:
+        """Advance a claimed voice result using actual foreground playback."""
+
+        delivery = self.deliveries.get_by_speech_id(
+            speech_id, tenant_id=self.tenant_id
+        )
+        if delivery is None or delivery.voice_session_id != voice_session_id:
+            return {"speech_id": speech_id, "status": "missing"}
+        result = self.get_result(voice_session_id, delivery.result_id)
+        now = utc_now()
+        normalized = str(state or "").strip().casefold()
+        playback_state = str((delivery.snapshot or {}).get("playback_state") or "claimed")
+        snapshot = dict(delivery.snapshot or {})
+        if normalized == "enqueued":
+            playback_state = "enqueued"
+        elif normalized == "started":
+            playback_state = "speaking"
+        elif normalized in {"played", "finished"}:
+            playback_state = "played"
+            delivery.playback_ended_at = delivery.playback_ended_at or now
+        elif normalized in {"interrupted", "failed"}:
+            playback_state = "interrupted" if normalized == "interrupted" else "failed"
+            delivery.interrupted_at = delivery.interrupted_at or now
+            if result.status == "delivered":
+                result.status = "ready"
+        else:
+            raise AppError(422, "invalid_speech_delivery_state", "Unsupported speech delivery state")
+        snapshot["playback_state"] = playback_state
+        delivery.playback_status = playback_state
+        delivery.snapshot = snapshot
+        self.db.commit()
+        self.db.refresh(delivery)
+        self.db.refresh(result)
+        self._emit_playback_event(result, delivery, playback_state)
+        return {
+            "speech_id": speech_id,
+            "result_id": result.id,
+            "status": playback_state,
+            "delivery_status": delivery.status,
+            "result_status": result.status,
+        }
 
     def release_delivery(
         self,
