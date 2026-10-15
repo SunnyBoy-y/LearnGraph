@@ -8,10 +8,3 @@ data/
 tests/.pytest-tmp/
 .egress-smoke/
 sandbox/.spec-test.json
-/tests/
-
-# Shared pytest fixtures are required by the checked-in backend tests and CI.
-!/tests/
-!/tests/conftest.py
-!/tests/api/
-!/tests/api/conftest.py

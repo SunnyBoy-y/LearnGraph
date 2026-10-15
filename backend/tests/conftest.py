@@ -46,6 +46,9 @@ os.environ["LEARNGRAPH_STORAGE_ROOT"] = str(_TEST_ROOT / "storage")
 # configured" and must never inherit a developer's registry reference; an
 # empty env value wins over the .env file in pydantic-settings.
 os.environ["LEARNGRAPH_SANDBOX_PREBUILT_IMAGE"] = ""
+# Pipecat sentence splitting must use the checked-in corpus in a clean checkout.
+# Do not depend on a developer's NLTK cache or download data during CI.
+os.environ["NLTK_DATA"] = str(Path(__file__).resolve().parents[2] / "docker" / "nltk_data")
 
 
 def pytest_configure(config: pytest.Config) -> None:

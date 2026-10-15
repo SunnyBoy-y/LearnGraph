@@ -75,7 +75,6 @@ coverage.xml
 htmlcov/
 *.egg-info/
 build/
-/tests/
 # LearnGraph runtime state and user data
 /data/
 /data/benchmarks/longmemeval/results/
@@ -142,30 +141,12 @@ temp/
 /three-files.yaml
 /workspace-*.yaml
 
-# 测试文件默认不入公开仓库：这里只保留「忽略」规则，不再用白名单把
-# backend/tests 与 frontend/src/test 纳入版本控制。新写的测试文件留在本地。
-#
-# 注意：.gitignore 对「已被跟踪」的文件无效，因此历史上已入库的测试仍会随
-# 仓库分发（CI 的 pytest / npm test 继续可用）；本策略只约束新增测试文件。
+# Test sources and fixtures are versioned. Keep machine-specific browser
+# probes and generated verification reports local; caches/output stay ignored above.
 /frontend/e2e/
 /frontend/playwright.config.*
-**/__tests__/
-**/tests/
-**/test/
-**/*_test.py
-**/test_*.py
-**/*.test.*
-**/*.spec.*
-**/*_spec.py
-**/test/**/*.{ts,tsx,js,jsx}
-
-# Shared pytest fixtures are required by the checked-in backend tests and CI.
-!backend/tests/
-backend/tests/*
-!backend/tests/conftest.py
-!backend/tests/api/
-backend/tests/api/*
-!backend/tests/api/conftest.py
+**/.pytest-tmp*/
+/backend/tests/regression-repairs-cases.json
 
 # Local editor, operating-system, and agent state
 .idea/
@@ -213,7 +194,6 @@ Desktop.ini
 /backend/scripts/run_sandbox_egress_proxy.py
 backend/sandbox/.spec-test.json
 .spec-test.json
-/tests/
 
 # 一次性本地验证 / 诊断脚本与临时补丁脚手架（只留本地，不入库）
 # 注：backend/app/ 下的产品代码永不在此列（如 backend/app/voice/embedded_ice.py 属于产品代码，应正常提交）

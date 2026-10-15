@@ -137,7 +137,7 @@ export function sandboxedHtmlPreviewDocument(
   doc.querySelectorAll("style").forEach((style) => {
     style.textContent = (style.textContent ?? "")
       // Keep network @imports (https://...), drop every other one.
-      .replace(/@import\s+[^;]+;?/giu, (match) => (/(?:https?:)?\/\//i.test(match) ? match : ""))
+      .replace(/@import\s+[^;]+;?/giu, (match) => (/^@import\s+(?:url\(\s*)?['"]?(?:https?:)?\/\//i.test(match) ? match : ""))
       // Keep data:/blob:/# and network url() references (external images,
       // fonts, gradients); drop every other URL so nothing hits non-http
       // schemes.

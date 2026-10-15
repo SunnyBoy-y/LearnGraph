@@ -9,6 +9,7 @@ const MINIMUM_NODE_MAJOR = 20
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const frontendDir = path.join(repoRoot, 'frontend')
 const backendDir = path.join(repoRoot, 'backend')
+const sandboxdDir = path.join(repoRoot, 'sandboxd')
 
 function assertSupportedNode() {
   const major = Number.parseInt(process.versions.node.split('.')[0], 10)
@@ -45,12 +46,12 @@ function parseArguments(argv) {
 function printHelp() {
   console.log(`Usage: node scripts/check.mjs [options]
 
-Run deterministic checks without relying on a test framework.
+Run the frontend, backend, and sandboxd checks used by CI.
 
 Options:
   --install          Install from the frontend and backend lockfiles first
-  --skip-frontend    Skip frontend lint and production build
-  --skip-backend     Skip backend syntax and application import checks
+  --skip-frontend    Skip frontend lint, tests, and production build
+  --skip-backend     Skip backend and sandboxd checks
   -h, --help         Show this help`)
 }
 
@@ -134,7 +135,7 @@ async function main() {
     if (options.install) {
       backendReady = await runCommand(
         'Synchronizing backend dependencies from uv.lock',
-        { command: 'uv', args: ['sync', '--locked'] },
+        { command: 'uv', args: ['sync', '--locked', '--extra', 'test', '--extra', 'voice'] },
         backendDir,
       )
       if (!backendReady) failures.push('Backend dependency synchronization')
@@ -167,6 +168,7 @@ async function main() {
     const pythonEnv = {
       ...process.env,
       PYTHONDONTWRITEBYTECODE: '1',
+      NLTK_DATA: path.join(repoRoot, 'docker', 'nltk_data'),
     }
     const syntaxCheck = [
       'from pathlib import Path',
@@ -179,7 +181,7 @@ async function main() {
     if (
       !(await runCommand(
         'Backend Python syntax',
-        { command: 'uv', args: ['run', '--locked', 'python', '-c', syntaxCheck] },
+        { command: 'uv', args: ['run', '--locked', '--extra', 'test', '--extra', 'voice', 'python', '-c', syntaxCheck] },
         backendDir,
         pythonEnv,
       ))
@@ -195,7 +197,7 @@ async function main() {
     if (
       !(await runCommand(
         'Backend application import',
-        { command: 'uv', args: ['run', '--locked', 'python', '-c', importCheck] },
+        { command: 'uv', args: ['run', '--locked', '--extra', 'test', '--extra', 'voice', 'python', '-c', importCheck] },
         backendDir,
         pythonEnv,
       ))
@@ -205,7 +207,7 @@ async function main() {
 
     if (
       !(await runCommand(
-        'P0 security regressions',
+        'Backend unit, API, security, and offline voice tests',
         {
           command: 'uv',
           args: [
@@ -213,18 +215,20 @@ async function main() {
             '--locked',
             '--extra',
             'test',
+            '--extra',
+            'voice',
             'pytest',
             '-q',
-            'tests/security',
-            '--basetemp',
-            'data/pytest-p0',
+            'tests',
+            '-m',
+            'not integration',
           ],
         },
         backendDir,
         pythonEnv,
       ))
     ) {
-      failures.push('P0 security regressions')
+      failures.push('Backend tests')
     }
 
     if (
@@ -232,7 +236,7 @@ async function main() {
         'Official Skill package verification',
         {
           command: 'uv',
-          args: ['run', '--locked', 'python', 'scripts/verify_skill_packages.py'],
+          args: ['run', '--locked', '--extra', 'test', '--extra', 'voice', 'python', 'scripts/verify_skill_packages.py'],
         },
         backendDir,
         pythonEnv,
@@ -246,7 +250,7 @@ async function main() {
         'Stored audio transcription regression',
         {
           command: 'uv',
-          args: ['run', '--locked', 'python', 'scripts/verify_file_transcription.py'],
+          args: ['run', '--locked', '--extra', 'test', '--extra', 'voice', 'python', 'scripts/verify_file_transcription.py'],
         },
         backendDir,
         pythonEnv,
@@ -263,6 +267,10 @@ async function main() {
           args: [
             'run',
             '--locked',
+            '--extra',
+            'test',
+            '--extra',
+            'voice',
             'python',
             'scripts/verify_transcription_model_routing.py',
           ],
@@ -272,6 +280,18 @@ async function main() {
       ))
     ) {
       failures.push('Dual transcription model routing')
+    }
+  }
+
+  if (!options.skipBackend) {
+    if (
+      !(await runCommand(
+        'sandboxd unit and contract tests (fake runtime)',
+        { command: 'uv', args: ['run', '--locked', '--extra', 'test', 'pytest', 'tests', '-q'] },
+        sandboxdDir,
+      ))
+    ) {
+      failures.push('sandboxd tests')
     }
   }
 

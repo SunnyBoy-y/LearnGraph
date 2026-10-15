@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
@@ -14,9 +15,43 @@ permissions:
   contents: read
 
 jobs:
+  mobile:
+    name: Android unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - run: npm ci
+      - run: npm run build
+      - run: npm run cap:sync
+      - name: Android local unit tests
+        working-directory: mobile/android
+        run: bash ./gradlew :app:testDebugUnitTest --no-daemon
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-results
+          path: mobile/android/app/build/test-results/
+          if-no-files-found: warn
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
@@ -29,12 +64,21 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
       - run: npm run lint
-      - run: npm run test
+      - name: Unit and UI tests
+        run: npm run test -- --reporter=default --reporter=junit --outputFile=test-results/junit.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-test-results
+          path: frontend/test-results/
+          if-no-files-found: warn
       - run: npm run build:check
 
   sandboxd:
     name: sandboxd (control plane unit/contract)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: sandboxd
@@ -43,24 +87,33 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          python-version: "3.12"
       - name: Install dependencies
         run: uv sync --locked --extra test
       - name: Syntax check
         run: >
-          uv run --locked python -c
+          uv run --locked --extra test python -c
           "from pathlib import Path; files = sorted(Path('sandboxd').rglob('*.py'));
           assert files; [compile(f.read_bytes(), str(f), 'exec') for f in files];
           print(f'Syntax checked {len(files)} Python files.')"
       - name: Import check
-        run: uv run --locked python -c "from sandboxd.main import create_app; assert create_app"
-      - name: Unit and contract tests (local-only tests, skipped when absent)
-        run: >
-          if [ -d tests ]; then uv run --locked --extra test pytest tests -q; else
-          echo 'sandboxd tests are kept local-only per project convention; skipping.'; fi
+        run: uv run --locked --extra test python -c "from sandboxd.main import create_app; assert create_app"
+      - name: Unit and contract tests (fake runtime, no Docker)
+        run: uv run --locked --extra test pytest tests -q --junitxml=test-results/junit.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandboxd-test-results
+          path: sandboxd/test-results/
+          if-no-files-found: warn
 
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NLTK_DATA: ${{ github.workspace }}/docker/nltk_data
     defaults:
       run:
         working-directory: backend
@@ -69,15 +122,25 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          python-version: "3.12"
+      - name: Install test and voice dependencies
+        run: uv sync --locked --extra test --extra voice
       - name: Syntax check
         run: >
-          uv run --locked python -c
+          uv run --locked --extra test --extra voice python -c
           "from pathlib import Path; files = sorted(Path('app').rglob('*.py'));
           assert files; [compile(f.read_bytes(), str(f), 'exec') for f in files];
           print(f'Syntax checked {len(files)} Python files.')"
       - name: Import application
-        run: uv run --locked python -c "from app.main import app; assert app.title"
+        run: uv run --locked --extra test --extra voice python -c "from app.main import app; assert app.title"
       - name: Verify official Skill packages
-        run: uv run --locked python scripts/verify_skill_packages.py
+        run: uv run --locked --extra test --extra voice python scripts/verify_skill_packages.py
       - name: Unit and API tests
-        run: uv run --locked --extra test pytest tests -q
+        run: uv run --locked --extra test --extra voice pytest tests -q -m "not integration" --junitxml=test-results/junit.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: backend/test-results/
+          if-no-files-found: warn

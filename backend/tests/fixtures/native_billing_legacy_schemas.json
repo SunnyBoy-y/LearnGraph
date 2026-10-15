@@ -1,0 +1,477 @@
+{
+  "source": "Actual locally reachable Git billing schema families audited 2026-10-11",
+  "groups": [
+    {
+      "signature": "fc6d72e78c0c",
+      "schema": {
+        "ResearchJob": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "created_by": "mapped_column(String(64), nullable=True, index=True)",
+            "question": "mapped_column(Text)",
+            "status": "mapped_column(String(40), default='completed', index=True)",
+            "provider_id": "mapped_column(String(80), default='local_mock')",
+            "budget_cny": "mapped_column(Float, default=0.0)",
+            "estimated_cost_cny": "mapped_column(Float, default=0.0)",
+            "actual_cost_cny": "mapped_column(Float, default=0.0)",
+            "provider_task_id": "mapped_column(String(160), nullable=True, index=True)",
+            "approval_status": "mapped_column(String(40), default='not_required')",
+            "source_scope": "mapped_column(JSON, default=list)",
+            "allowed_domains": "mapped_column(JSON, default=list)",
+            "error_message": "mapped_column(Text, nullable=True)",
+            "billing_snapshot": "mapped_column(JSON, default=dict)",
+            "evidence_pack": "mapped_column(JSON, default=dict)"
+          },
+          "unique_constraints": []
+        },
+        "PriceVersion": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "provider_id": "mapped_column(String(80), default='*', index=True)",
+            "model_id": "mapped_column(String(160), default='*', index=True)",
+            "feature": "mapped_column(String(80), default='*', index=True)",
+            "version": "mapped_column(Integer, default=1)",
+            "input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cached_input_usd_per_million": "mapped_column(Float, nullable=True)",
+            "cache_write_usd_per_million": "mapped_column(Float, nullable=True)",
+            "output_usd_per_million": "mapped_column(Float, default=0.0)",
+            "fixed_usd_per_call": "mapped_column(Float, default=0.0)",
+            "effective_at": "mapped_column(DateTime(timezone=True), default=utc_now, index=True)",
+            "retired_at": "mapped_column(DateTime(timezone=True), nullable=True, index=True)",
+            "source": "mapped_column(String(160), default='workspace_manual')",
+            "conditions": "mapped_column(JSON, default=dict)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "provider_id",
+              "model_id",
+              "feature",
+              "version"
+            ]
+          ]
+        },
+        "ExchangeRateVersion": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "base_currency": "mapped_column(String(3), default='USD')",
+            "quote_currency": "mapped_column(String(3), default='CNY')",
+            "version": "mapped_column(Integer, default=1)",
+            "rate": "mapped_column(Float)",
+            "effective_at": "mapped_column(DateTime(timezone=True), default=utc_now, index=True)",
+            "retired_at": "mapped_column(DateTime(timezone=True), nullable=True, index=True)",
+            "source": "mapped_column(String(160), default='workspace_manual')"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "base_currency",
+              "quote_currency",
+              "version"
+            ]
+          ]
+        },
+        "BudgetPolicy": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "name": "mapped_column(String(160))",
+            "provider_id": "mapped_column(String(80), default='*', index=True)",
+            "model_id": "mapped_column(String(160), default='*', index=True)",
+            "feature": "mapped_column(String(80), default='*', index=True)",
+            "period": "mapped_column(String(32), default='calendar_month_utc')",
+            "soft_limit_cny": "mapped_column(Float, nullable=True)",
+            "hard_limit_cny": "mapped_column(Float, nullable=True)",
+            "limit_currency": "mapped_column(String(8), default='CNY')",
+            "enabled": "mapped_column(Boolean, default=True, index=True)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "provider_id",
+              "model_id",
+              "feature",
+              "period"
+            ]
+          ]
+        },
+        "BudgetAlert": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "policy_id": "mapped_column(ForeignKey('budget_policies.id', ondelete='CASCADE'), index=True)",
+            "level": "mapped_column(String(16), index=True)",
+            "status": "mapped_column(String(24), default='open', index=True)",
+            "provider_id": "mapped_column(String(80))",
+            "model_id": "mapped_column(String(160))",
+            "feature": "mapped_column(String(80))",
+            "period_start": "mapped_column(DateTime(timezone=True))",
+            "period_end": "mapped_column(DateTime(timezone=True))",
+            "spent_cny": "mapped_column(Float, default=0.0)",
+            "projected_cost_cny": "mapped_column(Float, default=0.0)",
+            "limit_cny": "mapped_column(Float)",
+            "acknowledged_at": "mapped_column(DateTime(timezone=True), nullable=True)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "policy_id",
+              "level",
+              "period_start"
+            ]
+          ]
+        },
+        "UsageEvent": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "provider_id": "mapped_column(String(80))",
+            "model_id": "mapped_column(String(160))",
+            "feature": "mapped_column(String(80))",
+            "input_tokens": "mapped_column(Integer, default=0)",
+            "cached_input_tokens": "mapped_column(Integer, default=0)",
+            "cache_creation_input_tokens": "mapped_column(Integer, default=0)",
+            "output_tokens": "mapped_column(Integer, default=0)",
+            "reasoning_tokens": "mapped_column(Integer, default=0)",
+            "total_tokens": "mapped_column(Integer, default=0)",
+            "attempt": "mapped_column(Integer, default=1)",
+            "cost_usd": "mapped_column(Float, default=0.0)",
+            "cost_cny": "mapped_column(Float, default=0.0)",
+            "cost_status": "mapped_column(String(32), default='unpriced')",
+            "price_version_id": "mapped_column(ForeignKey('price_versions.id', ondelete='SET NULL'), nullable=True, index=True)",
+            "exchange_rate_version_id": "mapped_column(ForeignKey('exchange_rate_versions.id', ondelete='SET NULL'), nullable=True, index=True)",
+            "input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cached_input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cache_write_usd_per_million": "mapped_column(Float, default=0.0)",
+            "price_multiplier": "mapped_column(Float, default=1.0)",
+            "output_usd_per_million": "mapped_column(Float, default=0.0)",
+            "fixed_usd_per_call": "mapped_column(Float, default=0.0)",
+            "usd_cny_rate": "mapped_column(Float, default=0.0)",
+            "latency_ms": "mapped_column(Integer, default=0)"
+          },
+          "unique_constraints": []
+        }
+      },
+      "first": {
+        "commit": "ad2c57afff9160b78c47d059a6a5e6c8d9cd13f7",
+        "date": "2026-08-10T15:59:03+08:00",
+        "model_blob": "842af15f84f8d3e8685441dccb37cffb32f37b21"
+      },
+      "last": {
+        "commit": "9418438359e7118f8746b2a1a15769db5b00a4c7",
+        "date": "2026-09-24T19:39:56+08:00",
+        "model_blob": "96a51b2e6ebac1d1477e5308db69faff66cad8f1"
+      }
+    },
+    {
+      "signature": "29d71debd659",
+      "schema": {
+        "ResearchJob": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "question": "mapped_column(Text)",
+            "status": "mapped_column(String(40), default='completed', index=True)",
+            "provider_id": "mapped_column(String(80), default='local_mock')",
+            "budget_cny": "mapped_column(Float, default=0.0)",
+            "estimated_cost_cny": "mapped_column(Float, default=0.0)",
+            "actual_cost_cny": "mapped_column(Float, default=0.0)",
+            "provider_task_id": "mapped_column(String(160), nullable=True, index=True)",
+            "approval_status": "mapped_column(String(40), default='not_required')",
+            "source_scope": "mapped_column(JSON, default=list)",
+            "allowed_domains": "mapped_column(JSON, default=list)",
+            "error_message": "mapped_column(Text, nullable=True)",
+            "billing_snapshot": "mapped_column(JSON, default=dict)",
+            "evidence_pack": "mapped_column(JSON, default=dict)"
+          },
+          "unique_constraints": []
+        },
+        "PriceVersion": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "provider_id": "mapped_column(String(80), default='*', index=True)",
+            "model_id": "mapped_column(String(160), default='*', index=True)",
+            "feature": "mapped_column(String(80), default='*', index=True)",
+            "version": "mapped_column(Integer, default=1)",
+            "input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cached_input_usd_per_million": "mapped_column(Float, nullable=True)",
+            "cache_write_usd_per_million": "mapped_column(Float, nullable=True)",
+            "output_usd_per_million": "mapped_column(Float, default=0.0)",
+            "fixed_usd_per_call": "mapped_column(Float, default=0.0)",
+            "effective_at": "mapped_column(DateTime(timezone=True), default=utc_now, index=True)",
+            "retired_at": "mapped_column(DateTime(timezone=True), nullable=True, index=True)",
+            "source": "mapped_column(String(160), default='workspace_manual')",
+            "conditions": "mapped_column(JSON, default=dict)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "provider_id",
+              "model_id",
+              "feature",
+              "version"
+            ]
+          ]
+        },
+        "ExchangeRateVersion": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "base_currency": "mapped_column(String(3), default='USD')",
+            "quote_currency": "mapped_column(String(3), default='CNY')",
+            "version": "mapped_column(Integer, default=1)",
+            "rate": "mapped_column(Float)",
+            "effective_at": "mapped_column(DateTime(timezone=True), default=utc_now, index=True)",
+            "retired_at": "mapped_column(DateTime(timezone=True), nullable=True, index=True)",
+            "source": "mapped_column(String(160), default='workspace_manual')"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "base_currency",
+              "quote_currency",
+              "version"
+            ]
+          ]
+        },
+        "BudgetPolicy": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "name": "mapped_column(String(160))",
+            "provider_id": "mapped_column(String(80), default='*', index=True)",
+            "model_id": "mapped_column(String(160), default='*', index=True)",
+            "feature": "mapped_column(String(80), default='*', index=True)",
+            "period": "mapped_column(String(32), default='calendar_month_utc')",
+            "soft_limit_cny": "mapped_column(Float, nullable=True)",
+            "hard_limit_cny": "mapped_column(Float, nullable=True)",
+            "limit_currency": "mapped_column(String(8), default='CNY')",
+            "enabled": "mapped_column(Boolean, default=True, index=True)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "provider_id",
+              "model_id",
+              "feature",
+              "period"
+            ]
+          ]
+        },
+        "BudgetAlert": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "policy_id": "mapped_column(ForeignKey('budget_policies.id', ondelete='CASCADE'), index=True)",
+            "level": "mapped_column(String(16), index=True)",
+            "status": "mapped_column(String(24), default='open', index=True)",
+            "provider_id": "mapped_column(String(80))",
+            "model_id": "mapped_column(String(160))",
+            "feature": "mapped_column(String(80))",
+            "period_start": "mapped_column(DateTime(timezone=True))",
+            "period_end": "mapped_column(DateTime(timezone=True))",
+            "spent_cny": "mapped_column(Float, default=0.0)",
+            "projected_cost_cny": "mapped_column(Float, default=0.0)",
+            "limit_cny": "mapped_column(Float)",
+            "acknowledged_at": "mapped_column(DateTime(timezone=True), nullable=True)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "policy_id",
+              "level",
+              "period_start"
+            ]
+          ]
+        },
+        "UsageEvent": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "provider_id": "mapped_column(String(80))",
+            "model_id": "mapped_column(String(160))",
+            "feature": "mapped_column(String(80))",
+            "input_tokens": "mapped_column(Integer, default=0)",
+            "cached_input_tokens": "mapped_column(Integer, default=0)",
+            "cache_creation_input_tokens": "mapped_column(Integer, default=0)",
+            "output_tokens": "mapped_column(Integer, default=0)",
+            "reasoning_tokens": "mapped_column(Integer, default=0)",
+            "total_tokens": "mapped_column(Integer, default=0)",
+            "attempt": "mapped_column(Integer, default=1)",
+            "cost_usd": "mapped_column(Float, default=0.0)",
+            "cost_cny": "mapped_column(Float, default=0.0)",
+            "cost_status": "mapped_column(String(32), default='unpriced')",
+            "price_version_id": "mapped_column(ForeignKey('price_versions.id', ondelete='SET NULL'), nullable=True, index=True)",
+            "exchange_rate_version_id": "mapped_column(ForeignKey('exchange_rate_versions.id', ondelete='SET NULL'), nullable=True, index=True)",
+            "input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cached_input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cache_write_usd_per_million": "mapped_column(Float, default=0.0)",
+            "price_multiplier": "mapped_column(Float, default=1.0)",
+            "output_usd_per_million": "mapped_column(Float, default=0.0)",
+            "fixed_usd_per_call": "mapped_column(Float, default=0.0)",
+            "usd_cny_rate": "mapped_column(Float, default=0.0)",
+            "latency_ms": "mapped_column(Integer, default=0)"
+          },
+          "unique_constraints": []
+        }
+      },
+      "first": {
+        "commit": "336eccd5ca326bdfb7b58fe9a49ff6a51a7acdf7",
+        "date": "2026-07-30T07:31:48+08:00",
+        "model_blob": "3b2eff0b670d45b213d0ab97b86027f6e99877a9"
+      },
+      "last": {
+        "commit": "27cfcd3ffce42aa0a557ca908a463cd3f1ee0691",
+        "date": "2026-08-10T15:58:51+08:00",
+        "model_blob": "f5f18637935c7e51a2dad7e08457bf31b6263069"
+      }
+    },
+    {
+      "signature": "ffbc5b70bdb5",
+      "schema": {
+        "ResearchJob": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "question": "mapped_column(Text)",
+            "status": "mapped_column(String(40), default='completed', index=True)",
+            "provider_id": "mapped_column(String(80), default='local_mock')",
+            "budget_cny": "mapped_column(Float, default=0.0)",
+            "estimated_cost_cny": "mapped_column(Float, default=0.0)",
+            "actual_cost_cny": "mapped_column(Float, default=0.0)",
+            "provider_task_id": "mapped_column(String(160), nullable=True, index=True)",
+            "approval_status": "mapped_column(String(40), default='not_required')",
+            "source_scope": "mapped_column(JSON, default=list)",
+            "allowed_domains": "mapped_column(JSON, default=list)",
+            "error_message": "mapped_column(Text, nullable=True)",
+            "billing_snapshot": "mapped_column(JSON, default=dict)",
+            "evidence_pack": "mapped_column(JSON, default=dict)"
+          },
+          "unique_constraints": []
+        },
+        "PriceVersion": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "provider_id": "mapped_column(String(80), default='*', index=True)",
+            "model_id": "mapped_column(String(160), default='*', index=True)",
+            "feature": "mapped_column(String(80), default='*', index=True)",
+            "version": "mapped_column(Integer, default=1)",
+            "input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cached_input_usd_per_million": "mapped_column(Float, nullable=True)",
+            "cache_write_usd_per_million": "mapped_column(Float, nullable=True)",
+            "output_usd_per_million": "mapped_column(Float, default=0.0)",
+            "fixed_usd_per_call": "mapped_column(Float, default=0.0)",
+            "effective_at": "mapped_column(DateTime(timezone=True), default=utc_now, index=True)",
+            "retired_at": "mapped_column(DateTime(timezone=True), nullable=True, index=True)",
+            "source": "mapped_column(String(160), default='workspace_manual')",
+            "conditions": "mapped_column(JSON, default=dict)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "provider_id",
+              "model_id",
+              "feature",
+              "version"
+            ]
+          ]
+        },
+        "ExchangeRateVersion": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "base_currency": "mapped_column(String(3), default='USD')",
+            "quote_currency": "mapped_column(String(3), default='CNY')",
+            "version": "mapped_column(Integer, default=1)",
+            "rate": "mapped_column(Float)",
+            "effective_at": "mapped_column(DateTime(timezone=True), default=utc_now, index=True)",
+            "retired_at": "mapped_column(DateTime(timezone=True), nullable=True, index=True)",
+            "source": "mapped_column(String(160), default='workspace_manual')"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "base_currency",
+              "quote_currency",
+              "version"
+            ]
+          ]
+        },
+        "BudgetPolicy": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "name": "mapped_column(String(160))",
+            "provider_id": "mapped_column(String(80), default='*', index=True)",
+            "model_id": "mapped_column(String(160), default='*', index=True)",
+            "feature": "mapped_column(String(80), default='*', index=True)",
+            "period": "mapped_column(String(32), default='calendar_month_utc')",
+            "soft_limit_cny": "mapped_column(Float, nullable=True)",
+            "hard_limit_cny": "mapped_column(Float, nullable=True)",
+            "enabled": "mapped_column(Boolean, default=True, index=True)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "provider_id",
+              "model_id",
+              "feature",
+              "period"
+            ]
+          ]
+        },
+        "BudgetAlert": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "policy_id": "mapped_column(ForeignKey('budget_policies.id', ondelete='CASCADE'), index=True)",
+            "level": "mapped_column(String(16), index=True)",
+            "status": "mapped_column(String(24), default='open', index=True)",
+            "provider_id": "mapped_column(String(80))",
+            "model_id": "mapped_column(String(160))",
+            "feature": "mapped_column(String(80))",
+            "period_start": "mapped_column(DateTime(timezone=True))",
+            "period_end": "mapped_column(DateTime(timezone=True))",
+            "spent_cny": "mapped_column(Float, default=0.0)",
+            "projected_cost_cny": "mapped_column(Float, default=0.0)",
+            "limit_cny": "mapped_column(Float)",
+            "acknowledged_at": "mapped_column(DateTime(timezone=True), nullable=True)"
+          },
+          "unique_constraints": [
+            [
+              "workspace_id",
+              "policy_id",
+              "level",
+              "period_start"
+            ]
+          ]
+        },
+        "UsageEvent": {
+          "columns": {
+            "id": "mapped_column(String(36), primary_key=True, default=new_id)",
+            "provider_id": "mapped_column(String(80))",
+            "model_id": "mapped_column(String(160))",
+            "feature": "mapped_column(String(80))",
+            "input_tokens": "mapped_column(Integer, default=0)",
+            "cached_input_tokens": "mapped_column(Integer, default=0)",
+            "output_tokens": "mapped_column(Integer, default=0)",
+            "reasoning_tokens": "mapped_column(Integer, default=0)",
+            "total_tokens": "mapped_column(Integer, default=0)",
+            "attempt": "mapped_column(Integer, default=1)",
+            "cost_usd": "mapped_column(Float, default=0.0)",
+            "cost_cny": "mapped_column(Float, default=0.0)",
+            "cost_status": "mapped_column(String(32), default='unpriced')",
+            "price_version_id": "mapped_column(ForeignKey('price_versions.id', ondelete='SET NULL'), nullable=True, index=True)",
+            "exchange_rate_version_id": "mapped_column(ForeignKey('exchange_rate_versions.id', ondelete='SET NULL'), nullable=True, index=True)",
+            "input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "cached_input_usd_per_million": "mapped_column(Float, default=0.0)",
+            "price_multiplier": "mapped_column(Float, default=1.0)",
+            "output_usd_per_million": "mapped_column(Float, default=0.0)",
+            "fixed_usd_per_call": "mapped_column(Float, default=0.0)",
+            "usd_cny_rate": "mapped_column(Float, default=0.0)",
+            "latency_ms": "mapped_column(Integer, default=0)"
+          },
+          "unique_constraints": []
+        }
+      },
+      "first": {
+        "commit": "ddf3a1c14620d223c2d9b7c26709311d61407395",
+        "date": "2026-07-25T19:19:04+08:00",
+        "model_blob": "4b8d02b38ac1b1b9811d0b7e39c8fcba067f5ee1"
+      },
+      "last": {
+        "commit": "3d7688e6dc47321db3d037850234635dd14060bc",
+        "date": "2026-07-29T11:44:17+08:00",
+        "model_blob": "670c98e17db35850347d26ba75b664e3c9b5f4c5"
+      }
+    }
+  ]
+}

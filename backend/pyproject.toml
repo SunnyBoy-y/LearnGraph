@@ -57,8 +57,9 @@ voice = [
 ]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
-  "integration: requires an explicitly configured sandboxd/Docker runtime (opt-in, local only)",
+  "integration: requires an explicitly configured sandboxd/Docker runtime (opt-in)",
 ]
 
 [tool.hatch.build.targets.wheel]

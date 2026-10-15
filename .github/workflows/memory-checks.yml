@@ -6,6 +6,7 @@ on:
       - "backend/app/**"
       - "backend/tests/**"
       - "backend/pyproject.toml"
+      - "backend/uv.lock"
       - "frontend/src/features/memory/**"
       - "frontend/src/api/**"
       - "frontend/src/types/**"
@@ -16,6 +17,7 @@ on:
       - "backend/app/**"
       - "backend/tests/**"
       - "backend/pyproject.toml"
+      - "backend/uv.lock"
 
 permissions:
   contents: read
@@ -23,14 +25,19 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NLTK_DATA: ${{ github.workspace }}/docker/nltk_data
     defaults:
       run:
         working-directory: backend
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v6
-      - run: uv run --extra test pytest tests -q
-      - run: uv run python -c "from app.main import app; print(app.title)"
+        with:
+          python-version: "3.12"
+      - run: uv run --locked --extra test --extra voice pytest tests -q -m "not integration"
+      - run: uv run --locked --extra test --extra voice python -c "from app.main import app; print(app.title)"
 
   frontend:
     runs-on: ubuntu-latest

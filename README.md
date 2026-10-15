@@ -493,7 +493,7 @@ LearnGraph/
 | --- | --- |
 | `npm run dev` | 使用已有依赖联合启动前后端 |
 | `npm run dev:install` | 从锁文件安装依赖并启动 |
-| `npm run check` | 前端 lint/生产构建 + 后端语法/应用导入检查 |
+| `npm run check` | 前端 lint/测试/类型检查/构建 + 后端完整离线测试 + sandboxd 单元与契约测试 |
 | `npm run check:install` | 从锁文件安装依赖后执行全部检查 |
 | `npm run check:frontend` | 仅执行前端检查 |
 | `npm run check:backend` | 仅执行后端检查 |
@@ -502,6 +502,15 @@ LearnGraph/
 | `npm run docker -- <args>` | 任意 compose 子命令透传（如 `npm run docker -- down` / `logs -f app`） |
 | `node scripts/host-bridge.mjs` | 宿主机一键启动 Host Service Bridge（Docker 部署访问本机服务，可选） |
 
+测试源码和夹具随仓库分发。前端在 `frontend` 执行 `npm ci && npm test`；
+后端在 `backend` 执行 `uv run --locked --extra test --extra voice pytest tests -q -m "not integration"`；
+sandboxd 在 `sandboxd` 执行 `uv run --locked --extra test pytest tests -q`。
+GitHub Actions 在 Pull Request、推送到 `main` 或手动触发时执行上述三组测试，并上传 JUnit 报告；
+Android 单元测试在独立任务中通过 `:app:testDebugUnitTest` 执行（需 Java 21 和 Android SDK，本地先在 `mobile` 构建并执行 `npm run cap:sync`）。
+后端的 `voice` 依赖用于离线语音管线测试，无需真实云端 Provider 凭据。
+真实 Docker 往返测试也已入库，需配置隔离的 sandboxd 服务后单独执行
+`uv run --locked --extra test --extra voice pytest tests/integration/test_sandboxd_roundtrip.py -q`。
+`frontend/tests-orphaned` 保留已移除模块的历史用例；`frontend/e2e` 是依赖本机浏览器、账号和服务的诊断脚本，均不参与常规 CI。
 
 ## 📚 开发者文档
 
