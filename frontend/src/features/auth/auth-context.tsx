@@ -33,6 +33,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [permissionScope, setPermissionScope] = useState<{ token: string; workspaceId: string; permissions: string[] } | null>(null);
   const [adminScope, setAdminScope] = useState<{ token: string; isAdmin: boolean } | null>(null);
   const workspaceSelectionRequestRef = useRef(0);
+  const profileVersionRef = useRef(0);
 
   useEffect(
     () =>
@@ -76,6 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const checkSession = () => {
       if (checking) return;
       checking = true;
+      const profileVersion = profileVersionRef.current;
       void getCurrentUser()
         .then((user) => {
           if (cancelled || authStore.getAccessToken() !== session.accessToken) return;
@@ -90,8 +92,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           }).catch(() => { if (!cancelled) setPermissionScope(null); });
           const mustChangePassword = user.must_change_password;
           authStore.setMustChangePassword(mustChangePassword);
+          const profile = { id: user.id, display_name: user.display_name, avatar_url: user.avatar_url ?? null };
+          const applyProfile = profileVersion === profileVersionRef.current;
+          if (applyProfile) authStore.setProfile(profile);
           setSession((current) =>
-            current ? { ...current, mustChangePassword } : current,
+            current ? {
+              ...current,
+              mustChangePassword,
+              ...(applyProfile ? { userId: profile.id, displayName: profile.display_name, avatarUrl: profile.avatar_url } : {}),
+            } : current,
           );
         })
         .catch(() => undefined)
@@ -123,6 +132,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     () => ({
       authenticated: Boolean(session?.accessToken && session.workspaceId),
       username: session?.displayName ?? session?.username ?? "",
+      avatarUrl: session?.avatarUrl ?? null,
+      updateProfile(profile) {
+        if (!session || authStore.getAccessToken() !== session.accessToken || (session.userId && profile.id !== session.userId)) return;
+        profileVersionRef.current += 1;
+        authStore.setProfile(profile);
+        setSession((current) => current && current.accessToken === session.accessToken
+          ? { ...current, userId: profile.id, displayName: profile.display_name, avatarUrl: profile.avatar_url }
+          : current);
+      },
       workspaceId: session?.workspaceId ?? "",
       userId: session?.userId ?? session?.username ?? "",
       isSystemAdmin: adminScope?.token === session?.accessToken && adminScope?.isAdmin === true,

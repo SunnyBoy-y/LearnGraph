@@ -117,7 +117,10 @@ class AuthService:
             )
             self.db.commit()
             raise AppError(429, "account_temporarily_locked", "Account is temporarily locked")
-        if user is None or not password_valid or user.status != "active":
+        demo_disabled = (
+            user is not None and user.id == "demo-user" and not self.settings.demo_login_enabled
+        )
+        if user is None or not password_valid or user.status != "active" or demo_disabled:
             if user is not None:
                 user.failed_login_count += 1
                 if user.failed_login_count >= self.settings.auth_max_failed_logins:
@@ -181,6 +184,7 @@ class AuthService:
             user_id=user.id,
             username=user.username,
             display_name=user.display_name or user.username,
+            avatar_url=user.avatar_url,
             default_workspace_id=default_workspace.id if default_workspace is not None else None,
             must_change_password=user.must_change_password,
             demo_only=demo_only,
@@ -266,7 +270,7 @@ class AuthService:
         # the endpoint resolves the configured demo identity and password.
         del payload
         response = self.login(
-            DemoLoginRequest(
+            LoginRequest(
                 username=self.settings.demo_username,
                 password=self.settings.demo_password,
             ),
@@ -564,6 +568,7 @@ class AuthService:
         user.email = None
         user.email_normalized = None
         user.display_name = "Deleted account"
+        user.avatar_url = None
         user.password_hash = hash_password(new_session_token())
         user.status = "deleted"
         user.is_system_admin = False

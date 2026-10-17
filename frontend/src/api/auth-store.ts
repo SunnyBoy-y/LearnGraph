@@ -1,4 +1,4 @@
-import type { AuthSession, LoginResponse } from '@/types/auth'
+import type { AuthSession, LoginResponse, UserProfile } from '@/types/auth'
 import { createUuid } from '@/lib/uuid'
 
 const TOKEN_KEY = 'learngraph.access_token'
@@ -6,6 +6,7 @@ const WORKSPACE_KEY = 'learngraph.workspace_id'
 const USER_ID_KEY = 'learngraph.user_id'
 const USERNAME_KEY = 'learngraph.username'
 const DISPLAY_NAME_KEY = 'learngraph.display_name'
+const AVATAR_URL_KEY = 'learngraph.avatar_url'
 const SESSION_ID_KEY = 'learngraph.session_id'
 const DEVICE_ID_KEY = 'learngraph.device_id'
 const MUST_CHANGE_PASSWORD_KEY = 'learngraph.must_change_password'
@@ -16,6 +17,7 @@ type AuthState = {
   userId: string | null
   username: string | null
   displayName: string | null
+  avatarUrl: string | null
   sessionId: string | null
   mustChangePassword: boolean | null
 }
@@ -26,6 +28,7 @@ const memoryState: AuthState = {
   userId: null,
   username: null,
   displayName: null,
+  avatarUrl: null,
   sessionId: null,
   mustChangePassword: null,
 }
@@ -169,6 +172,7 @@ export const authStore = {
     const userId = read(USER_ID_KEY, memoryState.userId)
     const username = read(USERNAME_KEY, memoryState.username)
     const displayName = read(DISPLAY_NAME_KEY, memoryState.displayName)
+    const avatarUrl = read(AVATAR_URL_KEY, memoryState.avatarUrl)
     const sessionId = read(SESSION_ID_KEY, memoryState.sessionId)
     const mustChangePassword = readBoolean(
       MUST_CHANGE_PASSWORD_KEY,
@@ -180,6 +184,7 @@ export const authStore = {
       ...(userId ? { userId } : {}),
       ...(username ? { username } : {}),
       ...(displayName ? { displayName } : {}),
+      avatarUrl,
       ...(sessionId ? { sessionId } : {}),
       ...(mustChangePassword === null ? {} : { mustChangePassword }),
     }
@@ -201,6 +206,7 @@ export const authStore = {
     memoryState.userId = session.userId ?? null
     memoryState.username = session.username ?? null
     memoryState.displayName = session.displayName ?? null
+    memoryState.avatarUrl = session.avatarUrl ?? null
     memoryState.sessionId = session.sessionId ?? null
     memoryState.mustChangePassword = session.mustChangePassword ?? null
     write(TOKEN_KEY, memoryState.accessToken)
@@ -208,8 +214,20 @@ export const authStore = {
     write(USER_ID_KEY, memoryState.userId)
     write(USERNAME_KEY, memoryState.username)
     write(DISPLAY_NAME_KEY, memoryState.displayName)
+    write(AVATAR_URL_KEY, memoryState.avatarUrl)
     write(SESSION_ID_KEY, memoryState.sessionId)
     writeBoolean(MUST_CHANGE_PASSWORD_KEY, memoryState.mustChangePassword)
+  },
+
+  setProfile(profile: Pick<UserProfile, 'display_name' | 'avatar_url'> & { id?: string }): void {
+    if (profile.id) {
+      memoryState.userId = profile.id
+      write(USER_ID_KEY, memoryState.userId)
+    }
+    memoryState.displayName = profile.display_name
+    memoryState.avatarUrl = profile.avatar_url
+    write(DISPLAY_NAME_KEY, memoryState.displayName)
+    write(AVATAR_URL_KEY, memoryState.avatarUrl)
   },
 
   setMustChangePassword(value: boolean | null): void {
@@ -227,6 +245,7 @@ export const authStore = {
       userId: response.user_id,
       username: response.username,
       displayName: response.display_name,
+      avatarUrl: response.avatar_url ?? null,
       sessionId: response.session_id,
       mustChangePassword: response.must_change_password,
     })
@@ -238,6 +257,7 @@ export const authStore = {
     memoryState.userId = null
     memoryState.username = null
     memoryState.displayName = null
+    memoryState.avatarUrl = null
     memoryState.sessionId = null
     memoryState.mustChangePassword = null
     write(TOKEN_KEY, null)
@@ -245,6 +265,7 @@ export const authStore = {
     write(USER_ID_KEY, null)
     write(USERNAME_KEY, null)
     write(DISPLAY_NAME_KEY, null)
+    write(AVATAR_URL_KEY, null)
     write(SESSION_ID_KEY, null)
     writeBoolean(MUST_CHANGE_PASSWORD_KEY, null)
     notifyNativeAuthCleared()

@@ -3,12 +3,13 @@ from __future__ import annotations
 import logging
 import secrets
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.security import hash_password, normalize_identity
 from app.domain.models import (
+    AuthSession,
     ChatSession,
     Evidence,
     Exercise,
@@ -24,6 +25,7 @@ from app.domain.models import (
     User,
     Workspace,
     WorkspaceSetting,
+    utc_now,
 )
 from app.repositories.domain import GraphNodeRepository
 from app.services.authorization import ensure_permission_catalog
@@ -108,11 +110,10 @@ def ensure_auth_identities(db: Session) -> None:
             logger.warning(format_bootstrap_credentials(admin_name, bootstrap_password))
 
     demo = db.get(User, "demo-user")
-    # 身份存在性只由登录开关控制（演示数据另由 demo_seed_enabled 控制）。
-    # 若身份门取 or（login or seed），仅关闭 login 时 demo 身份仍保持 active，
-    # 普通登录 /auth/login 会继续接受公开的 demo 凭据——"关了入口还能登录"。
+    # The host configuration owns this built-in identity's availability.
+    # Seed data is independent and must never activate the account.
     demo_identity_enabled = settings.demo_login_enabled
-    if demo_identity_enabled and demo is None:
+    if demo is None:
         demo = User(
             id="demo-user",
             tenant_id=LOCAL_TENANT_ID,
@@ -120,13 +121,22 @@ def ensure_auth_identities(db: Session) -> None:
             username_normalized=normalize_identity(settings.demo_username),
             display_name="Demo User",
             password_hash=hash_password(settings.demo_password),
-            is_system_admin=True,
+            status="active" if demo_identity_enabled else "disabled",
+            is_system_admin=False,
             must_change_password=False,
         )
         db.add(demo)
         db.flush()
-    elif demo is not None and not demo_identity_enabled:
-        demo.status = "disabled"
+    # Also remove the administrator flag from accounts created by older versions.
+    demo.is_system_admin = False
+    if demo.status != "deleted":
+        demo.status = "active" if demo_identity_enabled else "disabled"
+    if demo.status != "active":
+        db.execute(
+            update(AuthSession)
+            .where(AuthSession.user_id == demo.id, AuthSession.revoked_at.is_(None))
+            .values(revoked_at=utc_now(), revoked_reason="demo_disabled")
+        )
     if demo_identity_enabled and db.get(Workspace, DEMO_WORKSPACE_ID) is None:
         db.add(
             Workspace(

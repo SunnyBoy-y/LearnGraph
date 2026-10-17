@@ -30,7 +30,7 @@ export function LoginPage() {
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const { demoLogin, login, register } = useAuth();
-  const demoLoginEnabled = import.meta.env.VITE_ENABLE_DEMO_LOGIN !== "false";
+  const [demoLoginEnabled, setDemoLoginEnabled] = useState(false);
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
@@ -56,7 +56,12 @@ export function LoginPage() {
     let cancelled = false;
     fetchDeploymentProfile()
       .then((profile) => {
-        if (!cancelled) setRegistrationEnabled(profile.registration_enabled);
+        if (!cancelled) {
+          setRegistrationEnabled(profile.registration_enabled);
+          setDemoLoginEnabled(
+            profile.demo_login_enabled && import.meta.env.VITE_ENABLE_DEMO_LOGIN !== "false",
+          );
+        }
       })
       .catch(() => {
         // 保持默认（显示注册入口）；端点不可达时登录页本身也无法工作。
@@ -94,9 +99,7 @@ export function LoginPage() {
     try {
       const result = await demoLogin();
       if (result.mustChangePassword) {
-        navigate("/auth/change-password", {
-          state: { currentPassword: "learn-graph-local" },
-        });
+        navigate("/auth/change-password");
         return;
       }
       navigate(returnToAfterLogin(result.workspaceId), { replace: true });

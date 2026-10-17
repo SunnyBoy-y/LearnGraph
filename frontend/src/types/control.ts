@@ -6,6 +6,7 @@ export interface CurrentUser {
   username: string;
   email: string | null;
   display_name: string;
+  avatar_url?: string | null;
   status: string;
   is_system_admin: boolean;
   must_change_password: boolean;

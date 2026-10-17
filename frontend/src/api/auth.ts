@@ -1,7 +1,8 @@
 import type {
-  DemoLoginRequest,
+  LoginRequest,
   LoginResponse,
   RegisterRequest,
+  UserProfile,
   Workspace,
   WorkspaceSelectionResponse,
 } from '@/types/auth'
@@ -18,8 +19,8 @@ export type AccountDeletionImpact = {
   owned_organization_count: number
 }
 
-export async function login(payload: DemoLoginRequest): Promise<LoginResponse> {
-  const response = await apiClient.post<LoginResponse, DemoLoginRequest>('/auth/login', payload, {
+export async function login(payload: LoginRequest): Promise<LoginResponse> {
+  const response = await apiClient.post<LoginResponse, LoginRequest>('/auth/login', payload, {
     auth: false,
     workspace: false,
   })
@@ -28,9 +29,9 @@ export async function login(payload: DemoLoginRequest): Promise<LoginResponse> {
 }
 
 export async function demoLogin(): Promise<LoginResponse> {
-  const response = await apiClient.post<LoginResponse, DemoLoginRequest>(
+  const response = await apiClient.post<LoginResponse>(
     '/auth/demo-login',
-    { username: 'demo', password: 'learn-graph-local' },
+    {},
     { auth: false, workspace: false },
   )
   authStore.setLoginResponse(response)
@@ -48,6 +49,20 @@ export async function register(payload: RegisterRequest): Promise<LoginResponse>
 
 export function logout(): Promise<{ status: string }> {
   return apiClient.post('/auth/logout', undefined, { workspace: false })
+}
+
+export function updateProfile(displayName: string): Promise<UserProfile> {
+  return apiClient.patch('/auth/profile', { display_name: displayName }, { workspace: false })
+}
+
+export function uploadAvatar(file: File): Promise<UserProfile> {
+  const form = new FormData()
+  form.append('file', file)
+  return apiClient.upload('/auth/profile/avatar', form, { workspace: false })
+}
+
+export function generateDefaultAvatar(): Promise<UserProfile> {
+  return apiClient.post('/auth/profile/avatar/default', undefined, { workspace: false })
 }
 
 export function changePassword(currentPassword: string, newPassword: string): Promise<{ status: string }> {

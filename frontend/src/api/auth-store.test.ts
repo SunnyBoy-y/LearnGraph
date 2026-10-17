@@ -8,6 +8,22 @@ describe('authStore mustChangePassword persistence', () => {
     localStorage.clear()
   })
 
+  it('persists profile changes across restart and removes the avatar on logout', () => {
+    authStore.setSession({ accessToken: 'profile-token', workspaceId: 'ws-profile', username: 'login-name', userId: 'user-1' })
+    authStore.setProfile({ display_name: '新昵称', avatar_url: 'data:image/png;base64,test-avatar' })
+    sessionStorage.clear()
+    expect(authStore.getSession()).toMatchObject({ username: 'login-name', displayName: '新昵称', avatarUrl: 'data:image/png;base64,test-avatar' })
+    authStore.clear()
+    expect(localStorage.getItem('learngraph.avatar_url')).toBeNull()
+    expect(sessionStorage.getItem('learngraph.avatar_url')).toBeNull()
+  })
+
+  it('does not reuse the previous account avatar after a new login', () => {
+    authStore.setSession({ accessToken: 'a', workspaceId: 'ws-a', avatarUrl: 'data:image/png;base64,a' })
+    authStore.setSession({ accessToken: 'b', workspaceId: 'ws-b' })
+    expect(authStore.getSession()?.avatarUrl).toBeNull()
+  })
+
   it('restores the password-change requirement after a session reload', () => {
     authStore.setSession({
       accessToken: 'token',

@@ -1,6 +1,6 @@
 import type { IsoDateTime } from './common'
 
-export interface DemoLoginRequest {
+export interface LoginRequest {
   username: string
   password: string
 }
@@ -21,6 +21,7 @@ export interface LoginResponse {
   username: string
   display_name: string
   default_workspace_id: string | null
+  avatar_url?: string | null
   must_change_password: boolean
   demo_only: boolean
 }
@@ -52,6 +53,13 @@ export interface AuthSession {
   userId?: string
   username?: string
   displayName?: string
+  avatarUrl?: string | null
   sessionId?: string
   mustChangePassword?: boolean
+}
+
+export interface UserProfile {
+  id: string
+  display_name: string
+  avatar_url: string | null
 }

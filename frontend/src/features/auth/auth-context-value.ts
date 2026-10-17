@@ -1,8 +1,11 @@
 import { createContext, useContext } from 'react'
+import type { UserProfile } from '@/types/auth'
 
 export type AuthContextValue = {
   authenticated: boolean
   username: string
+  avatarUrl: string | null
+  updateProfile: (profile: UserProfile) => void
   workspaceId: string
   userId: string
   isSystemAdmin: boolean

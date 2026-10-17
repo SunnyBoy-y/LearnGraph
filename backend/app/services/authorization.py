@@ -533,6 +533,12 @@ class IdentityManagementService:
         )
         if user is None:
             raise AppError(404, "user_not_found", "User not found")
+        if user.id == "demo-user":
+            raise AppError(
+                409,
+                "demo_status_managed_by_environment",
+                "Demo 状态只能通过宿主机 .env 中的 LEARNGRAPH_ENABLE_DEMO_LOGIN 修改并重建应用容器生效",
+            )
         user.status = payload.status
         if payload.status != "active":
             now = utc_now()

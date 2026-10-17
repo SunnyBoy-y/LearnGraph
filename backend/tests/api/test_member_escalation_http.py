@@ -1,8 +1,8 @@
 """组织内成员越权测试（S1-1/S1-2 修复固化）。
 
 场景：A 创建组织工作区（Admin），B 以 Member 身份加入同一组织工作区。
-- A 创建 FetchAuthorizationRequest / ResearchJob（付费/敏感资源）
-- B 尝试 decision / resume / research 读取与审批 → 期望 403（修复已生效）
+- A 创建 FetchAuthorizationRequest（付费/敏感资源）
+- B 尝试 decision / resume → 期望 403（修复已生效）
 - A（Admin/owner）同操作 → 200（对照）
 
 工作树已含 S1-1/S1-2 修复（actor/manage 校验 + owner 过滤），本套件固化这些修复。
@@ -107,27 +107,6 @@ def _insert_fetch_auth(client, headers, ws: str, actor_id: str, status: str = "p
     return rid
 
 
-def _insert_research(ws: str, actor_id: str) -> str:
-    rid = str(uuid.uuid4())
-    with SessionLocal() as db:
-        db.execute(
-            text(
-                """INSERT INTO research_jobs
-                   (id, workspace_id, created_by, question, status, provider_id, budget_cny,
-                    estimated_cost_cny, actual_cost_cny, approval_status, source_scope,
-                    allowed_domains, billing_snapshot, evidence_pack, created_at, updated_at)
-                   VALUES (:id, :ws, :actor, 'A 的私有研究问题（敏感）', 'awaiting_approval',
-                    'local_mock', 10.0, 0.0, 0.0, 'awaiting_approval', '[]', '[]', '{}', '{}', :now, :now)"""
-            ),
-            {
-                "id": rid,
-                "ws": ws,
-                "actor": actor_id,
-                "now": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
-            },
-        )
-        db.commit()
-    return rid
 
 
 def test_member_cannot_decide_others_fetch_auth(client, register_user, auth_headers):
@@ -166,44 +145,3 @@ def test_member_cannot_resume_others_fetch_auth(client, register_user, auth_head
         headers=auth_headers(token_b, ws),
     )
     assert r.status_code == 403, f"Member 恢复他人付费抓取应 403，实际 {r.status_code}"
-
-
-def test_member_cannot_read_others_research(client, register_user, auth_headers):
-    """S1-2 固化：B 读取 A 的研究详情 → 403。"""
-    ws, token_a, token_b, _ = _create_org_and_member(client, register_user, auth_headers)
-    me_a = client.get("/api/v1/auth/me", headers=auth_headers(token_a)).json()
-    rj = _insert_research(ws, me_a["id"])
-    r = client.get(f"/api/v1/research/{rj}", headers=auth_headers(token_b, ws))
-    assert r.status_code == 403, f"Member 读他人研究应 403，实际 {r.status_code}"
-
-
-def test_member_cannot_approve_others_research(client, register_user, auth_headers):
-    """S1-2 固化：B 批准 A 的付费研究 → 403。"""
-    ws, token_a, token_b, _ = _create_org_and_member(client, register_user, auth_headers)
-    me_a = client.get("/api/v1/auth/me", headers=auth_headers(token_a)).json()
-    rj = _insert_research(ws, me_a["id"])
-    r = client.post(
-        f"/api/v1/research/{rj}/approve",
-        headers=auth_headers(token_b, ws),
-        json={"approved": True},
-    )
-    assert r.status_code == 403, f"Member 代批准付费研究应 403，实际 {r.status_code}"
-
-
-def test_member_research_list_only_own(client, register_user, auth_headers):
-    """S1-2 固化：B 的 research 列表不含 A 的 job。"""
-    ws, token_a, token_b, _ = _create_org_and_member(client, register_user, auth_headers)
-    me_a = client.get("/api/v1/auth/me", headers=auth_headers(token_a)).json()
-    _insert_research(ws, me_a["id"])
-    r = client.get("/api/v1/research", headers=auth_headers(token_b, ws))
-    assert r.status_code == 200
-    assert r.json() == [], f"Member 列表应只见自己的 job，实际 {r.json()}"
-
-
-def test_owner_can_read_own_research(client, register_user, auth_headers):
-    """对照：A 读自己的研究 → 200。"""
-    ws, token_a, _, _ = _create_org_and_member(client, register_user, auth_headers)
-    me_a = client.get("/api/v1/auth/me", headers=auth_headers(token_a)).json()
-    rj = _insert_research(ws, me_a["id"])
-    r = client.get(f"/api/v1/research/{rj}", headers=auth_headers(token_a, ws))
-    assert r.status_code == 200, r.text

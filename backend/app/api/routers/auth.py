@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from fastapi import APIRouter, Query, Request, status
+from fastapi import APIRouter, Query, Request, UploadFile, status
 
 from app.api.deps import AppSettings, CurrentPrincipal, CurrentWorkspace, DB
 from app.core.config import get_settings
@@ -16,6 +16,8 @@ from app.domain.schemas.auth import (
     AccountDeletionImpact,
     ChangePasswordRequest,
     CurrentUserView,
+    ProfileUpdateRequest,
+    ProfileView,
     DemoLoginRequest,
     DemoLoginResponse,
     DeleteAccountRequest,
@@ -39,6 +41,7 @@ from app.domain.schemas.auth import (
 )
 from app.domain.schemas.common import ActionResponse
 from app.services.auth import AuthService
+from app.services.user_profile import MAX_AVATAR_BYTES, UserProfileService, normalize_avatar
 from app.services.authorization import AuthorizationService, IdentityManagementService
 
 
@@ -97,7 +100,7 @@ def demo_login(
     settings: AppSettings,
     db: DB,
 ) -> DemoLoginResponse:
-    """开发环境 Demo 登录。输入固定的本地演示账号，输出正常的、可撤销的认证会话。"""
+    """显式开启后的 Demo 登录。服务端解析配置，客户端无需提交账号密码。"""
 
     _enforce_auth_rate_limit(request)
     user_agent, ip_address, device_id = _request_metadata(request)
@@ -121,11 +124,31 @@ def current_user(principal: CurrentPrincipal, db: DB) -> CurrentUserView:
         username=user.username,
         email=user.email,
         display_name=user.display_name or user.username,
+        avatar_url=user.avatar_url,
         status=user.status,
         is_system_admin=user.is_system_admin,
         must_change_password=user.must_change_password,
         session_id=principal.session_id,
     )
+
+
+@router.patch("/auth/profile", response_model=ProfileView)
+def update_profile(payload: ProfileUpdateRequest, principal: CurrentPrincipal, db: DB) -> ProfileView:
+    return UserProfileService(db, principal).update(display_name=payload.display_name)
+
+
+@router.post("/auth/profile/avatar", response_model=ProfileView)
+def upload_avatar(file: UploadFile, principal: CurrentPrincipal, db: DB) -> ProfileView:
+    try:
+        content = file.file.read(MAX_AVATAR_BYTES + 1)
+        return UserProfileService(db, principal).update(avatar_url=normalize_avatar(content))
+    finally:
+        file.file.close()
+
+
+@router.post("/auth/profile/avatar/default", response_model=ProfileView)
+def default_avatar(principal: CurrentPrincipal, db: DB) -> ProfileView:
+    return UserProfileService(db, principal).update(reset_avatar=True)
 
 
 @router.post("/auth/logout", response_model=ActionResponse)

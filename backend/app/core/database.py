@@ -1191,8 +1191,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.15.0"
-CURRENT_SCHEMA_DESCRIPTION = "Native USD and CNY billing, exact ledger and currency-scoped budgets"
+CURRENT_SCHEMA_REVISION = "v1.16.0"
+CURRENT_SCHEMA_DESCRIPTION = "Persistent user avatars and editable display names"
 
 
 def _compute_schema_checksum() -> str:
@@ -1535,6 +1535,9 @@ def _apply_sqlite_additive_migrations(connection: Any = None) -> None:
     """
 
     additions = {
+        "users": {
+            "avatar_url": "TEXT",
+        },
         "auth_sessions": {
             "device_id": "VARCHAR(128) NOT NULL DEFAULT ''",
         },

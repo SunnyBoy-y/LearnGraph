@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.domain.schemas.common import ORMModel
 
@@ -21,8 +21,8 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=1024)
 
 
-class DemoLoginRequest(LoginRequest):
-    pass
+class DemoLoginRequest(BaseModel):
+    """No credentials are accepted from or exposed to the browser."""
 
 
 class LoginResponse(BaseModel):
@@ -33,6 +33,7 @@ class LoginResponse(BaseModel):
     user_id: str
     username: str
     display_name: str
+    avatar_url: str | None = None
     default_workspace_id: str | None
     must_change_password: bool
     demo_only: bool = False
@@ -48,10 +49,26 @@ class CurrentUserView(BaseModel):
     username: str
     email: str | None
     display_name: str
+    avatar_url: str | None = None
     status: str
     is_system_admin: bool
     must_change_password: bool
     session_id: str
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=160)
+
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def strip_display_name(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+
+class ProfileView(BaseModel):
+    id: str
+    display_name: str
+    avatar_url: str | None
 
 
 class ChangePasswordRequest(BaseModel):

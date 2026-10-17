@@ -77,6 +77,7 @@ class User(Base, TimestampMixin):
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     email_normalized: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
     display_name: Mapped[str] = mapped_column(String(160), default="")
+    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     password_hash: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     is_system_admin: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -1289,6 +1290,8 @@ class FileReference(Base, TimestampMixin, WorkspaceScopedMixin):
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+# Legacy storage only: retained for existing source FKs and billing migrations.
+# No API, agent tool, provider, or worker executes research jobs.
 class ResearchJob(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "research_jobs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)

@@ -388,6 +388,12 @@ def _voice_relay_stun_pool(connection: Connection) -> None:
             connection.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
 
 
+def _user_avatar(connection: Connection) -> None:
+    columns = {column["name"] for column in inspect(connection).get_columns("users")}
+    if "avatar_url" not in columns:
+        connection.exec_driver_sql("ALTER TABLE users ADD COLUMN avatar_url TEXT")
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -482,6 +488,11 @@ MIGRATIONS = (
         "v1.15.0",
         "Native USD and CNY billing, exact ledger and currency-scoped budgets",
         apply_native_billing_migration,
+    ),
+    SchemaMigration(
+        "v1.16.0",
+        "Persistent user avatars and editable display names",
+        _user_avatar,
     ),
 )
 
