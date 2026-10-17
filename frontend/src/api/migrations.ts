@@ -58,13 +58,15 @@ export function rollbackMigration(jobId: string): Promise<MigrationJob> {
   )
 }
 
-export function downloadFullBackup(): Promise<Blob> {
-  return apiClient.getBlob('/migrations/backup')
+export function downloadFullBackup(currentPassword: string, backupPassword: string): Promise<Blob> {
+  return apiClient.postBlob('/migrations/backup', { current_password: currentPassword, backup_password: backupPassword })
 }
 
-export function restoreFullBackup(file: File): Promise<BackupRestoreResult> {
+export function restoreFullBackup(file: File, currentPassword: string, backupPassword: string): Promise<BackupRestoreResult> {
   const form = new FormData()
   form.append('backup', file, file.name)
   form.append('confirm', 'true')
+  form.append('current_password', currentPassword)
+  form.append('backup_password', backupPassword)
   return apiClient.upload<BackupRestoreResult>('/migrations/restore', form)
 }

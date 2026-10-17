@@ -82,4 +82,6 @@ export interface BackupRestoreResult {
   files: number
   memory_files: number
   mode: string
+  restore_path: string | null
+  restart_required: boolean
 }

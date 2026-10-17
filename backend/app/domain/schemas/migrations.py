@@ -33,6 +33,11 @@ class MigrationConfirmRequest(BaseModel):
     confirm: Literal[True]
 
 
+class SiteBackupRequest(BaseModel):
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+    backup_password: SecretStr = Field(min_length=12, max_length=1024)
+
+
 class MigrationCheckpointView(BaseModel):
     sequence: int
     state: str
@@ -113,3 +118,5 @@ class BackupRestoreView(BaseModel):
     files: int
     memory_files: int
     mode: str
+    restore_path: str | None = None
+    restart_required: bool = False
