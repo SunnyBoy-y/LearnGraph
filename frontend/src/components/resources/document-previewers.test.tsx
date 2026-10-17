@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { BlobImage } from "./document-previewers";
+import { BlobImage, ExcelWorkbookViewer, HtmlDocumentViewer, RtfDocumentViewer, TextDocumentViewer } from "./document-previewers";
 
 /**
  * Regression guard for the PDF preview crash "Cannot convert object to
@@ -17,6 +17,7 @@ import { BlobImage } from "./document-previewers";
  */
 
 const workerSrcAssignments: unknown[] = [];
+const passwordChallenge = vi.hoisted(() => ({ enabled: false, attempts: [] as string[] }));
 
 vi.mock("pdfjs-dist", () => {
   const GlobalWorkerOptions = {
@@ -29,15 +30,30 @@ vi.mock("pdfjs-dist", () => {
   };
   return {
     GlobalWorkerOptions,
-    getDocument: () => ({
-      promise: Promise.resolve({
+    PasswordResponses: { INCORRECT_PASSWORD: 2 },
+    getDocument: () => {
+      const document = {
         numPages: 3,
         getPage: async () => {
           throw new Error("page rendering is out of scope for this test");
         },
         destroy: async () => undefined,
-      }),
-    }),
+      };
+      if (!passwordChallenge.enabled) return { promise: Promise.resolve(document) };
+      let resolveDocument!: (value: typeof document) => void;
+      const task = {
+        onPassword: undefined as undefined | ((submit: (password: string) => void, reason: number) => void),
+        promise: new Promise<typeof document>((resolve) => { resolveDocument = resolve; }),
+        destroy: async () => undefined,
+      };
+      const submit = (password: string) => {
+        passwordChallenge.attempts.push(password);
+        if (password === "correct") resolveDocument(document);
+        else queueMicrotask(() => task.onPassword?.(submit, 2));
+      };
+      queueMicrotask(() => task.onPassword?.(submit, 1));
+      return task;
+    },
     TextLayer: class {
       render() {
         return Promise.resolve();
@@ -60,6 +76,7 @@ function pdfBlob() {
 }
 
 describe("PdfDocumentViewer worker bootstrap", () => {
+  beforeEach(() => { passwordChallenge.enabled = false; passwordChallenge.attempts = []; });
   it("assigns the ?url default export as the worker source", async () => {
     workerSrcAssignments.length = 0;
 
@@ -86,6 +103,55 @@ describe("PdfDocumentViewer worker bootstrap", () => {
       expect(screen.getByLabelText(/PDF 第 1 页/u)).toBeInTheDocument();
     });
     expect(screen.queryByText(/Cannot convert object to primitive value/u)).toBeNull();
+  });
+
+  it("allows retrying an incorrect document password", async () => {
+    passwordChallenge.enabled = true;
+    render(<PdfDocumentViewer blob={pdfBlob()} pageNumber={1} scale={1} theme="paper" />);
+    fireEvent.change(await screen.findByLabelText("PDF 打开密码"), { target: { value: "wrong" } });
+    fireEvent.click(screen.getByRole("button", { name: "打开 PDF" }));
+    await screen.findByText("密码不正确，请重试。");
+    fireEvent.change(screen.getByLabelText("PDF 打开密码"), { target: { value: "correct" } });
+    fireEvent.click(screen.getByRole("button", { name: "打开 PDF" }));
+    await screen.findByLabelText(/PDF 第 1 页/u);
+    expect(passwordChallenge.attempts).toEqual(["wrong", "correct"]);
+  });
+});
+
+describe("document text readers", () => {
+  it("finishes loading an empty text file", async () => {
+    render(<TextDocumentViewer blob={new Blob([])} filename="empty.txt" />);
+    await screen.findByText("此文件为空。");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+  it("shows Markdown through the existing renderer and retains source mode", async () => {
+    render(<TextDocumentViewer blob={new Blob(["# Reader heading\n\n**bold**"])} filename="readme.md" />);
+    await screen.findByRole("heading", { name: "Reader heading" });
+    fireEvent.click(screen.getByRole("button", { name: "源码" }));
+    expect(document.querySelector("pre")?.textContent).toContain("# Reader heading");
+  });
+  it("finishes loading empty HTML without removing iframe isolation", async () => {
+    render(<HtmlDocumentViewer blob={new Blob([])} filename="empty.html" />);
+    expect(await screen.findByTitle("预览 empty.html")).toHaveAttribute("sandbox", "allow-scripts");
+    expect(screen.queryByText("正在读取 HTML…")).toBeNull();
+  });
+
+  it("uses the workbook grid for quoted CSV fields, line breaks and literal formulas", async () => {
+    const csv = 'name,note,value\r\n"A,B","two\nlines","=1+1"\r\n"say ""hi""",end,42';
+    render(<ExcelWorkbookViewer blob={new Blob([csv], { type: "text/csv" })} filename="data.csv" />);
+    await screen.findByText("A,B", {}, { timeout: 5000 });
+    expect(screen.getByText("two lines")).toBeInTheDocument();
+    expect(screen.getByText("=1+1")).toBeInTheDocument();
+    expect(screen.getByText('say "hi"')).toBeInTheDocument();
+  });
+
+  it("renders RTF formatting inside the shared sandbox instead of showing control words", async () => {
+    const rtf = '{\\rtf1\\ansi Hello \\b bold\\b0\\par}';
+    render(<RtfDocumentViewer blob={new Blob([rtf], { type: "application/rtf" })} filename="notes.rtf" />);
+    const frame = await screen.findByTitle("预览 notes.rtf", {}, { timeout: 5000 });
+    expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+    expect(frame.getAttribute("srcdoc")).toContain("bold");
+    expect(frame.getAttribute("srcdoc")).not.toContain("\\rtf1");
   });
 });
 

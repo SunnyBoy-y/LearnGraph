@@ -27,7 +27,6 @@ import {
   cancelDocumentJob,
   createDocumentJob,
   downloadFile,
-  downloadFileForPreview,
   getDocumentJob,
   listDocumentJobEvents,
   listDocumentRevisions,
@@ -49,10 +48,12 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   DocumentChatPanel,
   type PendingDocumentSelection,
+  type DocumentChatPreferences,
 } from "@/features/resources/document-chat-panel";
 import {
-  FilePreviewCanvas,
-} from "@/components/resources/file-preview";
+  FilePreviewContent,
+} from "@/components/resources/file-preview-content";
+import { PREVIEW_BUFFER_LIMIT } from "@/lib/seekable-file";
 import { requiresLearningIndex, resolveFilePreviewKind } from "@/lib/file-preview";
 import {
   isRealtimeTranscriptionModel,
@@ -60,6 +61,7 @@ import {
 } from "@/lib/model-choices";
 import { ConceptBranchWorkspace } from "@/features/resources/concept-branch-workspace";
 import { cn } from "@/lib/utils";
+import { setSessionComposerPrefs } from "@/lib/session-composer-prefs";
 import type {
   DocumentJobEvent,
   DocumentJobStatus,
@@ -306,14 +308,9 @@ export function DocumentLearningPage() {
   });
   const goals = useQuery({ queryKey: ["goals"], queryFn: listGoals });
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
-  const blob = useQuery({
-    queryKey: ["file-content", fileId],
-    queryFn: () =>
-      file?.size_bytes
-        ? downloadFileForPreview(fileId, file.size_bytes)
-        : downloadFile(fileId),
-    enabled: Boolean(fileId && file),
-  });
+  const [previewError, setPreviewError] = useState<Error | null>(null);
+  const [previewAttempt, setPreviewAttempt] = useState(0);
+  useEffect(() => { setPreviewError(null); setPreviewAttempt(0); }, [fileId]);
   const job = useQuery({
     queryKey: ["document-job", jobId],
     queryFn: () => getDocumentJob(jobId),
@@ -640,9 +637,12 @@ export function DocumentLearningPage() {
       jobBelongsToFile &&
       retryableDocumentJobStatuses.has(documentJob.status),
   );
-  const originalUnavailable = blob.isError && !blob.data;
+  const originalUnavailable = Boolean(previewError);
 
-  async function sendDocumentQuestionToFullChat(content: string) {
+  async function sendDocumentQuestionToFullChat(
+    content: string,
+    preferences: DocumentChatPreferences,
+  ) {
     let targetSessionId = chatSessionId;
     if (!targetSessionId) {
       const session = await createSession({
@@ -651,6 +651,7 @@ export function DocumentLearningPage() {
       });
       targetSessionId = session.id;
     }
+    setSessionComposerPrefs(targetSessionId, preferences);
     navigate(`/w/${workspaceId}/chat/${targetSessionId}`, {
       state: {
         pendingPrompt: content,
@@ -899,30 +900,27 @@ export function DocumentLearningPage() {
 
         <div className="document-learning-reader-shell">
         <main className={cn("min-w-0 bg-card xl:block", mobilePane === "reader" ? "block" : "hidden")}>
-          {blob.isPending && hasOriginalPreview ? (
-            <div className="grid min-h-[36rem] place-items-center text-sm text-muted-foreground">
-              <div className="flex items-center gap-2">
-                <LoaderCircle className="size-4 animate-spin" />
-                正在读取原文件…
-              </div>
-            </div>
-          ) : null}
           {originalUnavailable ? (
             <div className="flex flex-wrap items-center gap-3 border-b border-destructive/20 bg-destructive/5 px-5 py-3 text-xs" role="alert">
               <div className="min-w-0 flex-1">
                 <p className="font-semibold text-destructive">原文件暂时无法加载</p>
-                <p className="mt-0.5 truncate text-muted-foreground" title={blob.error.message}>
-                  {chunks.data?.length ? "已切换到可定位的索引文本。" : blob.error.message}
+                <p className="mt-0.5 truncate text-muted-foreground" title={previewError?.message}>
+                  {chunks.data?.length ? "已切换到可定位的索引文本。" : previewError?.message}
                 </p>
               </div>
-              <Button disabled={blob.isFetching} onClick={() => void blob.refetch()} size="sm" variant="outline">
-                {blob.isFetching ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+              <Button onClick={() => { setPreviewError(null); setPreviewAttempt((value) => value + 1); }} size="sm" variant="outline">
+                <RefreshCw className="size-3.5" />
                 重试原文件
               </Button>
             </div>
           ) : null}
-          {blob.data && hasOriginalPreview ? (
-            <FilePreviewCanvas
+          {hasOriginalPreview ? (
+            <FilePreviewContent
+              key={`${file.id}:${previewAttempt}`}
+              fileId={file.id}
+              fileSize={file.size_bytes}
+              onPreviewError={setPreviewError}
+              hideError
               audioDetails={isAudio ? (
               <section className="audio-transcript">
                 <div className="audio-transcript__header">
@@ -995,22 +993,22 @@ export function DocumentLearningPage() {
                 )}
               </section>
               ) : undefined}
-              blob={blob.data}
               filename={file.original_name}
               imageActions={previewKind === "image" ? (
               <div className="flex flex-wrap items-center justify-center gap-2">
                 <Button
-                  onClick={() =>
-                    setEmbeddedImages((current) => [
+                  onClick={() => {
+                    if (file.size_bytes > PREVIEW_BUFFER_LIMIT) { toast.error("图片过大，请缩小图片后再发送给模型。"); return; }
+                    void downloadFile(file.id).then((imageBlob) => setEmbeddedImages((current) => [
                       ...current,
                       {
                         id: createUuid(),
-                        blob: blob.data!,
+                        blob: imageBlob,
                         filename: file.original_name,
                         locator: { file_id: file.id, kind: "primary_image" },
                       },
-                    ])
-                  }
+                    ])).catch((reason: unknown) => toast.error(reason instanceof Error ? reason.message : "无法读取图片"));
+                  }}
                   size="sm"
                   type="button"
                 >

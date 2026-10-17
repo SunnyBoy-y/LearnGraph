@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -10,13 +10,17 @@ import {
 import { AudioLearningPlayer } from "@/components/resources/audio-learning-player";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { resolveFilePreviewKind } from "@/lib/file-preview";
+import { filePreviewBlobKey, resolveFilePreviewKind } from "@/lib/file-preview";
+import { blobFileSource, type SeekableFile } from "@/lib/seekable-file";
+import { EpubViewer } from "./epub-viewer";
+import { RangeTextViewer } from "./range-text-viewer";
 import {
   BlobImage,
   ExcelWorkbookViewer,
   HtmlDocumentViewer,
   PdfDocumentViewer,
   PowerPointViewer,
+  RtfDocumentViewer,
   TextDocumentViewer,
   WordDocumentViewer,
   type EmbeddedImageHandler,
@@ -25,18 +29,24 @@ import {
 } from "@/components/resources/document-previewers";
 
 
-function VideoPreview({ blob, filename }: { blob: Blob; filename: string }) {
+function VideoPreview({ blob, url, filename }: { blob?: Blob; url?: string; filename: string }) {
   const [source, setSource] = useState("");
+  const [error, setError] = useState(false);
   useEffect(() => {
-    const url = URL.createObjectURL(blob);
-    setSource(url);
-    return () => URL.revokeObjectURL(url);
-  }, [blob]);
+    setError(false);
+    if (url) { setSource(url); return; }
+    if (!blob) return;
+    const objectUrl = URL.createObjectURL(blob);
+    setSource(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [blob, url]);
   if (!source) return null;
+  if (error) return <p className="p-6 text-sm text-destructive" role="alert">当前浏览器无法解码此视频，请下载后使用本地播放器查看。</p>;
   return (
     <video
       className="max-h-[calc(100svh-12rem)] w-full bg-black"
       controls
+      onError={() => setError(true)}
       playsInline
       preload="metadata"
       src={source}
@@ -48,7 +58,9 @@ function VideoPreview({ blob, filename }: { blob: Blob; filename: string }) {
 }
 
 export interface FilePreviewCanvasProps {
-  blob: Blob;
+  blob?: Blob;
+  source?: SeekableFile;
+  mediaUrl?: string;
   filename: string;
   mimeType?: string;
   className?: string;
@@ -62,10 +74,18 @@ export interface FilePreviewCanvasProps {
   onPdfPageChange?: (page: number) => void;
 }
 
-export function FilePreviewCanvas({
+export function FilePreviewCanvas(props: FilePreviewCanvasProps) {
+  // A new document must not inherit page, password, error or zoom state.
+  const documentKey = `${props.source ? filePreviewBlobKey(props.source) : props.blob ? filePreviewBlobKey(props.blob) : props.mediaUrl ?? "empty"}:${props.filename}:${props.mimeType ?? ""}`;
+  return <FilePreviewDocument key={documentKey} {...props} />;
+}
+
+function FilePreviewDocument({
   blob,
+  source,
+  mediaUrl,
   filename,
-  mimeType = blob.type,
+  mimeType = blob?.type ?? "",
   className,
   onEmbeddedImage,
   onTextSelection,
@@ -76,6 +96,7 @@ export function FilePreviewCanvas({
   onPdfPageChange,
 }: FilePreviewCanvasProps) {
   const kind = resolveFilePreviewKind(filename, mimeType);
+  const seekable = useMemo(() => source ?? (blob ? blobFileSource(blob) : undefined), [source, blob]);
   const [internalPageNumber, setInternalPageNumber] = useState(1);
   const [pageCount, setPageCount] = useState(1);
   const [scale, setScale] = useState(1);
@@ -120,6 +141,7 @@ export function FilePreviewCanvas({
           </div>
           <PdfDocumentViewer
             blob={blob}
+            source={seekable}
             onDocument={(pages) => {
               setPageCount(pages);
               setPageNumber((page) => Math.min(page, pages));
@@ -130,27 +152,33 @@ export function FilePreviewCanvas({
             theme={pdfTheme}
           />
         </>
-      ) : kind === "word" ? (
+      ) : kind === "epub" && seekable ? (
+        <EpubViewer source={seekable} filename={filename} />
+      ) : kind === "word" && blob ? (
         <WordDocumentViewer blob={blob} onEmbeddedImage={onEmbeddedImage} onTextSelection={onTextSelection} />
-      ) : kind === "powerpoint" ? (
+      ) : kind === "rtf" && blob ? (
+        <RtfDocumentViewer blob={blob} filename={filename} />
+      ) : kind === "powerpoint" && blob ? (
         <PowerPointViewer blob={blob} onEmbeddedImage={onEmbeddedImage} onTextSelection={onTextSelection} />
-      ) : kind === "spreadsheet" ? (
-        <ExcelWorkbookViewer blob={blob} onTextSelection={onTextSelection} />
+      ) : kind === "spreadsheet" && blob ? (
+        <ExcelWorkbookViewer blob={blob} filename={filename} mimeType={mimeType} onTextSelection={onTextSelection} />
       ) : kind === "audio" ? (
         <div className="audio-document-workspace">
-          <AudioLearningPlayer blob={blob} filename={filename} />
+          <AudioLearningPlayer blob={blob} url={mediaUrl} filename={filename} />
           {audioDetails}
         </div>
       ) : kind === "video" ? (
-        <VideoPreview blob={blob} filename={filename} />
+        <VideoPreview blob={blob} url={mediaUrl} filename={filename} />
       ) : kind === "image" ? (
         <div className="grid min-h-[36rem] place-items-center gap-4 bg-muted/30 p-8">
-          <BlobImage alt={filename} blob={blob} zoomable={imageZoom} />
+          <BlobImage alt={filename} blob={blob} url={mediaUrl} zoomable={imageZoom} />
           {imageActions}
         </div>
-      ) : kind === "html" ? (
+      ) : kind === "html" && blob ? (
         <HtmlDocumentViewer blob={blob} filename={filename} />
-      ) : kind === "text" ? (
+      ) : kind === "text" && source ? (
+        <RangeTextViewer source={source} />
+      ) : kind === "text" && blob ? (
         <TextDocumentViewer blob={blob} filename={filename} />
       ) : (
         <div className="grid min-h-[36rem] place-items-center p-8 text-center text-sm text-muted-foreground">

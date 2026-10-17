@@ -47,6 +47,7 @@ import {
   thinkingStopIndex,
 } from "@/components/chat/thinking-slider";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
+import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
 import {
   groupPartsForDisplay,
   isReasoningTextPart,
@@ -81,6 +82,7 @@ import {
   setSessionComposerPrefs,
   getSessionComposerPrefs,
   type ResponseMode,
+  type SessionComposerPrefs,
   type ThinkingMode,
 } from "@/lib/session-composer-prefs";
 import { getAgentSandboxReadiness } from "@/api/control";
@@ -122,12 +124,17 @@ export interface PendingDocumentSelection {
 }
 
 
+export type DocumentChatPreferences = Pick<
+  SessionComposerPrefs,
+  "providerId" | "modelId" | "responseMode" | "thinkingMode"
+>;
+
 interface DocumentChatPanelProps {
   autoSubmitSeed?: boolean;
   compact?: boolean;
   embeddedImages?: Array<{ id: string; blob: Blob; filename: string; locator: Record<string, unknown> }>;
   file: FileRecord;
-  onSendToFullChat?: (content: string) => Promise<void> | void;
+  onSendToFullChat?: (content: string, preferences: DocumentChatPreferences) => Promise<void> | void;
   onRemoveEmbeddedImage?: (id: string) => void;
   onClearSelection: () => void;
   onSessionChange: (sessionId: string) => void;
@@ -375,6 +382,7 @@ export function DocumentChatPanel({
   }, [modelOptions]);
 
   useEffect(() => {
+    if (!activeProvider) return;
     setThinkingMode((current) => {
       if (responseMode === "fast" && !thinkingRequired) return "off";
       if (current === "off") {
@@ -386,7 +394,7 @@ export function DocumentChatPanel({
         ? current
         : (thinkingModes[0] ?? "off");
     });
-  }, [responseMode, thinkingModes, thinkingRequired]);
+  }, [activeProvider, responseMode, thinkingModes, thinkingRequired]);
 
   function persistComposerPrefs(
     targetSessionId: string,
@@ -503,7 +511,12 @@ export function DocumentChatPanel({
     if (onSendToFullChat) {
       setStatus("submitted");
       try {
-        await onSendToFullChat(content);
+        await onSendToFullChat(content, {
+          providerId: activeProvider?.id,
+          modelId: selectedModel?.id,
+          responseMode,
+          thinkingMode,
+        });
       } catch (error) {
         setStatus("error");
         toast.error(error instanceof Error ? error.message : "无法打开完整对话");
@@ -873,13 +886,111 @@ export function DocumentChatPanel({
 
   const compactModeLabel = responseMode === "fast"
     ? "快"
-    : thinkingMode === "low"
-      ? "低"
-      : thinkingMode === "high"
-        ? "高"
-        : thinkingMode === "xhigh"
-          ? "极"
-          : "中";
+    : thinkingLabels[thinkingMode];
+
+  // Both document layouts use the same model and thinking controls.
+  const modelMenu = (
+    <DropdownMenu
+      open={modeMenuOpen}
+      onOpenChange={(open) => {
+        setModeMenuOpen(open);
+        if (!open) setModelSearch("");
+      }}
+    >
+      <DropdownMenuTrigger asChild>
+        <button
+          aria-label="选择响应模式、思考力度和模型"
+          className={compact ? "document-chat-compact__mode" : "chat-mode-chip"}
+          // 回复途中同样允许切换：本次回答沿用发送时锁定的模型，改动只对
+          // 下一条消息生效。
+          disabled={!modelProviders.length}
+          title={selectedModel ? `${selectedModel.id} · ${thinkingLabels[thinkingMode]}` : "响应模式与模型"}
+          type="button"
+        >
+          <span>
+            {compact
+              ? compactModeLabel
+              : modeMenuOpen
+                ? "思考强度"
+                : responseMode === "fast"
+                  ? "极速"
+                  : thinkingLabels[thinkingMode]}
+          </span>
+          <ChevronDown aria-hidden="true" className="size-3.5" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" side={compact ? "top" : "bottom"} className="w-64" collisionPadding={12}>
+        <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
+        <div className="px-2 py-1">
+          <ThinkingSlider
+            onChange={handleThinkingSliderChange}
+            value={thinkingStopIndex(responseMode, thinkingMode)}
+          />
+        </div>
+        {!thinkingModes.length ? (
+          <p className="px-2 pb-1 text-[10px] text-muted-foreground">
+            当前模型未声明推理能力，按服务商默认执行。
+          </p>
+        ) : null}
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>模型</DropdownMenuLabel>
+        <div className="relative px-1 pb-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            aria-label="搜索模型"
+            className="h-8 pl-8 font-mono text-xs"
+            onChange={(event) => setModelSearch(event.target.value)}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+            placeholder="搜索模型名称或 Provider…"
+            value={modelSearch}
+          />
+        </div>
+        <div className="max-h-[min(50vh,20rem)] overflow-y-auto">
+          {filteredModelChoices.length ? (
+            <DropdownMenuRadioGroup
+              onValueChange={(value) => {
+                const choice = parseModelChoiceValue(value);
+                if (!choice) return;
+                setSelectedProviderId(choice.providerId);
+                setSelectedModelId(choice.modelId);
+                if (sessionId) {
+                  persistComposerPrefs(sessionId, {
+                    providerId: choice.providerId,
+                    modelId: choice.modelId,
+                  });
+                }
+              }}
+              value={
+                activeProvider && selectedModel
+                  ? modelChoiceValue(activeProvider.id, selectedModel.id)
+                  : ""
+              }
+            >
+              {filteredModelChoices.map(({ provider, model }) => (
+                <DropdownMenuRadioItem
+                  key={`${provider.id}:${model.id}`}
+                  value={modelChoiceValue(provider.id, model.id)}
+                >
+                  <span className="flex min-w-0 flex-col">
+                    <span className="truncate font-mono">{model.id}</span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {provider.display_name} ·{" "}
+                      {modelProtocolLabel(provider.provider_type)}
+                    </span>
+                  </span>
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          ) : (
+            <DropdownMenuItem disabled>
+              {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
+            </DropdownMenuItem>
+          )}
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 
   if (compact) {
     return (
@@ -913,15 +1024,7 @@ export function DocumentChatPanel({
             rows={1}
             value={draft}
           />
-          <button
-            aria-label="选择模式"
-            className="document-chat-compact__mode"
-            onClick={() => toast.message(`当前响应模式：${compactModeLabel}`)}
-            type="button"
-          >
-            <span>{compactModeLabel}</span>
-            <ChevronDown aria-hidden="true" className="size-3.5" />
-          </button>
+          {modelMenu}
           {draft.trim() ? (
             <button
               aria-label="发送文档问题"
@@ -956,104 +1059,7 @@ export function DocumentChatPanel({
             {activeProvider ? `${activeProvider.display_name} · 持久会话` : "真实模型未配置"}
           </p>
         </div>
-        <DropdownMenu
-          open={modeMenuOpen}
-          onOpenChange={(open) => {
-            setModeMenuOpen(open);
-            if (!open) setModelSearch("");
-          }}
-        >
-          <DropdownMenuTrigger asChild>
-            <button
-              aria-label="选择响应模式、思考力度和模型"
-              className="chat-mode-chip"
-              // 回复途中同样允许切换：本次回答沿用发送时锁定的模型，改动只对
-              // 下一条消息生效。
-              disabled={!modelProviders.length}
-              title="响应模式与模型"
-              type="button"
-            >
-              <span>
-                {modeMenuOpen
-                  ? "思考强度"
-                  : responseMode === "fast"
-                    ? "极速"
-                    : thinkingLabels[thinkingMode]}
-              </span>
-              <ChevronDown aria-hidden="true" className="size-3.5" />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-64" collisionPadding={12}>
-            <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
-            <div className="px-2 py-1">
-              <ThinkingSlider
-                onChange={handleThinkingSliderChange}
-                value={thinkingStopIndex(responseMode, thinkingMode)}
-              />
-            </div>
-            {!thinkingModes.length ? (
-              <p className="px-2 pb-1 text-[10px] text-muted-foreground">
-                当前模型未声明推理能力，按服务商默认执行。
-              </p>
-            ) : null}
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>模型</DropdownMenuLabel>
-            <div className="relative px-1 pb-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                aria-label="搜索模型"
-                className="h-8 pl-8 font-mono text-xs"
-                onChange={(event) => setModelSearch(event.target.value)}
-                onKeyDown={(event) => event.stopPropagation()}
-                onPointerDown={(event) => event.stopPropagation()}
-                placeholder="搜索模型名称或 Provider…"
-                value={modelSearch}
-              />
-            </div>
-            <div className="max-h-[min(50vh,20rem)] overflow-y-auto">
-              {filteredModelChoices.length ? (
-                <DropdownMenuRadioGroup
-                  onValueChange={(value) => {
-                    const choice = parseModelChoiceValue(value);
-                    if (!choice) return;
-                    setSelectedProviderId(choice.providerId);
-                    setSelectedModelId(choice.modelId);
-                    if (sessionId) {
-                      persistComposerPrefs(sessionId, {
-                        providerId: choice.providerId,
-                        modelId: choice.modelId,
-                      });
-                    }
-                  }}
-                  value={
-                    activeProvider && selectedModel
-                      ? modelChoiceValue(activeProvider.id, selectedModel.id)
-                      : ""
-                  }
-                >
-                  {filteredModelChoices.map(({ provider, model }) => (
-                    <DropdownMenuRadioItem
-                      key={`${provider.id}:${model.id}`}
-                      value={modelChoiceValue(provider.id, model.id)}
-                    >
-                      <span className="flex min-w-0 flex-col">
-                        <span className="truncate font-mono">{model.id}</span>
-                        <span className="text-[10px] text-muted-foreground">
-                          {provider.display_name} ·{" "}
-                          {modelProtocolLabel(provider.provider_type)}
-                        </span>
-                      </span>
-                    </DropdownMenuRadioItem>
-                  ))}
-                </DropdownMenuRadioGroup>
-              ) : (
-                <DropdownMenuItem disabled>
-                  {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
-                </DropdownMenuItem>
-              )}
-            </div>
-          </DropdownMenuContent>
-        </DropdownMenu>
+        {modelMenu}
         <Button
           aria-label="在完整会话画布中打开"
           disabled={busy}
@@ -1214,6 +1220,7 @@ export function DocumentChatPanel({
                     ),
                   )}
                 </MessageContent>
+                <StreamStatsBadge messageId={message.id} status={message.status} providerTrace={message.provider_trace} />
               </AiMessage>
             );
           })}

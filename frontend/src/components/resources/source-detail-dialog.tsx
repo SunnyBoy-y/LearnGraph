@@ -109,7 +109,6 @@ export function SourceDetailDialog({
           </dl>
           <p className="mt-3 break-all font-mono text-[11px] text-muted-foreground">内容哈希：{record.content_hash}</p>
           <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">原始 URL：{record.source_url}</p>
-          {record.research_job_id ? <p className="mt-1 font-mono text-[11px] text-muted-foreground">研究任务：{record.research_job_id}</p> : null}
           <details className="mt-4 rounded-lg border bg-muted/20 p-3">
             <summary className="cursor-pointer text-sm font-medium">查看已持久化的网页正文（{record.content.length} 个字符）</summary>
             <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{record.content}</p>

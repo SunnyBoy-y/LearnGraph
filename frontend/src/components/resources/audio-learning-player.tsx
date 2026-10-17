@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { LoaderCircle, Pause, Play, RotateCcw, Volume2 } from "lucide-react";
+import { Pause, Play, RotateCcw, Volume2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
@@ -12,12 +12,13 @@ function clock(value: number) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: string }) {
+export function AudioLearningPlayer({ blob, url, filename }: { blob?: Blob; url?: string; filename: string }) {
   const playerRef = useRef<HTMLElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const [source, setSource] = useState("");
   const [peaks, setPeaks] = useState<number[]>([]);
   const [decodeError, setDecodeError] = useState("");
+  const [playbackError, setPlaybackError] = useState("");
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -26,15 +27,19 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
   const { paused: systemPaused, toggle: toggleSystemPause } = usePreviewPause(playerRef);
 
   useEffect(() => {
-    const url = URL.createObjectURL(blob);
-    setSource(url);
-    return () => URL.revokeObjectURL(url);
-  }, [blob]);
+    setPlaybackError("");
+    if (url) { setSource(url); return; }
+    if (!blob) return;
+    const objectUrl = URL.createObjectURL(blob);
+    setSource(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [blob, url]);
 
   useEffect(() => {
     let cancelled = false;
     setPeaks([]);
     setDecodeError("");
+    if (!blob || blob.size > 4 * 1024 * 1024 || !duration || duration > 180) return;
     void blob.arrayBuffer().then(async (data) => {
       const context = new AudioContext();
       try {
@@ -60,7 +65,7 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
       }
     });
     return () => { cancelled = true; };
-  }, [blob]);
+  }, [blob, duration]);
 
   const progress = duration ? currentTime / duration : 0;
   const activeBars = useMemo(() => Math.floor(progress * peaks.length), [peaks.length, progress]);
@@ -75,6 +80,7 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
   return (
     <section className="audio-learning-player" aria-label={`音频播放器 ${filename}`} ref={playerRef}>
       <audio
+        onError={() => setPlaybackError("当前浏览器无法解码此音频，请下载后使用本地播放器查看。")}
         onDurationChange={(event) => setDuration(event.currentTarget.duration || 0)}
         onEnded={() => setPlaying(false)}
         onPause={() => setPlaying(false)}
@@ -107,7 +113,7 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
             key={index}
             style={{ height: `${Math.max(8, peak * 82)}%` }}
           />
-        )) : <LoaderCircle className="size-5 animate-spin" />}
+        )) : <span className="text-xs text-muted-foreground">使用时间轴播放</span>}
       </button>
       {!peaks.length ? (
         <Slider
@@ -119,6 +125,7 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
         />
       ) : null}
       {decodeError ? <p className="audio-learning-player__notice">{decodeError}</p> : null}
+      {playbackError ? <p className="audio-learning-player__notice" role="alert">{playbackError}</p> : null}
       <div className="audio-learning-player__controls">
         <Button
           aria-label={playing ? "暂停" : "播放"}
@@ -128,7 +135,7 @@ export function AudioLearningPlayer({ blob, filename }: { blob: Blob; filename: 
             if (systemPaused) {
               toggleSystemPause();
             } else if (audio.paused) {
-              void audio.play();
+              void audio.play().catch(() => setPlaybackError("音频播放失败，请检查文件格式或重试。"));
             } else {
               audio.pause();
             }

@@ -1,3 +1,4 @@
+import { readByteRange } from "@/lib/byte-range"
 import type { ApiErrorEnvelope, ValidationIssue } from '@/types/common'
 
 import { authStore } from './auth-store'
@@ -277,9 +278,46 @@ export class ApiClient {
     return this.request<TResponse>('GET', path, options)
   }
 
-  async getBlob(path: string, options: ApiRequestOptions = {}): Promise<Blob> {
+  async getBlob(path: string, options: ApiRequestOptions = {}, maxBytes?: number): Promise<Blob> {
     const response = await this.fetchResponse('GET', path, options)
+    if (maxBytes === undefined) return response.blob()
+    if (Number(response.headers.get('Content-Length')) > maxBytes) {
+      await response.body?.cancel()
+      throw new Error('文件超过直接预览限制，请刷新后使用分段阅读。')
+    }
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error('浏览器不支持流式文件读取')
+    const chunks: Uint8Array<ArrayBuffer>[] = []
+    let size = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        size += value.length
+        if (size > maxBytes) throw new Error('文件超过直接预览限制，请刷新后使用分段阅读。')
+        chunks.push(value as Uint8Array<ArrayBuffer>)
+      }
+      return new Blob(chunks, { type: response.headers.get('Content-Type') ?? '' })
+    } finally {
+      await reader.cancel()
+      reader.releaseLock()
+    }
+  }
+
+  async postBlob<TBody>(path: string, body: TBody, options: ApiRequestOptions = {}): Promise<Blob> {
+    const response = await this.fetchResponse('POST', path, options, { value: body, kind: 'json' })
     return response.blob()
+  }
+
+  /** Read a bounded range, refusing servers that silently return the entire file. */
+  async getByteRange(path: string, start: number, end: number, options: ApiRequestOptions = {}) {
+    const headers = new Headers(options.headers)
+    headers.set('Range', `bytes=${start}-${end - 1}`)
+    const response = await this.fetchResponse('GET', path, {
+      ...options,
+      headers,
+    })
+    return readByteRange(response, start, end)
   }
 
   /**

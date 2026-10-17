@@ -1,7 +1,4 @@
-import { nativeMoney } from "@/lib/money";
-import { useAuth } from "@/features/auth/auth-context-value";
-import { authStore } from "@/api/auth-store";
-import type { BillingCurrency } from "@/types/usage";
+import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
 import {
   useCallback,
   useEffect,
@@ -14,7 +11,6 @@ import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
-  ArrowRight,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -34,21 +30,17 @@ import {
   MoreHorizontal,
   RefreshCcw,
   Search,
-  Sparkles,
   Trash2,
   UploadCloud,
 } from "lucide-react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import {
-  approveResearch,
-  cancelResearch,
-  createResearchJob,
   deleteFileConfirmed,
   deleteFilesBatch,
   deleteSourceConfirmed,
-  downloadFile,
+  fileStreamUrl,
   fetchSource,
   getFileBatchDeleteImpact,
   getFileDeleteImpact,
@@ -56,12 +48,9 @@ import {
   getSourceDeleteImpact,
   listFileParserCapabilities,
   listFiles,
-  listResearchEvents,
-  listResearchJobs,
   listSourceRecords,
   parseFile,
   pollParseJob,
-  planResearch,
   searchWeb,
   uploadFile,
 } from "@/api";
@@ -81,7 +70,6 @@ import {
   SectionHeading,
   StatePill,
   Surface,
-  Timeline,
 } from "@/components/shared/page-elements";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -105,8 +93,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { ResearchPlan, SearchResponse } from "@/types/research";
-import type { SearchResult } from "@/types/research";
+import type { SearchResponse } from "@/types/search";
+import type { SearchResult } from "@/types/search";
 import type { FileParserCapability, FileRecord } from "@/types/files";
 import type { SourceRecord } from "@/types/workflow";
 
@@ -224,7 +212,7 @@ function fileCategory(file: FileRecord): FileCategory {
   if (["ppt", "odp"].includes(ext ?? "")) return "powerpoint";
   if (["doc", "odt", "rtf"].includes(ext ?? "")) return "document";
   const kind = resolveFilePreviewKind(file.original_name, file.mime_type);
-  if (["word", "text", "html"].includes(kind)) return "document";
+  if (["word", "rtf", "text", "html"].includes(kind)) return "document";
   if (["image", "spreadsheet", "powerpoint", "pdf", "audio", "video"].includes(kind)) return kind as FileCategory;
   return "other";
 }
@@ -242,23 +230,12 @@ function FileIcon({ file, large = false }: { file: FileRecord; large?: boolean }
 }
 
 function FileThumbnail({ file, large = false }: { file: FileRecord; large?: boolean }) {
-  const [url, setUrl] = useState<string>();
-  const [failed, setFailed] = useState(false);
-  useEffect(() => {
-    if (fileCategory(file) !== "image") return;
-    let active = true;
-    let objectUrl: string | undefined;
-    setFailed(false);
-    void downloadFile(file.id).then((blob) => {
-      if (!active) return;
-      objectUrl = URL.createObjectURL(blob);
-      setUrl(objectUrl);
-    }).catch(() => setFailed(true));
-    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [file.id, file.mime_type, file.original_name]);
   const isImage = fileCategory(file) === "image";
+  const { source: url, failed: streamFailed } = useFileStreamUrl(isImage ? file.id : undefined);
+  const [failedId, setFailedId] = useState("");
+  const failed = failedId === file.id || streamFailed;
   return <span className={`flex shrink-0 items-center justify-center overflow-hidden ${large ? `w-full rounded-xl bg-muted/30 ${isImage ? "min-h-40" : "h-40"}` : "size-9 rounded-lg border bg-background"}`}>
-    {url && !failed ? <img alt={file.original_name} className={large ? "h-auto max-h-[28rem] w-full object-contain" : "size-full object-cover"} onError={() => setFailed(true)} src={url} /> : <FileIcon file={file} large={large} />}
+    {url && !failed ? <img alt={file.original_name} className={large ? "h-auto max-h-[28rem] w-full object-contain" : "size-full object-cover"} onError={() => setFailedId(file.id)} src={url} /> : <FileIcon file={file} large={large} />}
   </span>;
 }
 
@@ -379,18 +356,13 @@ export function SourcesPage() {
       ) {
         return;
       }
-      const blob = await downloadFile(file.id);
-      const url = URL.createObjectURL(blob);
-      try {
-        const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.download = file.original_name || "download";
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-      } finally {
-        URL.revokeObjectURL(url);
-      }
+      const url = await fileStreamUrl(file.id);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = file.original_name || "download";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
       return file;
     },
     onError: (error) => toast.error(error.message),
@@ -816,7 +788,7 @@ export function SourcesPage() {
         </div>
         <div
           aria-label="资料状态筛选"
-          className="-mx-1 flex max-w-full gap-1 overflow-x-auto px-1 pb-0.5"
+          className="no-scrollbar -mx-1 flex max-w-full gap-1 overflow-x-auto overflow-y-hidden px-1 pb-0.5"
           role="group"
         >
           {fileFilters.map((filter) => (
@@ -1441,7 +1413,7 @@ export function SearchPage() {
   return (
     <PageFrame>
       <PageIntro
-        description="SearchProvider 负责秒级查询，FetchProvider 负责正文获取；Deep Research 是独立的分钟级任务。"
+        description="SearchProvider 负责秒级查询，FetchProvider 负责正文获取。"
         eyebrow="Search & fetch"
         title="联网搜索与网页获取"
       />
@@ -1527,8 +1499,8 @@ export function SearchPage() {
       </Surface>
       <Surface className="space-y-4 p-5">
         <SectionHeading
-          description="工作区级来源限制会同时用于普通联网搜索与 Deep Research；请求级域名只能进一步缩小范围。"
-          title="搜索与 Deep Research 来源白名单"
+          description="工作区级来源限制会同时用于普通联网搜索；请求级域名只能进一步缩小范围。"
+          title="搜索来源白名单"
         />
         <ResearchDomainAllowlistEditor />
       </Surface>
@@ -1598,20 +1570,6 @@ export function SearchPage() {
           ) : null}
         </div>
       </Surface>
-      <Surface className="p-5">
-        <SectionHeading title="搜索不是路线负责人" />
-        <p className="mt-3 text-sm leading-6 text-muted-foreground">
-          搜索和抓取只补充资料与证据。需要多来源综合时创建 Deep Research
-          任务；其结果仍回到图谱或路线草稿审核。
-        </p>
-        <Button asChild className="mt-4" size="sm" variant="outline">
-          <Link to={`/w/${workspaceId}/research/tasks/new`}>
-            <Sparkles className="size-4" />
-            创建研究任务
-            <ArrowRight className="size-4" />
-          </Link>
-        </Button>
-      </Surface>
       {saved ? (
         <SourceAssociationDialog
           onOpenChange={(open) => {
@@ -1622,310 +1580,6 @@ export function SearchPage() {
           source={saved}
         />
       ) : null}
-    </PageFrame>
-  );
-}
-
-function packList(pack: Record<string, unknown>, key: string): string[] {
-  const value = pack[key];
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
-}
-
-export function ResearchNewTaskPage() {
-  const { workspaceId = "" } = useParams();
-  const navigate = useNavigate();
-  const [question, setQuestion] = useState("");
-  const [budget, setBudget] = useState("0");
-  const [currency, setCurrency] = useState<BillingCurrency>("USD");
-  const [plan, setPlan] = useState<ResearchPlan | null>(null);
-  const { userId } = useAuth();
-  useEffect(() => { setPlan(null); setQuestion(""); setBudget("0"); }, [workspaceId, userId]);
-  const queryClient = useQueryClient();
-  type Draft = { workspaceId: string; userId: string; question: string; budget: string; currency: BillingCurrency };
-  const captureDraft = (): Draft => ({ workspaceId, userId, question, budget, currency });
-  const isCurrentDraft = (draft: Draft) => {
-    const session = authStore.getSession();
-    return session?.workspaceId === draft.workspaceId && (session.userId ?? session.username) === draft.userId;
-  };
-  const preview = useMutation({
-    mutationFn: (draft: Draft) => planResearch({ question: draft.question, budget_amount: draft.budget, currency: draft.currency, source_scope: [] }, draft.workspaceId),
-    onSuccess: (value, draft) => { if (isCurrentDraft(draft) && draft.question === question && draft.budget === budget && draft.currency === currency) setPlan(value); },
-    onError: (error, draft) => { if (isCurrentDraft(draft)) toast.error(error.message); },
-  });
-  const create = useMutation({
-    mutationFn: (draft: Draft) =>
-      createResearchJob({ question: draft.question, budget_amount: draft.budget, currency: draft.currency, source_scope: [] }, draft.workspaceId),
-    onSuccess: (created, draft) => {
-      if (!isCurrentDraft(draft) || created.workspace_id !== draft.workspaceId) return;
-      setPlan(null);
-      toast.success(
-        created.status === "awaiting_approval"
-          ? "研究任务等待预算确认"
-          : "研究任务已创建",
-      );
-      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(created.workspace_id, "research") });
-      navigate(
-        `/w/${encodeURIComponent(workspaceId)}/research/tasks/${encodeURIComponent(created.id)}`,
-      );
-    },
-    onError: (error, draft) => { if (isCurrentDraft(draft)) toast.error(error.message); },
-  });
-  return (
-    <PageFrame>
-      <PageIntro
-        actions={
-          <div className="flex gap-2">
-            <Button
-              disabled={preview.isPending || !question.trim()}
-              onClick={() => preview.mutate(captureDraft())}
-              variant="outline"
-            >
-              预估计划
-            </Button>
-            <Button
-              disabled={create.isPending || !question.trim()}
-              onClick={() => create.mutate(captureDraft())}
-            >
-              <Sparkles className="size-4" />
-              {create.isPending ? "创建中…" : "创建研究任务"}
-            </Button>
-          </div>
-        }
-        description="研究产物是可审核证据包，不会直接发布图谱、路线或授予成长星级。"
-        eyebrow="Deep Research"
-        title="新建研究任务"
-      />
-      <Surface className="p-5">
-        <SectionHeading
-          description="先预估 Provider、费用和审批要求，再创建可追踪任务。"
-          title="研究计划"
-        />
-        <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_10rem_auto]">
-          <div>
-            <Label htmlFor="research-question">研究问题</Label>
-            <Input
-              className="mt-2"
-              id="research-question"
-              onChange={(event) => { setQuestion(event.target.value); setPlan(null); }}
-              placeholder="输入需要多来源综合的问题"
-              value={question}
-            />
-          </div>
-          <div>
-            <Label htmlFor="research-budget">预算（原币）</Label>
-            <select aria-label="研究预算币种" value={currency} onChange={(event) => { setCurrency(event.target.value as BillingCurrency); setPlan(null); }} className="mt-2 h-9 rounded-md border bg-background"><option value="USD">美元 USD</option><option value="CNY">人民币 CNY</option></select>
-            <Input
-              className="mt-2"
-              id="research-budget"
-              min="0"
-              onChange={(event) => { setBudget(event.target.value); setPlan(null); }}
-              step="0.01"
-              type="number"
-              value={budget}
-            />
-          </div>
-          <div className="flex items-end">
-            <Badge className="h-9 px-3" variant="secondary">
-              {plan
-                ? `${plan.provider_id} · 预计 ${nativeMoney(plan.estimated_cost_amount, plan.currency)}`
-                : "尚未预估"}
-            </Badge>
-          </div>
-        </div>
-      </Surface>
-      <div className="grid gap-5 lg:grid-cols-[.85fr_1.15fr]">
-        <Surface className="p-5">
-          <SectionHeading title="实时任务流" />
-          <p className="py-8 text-center text-sm text-muted-foreground">
-            创建任务后，这里会显示服务端事件流。
-          </p>
-        </Surface>
-        <Surface className="p-5">
-          <SectionHeading title="证据包摘要" />
-          <p className="py-10 text-center text-sm text-muted-foreground">
-            尚无研究产物。
-          </p>
-          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/55 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-200">
-            <strong>审核边界：</strong>证据包
-            只进入候选审核，不会直接改写图谱或路线。
-          </div>
-        </Surface>
-      </div>
-    </PageFrame>
-  );
-}
-
-export function ResearchPage() {
-  const { taskId, workspaceId = "" } = useParams();
-  const queryClient = useQueryClient();
-  const { userId, effectivePermissions } = useAuth();
-  const canWrite = effectivePermissions.includes("workspace.write");
-  const jobs = useQuery({ queryKey: workspaceQueryKey(workspaceId, "research", "native-v2", userId), queryFn: ({ signal }) => listResearchJobs(workspaceId, signal) });
-  const job = taskId
-    ? jobs.data?.find((item) => item.id === taskId)
-    : undefined;
-  const events = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "research-events", "native-v2", userId, job?.id),
-    queryFn: ({ signal }) => listResearchEvents(job!.id, workspaceId, signal),
-    enabled: Boolean(job),
-  });
-  const approve = useMutation({
-    mutationFn: (capture: { id: string; quoteId?: string; workspaceId: string }) => approveResearch(capture.id, capture.quoteId, capture.workspaceId),
-    onSuccess: (updated) => {
-      toast.success("预算已确认，研究任务已启动");
-      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(updated.workspace_id, "research") });
-      void queryClient.invalidateQueries({
-        queryKey: workspaceQueryKey(updated.workspace_id, "research-events"),
-      });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  const cancel = useMutation({
-    mutationFn: (capture: { id: string; workspaceId: string }) => cancelResearch(capture.id, capture.workspaceId),
-    onSuccess: (updated) => {
-      toast.success("已提交取消");
-      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(updated.workspace_id, "research") });
-      void queryClient.invalidateQueries({
-        queryKey: workspaceQueryKey(updated.workspace_id, "research-events"),
-      });
-    },
-    onError: (error) => toast.error(error.message),
-  });
-  if (jobs.isPending)
-    return (
-      <PageFrame>
-        <LoadingState />
-      </PageFrame>
-    );
-  if (jobs.isError)
-    return (
-      <PageFrame>
-        <ErrorState message={jobs.error.message} />
-      </PageFrame>
-    );
-  if (!job)
-    return (
-      <PageFrame>
-        <ErrorState message="研究任务不存在或无权访问。" />
-      </PageFrame>
-    );
-  const pack = (job.evidence_pack ?? {}) as Record<string, unknown>;
-  const timeline = (events.data ?? []).map((event) => ({
-    time: new Date(event.created_at).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    }),
-    title: event.event_type,
-    detail: JSON.stringify(event.payload),
-    status: "done" as const,
-  }));
-  const canCancel = ![
-    "completed",
-    "completed_local_demo",
-    "completed_source_collection",
-    "failed",
-    "cancelled",
-    "rejected",
-  ].includes(job.status);
-  return (
-    <PageFrame>
-      <PageIntro
-        actions={
-          <Button asChild size="sm" variant="outline">
-            <Link to={`/w/${encodeURIComponent(workspaceId)}/research/tasks/new`}>
-              <Sparkles className="size-4" />
-              新建任务
-            </Link>
-          </Button>
-        }
-        description="研究产物是可审核证据包，不会直接发布图谱、路线或授予成长星级。"
-        eyebrow="Deep Research"
-        title="研究任务详情"
-      />
-      <div className="grid gap-5 lg:grid-cols-[.85fr_1.15fr]">
-        <Surface className="p-5">
-          <SectionHeading
-            action={
-              canCancel ? (
-                <Button
-                  disabled={cancel.isPending || !canWrite}
-                  onClick={() => cancel.mutate({ id: job.id, workspaceId })}
-                  size="xs"
-                  variant="outline"
-                >
-                  取消任务
-                </Button>
-              ) : null
-            }
-            title="实时任务流"
-          />
-          {job.status === "awaiting_approval" ? (
-            <div className="mt-4 rounded-xl border border-amber-200 p-4">
-              <p className="text-sm">
-                预计费用 {nativeMoney(job.estimated_cost_amount, job.currency)}
-                ；预算 {nativeMoney(job.budget_amount, job.currency)}，批准后才会调用远程 Provider。
-              </p>
-              <Button
-                className="mt-3"
-                disabled={approve.isPending || !canWrite || job.billing_snapshot?.schema_version !== 2}
-                onClick={() => approve.mutate({ id: job.id, quoteId: String(job.billing_snapshot?.quote_id ?? ""), workspaceId })}
-                size="sm"
-              >
-                确认预算并启动
-              </Button>
-              {job.billing_snapshot?.schema_version !== 2 ? <p className="mt-2 text-sm">旧报价已过期，请用原币预算重新创建研究计划。</p> : null}
-            </div>
-          ) : null}
-          <div className="mt-5">
-            {timeline.length ? (
-              <Timeline items={timeline} />
-            ) : (
-              <p className="py-8 text-center text-sm text-muted-foreground">
-                创建任务后，这里会显示服务端事件流。
-              </p>
-            )}
-          </div>
-        </Surface>
-        <Surface className="p-5">
-          <SectionHeading action={<StatePill status={job.status} />} title="证据包摘要" />
-          <p className="mt-3 text-sm">实际费用 {nativeMoney(job.actual_cost_amount, job.currency)}</p>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            {[
-              [
-                "事实/主张",
-                packList(pack, "facts")[0] ??
-                  packList(pack, "claims")[0] ??
-                  "暂无",
-              ],
-              ["候选概念", packList(pack, "candidate_concepts")[0] ?? "暂无"],
-              ["冲突", packList(pack, "conflicts")[0] ?? "暂无"],
-              ["覆盖缺口", packList(pack, "coverage_gaps")[0] ?? "暂无"],
-            ].map(([title, text], index) => (
-              <div className="rounded-xl border p-4" key={title}>
-                <div className="flex items-center gap-2">
-                  <span
-                    className={
-                      index === 3
-                        ? "size-2 rounded-full bg-amber-500"
-                        : "size-2 rounded-full bg-primary"
-                    }
-                  />
-                  <p className="text-sm font-semibold">{title}</p>
-                </div>
-                <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                  {text}
-                </p>
-              </div>
-            ))}
-          </div>
-          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/55 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/25 dark:text-amber-200">
-            <strong>审核边界：</strong>证据包
-            只进入候选审核，不会直接改写图谱或路线。
-          </div>
-        </Surface>
-      </div>
     </PageFrame>
   );
 }

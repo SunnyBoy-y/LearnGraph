@@ -33,6 +33,19 @@ export function listFiles(options?: {
   return apiClient.get<FileRecord[]>(query ? `/files?${query}` : "/files");
 }
 
+export function getFile(fileId: string, options: ApiRequestOptions = {}): Promise<FileRecord> {
+  return apiClient.get<FileRecord>(`/files/${encodeURIComponent(fileId)}`, options);
+}
+
+export function readFileRange(fileId: string, start: number, end: number, options: ApiRequestOptions = {}, officePreview = false) {
+  return apiClient.getByteRange(`/files/${encodeURIComponent(fileId)}/${officePreview ? "preview.pdf" : "content"}`, start, end, options);
+}
+
+export async function fileStreamUrl(fileId: string, options: ApiRequestOptions = {}) {
+  const { ticket } = await apiClient.get<{ ticket: string }>(`/files/${encodeURIComponent(fileId)}/stream-ticket`, options);
+  return `${apiClient.baseUrl.replace(/\/$/, "")}/files/${encodeURIComponent(fileId)}/stream?ticket=${encodeURIComponent(ticket)}`;
+}
+
 /** Exact name + SHA-256 match for chat upload reuse (no re-store). */
 export function lookupFile(options: {
   name: string;
@@ -172,30 +185,21 @@ export function listFileReferences(fileId: string): Promise<FileReference[]> {
   );
 }
 
-export function downloadFile(fileId: string): Promise<Blob> {
-  return apiClient.getBlob(`/files/${encodeURIComponent(fileId)}/content`)
+export function downloadFile(fileId: string, options: ApiRequestOptions = {}, maxBytes?: number): Promise<Blob> {
+  return apiClient.getBlob(`/files/${encodeURIComponent(fileId)}/content`, options, maxBytes)
 }
 
-/** Max bytes to load into browser memory for in-app preview (16 MiB). */
-const PREVIEW_MAX_BYTES = 16 * 1024 * 1024;
-
 /**
- * Download a file for preview, capping at PREVIEW_MAX_BYTES via Range header
- * when the file is large. This prevents large files (e.g. 200 MiB PDFs) from
- * exhausting browser memory on mobile / low-end devices.
+ * Blob-based readers need the complete container, including its trailing
+ * directory/xref. A byte prefix is not a valid preview of a large document.
+ * Keep this entry point for callers that also have file-size metadata.
  */
 export function downloadFileForPreview(
   fileId: string,
-  fileSizeBytes: number,
+  _fileSizeBytes: number,
+  options: ApiRequestOptions = {},
 ): Promise<Blob> {
-  if (fileSizeBytes <= PREVIEW_MAX_BYTES) {
-    return downloadFile(fileId);
-  }
-  return apiClient.getBlobRange(
-    `/files/${encodeURIComponent(fileId)}/content`,
-    0,
-    PREVIEW_MAX_BYTES - 1,
-  );
+  return downloadFile(fileId, options);
 }
 
 export function listAudioTranscriptions(fileId: string): Promise<AudioTranscription[]> {

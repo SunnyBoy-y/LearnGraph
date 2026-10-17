@@ -1,6 +1,8 @@
 export type FilePreviewKind =
   | "pdf"
   | "word"
+  | "rtf"
+  | "epub"
   | "powerpoint"
   | "spreadsheet"
   | "audio"
@@ -10,6 +12,19 @@ export type FilePreviewKind =
   | "text"
   | "legacy-office"
   | "unsupported";
+
+const blobIdentities = new WeakMap<object, number>();
+let nextBlobIdentity = 0;
+
+/** Stable identity for resetting reader state when its actual bytes change. */
+export function filePreviewBlobKey(blob: object): number {
+  let identity = blobIdentities.get(blob);
+  if (identity === undefined) {
+    identity = ++nextBlobIdentity;
+    blobIdentities.set(blob, identity);
+  }
+  return identity;
+}
 
 const TEXT_EXTENSIONS = new Set([
   "txt", "md", "markdown", "mdx", "csv", "tsv", "json", "jsonl", "xml",
@@ -30,6 +45,14 @@ function extensionOf(filename: string) {
   return dot >= 0 ? leaf.slice(dot + 1).toLowerCase() : "";
 }
 
+export function delimitedTextSeparator(filename: string, mimeType = "") {
+  const extension = extensionOf(filename);
+  const mime = mimeType.toLowerCase().split(";", 1)[0]?.trim();
+  if (extension === "tsv" || mime === "text/tab-separated-values") return "\t";
+  if (extension === "csv" || ["text/csv", "application/csv"].includes(mime ?? "")) return ",";
+  return undefined;
+}
+
 /**
  * Resolve binary container formats before generic XML/text checks.
  * OOXML MIME values contain "openxmlformats" and must never be decoded as XML.
@@ -42,6 +65,7 @@ export function resolveFilePreviewKind(
   const mime = mimeType.toLowerCase().split(";", 1)[0]?.trim() ?? "";
 
   if (extension === "pdf" || mime === "application/pdf") return "pdf";
+  if (extension === "epub" || mime === "application/epub+zip") return "epub";
   if (
     extension === "docx" ||
     mime.includes("wordprocessingml") ||
@@ -57,15 +81,17 @@ export function resolveFilePreviewKind(
     mime.includes("spreadsheetml") ||
     mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
   ) return "spreadsheet";
-  if (["doc", "xls", "ppt"].includes(extension)) return "legacy-office";
+  if (["doc", "xls", "ppt", "odt", "ods", "odp"].includes(extension) || ["application/msword", "application/vnd.ms-excel", "application/vnd.ms-powerpoint"].includes(mime)) return "legacy-office";
+  if (extension === "rtf" || ["application/rtf", "text/rtf"].includes(mime)) return "rtf";
+  if (delimitedTextSeparator(filename, mime)) return "spreadsheet";
   if (mime.startsWith("audio/") || ["mp3", "wav", "m4a", "aac", "flac", "ogg", "opus"].includes(extension)) return "audio";
   if (mime.startsWith("video/") || ["mp4", "webm", "mov", "mkv", "m4v"].includes(extension)) return "video";
   if (mime.startsWith("image/") || ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"].includes(extension)) return "image";
-  if (mime === "text/html" || ["html", "htm"].includes(extension)) return "html";
+  if (["text/html", "application/xhtml+xml"].includes(mime) || ["html", "htm", "xhtml"].includes(extension)) return "html";
   if (
     mime.startsWith("text/") ||
     ["application/json", "application/ld+json", "application/xml", "application/rtf"].includes(mime) ||
-    TEXT_EXTENSIONS.has(extension)
+    TEXT_EXTENSIONS.has(extension) || CODE_EXTENSIONS.has(extension)
   ) return "text";
   return "unsupported";
 }

@@ -12,6 +12,7 @@ import type { FileRecord } from "@/types/files";
 import type { PendingDocumentSelection } from "./document-chat-panel";
 import { DocumentChatPanel } from "./document-chat-panel";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
 
 export function ConceptBranchWorkspace({
   branchIds,
@@ -26,6 +27,7 @@ export function ConceptBranchWorkspace({
   selection: PendingDocumentSelection | null;
   workspaceId: string;
 }) {
+  const reducedMotion = useReducedMotionPreference();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
@@ -110,8 +112,8 @@ export function ConceptBranchWorkspace({
       animate={{ opacity: 1, scale: 1, x: position.x, y: position.y }}
       aria-label="概念解释分支"
       className="concept-branch-window"
-      initial={{ opacity: 0, scale: 0.96, x: position.x, y: position.y + 12 }}
-      transition={{ duration: 0.18 }}
+      initial={reducedMotion ? false : { opacity: 0, scale: 0.96, x: position.x, y: position.y + 12 }}
+      transition={{ duration: reducedMotion || dragRef.current ? 0 : 0.18 }}
     >
       <header
         className="concept-branch-window__drag"
@@ -153,10 +155,10 @@ export function ConceptBranchWorkspace({
           <motion.div
             animate={{ opacity: 1, rotate: 0, scale: 1, x: 0 }}
             className="concept-branch-stack__active"
-            exit={{ opacity: 0, rotate: -1.5, scale: 0.97, x: -28 }}
-            initial={{ opacity: 0, rotate: 1.2, scale: 0.98, x: 28 }}
+            exit={reducedMotion ? { opacity: 0 } : { opacity: 0, rotate: -1.5, scale: 0.97, x: -28 }}
+            initial={reducedMotion ? false : { opacity: 0, rotate: 1.2, scale: 0.98, x: 28 }}
             key={effectiveActiveId}
-            transition={{ duration: 0.2 }}
+            transition={{ duration: reducedMotion ? 0 : 0.2 }}
           >
             <DocumentChatPanel
               autoSubmitSeed

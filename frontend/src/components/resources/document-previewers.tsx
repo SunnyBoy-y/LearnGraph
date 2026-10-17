@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -17,9 +18,13 @@ import type { Cell, Workbook, Worksheet } from "exceljs";
 
 import { Button } from "@/components/ui/button";
 import { ImageLightbox } from "@/components/chat/image-lightbox";
-import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
-import { createSandboxRuntimeBridge } from "@/lib/sandbox-runtime-bridge";
-import { usePreviewPause } from "@/lib/preview-pause-controller";
+import { relativeHtmlResources } from "@/lib/sandboxed-html-preview";
+import { SandboxedHtmlFrame } from "./sandboxed-html-frame";
+import { useDocumentText } from "./use-document-text";
+import { MessageResponse } from "@/components/ai-elements/message";
+import { readDocumentBytes, readDocumentText } from "@/lib/document-text";
+import { delimitedTextSeparator } from "@/lib/file-preview";
+import { PREVIEW_RANGE_BYTES, type SeekableFile } from "@/lib/seekable-file";
 
 type PdfJsModule = typeof import("pdfjs-dist");
 
@@ -73,7 +78,8 @@ export type PdfBackgroundTheme = "paper" | "warm" | "night";
 
 
 export interface PdfDocumentViewerProps {
-  blob: Blob;
+  blob?: Blob;
+  source?: SeekableFile;
   pageNumber: number;
   scale: number;
   theme: PdfBackgroundTheme;
@@ -97,6 +103,8 @@ export interface PowerPointViewerProps {
 
 export interface ExcelWorkbookViewerProps {
   blob: Blob;
+  filename?: string;
+  mimeType?: string;
   onTextSelection?: TextSelectionHandler;
   rowsPerPage?: number;
   columnsPerPage?: number;
@@ -145,6 +153,7 @@ function ViewerState({ children, error = false }: { children: ReactNode; error?:
 
 export function PdfDocumentViewer({
   blob,
+  source,
   pageNumber,
   scale,
   theme,
@@ -159,6 +168,9 @@ export function PdfDocumentViewer({
   const [loadError, setLoadError] = useState("");
   const [pageError, setPageError] = useState("");
   const [rendering, setRendering] = useState(false);
+  const [passwordRequest, setPasswordRequest] = useState<{ submit: (password: string) => void; incorrect: boolean } | null>(null);
+  const [password, setPassword] = useState("");
+  const passwordInputId = useId();
 
   useEffect(() => {
     onDocumentRef.current = onDocument;
@@ -170,11 +182,40 @@ export function PdfDocumentViewer({
     let loadingTask: PDFDocumentLoadingTask | null = null;
     setPdf(null);
     setLoadError("");
+    setPasswordRequest(null);
+    setPassword("");
 
-    void Promise.all([loadPdfjs(), blob.arrayBuffer()])
+    const rangeController = new AbortController();
+    void Promise.all([loadPdfjs(), source ? Promise.resolve(null) : readDocumentBytes(blob!)])
       .then(([pdfjs, data]) => {
         if (cancelled) return null;
-        loadingTask = pdfjs.getDocument({ data: new Uint8Array(data) });
+        if (source) {
+          const file = source;
+          class RangeTransport extends pdfjs.PDFDataRangeTransport {
+            constructor() { super(file.size, null, true); }
+            requestDataRange(begin: number, end: number) {
+              void file.read(begin, end, rangeController.signal).then(
+                (bytes) => { if (!rangeController.signal.aborted) this.onDataRange(begin, bytes); },
+                (reason: unknown) => {
+                  if (!cancelled && !rangeController.signal.aborted) {
+                    setLoadError(reason instanceof Error ? reason.message : "PDF 分段读取失败");
+                    void loadingTask?.destroy();
+                  }
+                },
+              );
+            }
+            abort() { rangeController.abort(); }
+          }
+          loadingTask = pdfjs.getDocument({ range: new RangeTransport(), rangeChunkSize: PREVIEW_RANGE_BYTES, disableStream: true, disableAutoFetch: true });
+        } else {
+          loadingTask = pdfjs.getDocument({ data: new Uint8Array(data!) });
+        }
+        loadingTask.onPassword = (submit: (password: string) => void, reason: number) => {
+          if (!cancelled) {
+            setPassword("");
+            setPasswordRequest({ submit, incorrect: reason === pdfjs.PasswordResponses.INCORRECT_PASSWORD });
+          }
+        };
         return loadingTask.promise;
       })
       .then((document) => {
@@ -189,19 +230,20 @@ export function PdfDocumentViewer({
       })
       .catch((reason: unknown) => {
         if (!cancelled) {
-          setLoadError(reason instanceof Error ? reason.message : "PDF 加载失败");
+          setLoadError((previous) => previous || (reason instanceof Error ? reason.message : "PDF 加载失败"));
         }
       });
 
     return () => {
       cancelled = true;
+      rangeController.abort();
       if (loadedDocument) {
         void loadedDocument.destroy();
       } else {
         void loadingTask?.destroy();
       }
     };
-  }, [blob]);
+  }, [blob, source]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -277,6 +319,20 @@ export function PdfDocumentViewer({
     };
   }, [pageNumber, pdf, scale]);
 
+  if (passwordRequest) return (
+    <form className="mx-auto flex min-h-[24rem] max-w-sm flex-col justify-center gap-3 p-6" onSubmit={(event) => {
+      event.preventDefault();
+      const request = passwordRequest;
+      setPasswordRequest(null);
+      setPassword("");
+      request.submit(password);
+    }}>
+      <label htmlFor={passwordInputId} className="text-sm font-medium">此 PDF 需要打开密码</label>
+      <input id={passwordInputId} aria-label="PDF 打开密码" autoComplete="off" autoFocus className="rounded-md border bg-background px-3 py-2 text-sm" onChange={(event) => setPassword(event.target.value)} type="password" value={password} />
+      {passwordRequest.incorrect ? <p className="text-sm text-destructive" role="alert">密码不正确，请重试。</p> : null}
+      <Button disabled={!password} type="submit">打开 PDF</Button>
+    </form>
+  );
   if (loadError) return <ViewerState error>{loadError}</ViewerState>;
   if (!pdf) return <ViewerState>正在读取 PDF 原始文件...</ViewerState>;
 
@@ -472,7 +528,7 @@ export function PowerPointViewer({ blob, onEmbeddedImage, onTextSelection }: Pow
     container.replaceChildren();
     setLoading(true);
     setError("");
-    void Promise.all([import("pptx-preview"), blob.arrayBuffer()])
+    void Promise.all([import("pptx-preview"), readDocumentBytes(blob)])
       .then(async ([module, data]) => {
         if (cancelled) return;
         const previewer = module.init(container, { width: 960, height: 540, mode: "list" });
@@ -634,6 +690,8 @@ function existingCell(worksheet: Worksheet, row: number, column: number) {
 
 export function ExcelWorkbookViewer({
   blob,
+  filename = "",
+  mimeType = blob.type,
   onTextSelection,
   rowsPerPage = 80,
   columnsPerPage = 32,
@@ -653,9 +711,18 @@ export function ExcelWorkbookViewer({
     setWorkbook(null);
     setError("");
 
-    void blob
-      .arrayBuffer()
+    void readDocumentBytes(blob)
       .then(async (data) => {
+        const { Workbook } = await import("exceljs");
+        const parsedWorkbook = new Workbook();
+        const separator = delimitedTextSeparator(filename, mimeType);
+        if (separator) {
+          const { dsvFormat } = await import("d3-dsv");
+          const rows = dsvFormat(separator).parseRows(await readDocumentText(blob));
+          const worksheet = parsedWorkbook.addWorksheet("数据");
+          for (const row of rows) worksheet.addRow(row);
+          return parsedWorkbook;
+        }
         const signature = new Uint8Array(data, 0, Math.min(4, data.byteLength));
         if (
           signature.length < 4 ||
@@ -666,8 +733,6 @@ export function ExcelWorkbookViewer({
         ) {
           throw new Error("仅支持读取原始 .xlsx 文件；旧版 .xls 需要在隔离转换服务中处理");
         }
-        const { Workbook } = await import("exceljs");
-        const parsedWorkbook = new Workbook();
         await parsedWorkbook.xlsx.load(data);
         return parsedWorkbook;
       })
@@ -688,7 +753,7 @@ export function ExcelWorkbookViewer({
     return () => {
       cancelled = true;
     };
-  }, [blob]);
+  }, [blob, filename, mimeType]);
 
   useEffect(() => {
     setRowPage(0);
@@ -897,29 +962,37 @@ export function ExcelWorkbookViewer({
  */
 export function BlobImage({
   blob,
+  url,
   alt,
   zoomable = false,
 }: {
-  blob: Blob;
+  blob?: Blob;
+  url?: string;
   alt: string;
   /** 允许点击放大（复用共享灯箱）。 */
   zoomable?: boolean;
 }) {
   const [source, setSource] = useState("");
   const [zoomOpen, setZoomOpen] = useState(false);
+  const [decodeError, setDecodeError] = useState(false);
 
   useEffect(() => {
+    setDecodeError(false);
+    if (url) { setSource(url); return; }
+    if (!blob) return;
     const objectUrl = URL.createObjectURL(blob);
     setSource(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
-  }, [blob]);
+  }, [blob, url]);
 
   if (!source) return <ViewerState>正在读取图片原始文件...</ViewerState>;
+  if (decodeError) return <ViewerState error>当前浏览器无法解码此图片格式，请下载后查看。</ViewerState>;
   const image = (
     <img
       alt={alt}
       className="document-blob-image"
       draggable={false}
+      onError={() => setDecodeError(true)}
       src={source}
     />
   );
@@ -950,6 +1023,44 @@ export function BlobImage({
 }
 
 
+/** RTF reuses the same isolated HTML surface after local document conversion. */
+export function RtfDocumentViewer({ blob, filename }: { blob: Blob; filename: string }) {
+  const [result, setResult] = useState<{ blob: Blob; html?: string; error?: string }>();
+  const [mode, setMode] = useState<"preview" | "source">("preview");
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([import("rtf.js"), readDocumentBytes(blob)])
+      .then(async ([{ RTFJS, EMFJS, WMFJS }, bytes]) => {
+        RTFJS.loggingEnabled(false);
+        EMFJS.loggingEnabled(false);
+        WMFJS.loggingEnabled(false);
+        const doc = new RTFJS.Document(bytes, {});
+        const body = document.createElement("div");
+        body.append(...await doc.render());
+        sanitizeWordOutput(body);
+        if (!cancelled) setResult({ blob, html: body.innerHTML });
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) setResult({ blob, error: reason instanceof Error ? reason.message : "RTF 文件渲染失败" });
+      });
+    return () => { cancelled = true; };
+  }, [blob]);
+  const current = result?.blob === blob ? result : undefined;
+  return (
+    <div className="flex min-h-[36rem] flex-col">
+      <div className="flex gap-2 border-b p-2" aria-label="RTF 查看模式">
+        <Button aria-pressed={mode === "preview"} onClick={() => setMode("preview")} size="sm" variant="ghost">阅读</Button>
+        <Button aria-pressed={mode === "source"} onClick={() => setMode("source")} size="sm" variant="ghost">源码</Button>
+      </div>
+      {mode === "source" ? <TextDocumentViewer blob={blob} filename={filename} /> : !current ? (
+        <ViewerState>正在读取 RTF 原始文件…</ViewerState>
+      ) : current.error ? <ViewerState error>{current.error}</ViewerState> : (
+        <SandboxedHtmlFrame html={current.html ?? ""} title={`预览 ${filename}`} className="min-h-[36rem] w-full flex-1 border-0 bg-white p-4" />
+      )}
+    </div>
+  );
+}
+
 export function HtmlDocumentViewer({
   blob,
   filename,
@@ -958,45 +1069,11 @@ export function HtmlDocumentViewer({
   filename: string;
 }) {
   const [mode, setMode] = useState<"preview" | "source">("preview");
-  const [sourceText, setSourceText] = useState("");
-  const [previewHtml, setPreviewHtml] = useState("");
-  const [error, setError] = useState("");
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  usePreviewPause(rootRef);
-
-  // Browser-sandbox runtime bridge: relays JS network requests (net.fetch)
-  // to the approval-free sandbox-net gateway. No bundle context here, so
-  // vfs.read is unavailable but networking works.
-  useEffect(() => {
-    if (!previewHtml) return;
-    const bridge = createSandboxRuntimeBridge(iframeRef.current, {});
-    return () => bridge.destroy();
-  }, [previewHtml]);
-
-  useEffect(() => {
-    let cancelled = false;
-    setError("");
-    setSourceText("");
-    setPreviewHtml("");
-    void blob
-      .text()
-      .then((text) => {
-        if (cancelled) return;
-        setSourceText(text);
-        setPreviewHtml(sandboxedHtmlPreviewDocument(text, { runtimeShim: true }));
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : "无法读取 HTML 文件");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [blob]);
+  const { text: sourceText, error, loading } = useDocumentText(blob);
+  const missingResources = useMemo(() => relativeHtmlResources(sourceText), [sourceText]);
 
   return (
-    <div className="flex h-full min-h-[36rem] flex-col" ref={rootRef}>
+    <div className="flex h-full min-h-[36rem] flex-col">
       <div className="sticky top-0 z-10 flex shrink-0 flex-wrap items-center gap-2 border-b bg-background/95 p-2 backdrop-blur">
         <div className="flex rounded-lg border p-0.5" role="group" aria-label="HTML 查看模式">
           <button
@@ -1036,21 +1113,20 @@ export function HtmlDocumentViewer({
           {error}
         </p>
       ) : null}
-      {!error && !sourceText ? (
+      {!error && loading ? (
         <ViewerState>正在读取 HTML…</ViewerState>
       ) : null}
-      {mode === "source" && sourceText ? (
+      {!loading && !error && missingResources.length ? <p className="border-b px-4 py-2 text-xs text-muted-foreground" role="status">此 HTML 引用了未随文件提供的资源：{missingResources.slice(0, 3).join("、")}。请将资源内联，或通过完整网页产物打开。</p> : null}
+      {mode === "source" && !loading && !error ? (
         <pre className="m-0 min-h-0 flex-1 overflow-auto bg-muted/20 p-4 text-xs leading-5 text-foreground">
           <code>{sourceText}</code>
         </pre>
       ) : null}
-      {mode === "preview" && previewHtml ? (
-        <iframe loading="lazy"
-            className="min-h-[36rem] w-full flex-1 border-0 bg-white"
-          ref={iframeRef}
-          referrerPolicy="no-referrer"
-          sandbox="allow-scripts"
-          srcDoc={previewHtml}
+      {mode === "preview" && !loading && !error ? (
+        <SandboxedHtmlFrame
+          className="min-h-[36rem] w-full flex-1 border-0 bg-white"
+          html={sourceText}
+          network
           title={`预览 ${filename}`}
         />
       ) : null}
@@ -1066,25 +1142,9 @@ export function TextDocumentViewer({
   blob: Blob;
   filename: string;
 }) {
-  const [text, setText] = useState("");
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    void blob
-      .text()
-      .then((value) => {
-        if (!cancelled) setText(value);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "无法读取文本文件");
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [blob]);
+  const { text, error, loading } = useDocumentText(blob);
+  const [mode, setMode] = useState<"preview" | "source">("preview");
+  const markdown = /\.(md|markdown|mdx)$/i.test(filename);
 
   if (error) {
     return (
@@ -1093,11 +1153,24 @@ export function TextDocumentViewer({
       </p>
     );
   }
-  if (!text) return <ViewerState>正在读取 {filename}…</ViewerState>;
+  if (loading) return <ViewerState>正在读取 {filename}…</ViewerState>;
+  if (!text) return <p className="p-6 text-sm text-muted-foreground">此文件为空。</p>;
   return (
-    <pre className="m-0 max-h-[calc(100svh-12rem)] overflow-auto bg-muted/20 p-4 text-xs leading-5">
-      <code>{text}</code>
-    </pre>
+    <div>
+      {markdown ? (
+        <div className="flex gap-2 border-b p-2" aria-label="Markdown 查看模式">
+          <Button aria-pressed={mode === "preview"} onClick={() => setMode("preview")} size="sm" variant="ghost">阅读</Button>
+          <Button aria-pressed={mode === "source"} onClick={() => setMode("source")} size="sm" variant="ghost">源码</Button>
+        </div>
+      ) : null}
+      {markdown && mode === "preview" ? (
+        <div className="p-6"><MessageResponse isAnimating={false}>{text}</MessageResponse></div>
+      ) : (
+        <pre className="m-0 max-h-[calc(100svh-12rem)] overflow-auto bg-muted/20 p-4 text-xs leading-5">
+          <code>{text}</code>
+        </pre>
+      )}
+    </div>
   );
 }
 

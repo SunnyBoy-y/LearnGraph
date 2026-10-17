@@ -1,6 +1,22 @@
 import { describe, expect, it } from "vitest";
 
-import { requiresLearningIndex } from "./file-preview";
+import { requiresLearningIndex, resolveFilePreviewKind } from "./file-preview";
+
+describe("file preview routing", () => {
+  it.each(["main.java", "main.c", "main.cpp", "main.rs", "main.go"])("reads %s with an unknown MIME type", (filename) => {
+    expect(resolveFilePreviewKind(filename, "application/octet-stream")).toBe("text");
+    expect(resolveFilePreviewKind(filename)).toBe("text");
+  });
+  it("keeps XHTML in the isolated HTML viewer", () => {
+    expect(resolveFilePreviewKind("page.xhtml", "application/xhtml+xml")).toBe("html");
+  });
+  it.each([["data.csv", "text/plain"], ["data.tsv", "application/octet-stream"]])("uses the workbook viewer for %s", (filename, mime) => {
+    expect(resolveFilePreviewKind(filename, mime)).toBe("spreadsheet");
+  });
+  it("uses the RTF parser for RTF documents", () => {
+    expect(resolveFilePreviewKind("notes.rtf", "application/rtf")).toBe("rtf");
+  });
+});
 
 
 describe("requiresLearningIndex", () => {

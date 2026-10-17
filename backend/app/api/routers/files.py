@@ -4,10 +4,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 from typing import Annotated
-from fastapi import APIRouter, File, Header, Query, Request, Response, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, File, Header, Query, Request, Response, UploadFile, status
+from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.responses import FileResponse, StreamingResponse
 
-from app.api.deps import AppSettings, CurrentWorkspace, DB
+from app.api.deps import AppSettings, CurrentWorkspace, DB, bearer, current_principal, workspace_context
 from app.core.errors import AppError
 from app.domain.schemas.common import ActionResponse
 from app.domain.schemas.files import (
@@ -29,6 +30,8 @@ from app.domain.schemas.files import (
 )
 from app.domain.schemas.workflow import DeleteConfirm, DeleteImpact
 from app.services.files import FileService
+from app.services.file_previews import FilePreviewService
+from app.services.file_stream_tickets import issue_file_stream_ticket, read_file_stream_ticket
 from app.services.authorization import AuthorizationService
 from app.services.document_learning import DocumentLearningService
 from app.services.durable_queue import enqueue_document_job
@@ -212,6 +215,38 @@ def parse_file(
             DocumentLearningService.execution_token(job),
         )
     return DocumentJobView.model_validate(job)
+
+
+@router.get("/{file_id}", response_model=FileView)
+def get_file(file_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> FileView:
+    _require_file_access(db, context, file_id, "read")
+    return FileView.model_validate(service(db, context, settings).content_record(file_id))
+
+
+@router.get("/{file_id}/preview.pdf")
+def preview_office(file_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> Response:
+    _require_file_access(db, context, file_id, "read")
+    record = service(db, context, settings).content_record(file_id)
+    path = FilePreviewService(db, context.workspace_id, context.principal.user_id, settings).office_pdf(record)
+    return FileResponse(path, media_type="application/pdf", headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@router.get("/{file_id}/stream-ticket")
+def file_stream_ticket(file_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings,
+                       credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer)]) -> dict:
+    _require_file_access(db, context, file_id, "read")
+    return {"ticket": issue_file_stream_ticket(settings, file_id, context.workspace_id, credentials.credentials)}
+
+
+@router.get("/{file_id}/stream")
+def stream_file(file_id: str, request: Request, db: DB, settings: AppSettings,
+                ticket: Annotated[str, Query(min_length=1, max_length=4096)]) -> Response:
+    value = read_file_stream_ticket(settings, file_id, ticket)
+    # Reuse ordinary session, membership and file ACL checks on every range,
+    # including logout/revocation. The scoped ticket is never a login token.
+    principal = current_principal(HTTPAuthorizationCredentials(scheme="Bearer", credentials=value["bearer"]), db)
+    context = workspace_context(request, value["workspace"], principal, db)
+    return download_file(file_id, request, db, context, settings)
 
 
 @router.get("/{file_id}/content")

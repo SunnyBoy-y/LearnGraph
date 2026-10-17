@@ -1212,6 +1212,8 @@ class FileService:
         ]
         for reference in references:
             self.references.delete(reference)
+        from app.services.file_previews import delete_file_preview
+        delete_file_preview(self.settings, self.workspace_id, record)
         self.storage.delete(record.object_key)
         self.db.execute(
             text(
