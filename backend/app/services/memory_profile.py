@@ -56,8 +56,11 @@ from app.services.temporal_normalizer import TemporalNormalizer
 from app.services.token_estimate import estimate_tokens
 
 
-PROFILE_PROMPT_VERSION = "memory-profile-v2"
+PROFILE_PROMPT_VERSION = "memory-profile-v3"
 _PROFILE_MAX_ATOMS = 160
+_PROFILE_INPUT_TOKENS = 32_000
+_MEMORY_OPERATION_INPUT_TOKENS = 12_000
+_MODEL_INPUT_OVERHEAD_TOKENS = 512
 _PROFILE_MAX_MARKDOWN_CHARS = 12_000
 _EXCERPT_CHARS = 1_200
 _ELIGIBLE_SUMMARY = {"durable", "current"}
@@ -119,6 +122,19 @@ def _parse_iso(value: object) -> datetime | None:
 
 def _content_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _profile_prose(text: str, references: dict[str, str]) -> str:
+    """Keep wire-only citations in metadata, without cutting report sentences."""
+
+    def remove_citation(match: re.Match[str]) -> str:
+        cited = re.findall(r"A\d+", match.group())
+        return "" if all(reference in references for reference in cited) else match.group()
+
+    return re.sub(
+        r"[（(\[]\s*A\d+(?:\s*[、，,;；]\s*A\d+)*\s*[）)\]]",
+        remove_citation, text,
+    ).strip()
 
 
 def _unsafe_memory_reason(text: str) -> str | None:
@@ -331,8 +347,13 @@ def _profile_schema() -> dict[str, Any]:
         "type": "object",
         "properties": {
             "overview": {"type": "string"},
+            "overview_atom_ids": {
+                "type": "array", "items": {"type": "string"},
+                "minItems": 1,
+            },
             "dimensions": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -340,6 +361,7 @@ def _profile_schema() -> dict[str, Any]:
                         "title": {"type": "string"},
                         "paragraphs": {
                             "type": "array",
+                            "minItems": 1,
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -347,6 +369,7 @@ def _profile_schema() -> dict[str, Any]:
                                     "atom_ids": {
                                         "type": "array",
                                         "items": {"type": "string"},
+                                        "minItems": 1,
                                     },
                                 },
                                 "required": ["text", "atom_ids"],
@@ -357,7 +380,7 @@ def _profile_schema() -> dict[str, Any]:
                 },
             },
         },
-        "required": ["overview", "dimensions"],
+        "required": ["overview", "overview_atom_ids", "dimensions"],
     }
 
 
@@ -535,8 +558,6 @@ class MemoryProfileService:
         provider_id: str | None = None,
         model_id: str | None = None,
     ) -> tuple[dict[str, Any], str]:
-        if estimate_tokens(prompt + json.dumps(schema, ensure_ascii=False)) > 12000:
-            raise AppError(413, "memory_profile_input_budget_exceeded", "Memory operation exceeds its input budget; select fewer atoms")
         selected_provider_id, selected_model_id = self._model_selection(
             provider_id, model_id
         )
@@ -555,12 +576,36 @@ class MemoryProfileService:
                 "memory_profile_model_unavailable",
                 "The configured memory profile model is unavailable",
             )
+        # Full reports read many more atoms than an edit/extraction operation.
+        # Keep a bounded report budget while respecting the configured model's
+        # usable context, its actual output cap, and schema/protocol overhead.
+        task_budget = (
+            _PROFILE_INPUT_TOKENS
+            if schema_name in {"memory_profile", "memory_profile_verification"}
+            else _MEMORY_OPERATION_INPUT_TOKENS
+        )
+        output_reserve = max(
+            estimated_output_tokens, int(getattr(model, "max_output_tokens", 0) or 0)
+        )
+        input_budget = min(
+            task_budget,
+            int(getattr(model, "context_window_tokens", 0) or 128_000) - output_reserve,
+        )
+        input_tokens = (
+            estimate_tokens(prompt + json.dumps(schema, ensure_ascii=False))
+            + _MODEL_INPUT_OVERHEAD_TOKENS
+        )
+        if input_tokens > input_budget:
+            raise AppError(
+                413, "memory_profile_input_budget_exceeded",
+                "Memory input exceeds the report or configured model context budget",
+            )
         billing = BillingService(self.db, self.workspace_id, self.actor_id)
         quote = billing.preflight_model_call(
             provider_id=model.provider_id,
             model_id=getattr(model, "model_id", selected_model_id),
             feature=feature,
-            estimated_input_tokens=estimate_tokens(prompt),
+            estimated_input_tokens=input_tokens,
             estimated_output_tokens=estimated_output_tokens,
             remote_capability=bool(getattr(model, "remote_capability", True)),
         )
@@ -623,11 +668,19 @@ class MemoryProfileService:
                 owner_subject_id=self.actor_id,
             )
         if snapshot.status != "ready" or str(snapshot.stale_reason or "").startswith("refresh_failed"):
-            return MemoryProfileView(
-                id=snapshot.id, workspace_id=snapshot.workspace_id, owner_subject_id=snapshot.owner_subject_id,
-                version=snapshot.version, status=snapshot.status, stale_reason=snapshot.stale_reason,
-                generated_at=snapshot.generated_at, updated_at=snapshot.updated_at,
-            )
+            # A refresh failure may keep a verified report only while its
+            # evidence is unchanged. Never replace a report with an atom list
+            # or expose obsolete claims after sources are changed/deleted.
+            records = _eligible_profile_records(self.db, self.workspace_id, self.actor_id)
+            if snapshot.source_fingerprint != _atom_fingerprint(records):
+                return MemoryProfileView(
+                    id=snapshot.id, workspace_id=snapshot.workspace_id,
+                    owner_subject_id=snapshot.owner_subject_id, version=snapshot.version,
+                    status=snapshot.status, stale_reason=snapshot.stale_reason,
+                    source_count=len(records),
+                    generated_at=_as_utc(snapshot.generated_at) if snapshot.generated_at else None,
+                    updated_at=_as_utc(snapshot.updated_at) if snapshot.updated_at else None,
+                )
         stored = list(snapshot.structured_sections or [])
         overview = ""
         dimensions: list[dict[str, Any]] = []
@@ -666,8 +719,8 @@ class MemoryProfileService:
             structured_sections=stored,
             source_atom_ids=list(snapshot.source_atom_ids or []),
             source_fingerprint=snapshot.source_fingerprint,
-            generated_at=snapshot.generated_at,
-            updated_at=snapshot.updated_at,
+            generated_at=_as_utc(snapshot.generated_at) if snapshot.generated_at else None,
+            updated_at=_as_utc(snapshot.updated_at) if snapshot.updated_at else None,
             stale_reason=snapshot.stale_reason,
         )
 
@@ -925,7 +978,7 @@ class MemoryProfileService:
             MemoryProfileSnapshot.workspace_id == self.workspace_id,
             MemoryProfileSnapshot.owner_subject_id == self.actor_id,
         ).order_by(MemoryProfileSnapshot.version.desc()).limit(1))
-        if latest is not None and str(latest.stale_reason or "").startswith("refresh_failed|"):
+        if not force and latest is not None and str(latest.stale_reason or "").startswith("refresh_failed|"):
             failed_at = _parse_iso(str(latest.stale_reason).rsplit("|", 1)[-1])
             if failed_at is not None and utc_now() - failed_at < timedelta(seconds=60):
                 return self._profile_view(latest)
@@ -977,21 +1030,45 @@ class MemoryProfileService:
             # 原子快照视图，而不是抛出 memory_profile_model_unconfigured，
             # 保证刷新入口在未配置状态下也不报英文错误、仍能看到全部原子。
             return self._atomic_snapshot_view()
+        # UUID citations can consume most of a small model's output window.
+        # Use short, request-local references on the wire; persist original IDs
+        # for provenance, deletion and report-selection actions.
+        atom_refs = {f"A{index + 1}": atom["id"] for index, atom in enumerate(atoms)}
+        prompt_atoms = [
+            {**atom, "id": reference}
+            for reference, atom in zip(atom_refs, atoms)
+        ]
+
+        def resolve_references(values: Any) -> list[str]:
+            return list(dict.fromkeys(
+                atom_refs[str(value)] for value in values or [] if str(value) in atom_refs
+            ))
+
+        report_time = utc_now().isoformat()
         prompt = (
             "你是 LearnGraph 的长期记忆摘要整理器。仅依据 ATOMS JSON 写一篇完整的"
-            "中文用户记忆摘要。使用第二人称“你”。摘要是高层综合，不必包含所有原子。\n"
+            "中文学习报告。使用第二人称“你”。报告是高层综合，选取最有价值的学习主题，"
+            "不要逐条复述记忆，不要罗列全部兴趣、旧任务、临时指令或个人身份细节。\n"
+            f"当前时间：{report_time}。\n"
             "必须遵守：\n"
             "1. 每个段落只能陈述所引用 atom_ids 能直接支持的事实，绝不推断或发明。\n"
             "2. 合并重复事实；当前计划和稳定偏好分开；不要把一次事件写成习惯。\n"
-            "3. 不输出已取消、过期、未验证失效的内容（输入已经过滤，仍须遵守）。\n"
-            "4. overview 必填且是第一段概览，总体 1-4 句。\n"
+            "3. 输入可能包含日期已过去但尚未更新状态的旧目标：不得写成当前/未来安排。"
+            "如确有必要，只能写成曾经计划，并说明进度待确认，不推断已完成或未完成。\n"
+            "4. overview 必填且是第一段概览，总体 1-4 句；overview_atom_ids "
+            "只列出直接支撑概览的原子 ID，不要把所有原子都列入。\n"
             "5. dimensions 使用稳定 key（long_term_direction/learning_style/"
             "output_collaboration/stable_technical_preference/common_environment/"
             "long_term_limit/current_state），title 为展示标题；"
-            "没有足够证据的维度不生成。\n"
-            "6. 全文目标 800-1600 中文字符，硬上限约 2000；按完整段落取舍。\n"
-            "7. atom_ids 必须逐字来自输入。\n\n"
-            f"ATOMS JSON:\n{json.dumps(atoms, ensure_ascii=False)}"
+            "没有足够证据的维度不生成。学习薄弱点放 long_term_limit；"
+            "stable_technical_preference 仅写稳定技术偏好或有证据的优势；"
+            "common_environment 仅写实际学习/工作环境，没有就省略。\n"
+            "6. 全文目标 800-1200 中文字符，硬上限约 2000；按完整段落取舍。"
+            "最多 7 个维度，每个维度只写 1 个综合段落（不超过 240 字），"
+            "每段引用 1-8 条最直接的证据。概览不超过 240 字，引用不超过 12 条。\n"
+            "7. atom_ids 必须逐字来自输入中的 A1、A2 等短编号。\n\n"
+            "8. 引用编号只放在 overview_atom_ids / atom_ids 字段，正文不得出现编号。\n\n"
+            f"ATOMS JSON:\n{json.dumps(prompt_atoms, ensure_ascii=False)}"
         )
         try:
             payload, model_id = self._model_json(
@@ -1009,9 +1086,10 @@ class MemoryProfileService:
         sections: list[dict[str, Any]] = []
         claim_map: dict[str, list[str]] = {}
         markdown_parts: list[str] = []
-        raw_overview = str(payload.get("overview") or "").strip() if isinstance(payload, dict) else ""
+        raw_overview = _profile_prose(str(payload.get("overview") or ""), atom_refs) if isinstance(payload, dict) else ""
         raw_dimensions = payload.get("dimensions") if isinstance(payload, dict) else None
-        if raw_overview:
+        overview_atom_ids = resolve_references(payload.get("overview_atom_ids")) if isinstance(payload, dict) else []
+        if raw_overview and overview_atom_ids:
             sections.append(
                 {
                     "kind": "overview",
@@ -1020,12 +1098,12 @@ class MemoryProfileService:
                         {
                             "id": "overview",
                             "text": raw_overview[:_PROFILE_MAX_MARKDOWN_CHARS],
-                            "atom_ids": sorted(allowed_ids)[:80],
+                            "atom_ids": overview_atom_ids,
                         }
                     ],
                 }
             )
-            claim_map["overview"] = sorted(allowed_ids)[:80]
+            claim_map["overview"] = overview_atom_ids
             markdown_parts.append(raw_overview)
         for dimension_index, raw_dimension in enumerate(raw_dimensions or []):
             if not isinstance(raw_dimension, dict):
@@ -1040,14 +1118,8 @@ class MemoryProfileService:
             ):
                 if not isinstance(raw_paragraph, dict):
                     continue
-                text = str(raw_paragraph.get("text") or "").strip()
-                atom_ids = list(
-                    dict.fromkeys(
-                        str(value)
-                        for value in raw_paragraph.get("atom_ids") or []
-                        if str(value) in allowed_ids
-                    )
-                )
+                text = _profile_prose(str(raw_paragraph.get("text") or ""), atom_refs)
+                atom_ids = resolve_references(raw_paragraph.get("atom_ids"))
                 if not text or not atom_ids:
                     continue
                 claim_id = f"d{dimension_index}p{paragraph_index}"
@@ -1082,9 +1154,13 @@ class MemoryProfileService:
             for section in sections
             for paragraph in section["paragraphs"]
         ]
+        cited_ids = {atom_id for claim in claims for atom_id in claim["atom_ids"]}
+        verification_atoms = [atom for atom in atoms if atom["id"] in cited_ids]
         verification_prompt = (
             "你是记忆摘要事实校验器。逐条判断 CLAIMS 是否由其 atom_ids "
             "对应的 ATOMS 支持。摘要本身是高层综合，因此：\n"
+            f"当前时间：{report_time}；已过去的目标日期不得写成当前或未来安排，"
+            "也不得自行判断完成与否。\n"
             "必须判为**有效**：\n"
             "1. 把多个原子合并、并列、归类、去重，或按维度归纳成一条陈述；\n"
             "2. 用原子中出现过的信息作概括性表达，不改变原子所述内容；\n"
@@ -1094,7 +1170,7 @@ class MemoryProfileService:
             "2. 把一次事件写成习惯，或把「尚未确定」写成「已经确定」；\n"
             "3. 时态不一致，或放大/缩小原子表达的确定性、范围与适用条件。\n"
             "只返回可保留的 valid_claim_ids 和违规原因。\n\n"
-            f"ATOMS:\n{json.dumps(atoms, ensure_ascii=False)}\n\n"
+            f"ATOMS:\n{json.dumps(verification_atoms, ensure_ascii=False)}\n\n"
             f"CLAIMS:\n{json.dumps(claims, ensure_ascii=False)}"
         )
         try:
@@ -1133,6 +1209,8 @@ class MemoryProfileService:
             verified_sections.append(kept)
             if section.get("kind") == "overview":
                 markdown_parts.extend(paragraph["text"] for paragraph in paragraphs)
+                for paragraph in paragraphs:
+                    verified_claim_map[paragraph["id"]] = paragraph["atom_ids"]
             else:
                 markdown_parts.append(f"## {section['heading']}")
                 for paragraph in paragraphs:
@@ -1221,13 +1299,15 @@ class MemoryProfileService:
         self.db.flush()
         return evidence
 
-    def _existing_atom_context(self, selected_atom_ids: list[str] | None = None) -> list[dict[str, Any]]:
+    def _existing_atom_context(self, selected_atom_ids: list[str] | None = None, *, include_legacy: bool = False) -> list[dict[str, Any]]:
         query = select(MemoryRecord).where(
             MemoryRecord.workspace_id == self.workspace_id, MemoryRecord.tenant_id == self.workspace.tenant_id,
-            MemoryRecord.state == "active", MemoryRecord.atom_schema_version >= 1,
+            MemoryRecord.state == "active",
             MemoryRecord.deleted_at.is_(None), MemoryRecord.content_destroyed_at.is_(None),
             (MemoryRecord.subject_user_id.is_(None)) | (MemoryRecord.subject_user_id == self.actor_id),
         )
+        if not include_legacy:
+            query = query.where(MemoryRecord.atom_schema_version >= 1)
         records = list(self.db.scalars(query.order_by(MemoryRecord.updated_at.desc(), MemoryRecord.id).limit(80)))
         selected = set(selected_atom_ids or [])
         if selected:
@@ -1295,8 +1375,26 @@ class MemoryProfileService:
             provider_id=selected_provider_id,
             model_id=selected_model_id,
         )
-        existing_atoms = self._existing_atom_context(request.selected_atom_ids)
-        existing_ids = {item["id"] for item in existing_atoms}
+        return self.apply_atom_operations(
+            request, payload, evidence,
+            self._existing_atom_context(request.selected_atom_ids),
+            provider_id=selected_provider_id, model_id=selected_model_id,
+        )
+
+    def apply_atom_operations(
+        self,
+        request: MemoryProfileIntentRequest,
+        payload: dict[str, Any],
+        evidence: MemoryEvidence,
+        existing_atoms: list[dict[str, Any]],
+        *,
+        provider_id: str,
+        model_id: str,
+        refresh: bool = True,
+    ) -> MemoryProfileIntentResult:
+        """Execute validated atom operations through the shared draft/event pipeline."""
+        now = request.observed_at or utc_now()
+        selected_provider_id, selected_model_id = provider_id, model_id
         affected: list[str] = []
         drafts_created = 0
         auto_committed = 0
@@ -1452,7 +1550,7 @@ class MemoryProfileService:
                     affected.append(committed.result_memory_id)
         self.db.commit()
         profile_status = "stale"
-        if auto_committed:
+        if auto_committed and refresh:
             try:
                 profile_status = self.refresh_profile(
                     force=True,

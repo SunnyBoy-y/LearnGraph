@@ -18,6 +18,7 @@ import type {
   MemoryProfile,
   MemoryProfileIntentRequest,
   MemoryProfileIntentResult,
+  MemoryAgentStep,
   MemoryProviderMigrationResult,
   MemoryProviderStatus,
   MemoryPurgeResult,
@@ -28,7 +29,7 @@ import type {
   MemoryZone,
 } from '@/types/memory'
 
-import { apiClient, type QueryParams } from './client'
+import { ApiError, apiClient, type ApiRequestOptions, type QueryParams } from './client'
 
 export function listMemories(params: {
   zone?: MemoryZone
@@ -67,6 +68,10 @@ export function deleteMemory(memoryId: string): Promise<MemoryEntry> {
   return apiClient.delete<MemoryEntry>(`/memory/${encodeURIComponent(memoryId)}`)
 }
 
+export function deleteMemories(memoryIds: string[]): Promise<{ deleted_count: number; recoverable_count: number }> {
+  return apiClient.post('/memory/batch-delete', { memory_ids: memoryIds })
+}
+
 export function restoreDeletedMemory(memoryId: string): Promise<MemoryEntry> {
   return apiClient.post<MemoryEntry>(`/memory/${encodeURIComponent(memoryId)}/restore`)
 }
@@ -96,8 +101,8 @@ export function getMemoryPolicy(sessionId?: string): Promise<MemoryPolicy> {
   })
 }
 
-export function updateMemoryPolicy(payload: MemoryPolicyUpdateRequest): Promise<MemoryPolicy> {
-  return apiClient.put<MemoryPolicy, MemoryPolicyUpdateRequest>('/memory/policy', payload)
+export function updateMemoryPolicy(payload: MemoryPolicyUpdateRequest, options?: ApiRequestOptions): Promise<MemoryPolicy> {
+  return apiClient.put<MemoryPolicy, MemoryPolicyUpdateRequest>('/memory/policy', payload, options)
 }
 
 export function getMemoryProviderStatus(): Promise<MemoryProviderStatus> {
@@ -148,6 +153,29 @@ export function applyMemoryProfileIntent(
   )
 }
 
+export async function runMemoryProfileAgent(
+  payload: MemoryProfileIntentRequest,
+  onStep: (step: MemoryAgentStep) => void,
+): Promise<MemoryProfileIntentResult> {
+  const path = '/memory/profile/intents/stream'
+  let result: MemoryProfileIntentResult | undefined
+  for await (const event of apiClient.postSse<
+    MemoryAgentStep | MemoryProfileIntentResult | { code: string; message: string; partial_result?: MemoryProfileIntentResult }
+  >(path, payload)) {
+    if (event.event === 'step') onStep(event.data as MemoryAgentStep)
+    if (event.event === 'result') result = event.data as MemoryProfileIntentResult
+    if (event.event === 'error') {
+      const error = event.data as { code: string; message: string; partial_result?: MemoryProfileIntentResult }
+      throw new ApiError({
+        status: 502, code: error.code, message: error.message,
+        details: { partial_result: error.partial_result }, method: 'POST', url: path,
+      })
+    }
+  }
+  if (!result) throw new Error('记忆更新连接中断，请检查当前记忆后重试')
+  return result
+}
+
 export function reconcileMemoryTime(): Promise<{ reviewed: number; lapsed: number }> {
   return apiClient.post<{ reviewed: number; lapsed: number }>(
     '/memory/maintenance/reconcile-time',
@@ -171,25 +199,32 @@ export function getMemoryEnhancement(): Promise<MemoryEnhancement> {
 
 export function updateMemoryEnhancement(
   payload: MemoryEnhancementUpdateRequest,
+  options?: ApiRequestOptions,
 ): Promise<MemoryEnhancement> {
   return apiClient.put<MemoryEnhancement, MemoryEnhancementUpdateRequest>(
     '/memory/enhancement',
     payload,
+    options,
   )
 }
 
 export function reindexMemoryEmbeddings(
   pruneStale = false,
+  options?: ApiRequestOptions,
 ): Promise<MemoryEmbeddingReindexResult> {
   const query = pruneStale ? '?prune_stale=true' : ''
   return apiClient.post<MemoryEmbeddingReindexResult>(
     `/memory/enhancement/reindex${query}`,
+    undefined,
+    options,
   )
 }
 
-export function pruneMemoryEmbeddings(): Promise<MemoryEmbeddingPruneResult> {
+export function pruneMemoryEmbeddings(options?: ApiRequestOptions): Promise<MemoryEmbeddingPruneResult> {
   return apiClient.post<MemoryEmbeddingPruneResult>(
     '/memory/enhancement/prune-embeddings',
+    undefined,
+    options,
   )
 }
 

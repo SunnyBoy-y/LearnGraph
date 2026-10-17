@@ -41,6 +41,15 @@ class MemoryCreateRequest(BaseModel):
         return self
 
 
+class MemoryBatchDeleteRequest(BaseModel):
+    memory_ids: list[str] = Field(min_length=1, max_length=10_000)
+
+
+class MemoryBatchDeleteResult(BaseModel):
+    deleted_count: int
+    recoverable_count: int
+
+
 class MemoryUpdateRequest(BaseModel):
     expected_revision: int | None = Field(default=None, ge=1)
     title: str | None = Field(default=None, min_length=1, max_length=240)
@@ -399,6 +408,7 @@ class MemoryProfileIntentResult(BaseModel):
     profile_status: str = "stale"
     provider_id: str | None = None
     model_id: str | None = None
+    message: str = ""
 
 
 class ContextSummaryView(ORMModel):
@@ -613,7 +623,7 @@ class SpeechModelCatalogView(BaseModel):
 class ProviderTypeCatalogView(BaseModel):
     provider_type: str
     role: Literal[
-        "model", "image_generation", "vision", "search", "image_search", "fetch", "deep_research", "memory", "transcription", "tts", "embedding", "development"
+        "model", "image_generation", "vision", "search", "image_search", "fetch", "memory", "transcription", "tts", "embedding", "development"
     ]
     label: str
     description: str
@@ -1298,7 +1308,7 @@ class WebFetchPolicySettingValue(BaseModel):
 
 
 class ResearchPolicySettingValue(BaseModel):
-    """Workspace-wide exact-host allowlist for search and Deep Research."""
+    """Workspace-wide exact-host allowlist for search."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1421,7 +1431,6 @@ class FunctionalModelDefaultsSettingValue(BaseModel):
     image_generation: FunctionalModelTarget | None = None
     search: FunctionalModelTarget | None = None
     fetch: FunctionalModelTarget | None = None
-    deep_research: FunctionalModelTarget | None = None
 
 
 class ChatResponseStyleSettingValue(BaseModel):

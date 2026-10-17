@@ -50,6 +50,26 @@ def test_memory_drafts_list(client, register_user, auth_headers):
     assert r.status_code == 200, r.text
 
 
+def test_memory_batch_delete_http(client, register_user, auth_headers):
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    ids = []
+    for title in ('batch first', 'batch second'):
+        response = client.post('/api/v1/memory', headers=headers, json={'title': title, 'content': title})
+        assert response.status_code in (200, 201), response.text
+        ids.append(response.json()['id'])
+    # A missing/foreign target must not delete the valid targets in the request.
+    response = client.post('/api/v1/memory/batch-delete', headers=headers, json={'memory_ids': ids + ['missing']})
+    assert response.status_code == 404, response.text
+    assert {item['id'] for item in client.get('/api/v1/memory', headers=headers).json()} >= set(ids)
+    response = client.post('/api/v1/memory/batch-delete', headers=headers, json={'memory_ids': ids})
+    assert response.status_code == 200, response.text
+    assert response.json() == {'deleted_count': 2, 'recoverable_count': 2}
+    assert not set(ids) & {item['id'] for item in client.get('/api/v1/memory/views', headers=headers).json()}
+    response = client.post('/api/v1/memory/batch-delete', headers=headers, json={'memory_ids': []})
+    assert response.status_code == 422
+
+
 def test_memory_v2_search_validation(client, register_user, auth_headers):
     """V2 检索：无查询词应 4xx；有查询词返回 200（空结果可接受）。"""
     token, ws, _, _ = register_user()

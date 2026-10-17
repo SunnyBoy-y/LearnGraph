@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -70,6 +71,7 @@ export function MemoryAllList({
   items,
   workspaceId,
   onDelete,
+  onDeleteMany,
   onRestoreRevision,
   onUpdate,
 }: {
@@ -78,13 +80,40 @@ export function MemoryAllList({
   items: MemoryEntry[]
   workspaceId: string
   onDelete: (id: string) => void
+  onDeleteMany: (ids: string[]) => Promise<void>
   onRestoreRevision: (item: MemoryEntry, revision: number) => void
   onUpdate: (id: string, payload: Parameters<typeof updateMemory>[1]) => Promise<void>
 }) {
   const [category, setCategory] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [deleteTarget, setDeleteTarget] = useState<MemoryEntry[] | null>(null)
   const options = memoryCategoryOptions(items)
   const visible = category ? items.filter((item) => memoryCategoryLabel(item) === category) : items
+  const selected = items.filter((item) => selectedIds.has(item.id))
+  const visibleSelected = visible.filter((item) => selectedIds.has(item.id)).length
+
+  function selectVisible(checked: boolean) {
+    setSelectedIds((previous) => {
+      const next = new Set(previous)
+      for (const item of visible) {
+        if (checked) next.add(item.id)
+        else next.delete(item.id)
+      }
+      return next
+    })
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget || busy) return
+    try {
+      await onDeleteMany(deleteTarget.map((item) => item.id))
+      setSelectedIds((previous) => new Set([...previous].filter((id) => !deleteTarget.some((item) => item.id === id))))
+      setDeleteTarget(null)
+    } catch {
+      // The parent displays the API error; keep the selection for retry.
+    }
+  }
 
   return (
     <div className="space-y-3">
@@ -112,8 +141,32 @@ export function MemoryAllList({
             </Button>
           ))}
         </div>
-        {createAction}
+        <div className="flex flex-wrap items-center gap-2">
+          {createAction}
+          <Button disabled={busy || !items.length} onClick={() => setDeleteTarget(items)} size="sm" variant="outline">
+            <Trash2 className="size-3.5" />清空全部
+          </Button>
+        </div>
       </div>
+
+      {items.length ? (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border bg-muted/20 px-5 py-2.5">
+          <label className="flex items-center gap-3 text-sm">
+            <Checkbox
+              aria-label="全选当前分类"
+              checked={visibleSelected > 0 && visibleSelected < visible.length ? 'indeterminate' : visible.length > 0 && visibleSelected === visible.length}
+              disabled={busy || !visible.length}
+              onCheckedChange={(checked) => selectVisible(checked === true)}
+            />
+            全选当前分类
+          </label>
+          <span aria-live="polite" className="text-xs text-muted-foreground">已选 {selected.length} 条</span>
+          {selected.length ? <Button disabled={busy} onClick={() => setSelectedIds(new Set())} size="sm" variant="ghost">取消选择</Button> : null}
+          <Button className="ml-auto" disabled={busy || !selected.length} onClick={() => setDeleteTarget(selected)} size="sm" variant="destructive">
+            <Trash2 className="size-3.5" />{busy ? '处理中…' : '删除所选'}
+          </Button>
+        </div>
+      ) : null}
 
       {!items.length ? (
         <div className="surface p-2">
@@ -130,6 +183,13 @@ export function MemoryAllList({
                 busy={busy}
                 item={item}
                 key={item.id}
+                selected={selectedIds.has(item.id)}
+                onSelect={(checked) => setSelectedIds((previous) => {
+                  const next = new Set(previous)
+                  if (checked) next.add(item.id)
+                  else next.delete(item.id)
+                  return next
+                })}
                 onDelete={() => onDelete(item.id)}
                 onOpenDetail={() => setDetailId(item.id)}
                 onRestoreRevision={(revision) => onRestoreRevision(item, revision)}
@@ -152,6 +212,23 @@ export function MemoryAllList({
         onClose={() => setDetailId(null)}
         workspaceId={workspaceId}
       />
+      <AlertDialog onOpenChange={(open) => !busy && !open && setDeleteTarget(null)} open={deleteTarget !== null}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogMedia className="bg-destructive/10 text-destructive"><Trash2 /></AlertDialogMedia>
+            <AlertDialogTitle>删除这 {deleteTarget?.length ?? 0} 条记忆？</AlertDialogTitle>
+            <AlertDialogDescription>
+              这些记忆将从报告和后续召回中移除。普通记忆移入回收站，30 分钟内可恢复。
+              {deleteTarget?.some((item) => item.view_source === 'event') ? '来自学习记录的只读记忆将永久删除，无法恢复。' : ''}
+              清空全部会处理所有分类中的记忆。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <Button disabled={busy} onClick={() => void confirmDelete()} variant="destructive">{busy ? '删除中…' : '确认删除'}</Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
@@ -161,6 +238,8 @@ function MemoryListRow({
   item,
   workspaceId,
   onDelete,
+  selected,
+  onSelect,
   onOpenDetail,
   onRestoreRevision,
   onUpdate,
@@ -169,6 +248,8 @@ function MemoryListRow({
   item: MemoryEntry
   workspaceId: string
   onDelete: () => void
+  selected: boolean
+  onSelect: (checked: boolean) => void
   onOpenDetail: () => void
   onRestoreRevision: (revision: number) => void
   onUpdate: (payload: Parameters<typeof updateMemory>[1]) => Promise<void>
@@ -180,7 +261,8 @@ function MemoryListRow({
   const updated = memoryUpdatedHint(item.updated_at)
 
   return (
-    <div className="flex items-start gap-3 px-5 py-3.5">
+    <div className={`flex items-start gap-3 px-5 py-3.5 ${selected ? 'bg-primary/5' : ''}`}>
+      <Checkbox aria-label={`选择记忆：${item.title}`} checked={selected} className="mt-0.5" disabled={busy} onCheckedChange={(checked) => onSelect(checked === true)} />
       <div className="min-w-0 flex-1">
         <p className="line-clamp-2 text-sm font-medium leading-5">{item.title}</p>
         <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
@@ -206,6 +288,7 @@ function MemoryListRow({
         </p>
       </div>
       <div className="flex shrink-0 items-center gap-0.5">
+        <Button aria-label={`删除记忆：${item.title}`} disabled={busy} onClick={() => setDeleteOpen(true)} size="icon-xs" variant="ghost"><Trash2 className="size-3.5" /></Button>
         {readOnly ? null : (
           <EditMemoryDialog
             busy={busy}
@@ -229,7 +312,7 @@ function MemoryListRow({
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem
-              disabled={readOnly}
+              disabled={busy}
               onSelect={() => setDeleteOpen(true)}
               variant="destructive"
             >
@@ -268,12 +351,12 @@ function MemoryListRow({
             </AlertDialogMedia>
             <AlertDialogTitle>删除“{item.title}”？</AlertDialogTitle>
             <AlertDialogDescription>
-              删除后会从报告中移除。30 分钟内可以在 ··· → 回收站直接恢复；之后正文不可恢复。
+              {readOnly ? '这条记忆来自学习记录，将从报告和召回中永久删除，无法恢复。' : '删除后会从报告中移除。30 分钟内可以在 ··· → 回收站直接恢复；之后正文不可恢复。'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction onClick={onDelete} variant="destructive">
+            <AlertDialogAction disabled={busy} onClick={onDelete} variant="destructive">
               确认删除
             </AlertDialogAction>
           </AlertDialogFooter>

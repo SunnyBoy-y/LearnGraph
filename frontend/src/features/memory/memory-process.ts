@@ -1,12 +1,6 @@
 import type { MemoryProfileIntentResult } from '@/types/memory'
 
-/**
- * Small in-memory event log for the memory composer.  Memory profile writes
- * are intentionally synchronous REST calls (they are not chat messages), so
- * they do not naturally appear in the conversation. Keeping the latest
- * operation here lets the shell render a local reasoning/tool timeline
- * without inventing a second session just for UI.
- */
+/** Latest server-emitted memory Agent execution, scoped to the workspace. */
 
 export type MemoryProcessStepKind = 'request' | 'reasoning' | 'tool' | 'result'
 export type MemoryProcessStepStatus = 'pending' | 'running' | 'completed' | 'failed'
@@ -87,13 +81,7 @@ export function startMemoryProcess(input: {
     modelId: input.modelId,
     status: 'running',
     startedAt,
-    steps: [
-      step('request', 'request', '已接收记忆更新请求', 'completed'),
-      step('reasoning', 'reasoning', '推理：分析记忆意图', 'running', '识别需要记住、修改或忘记的事实'),
-      step('read-memory', 'tool', '工具调用：读取并校验现有记忆', 'running'),
-      step('write-memory', 'tool', '工具调用：写入记忆草稿', 'pending'),
-      step('result', 'result', '整理学习记忆报告', 'pending'),
-    ],
+    steps: [step('prepare', 'request', '正在连接记忆 Agent', 'running')],
   })
   notify()
   return id
@@ -110,46 +98,45 @@ export function updateMemoryProcess(
   notify()
 }
 
+export function recordMemoryProcessStep(
+  workspaceId: string,
+  id: string,
+  event: Omit<MemoryProcessStep, 'startedAt' | 'completedAt'>,
+) {
+  updateMemoryProcess(workspaceId, id, (current) => {
+    const previous = current.steps.find((item) => item.id === event.id)
+    const next: MemoryProcessStep = {
+      ...event,
+      startedAt: previous?.startedAt ?? now(),
+      ...(['completed', 'failed'].includes(event.status) ? { completedAt: now() } : {}),
+    }
+    return {
+      ...current,
+      steps: previous
+        ? current.steps.map((item) => item.id === event.id ? next : item)
+        : [...current.steps, next],
+    }
+  })
+}
+
 export function completeMemoryProcess(
   workspaceId: string,
   id: string,
   result: MemoryProfileIntentResult,
 ) {
-  updateMemoryProcess(workspaceId, id, (current) => {
-    const timestamp = now()
-    const committed = result.auto_committed || result.drafts_created
-    const detail = result.status === 'no_change'
-      ? '没有识别到需要长期保存的变化'
-      : `${result.drafts_created} 条草稿 · ${result.auto_committed} 条已自动提交`
-    return {
-      ...current,
-      status: 'completed',
-      completedAt: timestamp,
-      providerId: result.provider_id ?? current.providerId,
-      modelId: result.model_id ?? current.modelId,
-      result,
-      steps: current.steps.map((item) => {
-        if (item.id === 'reasoning') {
-          return { ...item, status: 'completed', completedAt: timestamp }
-        }
-        if (item.id === 'read-memory') {
-          return { ...item, status: 'completed', completedAt: timestamp }
-        }
-        if (item.id === 'write-memory') {
-          return {
-            ...item,
-            status: 'completed',
-            detail: committed ? `已处理 ${committed} 条记忆` : '未产生新的写入',
-            completedAt: timestamp,
-          }
-        }
-        if (item.id === 'result') {
-          return { ...item, status: 'completed', detail, completedAt: timestamp }
-        }
-        return item
-      }),
-    }
-  })
+  updateMemoryProcess(workspaceId, id, (current) => ({
+    ...current,
+    status: 'completed',
+    completedAt: now(),
+    providerId: result.provider_id ?? current.providerId,
+    modelId: result.model_id ?? current.modelId,
+    result,
+    steps: [...current.steps, step(
+      'result', 'result', '记忆 Agent 处理结果', 'completed',
+      `提交 ${result.auto_committed} 条，待确认 ${Math.max(0, result.drafts_created - result.auto_committed)} 条`
+        + (result.message ? `。${result.message}` : ''),
+    )],
+  }))
 }
 
 export function failMemoryProcess(workspaceId: string, id: string, error: string) {

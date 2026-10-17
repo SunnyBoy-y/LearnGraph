@@ -263,6 +263,15 @@ export interface MemoryProfileIntentResult {
   profile_status: string
   provider_id?: string | null
   model_id?: string | null
+  message?: string
+}
+
+export interface MemoryAgentStep {
+  id: string
+  kind: 'request' | 'reasoning' | 'tool' | 'result'
+  label: string
+  detail?: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
 }
 
 /**

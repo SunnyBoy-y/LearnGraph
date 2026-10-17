@@ -1,5 +1,6 @@
 import { type RefObject, useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
+import { useReducedMotionPreference } from '@/lib/motion-preferences'
 import { ArrowUp, Check, ChevronDown, LoaderCircle, Pencil, Search } from 'lucide-react'
 
 import {
@@ -168,6 +169,7 @@ export function MemoryReportComposer({
   providerId: string
   selection: MemoryReportSelection | null
 }) {
+  const reducedMotion = useReducedMotionPreference()
   return (
     <div className="w-full max-w-[800px]">
       <AnimatePresence initial={false}>
@@ -175,8 +177,9 @@ export function MemoryReportComposer({
           <motion.div
             animate={{ height: 'auto', opacity: 1, y: 0 }}
             className="mb-2 flex items-center gap-2 overflow-hidden px-2 text-xs text-muted-foreground"
-            exit={{ height: 0, opacity: 0, y: 4 }}
-            initial={{ height: 0, opacity: 0, y: 4 }}
+            exit={{ height: 0, opacity: 0, y: reducedMotion ? 0 : 4 }}
+            initial={reducedMotion ? false : { height: 0, opacity: 0, y: 4 }}
+            transition={{ duration: reducedMotion ? 0 : 0.16 }}
           >
             <Pencil className="size-3.5 text-primary" />
             <span className="min-w-0 flex-1 truncate">正在纠正：“{selection.text}”</span>
@@ -210,13 +213,7 @@ export function MemoryReportComposer({
             value={draft}
           />
         </PromptInputBody>
-        <div className="memory-report-composer__hint" data-align="block-end">
-          <span>记忆更新会先被整理为可追溯的原子，再写入报告。</span>
-        </div>
         <div className="memory-report-composer__actions" data-align="block-end">
-          <span className="memory-report-composer__examples">
-            例如“记住我现在在准备考研” · “我更喜欢先看例子再讲原理”
-          </span>
           <span className="memory-report-composer__controls">
             <MemoryModelPicker
               disabled={busy}

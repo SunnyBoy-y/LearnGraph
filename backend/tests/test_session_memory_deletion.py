@@ -305,7 +305,7 @@ def test_profile_discards_generated_summary_after_source_deletion(env):
         if kwargs["schema_name"] == "memory_profile":
             workflow.delete_session("delete", "Delete")
             return ({"dimensions": [{"key": "learning_style", "title": "Style",
-                "paragraphs": [{"text": "private preference", "atom_ids": [record.id]}]}]}, "fake")
+                "paragraphs": [{"text": "private preference", "atom_ids": ["A1"]}]}]}, "fake")
         return ({"valid_claim_ids": ["d0p0"]}, "fake")
     with (
         patch.object(service, "_atom_payloads", return_value=([record], [{"id": record.id}])),

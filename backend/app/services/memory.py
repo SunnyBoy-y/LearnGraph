@@ -1682,6 +1682,74 @@ class MemoryService:
             ],
         }
 
+    def delete_many(self, memory_ids: list[str]) -> dict[str, int]:
+        """Validate every target before writing, then commit the whole batch once."""
+        ids = list(dict.fromkeys(memory_ids))
+        self.purge_expired()
+        visible = {item.id: item for item in self.list_views()}
+        if any(memory_id not in visible for memory_id in ids):
+            raise AppError(404, "memory_not_found", "Memory was not found")
+        recoverable = 0
+        with self.atomic_write():
+            for memory_id in ids:
+                if visible[memory_id].view_source != "event":
+                    self.delete(memory_id)
+                    recoverable += 1
+                else:
+                    self._forget_event_view(memory_id)
+        return {"deleted_count": len(ids), "recoverable_count": recoverable}
+
+    def _forget_event_view(self, memory_id: str) -> None:
+        from sqlalchemy import delete
+        from app.domain.memory_event_models import MemoryPayloadKey, MemoryScopeContext
+        from app.domain.models import MemoryEmbedding
+        from app.domain.memory_event_types import MemoryEventType
+        from app.services.memory_event_store import AppendEvent
+        from app.services.memory_projector import MemoryProjector
+
+        document = self.db.scalar(select(MemorySearchDocument).where(
+            MemorySearchDocument.tenant_id == self.workspace.tenant_id,
+            MemorySearchDocument.workspace_id == self.workspace_id,
+            MemorySearchDocument.target_type == "memory",
+            MemorySearchDocument.target_id == memory_id,
+            MemorySearchDocument.status == "active",
+        ))
+        if document is None:
+            raise AppError(404, "memory_not_found", "Memory was not found")
+        scope = MemoryScopeContext(
+            tenant_id=self.workspace.tenant_id, workspace_id=self.workspace_id,
+            principal_user_id=self.actor_id, conversation_id=document.conversation_id,
+        )
+        store = self._event_store()
+        stream = store.events.stream_for_aggregate(scope, "memory_atom", memory_id)
+        if stream is None:
+            raise AppError(404, "memory_not_found", "Memory stream was not found")
+        store.destroy_stream_payloads(scope, stream.id, actor_id=self.actor_id, reason="user_deleted")
+        result = store.append(
+            scope, aggregate_type="memory_atom", aggregate_id=memory_id,
+            expected_version=stream.current_version,
+            event=AppendEvent(
+                event_type=MemoryEventType.MEMORY_FORGOTTEN,
+                payload={"memory_id": memory_id},
+                idempotency_key=f"delete-event-view:{memory_id}", actor_id=self.actor_id,
+            ),
+            outbox_kinds=("markdown", "mem0", "embedding", "profile", "index"),
+        )
+        MemoryProjector(self.db).apply(result.event, {"memory_id": memory_id})
+        self.db.execute(delete(MemoryEmbedding).where(
+            MemoryEmbedding.workspace_id == self.workspace_id,
+            MemoryEmbedding.memory_id == memory_id,
+        ))
+        key = self.db.get(MemoryPayloadKey, result.event.payload_key_id)
+        if key is not None:
+            key.wrapped_dek, key.status = None, "destroyed"
+            key.destroyed_at, key.destroyed_by = utc_now(), self.actor_id
+            key.reason = "user_deleted"
+        stream.status, stream.payload_key_id = "forgotten", None
+        self._mark_profile_stale("memory_deleted")
+        self.audit.record(actor_id=self.actor_id, action="memory.forget",
+                          resource_type="memory", resource_id=memory_id, details={})
+
     def delete(self, memory_id: str) -> MemoryView:
         self.purge_expired()
         record = self._require_active(memory_id)

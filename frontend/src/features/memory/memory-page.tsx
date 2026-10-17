@@ -5,9 +5,9 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 
 import {
-  applyMemoryProfileIntent,
+  runMemoryProfileAgent,
   createMemory,
-  deleteMemory,
+  deleteMemories,
   exportMemoryMarkdown,
   getCurrentUser,
   getGraph,
@@ -69,6 +69,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import type {
   MemoryCreateRequest,
+  MemoryProfileIntentRequest,
+  MemoryAgentStep,
   MemoryEntry,
   MemoryNamespace,
   MemoryScopeType,
@@ -86,6 +88,7 @@ import { MemorySettingsDialog } from './components/memory-settings-dialog'
 import { MemoryTrashDialog } from './components/memory-trash-dialog'
 import {
   completeMemoryProcess,
+  recordMemoryProcessStep,
   failMemoryProcess,
   startMemoryProcess,
 } from './memory-process'
@@ -101,19 +104,6 @@ const zoneDefinitions: Array<{ zone: MemoryZone; title: string }> = [
 type MemoryTab = 'report' | 'all' | 'pending'
 
 /**
- * 从自然语言输入推导记忆标题：取首个非空行，去掉常见 Markdown 标记，
- * 截断到 240 字符以内（服务端标题上限）。仅用于无模型降级保存路径。
- */
-function memoryTitleFromText(text: string): string {
-  const firstLine = text
-    .split('\n')
-    .map((line) => line.trim())
-    .find(Boolean)
-  const cleaned = (firstLine ?? text).replace(/[#>*`[\]()]/g, '').trim()
-  return cleaned.slice(0, 240) || '用户记忆'
-}
-
-/**
  * `memory_profile_*` 错误码的中文口径。
  *
  * 后端这些 AppError 的 message 全是英文（例如刷新报告时的
@@ -123,9 +113,21 @@ function memoryTitleFromText(text: string): string {
  */
 function memoryProfileErrorText(error: unknown, fallback: string): string | null {
   if (!(error instanceof ApiError)) return null
+  const partial = (error.details as { partial_result?: { auto_committed?: number } } | undefined)?.partial_result
+  if (partial?.auto_committed) {
+    return `处理未完成，本次已提交 ${partial.auto_committed} 条记忆。请先查看当前记忆，再补充未完成的修改`
+  }
+  if (error.code === 'memory_profile_model_unconfigured') {
+    return '请先选择模型，或在记忆设置中配置模型后重试'
+  }
   if (error.code === 'memory_profile_model_unavailable') {
     return '记忆模型当前不可用，请到「记忆设置」检查模型配置后重试'
   }
+  if (error.code === 'memory_profile_input_budget_exceeded') {
+    return '记忆内容超出了当前模型的报告输入预算，请检查记忆摘要模型的上下文配置'
+  }
+  if (error.code === 'memory_profile_agent_limit') return '本次处理已达到上限，请缩小修改范围后重试'
+  if (error.code === 'memory_profile_agent_tools_unavailable') return '所选模型不支持工具调用，请选择支持工具的模型'
   if (error.code.startsWith('memory_profile_')) return fallback
   return null
 }
@@ -253,9 +255,9 @@ export function MemoryPage() {
     onError: (error) => toast.error(error.message),
   })
   const remove = useMutation({
-    mutationFn: deleteMemory,
-    onSuccess: async () => {
-      toast.success('已移入回收站，30 分钟内可以恢复')
+    mutationFn: deleteMemories,
+    onSuccess: async (result) => {
+      toast.success(`已删除 ${result.deleted_count} 条记忆${result.recoverable_count ? '，普通记忆 30 分钟内可在回收站恢复' : ''}`)
       await refreshMemory()
     },
     onError: (error) => toast.error(error.message),
@@ -287,10 +289,13 @@ export function MemoryPage() {
     onError: (error) => toast.error(error.message),
   })
   const editProfile = useMutation({
-    mutationFn: applyMemoryProfileIntent,
+    mutationFn: ({ payload, onStep }: {
+      payload: MemoryProfileIntentRequest
+      onStep: (step: MemoryAgentStep) => void
+    }) => runMemoryProfileAgent(payload, onStep),
     onSuccess: async (result) => {
       if (result.status === 'no_change') {
-        toast.info('没有识别到需要长期保存的变化')
+        toast.info(result.message || '没有识别到需要长期保存的变化')
       } else if (result.auto_committed) {
         toast.success(`已整理并更新 ${result.auto_committed} 条记忆`)
       } else {
@@ -298,14 +303,12 @@ export function MemoryPage() {
       }
       await refreshMemory()
     },
-    onError: (error) => {
-      // 未配置记忆模型时 quickAdd 会降级为直接创建普通记忆并给出中文提示，
-      // 这里不再重复弹出英文错误。其余 memory_profile_* 错误统一翻成中文。
-      if (error instanceof ApiError && error.code === 'memory_profile_model_unconfigured') return
+    onError: async (error) => {
       toast.error(
         memoryProfileErrorText(error, '整理这次没能完成，输入内容已保留，可稍后重试')
           ?? error.message,
       )
+      await refreshMemory()
     },
   })
   const regenerateProfile = useMutation({
@@ -315,8 +318,12 @@ export function MemoryPage() {
       // 只提示保持快照模式，配置模型后可一键生成正式报告。
       if (result.status === 'atomic_snapshot') {
         toast.info('未配置记忆摘要模型，当前保持原子快照；配置后可生成正式报告')
-      } else {
+      } else if (result.status === 'ready') {
         toast.success('学习记忆报告已整篇重写')
+      } else if (result.status === 'empty') {
+        toast.info('当前还没有可用于生成学习报告的有效记忆')
+      } else {
+        toast.error('学习报告尚未生成成功，请稍后重试')
       }
       await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile') })
     },
@@ -328,7 +335,7 @@ export function MemoryPage() {
         if (error.code === 'memory_profile_model_unconfigured') return
       }
       toast.error(
-        memoryProfileErrorText(error, '刷新失败：模型这次没能完成整理，已保留上一版报告，可稍后再试')
+        memoryProfileErrorText(error, '刷新失败：模型这次没能完成整理，可稍后再试')
           ?? error.message,
       )
     },
@@ -355,10 +362,10 @@ export function MemoryPage() {
       )
     },
   })
-  // 报告正文“忘记这件事”的软删除：逐条删除后统一刷新，失败直接提示。
+  // 报告正文也复用原子批量删除，避免部分成功后界面残留旧数据。
   const forgetSelectionMutation = useMutation({
     mutationFn: async (items: MemoryEntry[]) => {
-      for (const item of items) await deleteMemory(item.id)
+      await deleteMemories(items.map((item) => item.id))
     },
     onSuccess: async () => {
       setForgetTarget(null)
@@ -399,43 +406,6 @@ export function MemoryPage() {
     regenerateProfile.isPending ||
     migrateAtoms.isPending
 
-  // “告诉 AI 导师需要记住、修改或忘记什么”优先走自然语言意图（LLM 原子化整理）。
-  // 当工作区未配置记忆提取/摘要模型时，后端会返回 memory_profile_model_unconfigured ——
-  // 此时降级为直接创建一条普通记忆，保证输入框在无模型状态也能发送并立即在报告与
-  // 记忆列表中生效（原子快照模式会逐条列出，配置模型后可一键整理为原子）。
-  const quickAdd = async (
-    content: string,
-    selectedText?: string,
-    selectedAtomIds?: string[],
-    model?: { providerId: string; modelId: string },
-  ) => {
-    try {
-      return await editProfile.mutateAsync({
-        text: content,
-        selected_text: selectedText,
-        selected_atom_ids: selectedAtomIds,
-        provider_id: model?.providerId || undefined,
-        model_id: model?.modelId || undefined,
-        timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai',
-      })
-    } catch (error) {
-      if (error instanceof ApiError && error.code === 'memory_profile_model_unconfigured') {
-        toast.info('未配置记忆提取/摘要模型，已按普通记忆直接保存；配置模型后可自动原子化整理')
-        await create.mutateAsync({
-          title: memoryTitleFromText(content),
-          content,
-          zone: 'topics',
-          namespace: 'workspace',
-          scope_type: 'workspace',
-          record_kind: 'semantic_memory',
-          source: 'user_confirmed',
-        })
-        return null
-      }
-      throw error
-    }
-  }
-
   async function submitIntent(contentValue: string): Promise<boolean> {
     const content = contentValue.trim()
     if (!content || composerBusy) return false
@@ -450,25 +420,18 @@ export function MemoryPage() {
       modelId: selectedModel?.modelId,
     })
     try {
-      const result = await quickAdd(
-        content,
-        selection?.text,
-        selection?.atomIds,
-        selectedModel,
-      )
-      completeMemoryProcess(
-        workspaceId,
-        process,
-        result ?? {
-          status: 'ok',
-          drafts_created: 1,
-          auto_committed: 1,
-          affected_memory_ids: [],
-          profile_status: 'atomic_snapshot',
+      const result = await editProfile.mutateAsync({
+        payload: {
+          text: content,
+          selected_text: selection?.text,
+          selected_atom_ids: selection?.atomIds,
           provider_id: selectedModel?.providerId,
           model_id: selectedModel?.modelId,
+          timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai',
         },
-      )
+        onStep: (step) => recordMemoryProcessStep(workspaceId, process, step),
+      })
+      completeMemoryProcess(workspaceId, process, result)
     } catch (error) {
       // 错误已由 mutation 的 onError 提示，保留输入内容让用户修改后重试。
       failMemoryProcess(
@@ -617,7 +580,8 @@ export function MemoryPage() {
                 />
               }
               items={activeMemories}
-              onDelete={(id) => remove.mutate(id)}
+              onDelete={(id) => remove.mutate([id])}
+              onDeleteMany={(ids) => remove.mutateAsync(ids).then(() => undefined)}
               onRestoreRevision={(item, revision) =>
                 restoreRevision.mutate({
                   id: item.id,
@@ -711,7 +675,7 @@ export function MemoryPage() {
         exportBusy={exportArchive.isPending}
         onExport={() => exportArchive.mutate()}
         onOpenChange={setSettingsOpen}
-        onOpenGovernance={() => navigate('../settings/workspace')}
+        onOpenGovernance={() => navigate('../settings/memory')}
         onOpenTrash={() => setTrashOpen(true)}
         open={settingsOpen}
       />

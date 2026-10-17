@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
+import logging
+from queue import Empty, Queue
+from threading import Event, Thread
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query, Response, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.domain.models import ContextSummary
+from app.domain.models import Workspace
 from app.domain.schemas.management import (
     ContextSummaryView,
     EffectiveMemoryPackageView,
     MemoryBindingView,
+    MemoryBatchDeleteRequest,
+    MemoryBatchDeleteResult,
     MemoryCreateRequest,
     MemoryDraftCreateRequest,
     MemoryDraftDecisionRequest,
@@ -35,6 +44,7 @@ from app.domain.schemas.management import (
 )
 from app.providers.factory import memory_provider_for_workspace
 from app.services.memory import MemoryService
+from app.services.memory_agent import MemoryIntentAgent
 from app.services.memory_enhancement import (
     embedding_index_status,
     extract_session_memories,
@@ -285,6 +295,58 @@ def apply_memory_profile_intent(
     settings: AppSettings,
 ) -> MemoryProfileIntentResult:
     return profile_service(db, context, settings).apply_intent(payload)
+
+
+@router.post("/profile/intents/stream")
+def stream_memory_profile_intent(
+    payload: MemoryProfileIntentRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> StreamingResponse:
+    # Validate configuration before sending 200; the stream owns its own session.
+    MemoryIntentAgent(profile_service(db, context, settings), payload)
+    workspace_id, actor_id = context.workspace_id, context.principal.user_id
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False, autoflush=False)
+
+    def events():
+        queue = Queue()
+        stopped = Event()
+
+        def work():
+            try:
+                with factory() as stream_db:
+                    workspace = stream_db.get(Workspace, workspace_id)
+                    agent = MemoryIntentAgent(
+                        MemoryProfileService(stream_db, workspace, actor_id, settings), payload,
+                    )
+                    for event in agent.run(cancelled=stopped.is_set):
+                        queue.put(event)
+            except Exception:
+                logging.getLogger(__name__).exception("Memory agent stream initialization failed")
+                queue.put({"event": "error", "data": {
+                    "code": "memory_profile_agent_failed", "message": "记忆更新未完成，请检查当前记忆后重试",
+                }})
+            finally:
+                queue.put(None)
+
+        Thread(target=work, name="memory-composer-agent", daemon=True).start()
+        try:
+            while True:
+                try:
+                    event = queue.get(timeout=10)
+                except Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                if event is None:
+                    break
+                yield f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+        finally:
+            stopped.set()
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-store, no-transform", "X-Accel-Buffering": "no",
+    })
 
 
 @router.get("/package", response_model=EffectiveMemoryPackageView)
@@ -629,6 +691,16 @@ def list_memory_bindings(
     settings: AppSettings,
 ) -> list[MemoryBindingView]:
     return service(db, context, settings).list_bindings(memory_id)
+
+
+@router.post("/batch-delete", response_model=MemoryBatchDeleteResult)
+def delete_memories(
+    payload: MemoryBatchDeleteRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MemoryBatchDeleteResult:
+    return MemoryBatchDeleteResult(**service(db, context, settings).delete_many(payload.memory_ids))
 
 
 @router.delete("/{memory_id}", response_model=MemoryView)

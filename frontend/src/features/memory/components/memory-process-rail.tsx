@@ -53,8 +53,8 @@ export function MemoryProcessRail({ workspaceId }: { workspaceId: string }) {
           <span className="memory-process-rail__eyebrow">
             <Brain className="size-3.5" />AI 导师过程
           </span>
-          <h2>推理与工具调用</h2>
-          <p>发送记忆后，这里会显示本次整理的可追踪阶段。</p>
+          <h2>Agent 与工具调用</h2>
+          <p>显示记忆 Agent 的实际工具调用和执行结果。</p>
         </div>
         {process ? (
           <span className={`memory-process-rail__status is-${process.status}`}>
@@ -67,7 +67,7 @@ export function MemoryProcessRail({ workspaceId }: { workspaceId: string }) {
         <div className="memory-process-rail__empty">
           <Wrench className="size-5" />
           <strong>等待一次记忆更新</strong>
-          <span>输入“记住、修改或忘记什么”，发送后会在这里看到推理与工具步骤。</span>
+          <span>输入“记住、修改或忘记什么”，发送后会在这里看到实际执行步骤。</span>
         </div>
       ) : (
         <div className="memory-process-rail__body">
@@ -90,7 +90,7 @@ export function MemoryProcessRail({ workspaceId }: { workspaceId: string }) {
             ))}
           </ol>
           <p className="memory-process-rail__note">
-            过程摘要只展示阶段与结果，不会把模型的隐式思维原文暴露出来。
+            步骤来自服务端实际执行事件；仅展示决策阶段与工具结果。
           </p>
           {process.error ? <p className="memory-process-rail__error">{process.error}</p> : null}
         </div>

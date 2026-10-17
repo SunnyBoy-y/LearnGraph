@@ -1,6 +1,9 @@
+import { currentWorkspaceQueryKey } from '@/lib/query-keys';
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { AnimatePresence, motion } from 'motion/react'
+import { useContentHighlights } from '@/hooks/use-content-highlights'
+import { cn } from '@/lib/utils'
+import { memoryParagraphKey, memoryReportContent } from '../memory-motion'
 import {
   Clock3,
   Compass,
@@ -67,15 +70,15 @@ function useMemoryUsageSummary() {
   }, [receipts.data])
 }
 
-function ReportBodyParagraphs({ dimensions }: { dimensions: MemoryProfileDimension[] }) {
+function ReportBodyParagraphs({ dimensions, changed }: { dimensions: MemoryProfileDimension[]; changed: ReadonlySet<string> }) {
   return (
     <div className="space-y-3.5">
-      {dimensions.map((dimension, dimensionIndex) =>
+      {dimensions.map((dimension) =>
         dimension.paragraphs.map((paragraph, paragraphIndex) => (
           <p
-            className={PARAGRAPH_CLASS}
+            className={cn(PARAGRAPH_CLASS, changed.has(memoryParagraphKey(dimension.key, paragraph, paragraphIndex)) && 'memory-content-updated')}
             data-memory-atom-ids={paragraph.atom_ids.join(',')}
-            key={paragraph.id ?? `${dimension.key}-${dimensionIndex}-${paragraphIndex}`}
+            key={memoryParagraphKey(dimension.key, paragraph, paragraphIndex)}
           >
             {paragraph.text}
           </p>
@@ -135,7 +138,7 @@ export function MemoryReport({
   }, [])
 
   const policy = useQuery({
-    queryKey: ['memory-policy'],
+    queryKey: currentWorkspaceQueryKey('memory-policy'),
     queryFn: () => getMemoryPolicy(),
     retry: false,
     staleTime: 60_000,
@@ -145,6 +148,14 @@ export function MemoryReport({
   const sections = useMemo(
     () => buildMemoryReportSections(profile?.dimensions ?? []),
     [profile?.dimensions],
+  )
+  const reportContent = useMemo(() => memoryReportContent(profile), [profile])
+  const changed = useContentHighlights(
+    `${profile?.workspace_id}:${profile?.owner_subject_id}:${profile?.scope}`,
+    reportContent,
+    reportContent.size > 0,
+    1100,
+    true,
   )
   const updatedHint = memoryUpdatedHint(profile?.generated_at ?? profile?.updated_at ?? null)
   const failure = memoryRefreshFailure(profile?.stale_reason)
@@ -205,6 +216,7 @@ export function MemoryReport({
     else if (profile.status === 'atomic_snapshot') parts.push('原子快照模式')
     else if (profile.status === 'ready') parts.push('报告为最新')
     else if (profile.status === 'building') parts.push('报告生成中')
+    else if (profile.status === 'failed') parts.push('报告刷新失败')
     return parts.length ? parts.join(' · ') : null
   })()
 
@@ -280,12 +292,14 @@ export function MemoryReport({
               </div>
             ) : null}
 
-            {profile?.status === 'stale' ? (
+            {profile?.status === 'stale' || profile?.status === 'failed' ? (
               <div className="mb-7 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/25 bg-amber-50/60 px-4 py-3 text-xs text-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
                 <span>
                   {failure
-                    ? `上次刷新失败：${failure.message}${failure.at ? `（${failure.at}）` : ''}，已保留上一版报告。点右侧可再试一次。`
-                    : '原子记忆已经有变化，旧报告不会注入对话。刷新后会基于当前证据重写。'}
+                    ? `上次刷新失败：${failure.message}${failure.at ? `（${failure.at}）` : ''}。可重新生成学习报告。`
+                    : profile.status === 'failed'
+                      ? '报告暂时未能生成，可重新刷新报告。'
+                      : '记忆已经有变化，刷新后会重新整理学习报告。'}
                 </span>
                 <Button disabled={busy} onClick={() => void onRefresh()} size="xs" variant="outline">
                   立即刷新
@@ -300,21 +314,14 @@ export function MemoryReport({
               </div>
             ) : null}
 
-            <AnimatePresence mode="wait">
               {sections.length || profile?.overview ? (
-                <motion.article
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -6 }}
-                  initial={{ opacity: 0, y: 8 }}
-                  key={profile?.version ?? 0}
-                  transition={{ duration: 0.22, ease: 'easeOut' }}
-                >
+                <article>
                   {profile?.overview ? (
                     <section className="rounded-2xl bg-muted/30 px-5 py-5 sm:px-6 sm:py-6">
                       <h3 className="text-[15px] font-semibold tracking-tight text-muted-foreground">
                         AI 导师眼中的你
                       </h3>
-                      <blockquote className="mt-3 border-l-2 border-primary/35 pl-4 text-[16px] leading-8 text-foreground/90">
+                      <blockquote className={cn('mt-3 border-l-2 border-primary/35 pl-4 text-[16px] leading-8 text-foreground/90', changed.has('overview') && 'memory-content-updated')}>
                         {profile.overview}
                       </blockquote>
                     </section>
@@ -340,21 +347,16 @@ export function MemoryReport({
                             </p>
                           ) : null}
                           <div className="mt-3">
-                            <ReportBodyParagraphs dimensions={section.dimensions} />
+                            <ReportBodyParagraphs dimensions={section.dimensions} changed={changed} />
                           </div>
                         </section>
                       )
                     })}
                   </div>
-                </motion.article>
+                </article>
               ) : profile?.structured_sections.length ? (
-                <motion.article
-                  animate={{ opacity: 1, y: 0 }}
+                <article
                   className="space-y-9"
-                  exit={{ opacity: 0, y: -6 }}
-                  initial={{ opacity: 0, y: 8 }}
-                  key={profile.version}
-                  transition={{ duration: 0.22, ease: 'easeOut' }}
                 >
                   {profile.structured_sections.map((section, sectionIndex) => (
                     <section
@@ -367,9 +369,9 @@ export function MemoryReport({
                       <div className="mt-3 space-y-3.5">
                         {section.paragraphs.map((paragraph, paragraphIndex) => (
                           <p
-                            className={PARAGRAPH_CLASS}
+                            className={cn(PARAGRAPH_CLASS, changed.has(memoryParagraphKey(section.heading, paragraph, paragraphIndex)) && 'memory-content-updated')}
                             data-memory-atom-ids={paragraph.atom_ids.join(',')}
-                            key={paragraph.id ?? `${sectionIndex}-${paragraphIndex}`}
+                            key={memoryParagraphKey(section.heading, paragraph, paragraphIndex)}
                           >
                             {paragraph.text}
                           </p>
@@ -377,18 +379,24 @@ export function MemoryReport({
                       </div>
                     </section>
                   ))}
-                </motion.article>
+                </article>
               ) : profile?.markdown ? (
-                <motion.div animate={{ opacity: 1 }} initial={{ opacity: 0 }} key={profile.version}>
+                <div className={changed.has('markdown') ? 'memory-content-updated' : undefined}>
                   <MessageResponse className="text-[15px] leading-7 text-foreground/88">
                     {profile.markdown}
                   </MessageResponse>
-                </motion.div>
+                </div>
               ) : (
-                <motion.div animate={{ opacity: 1 }} initial={{ opacity: 0 }}>
+                <div>
                   <EmptyState
-                    description="在下方输入框告诉 AI 导师值得长期记住的事实、偏好或变化。内容会先被整理为可追溯的原子，再写进这份报告。"
-                    title="还没有可以生成报告的原子记忆"
+                    description={profile?.status === 'failed' || profile?.status === 'stale'
+                      ? '可以点击「立即刷新」重试，或在下方输入框补充需要记住的内容。'
+                      : '在下方输入框告诉 AI 导师值得长期记住的事实、偏好或变化。'}
+                    title={profile?.status === 'failed'
+                      ? '学习报告暂时无法生成'
+                      : profile?.status === 'stale'
+                        ? '学习报告需要更新'
+                        : '还没有可以生成报告的记忆'}
                   />
                   {legacyCount ? (
                     <div className="mt-4 flex justify-center">
@@ -403,9 +411,8 @@ export function MemoryReport({
                       </Button>
                     </div>
                   ) : null}
-                </motion.div>
+                </div>
               )}
-            </AnimatePresence>
 
             {usage ? (
               <section className="mt-9 border-t pt-7">
