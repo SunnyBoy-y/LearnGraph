@@ -2,7 +2,7 @@
  * 练习页「去设置换模型」出口的回归测试（git 旁路：本文件不入公开仓库）。
  *
  * 这条链路的价值全在**跳对地方**：错误文案说「设置 → 功能模型 → 练习出题与
- * 判分模型」，按钮就必须落在 /settings/workspace（工作区设置页的「功能模型」
+ * 判分模型」，按钮就必须落在 /settings/models?tab=tasks（任务模型分配页的「功能模型」
  * 卡片），不能落到 Provider 页 —— 那里只能改 Provider 默认模型。
  */
 
@@ -12,14 +12,14 @@ import { PRACTICE_MODEL_ERROR_CODES, PracticeModelSettingLink } from '@/features
 import { renderWithProviders } from './render'
 
 describe('PracticeModelSettingLink', () => {
-  it('跳到工作区设置页（功能模型卡片所在页）', () => {
+  it('跳到任务模型分配页（功能模型卡片所在页）', () => {
     const { getByRole } = renderWithProviders(
       <PracticeModelSettingLink workspaceId="ws-1" />,
       { initialEntries: ['/w/ws-1/practice/session/session-1'] },
     )
 
     const link = getByRole('link', { name: '去设置出题模型' })
-    expect(link.getAttribute('href')).toBe('/w/ws-1/settings/workspace')
+    expect(link.getAttribute('href')).toBe('/w/ws-1/settings/models?tab=tasks')
   })
 
   it('支持自定义文案', () => {

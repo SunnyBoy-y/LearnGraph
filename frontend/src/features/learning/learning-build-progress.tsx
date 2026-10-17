@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { Check, LoaderCircle } from 'lucide-react'
+import { Check } from 'lucide-react'
+import { TaskStatusIcon } from '@/components/shared/task-status-icon'
 import { Button } from '@/components/ui/button'
 import type { Build } from './node-learning-api'
 
@@ -25,7 +26,7 @@ export function LearningBuildProgress({build, busy, refreshing, error, onRefresh
   const label = ({queued: '等待后台处理', running: `正在生成${build.stage}`, ready: '学习页已准备好', failed: '本阶段未能完成', cancelled: '准备已取消', skipped: '此任务已跳过'} as Record<string, string>)[build.status] ?? build.status
   return <div className="learning-build-progress">
     <div className="learning-section-heading" role="status">
-      {active && <LoaderCircle className="size-5 animate-spin" aria-hidden="true" />}
+      <TaskStatusIcon taskKey={build.id} status={active ? 'running' : build.status === 'ready' ? 'succeeded' : build.status === 'failed' ? 'failed' : 'cancelled'} className="size-5" />
       <strong>{label}</strong><span className="learning-muted">已完成 {build.completed_stages} / {build.total_stages} 个阶段</span>
     </div>
     <progress value={build.completed_stages} max={build.total_stages} aria-label="学习页构建阶段进度" />

@@ -50,6 +50,57 @@ describe('graph layout regression', () => {
 })
 
 describe('graph rendering regression', () => {
+  it.each(['camera', 'node'])('cancels a queued resize frame when the learner moves the %s first', (target) => {
+    const observers: { callback: ResizeObserverCallback; active: boolean }[] = []
+    vi.stubGlobal('ResizeObserver', class {
+      entry: typeof observers[number]
+      constructor(callback: ResizeObserverCallback) { this.entry = { callback, active: true }; observers.push(this.entry) }
+      observe() {}
+      disconnect() { this.entry.active = false }
+    })
+    vi.useFakeTimers()
+    const frames = new Map<number, FrameRequestCallback>()
+    let sequence = 0
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frames.set(++sequence, callback); return sequence })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(id => { frames.delete(id) })
+    try {
+      const g = graph(3)
+      const flow = { getZoom: () => 1, getNodes: () => capture.props.nodes, fitView: vi.fn(), setCenter: vi.fn(), fitBounds: vi.fn() }
+      const ui = render(<KnowledgeGraph {...g} layout="tree" interactive initialFit="focus" />)
+      act(() => capture.props.onInit(flow))
+      act(() => observers.filter(observer => observer.active).forEach(observer => observer.callback(
+        [{ contentRect: { width: 640, height: 480 } } as ResizeObserverEntry], {} as ResizeObserver,
+      )))
+      act(() => vi.advanceTimersByTime(120))
+      expect(frames.size).toBeGreaterThan(0)
+      act(() => target === 'camera'
+        ? capture.props.onMove({ type: 'wheel' }, { zoom: .8 })
+        : capture.props.onNodeDragStart({ type: 'pointermove' }, g.nodes[1]))
+      act(() => { frames.forEach(frame => frame(120)); frames.clear() })
+      expect(flow.fitView).not.toHaveBeenCalled()
+      expect(flow.setCenter).not.toHaveBeenCalled()
+      ui.unmount()
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('reveals a new relation without reframing a viewport the learner moved', async () => {
+    const g = graph(3)
+    const flow = { getZoom: () => 1, getNodes: () => capture.props.nodes, fitView: vi.fn(), setCenter: vi.fn(), fitBounds: vi.fn() }
+    const view = render(<KnowledgeGraph {...g} layout="tree" interactive initialFit="view" />)
+    act(() => capture.props.onInit(flow))
+    await waitFor(() => expect(flow.fitView).toHaveBeenCalled())
+    act(() => capture.props.onMove({ type: 'pointermove' }, { zoom: .8 }))
+    const previousFits = flow.fitView.mock.calls.length
+    const nextNode = { id: 'new', type: 'knowledge', position: { x: 0, y: 0 }, data: { label: '新节点' } } as KnowledgeNode
+    view.rerender(<KnowledgeGraph nodes={[...g.nodes, nextNode]} edges={[...g.edges, { id: 'new-edge', source: '1', target: 'new', data: { relation: 'contains' } }]} layout="tree" interactive initialFit="view" />)
+    await waitFor(() => expect(capture.props.nodes.find((node: KnowledgeNode) => node.id === 'new')?.className).toContain('graph-relation-target'))
+    expect(capture.props.edges.filter((edge: Edge) => edge.target === 'new').map((edge: Edge) => ({ source: edge.source, target: edge.target, feedback: edge.className?.includes('graph-relation-arrive') }))).toContainEqual({ source: '1', target: 'new', feedback: true })
+    expect(flow.fitView).toHaveBeenCalledTimes(previousFits)
+    expect(flow.setCenter).not.toHaveBeenCalled()
+  })
   it('preserves non-root topology when switching to spatial layout', async () => {
     const g = graph(4, true)
     render(<KnowledgeGraph {...g} layout="spatial" interactive initialFit="focus" />)

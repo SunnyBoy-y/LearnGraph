@@ -1,5 +1,6 @@
 import type { ReactNode } from "react"
-import { AnimatePresence, motion, useReducedMotion } from "motion/react"
+import { AnimatePresence, motion } from "motion/react"
+import { useReducedMotionPreference } from "@/lib/motion-preferences"
 import { useLocation } from "react-router-dom"
 
 /**
@@ -17,7 +18,7 @@ const routeVariants = {
     opacity: 1,
     y: 0,
     transition: {
-      duration: 0.42,
+      duration: 0.2,
       ease: [0.16, 1, 0.3, 1],
     },
   },
@@ -25,7 +26,7 @@ const routeVariants = {
     opacity: 0,
     y: -6,
     transition: {
-      duration: 0.2,
+      duration: 0.12,
       ease: [0.7, 0, 0.84, 0],
     },
   },
@@ -47,14 +48,7 @@ const routeVariants = {
 
 export function RouteMotion({ children }: { children: ReactNode }) {
   const location = useLocation()
-  const reducedMotionFromHook = useReducedMotion()
-  // `useReducedMotion` is nullable during its first render. Read the media
-  // query as a synchronous fallback so a reduced-motion user never sees the
-  // entrance frame before Motion finishes subscribing.
-  const prefersReducedMotion =
-    reducedMotionFromHook ??
-    (typeof window !== "undefined" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches)
+  const prefersReducedMotion = useReducedMotionPreference()
   // Graph query-string changes (for example selecting a node with `?node=`)
   // update the current surface in place. Treating them as a new route causes
   // AnimatePresence to unmount the old outlet before mounting it again, which
@@ -63,9 +57,14 @@ export function RouteMotion({ children }: { children: ReactNode }) {
   const isGraphWorkspaceRoute = /^\/w\/[^/]+\/graphs(?:\/[^/]+)?$/.test(
     location.pathname,
   )
-  const routeKey = isGraphWorkspaceRoute
+  // Chat owns live stream state and resets session-specific UI itself. Keep
+  // that canvas mounted across /chat/new -> /chat/:id and session switches;
+  // replacing it here strands SSE updates in the outgoing component until
+  // the durable history is fetched after generation finishes.
+  const chatWorkspacePath = location.pathname.match(/^(\/w\/[^/]+\/chat)\/[^/]+$/)?.[1]
+  const routeKey = chatWorkspacePath ?? (isGraphWorkspaceRoute
     ? location.pathname
-    : `${location.pathname}${location.search}`
+    : `${location.pathname}${location.search}`)
 
   return (
     <AnimatePresence initial={false} mode="wait">

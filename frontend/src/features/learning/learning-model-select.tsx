@@ -1,4 +1,7 @@
 import { useMemo } from "react";
+import { Link } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { authStore } from "@/api/auth-store";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -31,10 +34,12 @@ export function LearningModelSelect({
   workspaceId,
   disabled,
   ariaLabel = "教学包生成模型",
+  settingsEditor = false,
 }: {
   workspaceId?: string;
   disabled?: boolean;
   ariaLabel?: string;
+  settingsEditor?: boolean;
 }) {
   const queryClient = useQueryClient();
   // 必须与设置页用同一个 queryKey，否则两处会各存一份缓存、互相看不到改动。
@@ -68,10 +73,11 @@ export function LearningModelSelect({
   );
 
   const save = useMutation({
+    onMutate: () => settingsQueryKey,
     mutationFn: (next: { provider_id: string | null; model_id: string | null }) =>
-      updateSetting(LEARNING_PACKAGE_MODEL_SETTING_KEY, next),
-    onSuccess: (setting) => {
-      queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (existing) => [
+      updateSetting(LEARNING_PACKAGE_MODEL_SETTING_KEY, next, { headers: { "X-Workspace-ID": String(settingsQueryKey[1]) } }),
+    onSuccess: (setting, _variables, originKey) => {
+      queryClient.setQueryData<WorkspaceSetting[]>(originKey!, (existing) => [
         ...(existing ?? []).filter((item) => item.key !== setting.key),
         setting,
       ]);
@@ -79,6 +85,12 @@ export function LearningModelSelect({
     },
     onError: (error: Error) => toast.error(error.message),
   });
+
+  if (!settingsEditor) {
+    return <Button asChild variant="outline" size="sm"><Link to={`/w/${workspaceId ?? authStore.getWorkspaceId()}/settings/models?tab=tasks`}>
+      {ariaLabel}：{options.find(option => option.value === value)?.label ?? "当前配置不可用"}
+    </Link></Button>;
+  }
 
   return (
     <SearchableFeatureModelSelect

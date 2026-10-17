@@ -72,6 +72,8 @@ const minimalAction: ActionItem = {
 const authValue: AuthContextValue = {
   authenticated: true,
   username: "tester",
+  avatarUrl: null,
+  updateProfile: vi.fn(),
   workspaceId: WORKSPACE_ID,
   workspaceName: "测试工作区",
   mustChangePassword: false,

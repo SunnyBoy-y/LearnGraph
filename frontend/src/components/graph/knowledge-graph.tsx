@@ -51,6 +51,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { motionDuration } from "@/lib/motion-preferences";
+import { graphRelationKey, useGraphRelationFeedback } from "./graph-motion";
 import { toast } from "sonner";
 import {
   TREE_CARD_W,
@@ -548,6 +550,7 @@ export function KnowledgeGraph({
   collapsedIds: collapsedIdsProp,
   onCollapsedIdsChange,
 }: KnowledgeGraphProps) {
+  const relationFeedback = useGraphRelationFeedback(nodes, edges);
   const [view, setView] = useState<KnowledgeGraphLayout>(layout);
   const [visibleCount, setVisibleCount] = useState(grow ? 1 : nodes.length);
   const [internalSelectedIds, setInternalSelectedIds] = useState<string[]>(
@@ -636,11 +639,12 @@ export function KnowledgeGraph({
   }, [grow, nodes.length]);
 
   useEffect(() => {
-    if (!grow || !flowInstance) return;
+    if (!grow || !flowInstance || userInteracted.current) return;
     const timer = window.setTimeout(() => {
+      if (userInteracted.current) return;
       void flowInstance.fitView({
         padding: compact ? 0.26 : 0.18,
-        duration: 260,
+        duration: motionDuration(260),
       });
     }, 40);
     return () => window.clearTimeout(timer);
@@ -673,6 +677,9 @@ export function KnowledgeGraph({
       }
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
+        // A pan/zoom can arrive after the resize debounce queued this frame.
+        // Recheck here so stale automatic framing never wins that race.
+        if (suppressAutoFit.current || userInteracted.current) return;
         const focusedNode = focusId ? flowInstance.getNode(focusId) : undefined;
         if (focusedNode) {
           const previous = resizeViewport.current;
@@ -697,7 +704,7 @@ export function KnowledgeGraph({
           void flowInstance.setCenter(
             focusedNode.position.x + nodeWidth / 2,
             focusedNode.position.y + nodeHeight / 2,
-            { zoom: targetZoom, duration: 220 },
+            { zoom: targetZoom, duration: motionDuration(220) },
           );
           window.setTimeout(() => {
             suppressAutoFit.current = false;
@@ -707,7 +714,7 @@ export function KnowledgeGraph({
         }
         void flowInstance.fitView({
           padding: compact ? 0.16 : view === "tree" ? 0.22 : 0.12,
-          duration: 220,
+          duration: motionDuration(220),
         });
         resizeViewport.current = { width, height, zoom: flowInstance.getZoom() };
       });
@@ -838,7 +845,7 @@ export function KnowledgeGraph({
         // Tree layout positions are node centers, not top-left coordinates.
         void flowInstance.setCenter(pos.x, pos.y, {
           zoom: flowInstance.getZoom(),
-          duration: 420,
+          duration: motionDuration(420),
         });
         window.setTimeout(() => {
           suppressAutoFit.current = false;
@@ -989,7 +996,7 @@ export function KnowledgeGraph({
               else node.data.onStudy?.(nodeId);
             } : undefined,
           },
-          className: "graph-node-enter",
+          className: cn("graph-node-enter", relationFeedback.targets.has(node.id) && "graph-relation-target"),
           selected: internalSelectedIds.includes(node.id),
           position:
             positionOverrides[node.id] ??
@@ -1043,6 +1050,7 @@ export function KnowledgeGraph({
       layoutItemById,
       matchIds,
       positionOverrides,
+      relationFeedback.targets,
       rootEmphasis,
       structuredTree.childrenByParent,
       structuredTree.depths,
@@ -1070,6 +1078,13 @@ export function KnowledgeGraph({
   );
 
   const visibleEdges = useMemo(() => {
+    const markRelation = <T extends Edge>(edge: T): T => ({
+      ...edge,
+      className: cn(edge.className, (
+        relationFeedback.relations.has(graphRelationKey(edge)) ||
+        (edge.type === 'knowledgeTree' && Boolean(edge.data?.spine) && relationFeedback.targets.has(edge.target))
+      ) && "graph-relation-arrive"),
+    });
     // Plan sequence edges are appended in every layout: they carry the optional
     // "执行顺序" overlay and must never replace the knowledge hierarchy.
     const planOverlay = planEdges
@@ -1085,7 +1100,7 @@ export function KnowledgeGraph({
       return [
         ...edges.filter(
           (edge) => visibleIds.has(edge.source) && visibleIds.has(edge.target),
-        ),
+        ).map(markRelation),
         ...planOverlay,
       ];
     }
@@ -1115,18 +1130,18 @@ export function KnowledgeGraph({
     // The tree already communicates the learnable containment hierarchy.
     // Rendering every additional semantic relation here made the canvas noisy
     // and produced long, dashed lines with no clear action for the learner.
-    return [...treeEdges, ...planOverlay];
-  }, [edges, neighborhoodHighlight, planEdges, structuredTree.edges, view, visibleIds]);
+    return [...treeEdges.map(markRelation), ...planOverlay];
+  }, [edges, neighborhoodHighlight, planEdges, relationFeedback.relations, relationFeedback.targets, structuredTree.edges, view, visibleIds]);
 
   // Initial / structure fit — skip while the user is mid-focus or collapsing.
   useEffect(() => {
-    if (!flowInstance || suppressAutoFit.current) return;
+    if (!flowInstance || suppressAutoFit.current || userInteracted.current) return;
     if (initialFit === "focus" && !userInteracted.current) return;
     const timer = window.setTimeout(() => {
-      if (suppressAutoFit.current) return;
+      if (suppressAutoFit.current || userInteracted.current) return;
       void flowInstance.fitView({
         padding: compact ? 0.22 : view === "tree" ? 0.2 : 0.16,
-        duration: 220,
+        duration: motionDuration(220),
       });
     }, 0);
     return () => window.clearTimeout(timer);
@@ -1158,7 +1173,7 @@ export function KnowledgeGraph({
     const targetZoom = clampGraphZoom(1, minimumZoom, maximumZoom);
     void flowInstance.setCenter(pos.x, pos.y, {
       zoom: targetZoom,
-      duration: 480,
+      duration: motionDuration(480),
     });
     window.setTimeout(() => {
       suppressAutoFit.current = false;
@@ -1194,7 +1209,7 @@ export function KnowledgeGraph({
         suppressAutoFit.current = true;
         void flowInstance.setCenter(center.x, center.y, {
           zoom: flowInstance.getZoom(),
-          duration: 420,
+          duration: motionDuration(420),
         });
         window.setTimeout(() => {
           suppressAutoFit.current = false;
@@ -1238,7 +1253,7 @@ export function KnowledgeGraph({
           width: Math.max(1, maxX - minX),
           height: Math.max(1, maxY - minY),
         },
-        { duration: 460, padding: compact ? 0.3 : 0.22 },
+        { duration: motionDuration(460), padding: compact ? 0.3 : 0.22 },
       );
       window.setTimeout(() => {
         suppressAutoFit.current = false;
@@ -1253,7 +1268,7 @@ export function KnowledgeGraph({
     suppressAutoFit.current = true;
     void flowInstance.fitView({
       padding: compact ? 0.25 : view === "tree" ? 0.2 : 0.18,
-      duration: 320,
+      duration: motionDuration(320),
     });
     window.setTimeout(() => {
       suppressAutoFit.current = false;
@@ -1313,6 +1328,9 @@ export function KnowledgeGraph({
     activateNode(node);
 
   const selectLayout = (nextView: KnowledgeGraphLayout) => {
+    // An explicit layout change may frame its new arrangement. Incoming
+    // relations alone must leave a viewport the learner has moved untouched.
+    userInteracted.current = false;
     setPositionOverrides({});
     setView(nextView);
     lastFocusedId.current = null;
@@ -1320,12 +1338,13 @@ export function KnowledgeGraph({
 
   const zoomBy = (delta: number) => {
     if (!flowInstance) return;
+    userInteracted.current = true;
     const next = clampGraphZoom(
       flowInstance.getZoom() + delta,
       minimumZoom,
       maximumZoom,
     );
-    void flowInstance.zoomTo(next, { duration: 180 });
+    void flowInstance.zoomTo(next, { duration: motionDuration(180) });
     setZoom(next);
   };
 
@@ -1725,6 +1744,7 @@ export function KnowledgeGraph({
           setZoom(current => Math.abs(current - viewport.zoom) < 0.001 ? current : viewport.zoom);
         }}
         onNodeClick={handleNodeClick}
+        onNodeDragStart={() => { userInteracted.current = true; }}
         onNodeDragStop={(_, node) =>
           setPositionOverrides((current) => ({
             ...current,

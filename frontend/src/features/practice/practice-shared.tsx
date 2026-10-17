@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
 import { CalendarDays, ExternalLink, TrendingDown, TrendingUp } from "lucide-react";
 import {
   CartesianGrid,
@@ -109,6 +110,7 @@ export function PracticeTrendChart({
   height?: number;
   emptyLabel?: string;
 }) {
+  const reducedMotion = useReducedMotionPreference();
   const data = useMemo<ChartPoint[]>(
     () =>
       points.map((point) => ({
@@ -177,6 +179,7 @@ export function PracticeTrendChart({
               labelFormatter={(label) => `${label}`}
             />
             <Line
+              isAnimationActive={!reducedMotion}
               connectNulls={false}
               dataKey="firstTry"
               dot={{ r: 3 }}
@@ -186,6 +189,7 @@ export function PracticeTrendChart({
               type="monotone"
             />
             <Line
+              isAnimationActive={!reducedMotion}
               connectNulls={false}
               dataKey="final"
               dot={{ r: 3 }}
@@ -326,7 +330,7 @@ export function PracticeModelSettingLink({
 }) {
   return (
     <Button asChild className={className} size="sm" variant="outline">
-      <Link to={`/w/${workspaceId}/settings/workspace`}>{label}</Link>
+      <Link to={`/w/${workspaceId}/settings/models?tab=tasks`}>{label}</Link>
     </Button>
   );
 }

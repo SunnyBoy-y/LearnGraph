@@ -9,6 +9,7 @@ import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import { IncrementalMarkdown } from "@/components/ai-elements/incremental-markdown";
 import { Button } from "@/components/ui/button";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
 import type {
   ActivitySpec,
   ActivityState,
@@ -37,6 +38,7 @@ function useTypewriterText(
   replayKey: string,
   deferUntilActive: boolean,
 ) {
+  const reducedMotion = useReducedMotionPreference();
   const [visibleLength, setVisibleLength] = useState(() =>
     active || deferUntilActive ? 0 : text.length,
   );
@@ -60,11 +62,7 @@ function useTypewriterText(
       return;
     }
 
-    if (
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches
-    ) {
+    if (reducedMotion) {
       setVisibleLength(text.length);
       startedRef.current = true;
       return;
@@ -90,7 +88,7 @@ function useTypewriterText(
       });
     }, TYPEWRITER_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [active, deferUntilActive, replayKey, text]);
+  }, [active, deferUntilActive, reducedMotion, replayKey, text]);
 
   return text.slice(0, visibleLength);
 }

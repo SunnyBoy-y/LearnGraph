@@ -1,4 +1,5 @@
 import { StrictMode } from 'react'
+import { MotionConfig } from 'motion/react'
 import { createRoot } from 'react-dom/client'
 import App from '@/App'
 import { isNativeApp } from '@/lib/native-bridge'
@@ -6,6 +7,7 @@ import '@xyflow/react/dist/style.css'
 import 'katex/dist/katex.min.css'
 import 'streamdown/styles.css'
 import '@/index.css'
+import '@/styles/motion-feedback.css'
 
 try {
   document.documentElement.dataset.colorMode = 'mono'
@@ -22,6 +24,6 @@ try {
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <MotionConfig reducedMotion="user"><App /></MotionConfig>
   </StrictMode>,
 )
