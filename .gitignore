@@ -196,10 +196,7 @@ Desktop.ini
 /image/
 /doc/
 **/doc/
-# 文档规则：开发文档放 doc/ 目录且不入库；docs/ 下仅提交 html 文档，
-# 新增 markdown 文档一律不入库（历史已跟踪文件不受影响）
-/docs/*.md
-!/docs/stream-ui-protocol.md
+# Developer documentation in docs/ is versioned; local working notes stay in doc/.
 /ROADMAP.md
 
 # Audit records and one-off verification/smoke/debug scripts are retained locally, not published
@@ -251,3 +248,50 @@ backend/sandbox/.spec-test.json
 
 # Reproducible browser runtimes generated from locked npm dependencies.
 /frontend/public/code-trainer/
+
+# Local frontend previews, demonstrations, probes, and their recorded data.
+# Production components and maintained tests remain versioned.
+/frontend/src/dev/
+/frontend/src/previews/
+/frontend/*-preview.html
+/frontend/code-trainer.html
+/frontend/memory-deletion.html
+/frontend/stream-ui.html
+/frontend/rnnoise-live*
+/frontend/rnnoise-preview.*
+/frontend/rnnoise-priority-probe.js
+/frontend/public/ui-input-events.json
+/frontend/public/ui-input-live-events.json
+/frontend/scripts/test-code-trainer-browser.mjs
+/frontend/scripts/test-code-trainer-editor-browser.mjs
+/frontend/scripts/test-code-trainer-live.mjs
+/frontend/scripts/test-rich-response-browser.mjs
+/frontend/FIRST FILE CONTENT
+/frontend/SECOND FILE CONTENT
+
+# Applied one-shot source patches and machine/account-specific diagnostics.
+/backend/scripts/apply_*.py
+/backend/scripts/patch_*.py
+/backend/scripts/harness_repairs_phase*.json
+/backend/scripts/normalize_patch_literals.py
+/backend/scripts/run_memory_background_patch.py
+/backend/scripts/fix_transcription_model_id.py
+/backend/scripts/seed_native_billing_verification.py
+/backend/repro_*.py
+/backend/repair_non_dashscope_capabilities.py
+/backend/scripts/verify_*
+# Maintained offline regression suites and CI package checks are not scratch files.
+!/backend/scripts/verify_asr_filler.py
+!/backend/scripts/verify_memory_regressions.py
+!/backend/scripts/verify_provider_settings.py
+!/backend/scripts/verify_skill_packages.py
+!/backend/scripts/verify_voice_noise_interrupt.py
+!/backend/scripts/verify_voice_owner_lease.py
+!/backend/scripts/verify_voice_runtime_migration.py
+
+# Local visual acceptance evidence; retain developer docs and architecture vectors.
+/docs/*.png
+/docs/*.jpg
+/docs/*.jpeg
+/docs/*.webp
+/frontend/tests-orphaned/
