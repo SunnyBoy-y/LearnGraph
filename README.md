@@ -511,7 +511,7 @@ Android 单元测试在独立任务中通过 `:app:testDebugUnitTest` 执行（�
 后端的 `voice` 依赖用于离线语音管线测试，无需真实云端 Provider 凭据。
 真实 Docker 往返测试也已入库，需配置隔离的 sandboxd 服务后单独执行
 `uv run --locked --extra test --extra voice pytest tests/integration/test_sandboxd_roundtrip.py -q`。
-`frontend/tests-orphaned` 保留已移除模块的历史用例；`frontend/e2e` 是依赖本机浏览器、账号和服务的诊断脚本，均不参与常规 CI。
+已移除模块的历史用例 `frontend/tests-orphaned`、本机浏览器诊断 `frontend/e2e`、界面预览与验收截图仅保留在本地并由 Git 忽略；正式测试及其夹具正常入库并参与 CI。
 
 ## 应用内版本更新与回退
 

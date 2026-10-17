@@ -30,7 +30,7 @@
 `?source=fixture` 回放确定性 HTTP 测试数据。左侧依据旧行为重建，右侧使用当前 StreamUI；播放时间经过放慢。
 原始实际调用记录在 `audit/ui-input-stream/live-deepseek.json`；HTTP 边界测试录制在同目录 `events.json`。
 
-![同视口增量预览](ui-input-stream-desktop.png)
+本地验收截图：同视口增量预览（`ui-input-stream-desktop.png`，不随仓库分发）。
 
 ## 现有部署更新与正式聊天验收（2026-10-16）
 
@@ -42,7 +42,7 @@
 
 首轮后续重试仍出现首 token 前 `ProviderTransportError`；其中一次还因上述容器更新被中断，持续失败的极速重试已手动取消。没有以模拟数据或预览结果替代成功验收。刷新正式页面后，已成功的芝诺回答恢复出唯一一个 document，追赶速度仍可调整至 5，单步播放到 0.1 秒；控制台无新增 error，页面无正在生成的请求。本次会话所有消息版本的事件序号严格递增。后续连接排查和完整 Agent 验收见下一节；真实外部图片搜索不在本次验证范围内。
 
-![正式聊天刷新后的原生模拟](rich-response-deployed.png)
+本地验收截图：正式聊天刷新后的原生模拟（`rich-response-deployed.png`，不随仓库分发）。
 
 部署前已在线备份数据库到持久卷 `/data/backups/pre-rich-response-20261016.db`，原镜像保留为 `learngraph:pre-rich-response-20261016`。本次部署记录、原 Compose 覆盖文件和会话限定的事件快照保存在本地忽略目录 `backend/test-results/rich-response/`；不包含登录凭据或 API 密钥。
 
@@ -62,7 +62,7 @@
 
 证据位于本地忽略目录 `backend/test-results/rich-response/`：`upstream-*.jsonl` 是限定的诊断结果，`deployed-events.json` 为本次会话事件与最终快照，`agent-completed-browser.json` 为刷新后的 DOM 检查。没有保存或输出 API 密钥。验收完成时正式镜像为 `sha256:4c863cf5a79ecd1259686806d72c5bd1fdf87d3398cff1acb40df7f3971fccd3`，健康状态为 `healthy`。
 
-![完整 Agent 回复：双栏图表及后续分析](rich-response-agent-deployed.png)
+本地验收截图：完整 Agent 回复：双栏图表及后续分析（`rich-response-agent-deployed.png`，不随仓库分发）。
 
 ## 通用富媒体回答（2026-10-16）
 
@@ -128,8 +128,8 @@ node scripts/test-rich-response-browser.mjs
 
 原始新用例事件和消息在本地忽略目录 `backend/test-results/rich-response/real-model.json`，浏览器检查在同目录 `browser.json`。预览截图：
 
-![同视口代码重建对照](rich-response-light.png)
-![真实模型文档快照回放](rich-response-real.png)
+本地验收截图：同视口代码重建对照（`rich-response-light.png`，不随仓库分发）。
+本地验收截图：真实模型文档快照回放（`rich-response-real.png`，不随仓库分发）。
 
 LearnGraph 的内部声明式 UI 协议。它参考 [A2UI](https://github.com/a2ui-project/a2ui) 的注册组件思想，但不是 A2UI/[AG-UI](https://docs.ag-ui.com/introduction) 的兼容实现。沿用现有 SSE、事件游标、消息版本和历史快照，不新增一条与文本竞争的连接。
 
@@ -184,8 +184,8 @@ LearnGraph 的内部声明式 UI 协议。它参考 [A2UI](https://github.com/a2
 
 本地演示页底部的“与已有控件并排检查”可同时查看旧指标卡、新指标卡和原有输入控件。已验证浅色、深色下卡片边框、底色、14px 圆角、12px 标题和指标区域样式一致，旧输入提交与新控件解释事件独立。指标区域在宽容器中最多三列，520px 及以下改为说明在左、数值在右的纵向列表；以容器宽度适配消息栏和侧栏。33 项相关测试、类型检查和生产构建通过。
 
-![指标卡重新设计：浅色](metric-card-redesign.png)
-![指标卡重新设计：深色](metric-card-redesign-dark.png)
+本地验收截图：指标卡重新设计：浅色（`metric-card-redesign.png`，不随仓库分发）。
+本地验收截图：指标卡重新设计：深色（`metric-card-redesign-dark.png`，不随仓库分发）。
 
 ## 传输与恢复
 
@@ -225,7 +225,7 @@ Content-Type: application/json
 
 完整事件快照、模型调用元数据和回答保存在本地忽略目录 `backend/test-results/stream-ui-live/2026-10-15/verification.json`，浏览器状态在同目录 `browser.json`。证据只包含本次虚构用例，不保存 API 密钥或登录凭据。
 
-![真实对话中的节点选择与 AI 解释入口](stream-ui-live-graph.png)
+本地验收截图：真实对话中的节点选择与 AI 解释入口（`stream-ui-live-graph.png`，不随仓库分发）。
 
 ## 关键实现
 
@@ -258,8 +258,8 @@ npm run build
 
 本次使用真实部署和真实搜索结果，没有替换为 Stub。它覆盖本次两张图的链路；网络超时仍按资源不可用降级，不阻断正文生成。部署前数据库备份为 `/data/backups/pre-rich-images-20261017T041756Z.db`。并行的托管 Agent 会话部署包含此次图片修复，最终运行镜像和文件散列已保存在 `images-deployment.json` 与 `images-final-deployment-hashes.json`。
 
-![正式聊天中的真实图片、来源和流式正文](rich-response-images-streaming.png)
-![刷新后恢复的正式图文消息](rich-response-images-deployed.png)
+本地验收截图：正式聊天中的真实图片、来源和流式正文（`rich-response-images-streaming.png`，不随仓库分发）。
+本地验收截图：刷新后恢复的正式图文消息（`rich-response-images-deployed.png`，不随仓库分发）。
 
 ## 普通自然语言验收（2026-10-17）
 
@@ -283,8 +283,8 @@ npm run build
 
 原始基线、查询失配、最终事件、模式信息、浏览器像素及限制记录位于本地忽略目录 `backend/test-results/rich-response/natural-*.json`，汇总为 `natural-acceptance.json`。旧下载图片回复的重试按钮还会打开“重试绘图”对话框；本轮取消了该操作，未调用绘图生成，并使用新空白会话重放同一原问题。
 
-![自然提问后由 AI 自主选择的图文区域：一张真实图片与两项不可用资源](rich-response-natural-mixed.png)
-![自主生成的株高和增量图表](rich-response-natural-final-chart.png)
+本地验收截图：自然提问后由 AI 自主选择的图文区域：一张真实图片与两项不可用资源（`rich-response-natural-mixed.png`，不随仓库分发）。
+本地验收截图：自主生成的株高和增量图表（`rich-response-natural-final-chart.png`，不随仓库分发）。
 
 
 ## 缺图与解释原因修复（2026-10-17）
@@ -330,15 +330,15 @@ npm run build
 
 修改前：
 
-![正式聊天修改前，小图纵排且右侧留空](rich-layout-before.png)
+本地验收截图：正式聊天修改前，小图纵排且右侧留空（`rich-layout-before.png`，不随仓库分发）。
 
 修改后：
 
-![正式聊天修改后，两张小图并排、明细表全宽](rich-layout-after.png)
+本地验收截图：正式聊天修改后，两张小图并排、明细表全宽（`rich-layout-after.png`，不随仓库分发）。
 
-![宽屏打开侧栏时两张图仍然并排](rich-layout-wide-sidebar.png)
+本地验收截图：宽屏打开侧栏时两张图仍然并排（`rich-layout-wide-sidebar.png`，不随仓库分发）。
 
-![手机视口恢复单列](rich-layout-mobile.png)
+本地验收截图：手机视口恢复单列（`rich-layout-mobile.png`，不随仓库分发）。
 
 ## 模型决定布局，前端适配宽度（2026-10-17）
 
@@ -354,7 +354,7 @@ npm run build
 
 本次仅验收布局职责、消息快照恢复、尺寸适配与交互保留，不把整篇学习建议的内容质量作为布局验收结论。
 
-![模型自主选择三列组，正式聊天按可用宽度自适应为2加1](model-layout-formal.png)
+本地验收截图：模型自主选择三列组，正式聊天按可用宽度自适应为2加1（`model-layout-formal.png`，不随仓库分发）。
 
 ## 四类普通问题扩展验证与失败占位修复（2026-10-17）
 
@@ -375,7 +375,7 @@ npm run build
 
 代码修复已叠加到当时最新运行镜像，部署为 `sha256:b5d939f82b074aedf7e689cd574654891756d7d04846181778ba7222519f50e8`。运行容器健康，入口、富文档 CSS、AgentToolRuntime 与构建产物哈希一致；容器内实际调用畸形 UI JSON 的解析错误反馈检查通过。首次发布因检测到正在生成的回答而延后，后续基于更新后的镜像重新叠加，保留并行修改。此处部署与静态资源核验不代替尚未完成的目视复测。
 
-![图片检索超时仍保留大块占位，修复前](multi-layout-image-before.png)
+本地验收截图：图片检索超时仍保留大块占位，修复前（`multi-layout-image-before.png`，不随仓库分发）。
 
 
 另一个真实失败基线是 AI 把 `query` 填到 `media_text` 布局上：此前虽通过校验，但图片调度器只处理图片节点，因此既没有查图，也没有图占位。现在新增命令校验，明确反馈应创建带 `parent_id` 的图片子节点，要求模型在同一回答内纠正；布局结构本身仍沿用既有协议与渲染器，没有新增旁路格式。该失败记录为 `natural-fixed-attempt5-layout-query.json`。
@@ -402,9 +402,9 @@ npm run build
 
 原始证据位于本地忽略目录：`natural-fixed-final-events.json`、`natural-fixed-browser.json`、`natural-fixed-image-http.json`、`natural-fixed-acceptance.json`、`natural-fixed-deployment.json`；失败、中断和错误素材基线继续保留。这是观察用例的端到端通过，不是模型事实准确率或图片相关性的全面保证。
 
-![正式聊天：AI 自主选择的真实两图与相邻说明](rich-response-natural-fixed.png)
-![正式聊天：用户五天记录的原生交互图表](rich-response-natural-fixed-chart.png)
-![普通原因追问读取服务端真实资源状态](rich-response-natural-fixed-cause.png)
+本地验收截图：正式聊天：AI 自主选择的真实两图与相邻说明（`rich-response-natural-fixed.png`，不随仓库分发）。
+本地验收截图：正式聊天：用户五天记录的原生交互图表（`rich-response-natural-fixed-chart.png`，不随仓库分发）。
+本地验收截图：普通原因追问读取服务端真实资源状态（`rich-response-natural-fixed-cause.png`，不随仓库分发）。
 
 
 ## 跨主题正式页面实测（2026-10-17）
@@ -433,10 +433,10 @@ npm run build
 
 真实故障与修复后回复截图分别来自正式页面，均为1280×720；回复版本、滚动位置和侧栏状态不同，不是受控的CSS前后对比。
 
-![用户原始水果问题：两图超时](rich-response-fruit-before.png)
-![原问题的新会话：苹果和香蕉的真实图片及相邻文字](rich-response-fruit-after.png)
-![动物主题：海豹和海狮的真实照片对照](rich-response-animal-after.png)
-![纯数字主题：咖啡销量原生图表](rich-response-coffee-chart.png)
+本地验收截图：用户原始水果问题：两图超时（`rich-response-fruit-before.png`，不随仓库分发）。
+本地验收截图：原问题的新会话：苹果和香蕉的真实图片及相邻文字（`rich-response-fruit-after.png`，不随仓库分发）。
+本地验收截图：动物主题：海豹和海狮的真实照片对照（`rich-response-animal-after.png`，不随仓库分发）。
+本地验收截图：纯数字主题：咖啡销量原生图表（`rich-response-coffee-chart.png`，不随仓库分发）。
 
 
 修复后当前观察用例：
@@ -448,15 +448,15 @@ npm run build
 
 最终实际结果只支持这些观察用例的自主选择、资源加载与渲染通过。首轮失败、后续重试、过渡版查询无结果与特殊款图片问题均保留；没有把重试后的命中率当作所有主题首次回答的稳定成功率，也不把展示通过说成整段答案的事实准确率。
 
-![乐器主题修复后：普通声学小提琴的真实照片](rich-response-music-after.png)
-![同一自然问题自主生成的练琴数据图表](rich-response-music-final-chart.png)
+本地验收截图：乐器主题修复后：普通声学小提琴的真实照片（`rich-response-music-after.png`，不随仓库分发）。
+本地验收截图：同一自然问题自主生成的练琴数据图表（`rich-response-music-final-chart.png`，不随仓库分发）。
 
 
 最终核对：乐器v4两张真实照片在并行更新重启后重新打开同一会话，仍以1024×768与720×720实际解码；原生图表可继续切换。水果、动物各两张照片的刷新恢复亦通过。`verify_cross.py` 已核对六组回答完成、原始提问无协议/组件指令、Agent中等思考、资源文件与浏览器像素、三组原始数字数列、无关配图未被强加给数字及算术问题、有序事件；输出 `cross-topic-acceptance.json`。图文三组的当前版本分别为水果v1、动物v3、乐器v4，不能误写为均首轮成功。
 
 当前并行更新后的运行镜像 `sha256:408294fb5e64a51d4c99b278d4ffd08b9be4b3bcaa375cd2146618763d4c6ba1` 健康，已确认保留本轮预算、精确标题优先、通用查询指引修正。源码哈希及检查时刻见 `cross-topic-deployment.json`；后续并行部署可能继续更改镜像。浏览器证据为 `cross-topic-browser.json`，其中乐器恢复方式明确为重启后重新打开同一条已完成回复。
 
-![并行部署恢复后，同一乐器回复的数据图表](rich-response-music-restored-chart.png)
+本地验收截图：并行部署恢复后，同一乐器回复的数据图表（`rich-response-music-restored-chart.png`，不随仓库分发）。
 
 
 ## 图库失败自动降级为 SVG（2026-10-17）
@@ -477,12 +477,12 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 
 正式页同一模型分组在宽屏800px内容区为两列各390px；两侧栏展开后583px内容区自动逐项换行。手机390px内容宽346px、360px内容宽316px，均为单列；两种手机宽度的 documentElement.scrollWidth 均等于视口宽度，SVG分别为346×216.25、316×197.5，没有横向页面溢出。
 
-![正式聊天中的SVG降级与正常照片并排](svg-fallback-formal.png)
-![正式聊天手机端SVG降级](svg-fallback-mobile.png)
+本地验收截图：正式聊天中的SVG降级与正常照片并排（`svg-fallback-formal.png`，不随仓库分发）。
+本地验收截图：正式聊天手机端SVG降级（`svg-fallback-mobile.png`，不随仓库分发）。
 
 同内容前后对照入口：`http://127.0.0.1:5175/rich-response-preview.html?case=svg-fallback`。它复用正式消息渲染组件，使用固定素材重建相同快照，只改变 fallback_svg；它不是模型验收或真实图库故障证据。正式页面截图和忽略目录中的 svg-live-evidence.json、svg-fault-probe.json、svg-browser-metrics.json 才是上述实际观察记录。
 
-![同快照代码重建的前后对照](svg-fallback-comparison.png)
+本地验收截图：同快照代码重建的前后对照（`svg-fallback-comparison.png`，不随仓库分发）。
 
 
 ## SVG 降级后的跨主题普通问题实测（2026-10-17）
@@ -499,9 +499,9 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 
 这些结果确认了自然图库下载失败和检索失败后的正式页面降级，以及手机排版；它们不等于所有自然问题都能生成准确示意图，也不是模型回答内容的全面事实审计。图库原因仅按服务端记录区分，没有进一步推断具体上游网络故障。
 
-![动物辨认：自然下载失败后的手机SVG](svg-ordinary-animal-mobile.png)
-![轴承原理：自然检索失败后的手机SVG](svg-ordinary-mechanism-mobile360.png)
-![销量问题：手机交互图表](svg-ordinary-numbers-mobile.png)
+本地验收截图：动物辨认：自然下载失败后的手机SVG（`svg-ordinary-animal-mobile.png`，不随仓库分发）。
+本地验收截图：轴承原理：自然检索失败后的手机SVG（`svg-ordinary-mechanism-mobile360.png`，不随仓库分发）。
+本地验收截图：销量问题：手机交互图表（`svg-ordinary-numbers-mobile.png`，不随仓库分发）。
 
 原始普通提问与正式链接、持久化UI/异步事件、10种视口的实际DOM几何数据及断言审计分别保存在忽略目录的 `svg-ordinary-cases.json`、`svg-ordinary-events.json`、`svg-ordinary-browser-metrics.json`、`svg-ordinary-audit.json`。本轮没有改动产品代码或重新部署。
 
@@ -529,11 +529,11 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 - [企鹅海雀首轮](http://127.0.0.1:18000/w/6e37956a-2dd4-4fd7-9774-9589016bbb23/chat/b228d9ba-185f-4abc-84d7-d9486ca4641d)：问题为“企鹅和海雀长得很像，它们到底有什么区别？”两张真实照片均 ready，200×300 和 1024×771，图文混排。海雀照片主体确为刀嘴海雀，但实际为飞行姿态，模型图注仍写站在岩壁；本轮不能算图注与姿态一致性通过。
 - [乐器与数据首轮](http://127.0.0.1:18000/w/6e37956a-2dd4-4fd7-9774-9589016bbb23/chat/7e859f3d-6bc3-4923-af63-aea8946acf84)：问题为“小提琴和中提琴怎么分？这周五天我分别练了20、25、15、35、40分钟，练习节奏怎么样？”两张真实照片均 ready，451×631 和 720×720，人工查看为普通木制小提琴和人持中提琴。原生图表数据为 `[20,25,15,35,40]`，合计 135、均值 27，柱状切折线交互成功。
 
-![正式聊天首轮苹果香蕉真实照片](rich-response-cooldown-fruit.png)
-![苹果照片放大核验](rich-response-cooldown-apple-lightbox.png)
-![跨主题真实照片](rich-response-cooldown-birds.png)
-![乐器图文混排](rich-response-cooldown-music.png)
-![首轮原生图表](rich-response-cooldown-chart.png)
+本地验收截图：正式聊天首轮苹果香蕉真实照片（`rich-response-cooldown-fruit.png`，不随仓库分发）。
+本地验收截图：苹果照片放大核验（`rich-response-cooldown-apple-lightbox.png`，不随仓库分发）。
+本地验收截图：跨主题真实照片（`rich-response-cooldown-birds.png`，不随仓库分发）。
+本地验收截图：乐器图文混排（`rich-response-cooldown-music.png`，不随仓库分发）。
+本地验收截图：首轮原生图表（`rich-response-cooldown-chart.png`，不随仓库分发）。
 
 自动验收脚本 `backend/test-results/rich-response/verify_cooldown.py` 交叉核对首轮版本、真实文件 ID、浏览器正像素、最终无 SVG 兜底、图表数据与事件顺序，结果为三题各 2 张真实照片。原始事件、浏览器观察、镜像内文件 hash 和结果分别为 `cooldown-*-events.json`、`cooldown-browser.json`、`cooldown-runtime-audit.json`、`cooldown-acceptance.json`；没有保存图片 ticket 查询串。
 
@@ -564,8 +564,8 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 
 历史会话 `b228d9ba-185f-4abc-84d7-d9486ca4641d` 的同一对真实文件刷新后已显示 `White-flippered Penguin -standing on rocks`、`Razorbill Auk`，飞行海雀不再被图注写成站立。没有修改历史数据库；该历史回复正文中“右图……常蹲在崖壁上”的旧段落仍保留，不能声称整条历史回答都已纠正。下面为实际正式页面同视口前后截图：
 
-![历史海雀图注修复前](rich-response-caption-before.png)
-![相同真实文件使用来源标题后](rich-response-caption-after.png)
+本地验收截图：历史海雀图注修复前（`rich-response-caption-before.png`，不随仓库分发）。
+本地验收截图：相同真实文件使用来源标题后（`rich-response-caption-after.png`，不随仓库分发）。
 
 首批跨主题实测暴露出新的检索 ReadTimeout，继而增加 provider 范围内的共享 HTTP 连接租约：同一 provider 的浅拷贝、父任务及仍在运行的查询共享 client，最后一个租约结束后关闭，迟到查询不会使用已关闭的 client。连接上限为 8，与查询执行器上限一致，等待连接池的时间上限为 1 秒。元数据共享预算为 20 秒，优先目录通道最多占 10 秒，图片总预算仍为 25 秒。既有 429 冷却和同一 Openverse 内的来源通道切换保留。该优化没有消除所有外部超时。
 
@@ -587,9 +587,9 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 
 因此最终五题只有工程机械满足本轮严格标准，整体验收为 false。图库照片下载成功、来源标题绑定正确、对象主体选对是三个不同条件；SVG、旧记录回放、同一回复内的工具自纠和后续成功案例均不替代首轮验收。
 
-![工程机械首轮真实照片与来源图注，刷新后](rich-response-caption-machines.png)
-![咖啡器具只有一张真实照片，未通过](rich-response-caption-coffee-partial.png)
-![电车候选真实但主体错误，未通过](rich-response-caption-transit-wrong-subject.png)
+本地验收截图：工程机械首轮真实照片与来源图注，刷新后（`rich-response-caption-machines.png`，不随仓库分发）。
+本地验收截图：咖啡器具只有一张真实照片，未通过（`rich-response-caption-coffee-partial.png`，不随仓库分发）。
+本地验收截图：电车候选真实但主体错误，未通过（`rich-response-caption-transit-wrong-subject.png`，不随仓库分发）。
 
 相关后端 85 项、前端 43 项测试通过，生产前端构建通过。后端 JUnit 为 `backend/test-results/rich-response/caption-junit.xml`；这些测试验证标签/补丁/连接租约/筛选等机制，不是总体图片准确率证据。原始事件保存为 `caption-*-events.json`，浏览器正像素与来源标题为 `caption-browser.json`，首轮版本审计与部署核对为 `caption-runtime-audit.json`，保留未通过项的汇总为 `caption-acceptance.json`，可用同目录 `verify_caption.py` 重新核对。证据中没有图片 ticket 查询串。
 
@@ -614,7 +614,7 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 
 两会话均只有一个用户消息和一个 assistant 消息，全部完成，消息及版本记录均为第 1 版，没有编辑或重新生成。原始事件、浏览器观察、版本、运行文件哈希和核对结果分别为忽略目录下 `auto-svg-*-events.json`、`auto-svg-browser.json`、`auto-svg-versions.json`、`auto-svg-runtime-hashes.json`、`auto-svg-acceptance.json`。SVG 降级成功仍不代表 Openverse 已检索到真实照片，也不代表所有绘图细节经过事实审校。
 
-![正式页：检索失败自动 SVG，成功的真实照片保留](openverse-auto-svg-formal.png)
+本地验收截图：正式页：检索失败自动 SVG，成功的真实照片保留（`openverse-auto-svg-formal.png`，不随仓库分发）。
 
 ### 2026-10-17：按用户要求隐藏 SVG 下方文案
 
@@ -624,8 +624,8 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 
 用户指出的正式会话 `597126a8-80d1-468d-9899-9a2d884fa8ee` 在相同 740×918 视口保存修改前后截图；没有重新生成或修改历史消息。
 
-![SVG 图下文字移除前](svg-caption-hidden-before.png)
-![SVG 图下文字移除后](svg-caption-hidden-after.png)
+本地验收截图：SVG 图下文字移除前（`svg-caption-hidden-before.png`，不随仓库分发）。
+本地验收截图：SVG 图下文字移除后（`svg-caption-hidden-after.png`，不随仓库分发）。
 
 后续正式复测还暴露了两处本地问题，不能全部归为上游不可用：
 
@@ -642,9 +642,9 @@ SVG 与消息快照一起保存，异步资源回填只更新服务端资源字�
 
 还在360px正式页面复查动物第5版的历史自然失败记录：两张SVG实际渲染，无横向溢出或残留图片占位。该版在保存补丁前已产生，仍保留原来一个 download_failed、一个被覆盖回 pending 的数据库基线；本轮没有追改历史数据，不能将其算作新补丁的终态发布通过。补丁后对动物题的重试在创建版本时再次遇到 database is locked，没有进入图库请求；也不能算通过。上述独立的重试前置锁冲突和流式 React #185 尚未作为本轮图库修复的一部分解决。
 
-![正式植物问题恢复两张真实照片的手机页](image-recovery-plants-mobile.png)
-![枫叶真实照片放大核对](image-recovery-maple-lightbox.png)
-![双侧栏展开时的照片布局](image-recovery-plants-sidebars.png)
-![历史自然失败的手机SVG兜底](image-recovery-animal-fallback-mobile.png)
+本地验收截图：正式植物问题恢复两张真实照片的手机页（`image-recovery-plants-mobile.png`，不随仓库分发）。
+本地验收截图：枫叶真实照片放大核对（`image-recovery-maple-lightbox.png`，不随仓库分发）。
+本地验收截图：双侧栏展开时的照片布局（`image-recovery-plants-sidebars.png`，不随仓库分发）。
+本地验收截图：历史自然失败的手机SVG兜底（`image-recovery-animal-fallback-mobile.png`，不随仓库分发）。
 
 验收脚本 `backend/test-results/rich-response/verify_image_recovery.py` 已通过，交叉核对正式资源文件ID、浏览器真实像素、两张图片的完整终态转换及5个视口/刷新状态。原始版本和资源事件摘要、浏览器几何与结论分别为 `image-recovery-formal-audit.json`、`image-recovery-browser-metrics.json`、`image-recovery-acceptance.json`，未保存图片ticket。真实图片恢复已在上述一条完整正式回答中验证，其他失败、中断和前置错误记录全部保留，不代表所有图库请求均恢复或整体成功率已保证。
