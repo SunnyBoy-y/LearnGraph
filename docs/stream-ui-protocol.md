@@ -1,5 +1,37 @@
 # LearnGraph SUIP 0.1
 
+## 工具参数增量预览与按需 SVG（2026-10-17）
+
+本节描述当前源码实现；后文保留此前部署和验收记录。本次没有重启或替换正在使用的 `18000` 服务。
+
+`tool_call_delta` 经现有 `ChatService._stream_agent_chat → rich_events` 进入有界 JSON 增量解析器。
+头部完整后，完整记录可提前预览，段落等惰性文本支持字符串尚未结束时的预览；图片、SVG、图表及交互组件只接受完整记录。
+每个候选仍经原 `Command/Snapshot`、父子关系、资源归属、SVG 安全规则及字节限制校验，不执行半截 JSON。
+
+预览复用当前版本的一个 `MessagePartRecord`，通过原 `part.started/part.replaced` SSE 发布并可重放，
+`payload.ui_operation=ui.preview`。首份快照立即提交数据库，后续更新沿用现有事件批次。
+服务端字段 `preview={tool_call_id,sequence,base}` 保存未提交标记和原快照：预览序号递增，正式 revision 保持不变。
+最终完整工具调用校验通过后替换同一 part，清空 preview，并按原协议提交一次；失败片段可回退到最终完整参数处理。
+工具最终无效时取消预览；用户中断时保留未提交标记，渲染器明确显示已接收部分。预览不能触发完成态交互动作。
+
+新图片查询不再必须附带 `fallback_svg`。图片检索仍在已有资源任务中异步执行；预览阶段不会启动检索。
+显式 complete 会在资源原有总预算内收集该块的结果。若存在检索失败且缺少示意图的节点，工具返回
+`ui_fallback_needed`，含当前正式 revision 和待补节点，模型可用原 patch 在同一记录按需补图后 complete。
+若模型选择纯文字收尾，服务端仍可自动结束文档。成功图片不要求生成 SVG；现有 SVG 的安全校验、显示、历史兼容性保留。
+工具说明与生成提示改为直接输出首段，不要求空 mount，也不要求提前规划整页或绘制备用 SVG。
+
+真实 DeepSeek 验收在临时源码副本与 SQLite 备份中运行，没有修改正式会话：13.069 秒完成一条回复，
+正式 mount 前收到 7 次预览；首个有正文的预览为 57 字符，比完整 mount 提交早 0.843 秒。
+预览 revision 均为 0，最终 mount 为 0、complete 为 1，历史只有一个 document。
+有一次 complete 错带 mount-only 的 component 被拒绝，模型修正后成功，不能算作工具首尝试全部成功。
+该单例验证提前可读，不代表已经测得思考 token 或总时延的下降。
+
+交互预览：`http://127.0.0.1:5188/ui-input-preview.html`，默认回放上述真实 DeepSeek 的 UI 事件及历史快照；
+`?source=fixture` 回放确定性 HTTP 测试数据。左侧依据旧行为重建，右侧使用当前 StreamUI；播放时间经过放慢。
+原始实际调用记录在 `audit/ui-input-stream/live-deepseek.json`；HTTP 边界测试录制在同目录 `events.json`。
+
+![同视口增量预览](ui-input-stream-desktop.png)
+
 ## 现有部署更新与正式聊天验收（2026-10-16）
 
 本次把现有 `learngraph-app-1` 更新为 `learngraph:rich-response-20261016`，并把 `docker-compose.update.json` 的 app 镜像固定到新镜像摘要。该镜像基于部署原镜像，叠加本次后端文件及生产前端构建；沿用原数据库、登录和工作区。部署时首页 SHA-256 与本地构建一致：`a0dbfbfc55d6176228f46d1f81492ca98d52b8c5e6305032c51e92e8952af39b`。

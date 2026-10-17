@@ -166,7 +166,7 @@ class UIArgumentStream:
                                 break
                             except (ValueError, UnicodeError):
                                 continue
-                    if "id" in node and "type" in node:
+                    if "id" in node and node.get("type") in {"paragraph", "heading", "list", "quote", "code", "math"}:
                         node["state"] = "streaming"
                         entries.append(node)
             if entries:
