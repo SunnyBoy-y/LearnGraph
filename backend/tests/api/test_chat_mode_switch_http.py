@@ -99,11 +99,11 @@ def test_high_fast_retry_high_preserves_content_without_execution_state(
     # Simulate an old completed message from before this repair. It must remain
     # inspectable in storage but cannot teach the next direct turn its protocol.
     from app.core.database import SessionLocal
-    from app.domain.models import MessagePartRecord
+    from app.domain.models import MessagePartRecord, MessageVersion
     from sqlalchemy import select
     with SessionLocal() as db:
-        part = db.scalar(select(MessagePartRecord).where(
-            MessagePartRecord.message_id == first["id"], MessagePartRecord.part_type == "text",
+        part = db.scalar(select(MessagePartRecord).join(MessageVersion, MessagePartRecord.message_version_id == MessageVersion.id).where(
+            MessageVersion.message_id == first["id"], MessagePartRecord.part_type == "text",
         ))
         part.content += LEAK
         db.commit()
