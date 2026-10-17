@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Header, Query, status
 
@@ -409,11 +409,21 @@ def execute_agent_command(
     ] = None,
 ) -> SandboxAgentCommandView:
     require_agent_sandbox_permission(context)
-    return SandboxAgentCommandView.model_validate(
-        agent_service(db, context, settings).execute_command(
-            payload, idempotency_key=idempotency_key
-        )
-    )
+    from sqlalchemy import select
+    from app.core.errors import AppError
+    from app.domain.models import SandboxAgentCommand
+    from app.services.sandbox_scheduler import SandboxSchedulerService,foreground_wait_seconds
+    agent_service(db,context,settings)._validate_command(payload)
+    scheduler=SandboxSchedulerService(db,settings)
+    job=scheduler.submit_job(workspace_id=context.workspace_id,owner_user_id=context.principal.user_id,
+        chat_session_id=payload.chat_session_id,kind='agent_command',payload=payload.model_dump(mode='json'),
+        idempotency_key=idempotency_key)
+    scheduler.schedule_once()
+    job=scheduler.wait_job(job,foreground_wait_seconds(settings))
+    command=db.scalar(select(SandboxAgentCommand).where(SandboxAgentCommand.job_id==job.id))
+    if command is None or command.status in {'created','running'}:
+        raise AppError(503,'sandbox_execution_pending','Execution has not completed',{'job_id':job.id,'status':job.status})
+    return SandboxAgentCommandView.model_validate(command)
 
 
 @router.get("/agent/commands", response_model=list[SandboxAgentCommandView])
@@ -602,6 +612,17 @@ def cancel_agent_task(
         select_sandbox_task(db, context, task_id)
     )
     return _agent_task_view(task)
+
+
+@router.post("/agent-tasks/{task_id}/execution/{operation}")
+def control_agent_session(task_id: str, operation: Literal["pause", "resume", "takeover"],
+                          db: DB, context: CurrentWorkspace, settings: AppSettings):
+    require_agent_sandbox_permission(context)
+    task = db.scalar(select_sandbox_task(db, context, task_id))
+    if task is None:
+        raise AppError(404, "sandbox_agent_task_not_found", "Task was not found")
+    from app.services.managed_agent_session import control_child_session
+    return control_child_session(db, settings, task, operation)
 
 
 @router.post("/agent-tasks/{task_id}/retry", response_model=SandboxAgentTaskView)

@@ -276,10 +276,23 @@ class SandboxAgentCommandRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
     # The command is deliberately an argv array.  The service applies the
     # policy and never invokes a shell or evaluates a command string.
-    argv: list[str] = Field(min_length=1, max_length=32)
+    argv: list[str] | None = Field(default=None, min_length=1, max_length=32)
+    command: str | None = Field(default=None, min_length=1, max_length=16_384)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=600)
+    yield_time_ms: int | None = Field(default=None, ge=0, le=10000)
+    max_output_tokens: int = Field(default=4000, ge=256, le=16000)
     cwd: str = Field(default=".", min_length=1, max_length=255)
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
     runtime: Literal["python-node", "python-node-browser"] = "python-node"
+
+    @model_validator(mode="after")
+    def resolve_command(self) -> "SandboxAgentCommandRequest":
+        if (self.argv is None) == (self.command is None):
+            raise ValueError("Provide exactly one of command or argv")
+        if self.command is not None:
+            self.argv = ["bash", "-lc", self.command]
+            self.command = None  # Persist one canonical argv in queued jobs.
+        return self
 
 
 class SandboxAgentFileWriteRequest(BaseModel):
@@ -322,12 +335,28 @@ class SandboxAgentImagePublishRequest(BaseModel):
     sandbox_session_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
+class SandboxAgentFileSlice(BaseModel):
+    path: str = Field(min_length=1, max_length=255)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    cursor: str | None = Field(default=None, min_length=1, max_length=2048)
+    max_chars: int | None = Field(default=None, ge=1, le=1048576)
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.end_line is not None and self.end_line < (self.start_line or 1):
+            raise ValueError("end_line must be greater than or equal to start_line")
+        return self
+
+
 class SandboxAgentFileReadRequest(BaseModel):
     chat_session_id: str = Field(min_length=1, max_length=36)
     path: str | None = Field(default=None, min_length=1, max_length=255)
     # Single and batch reads are mutually exclusive. Batch paths keep their
     # input order; duplicates are rejected rather than silently re-read.
     paths: list[str] | None = Field(default=None, min_length=1, max_length=16)
+    items: list[SandboxAgentFileSlice] | None = Field(default=None, min_length=1, max_length=16)
+    max_total_chars: int = Field(default=16000, ge=256, le=64000)
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=1)
     max_chars: int | None = Field(default=16384, ge=1, le=1_048_576)
@@ -336,10 +365,12 @@ class SandboxAgentFileReadRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_read_selection(self) -> "SandboxAgentFileReadRequest":
-        if (self.path is None) == (self.paths is None):
-            raise ValueError("Provide exactly one of path or paths")
-        if self.cursor is not None and self.paths is not None:
+        if sum(value is not None for value in (self.path, self.paths, self.items)) != 1:
+            raise ValueError("Provide exactly one of path, paths or items")
+        if self.cursor is not None and (self.paths is not None or self.items is not None):
             raise ValueError("Continue each file separately using path and its next_cursor")
+        if self.items is not None:
+            return self
         selected = self.paths if self.paths is not None else [self.path]
         if any(not isinstance(path, str) or not path.strip() or len(path) > 255 for path in selected):
             raise ValueError("Each path must be a non-empty string of at most 255 characters")

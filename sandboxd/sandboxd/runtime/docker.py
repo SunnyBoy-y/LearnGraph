@@ -11,7 +11,7 @@ Security invariants (fail closed):
   device / cap_add options — this adapter only builds fixed hardened specs;
 - file paths are validated by the controller before reaching this layer and
   re-checked here;
-- output/exec timeout kills the whole container (process tree);
+- output/exec timeout terminates the execution's container-local process group;
 - only containers/volumes/networks bearing the deployment's managed labels
   are ever touched.
 """
@@ -239,6 +239,8 @@ class DockerRuntimeBackend:
         """Aggregate live resource usage of this deployment's managed
         containers (memory working-set). Host totals are returned alongside so
         schedulers can compute pressure ratios for dynamic admission."""
+        from docker.errors import InvalidVersion
+
         client = self._client()
         try:
             info = client.info()
@@ -256,7 +258,13 @@ class DockerRuntimeBackend:
                 containers = []
             for container in containers:
                 try:
-                    stat = container.stats(stream=False)
+                    # We only need memory usage. Docker's default non-streaming
+                    # mode waits for two samples (needed for CPU deltas), which
+                    # used to add a sampling interval for every container.
+                    try:
+                        stat = container.stats(stream=False, one_shot=True)
+                    except InvalidVersion:
+                        stat = container.stats(stream=False)
                 except Exception:  # noqa: BLE001 - one bad container must not fail the probe
                     continue
                 mem = (stat.get("memory_stats") or {}).get("usage") or 0
@@ -543,6 +551,7 @@ class DockerRuntimeBackend:
         Creates a short-lived hardened container (no workspace volume, network
         none, runner UID, read-only rootfs, drop ALL, NNP, seccomp, resource
         limits, tmpfs) and executes fixed interpreter probes (Python + Node).
+        Browser runtimes must also launch Chromium and produce a screenshot.
         The container is always removed in ``finally``; a crash leaves no
         managed smoke container behind.
         """
@@ -560,6 +569,11 @@ class DockerRuntimeBackend:
                 if runtime_kind == CODE_RUNTIME_KIND
                 else BROWSER_SHM_SIZE
             )
+            # Chromium's renderer/print processes exceed the interpreter-only
+            # budget, especially when ARM64 runs under QEMU. Match the default
+            # browser session limits; keep code-only smoke lightweight.
+            memory_bytes = 2 * 1024**3 if runtime_kind == BROWSER_RUNTIME_KIND else 512 * 1024**2
+            pids_limit = 512 if runtime_kind == BROWSER_RUNTIME_KIND else 128
             container = client.containers.create(
                 image_ref,
                 command=["sleep", "infinity"],
@@ -580,9 +594,9 @@ class DockerRuntimeBackend:
                 user=self.workspace_uid,
                 cap_drop=["ALL"],
                 security_opt=_seccomp_options(self.seccomp_dir, runtime_kind),
-                mem_limit=512 * 1024 * 1024,
-                memswap_limit=512 * 1024 * 1024,
-                pids_limit=128,
+                mem_limit=memory_bytes,
+                memswap_limit=memory_bytes,
+                pids_limit=pids_limit,
                 nano_cpus=1_000_000_000,
                 ulimits=[
                     Ulimit(
@@ -603,6 +617,8 @@ class DockerRuntimeBackend:
                 ),
                 ("node", "--version"),
             )
+            if runtime_kind == BROWSER_RUNTIME_KIND:
+                probes += (("node", "/opt/learngraph/browser-smoke.js"),)
             for argv in probes:
                 result = self._run_exec(
                     client,
@@ -615,7 +631,9 @@ class DockerRuntimeBackend:
                 if result.timed_out:
                     return False, f"smoke timed out for {' '.join(argv)}"
                 if result.exit_code != 0:
-                    detail = result.stderr.decode("utf-8", "replace").strip()[:300]
+                    # Chromium prints its full launch command before the real
+                    # failure. Preserve the tail containing the fatal reason.
+                    detail = result.stderr.decode("utf-8", "replace").strip()[-1200:]
                     return False, f"smoke failed for {' '.join(argv)}: {detail or result.exit_code}"
             return True, ""
         except DockerRuntimeUnavailable:
@@ -797,195 +815,74 @@ class DockerRuntimeBackend:
             if signal == "TERM":
                 time.sleep(max(0.0, grace_seconds))
 
-    def _run_exec(
-        self,
-        client: Any,
-        container: Any,
-        argv: tuple[str, ...],
-        *,
-        workdir: str,
-        timeout_seconds: int,
-        output_limit: int,
-        execution_id: str | None = None,
-    ) -> RuntimeExecResult:
-        started = time.monotonic()
-        environment = {
-            "HOME": "/tmp",
-            "XDG_CONFIG_HOME": "/tmp/.config",
-            "XDG_CACHE_HOME": "/tmp/.cache",
-        }
-        # Wrap argv in setsid so the command becomes its own process-group
-        # leader (PID == PGID). On timeout/truncate/cancel we can then target
-        # exactly that process group instead of the whole container.
-        # ``-w`` is required: when the exec process is itself a process-group
-        # leader (docker exec), plain ``setsid`` forks and exits immediately
-        # with 0, so docker would report exit 0 for every command — the real
-        # program runs in the child and its exit code is lost. ``-w`` makes
-        # setsid wait for the child and propagate its exit code.
-        deadline = started + max(1, timeout_seconds)
-        timed_out, truncated, exec_id, pid, stdout, stderr = self._exec_and_stream(
-            client,
-            container,
-            ("setsid", "-w") + tuple(argv),
-            workdir=workdir,
-            environment=environment,
-            timeout_seconds=timeout_seconds,
-            deadline=deadline,
-            output_limit=output_limit,
-        )
-        # A wrapped setsid exec that exits 127 usually means the image has no
-        # setsid binary; retry once with the plain argv so the command still
-        # runs (cancel degrades to best-effort for that exec).
-        if not timed_out and not truncated and pid is None:
-            try:
-                inspect = client.api.exec_inspect(exec_id)
-                exit_127 = inspect.get("ExitCode") == 127
-            except Exception:  # noqa: BLE001
-                exit_127 = False
-            if exit_127:
-                timed_out, truncated, exec_id, pid, stdout, stderr = self._exec_and_stream(
-                    client,
-                    container,
-                    tuple(argv),
-                    workdir=workdir,
-                    environment=environment,
-                    timeout_seconds=timeout_seconds,
-                    deadline=deadline,
-                    output_limit=output_limit,
-                )
-
-        if execution_id:
-            self._track_exec(
-                execution_id,
-                {
-                    "exec_id": exec_id,
-                    "pid": pid,
-                    "container_id": container.id,
-                    "deadline": deadline,
-                },
-            )
+    def start_exec(self, handle, argv, *, execution_id, cwd, timeout_seconds, output_limit):
+        from sandboxd.runtime.supervisor import SUPERVISOR
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", execution_id):
+            raise DockerRuntimeError("Invalid execution id")
+        client = self._client()
         try:
-            if timed_out or truncated:
-                # Task-level termination: kill only this process group.
-                self._terminate_process_group(client, container, pid)
-                exit_code = -1
-            else:
-                # The output stream can EOF early when the docker-py socket
-                # layer reports empty reads (SocketIO), while the exec process
-                # is still running — at that point exec_inspect still reports
-                # ExitCode=0. Never trust a code read right after streaming:
-                # poll until the exec actually finished (Running=False).
-                exit_code = self._wait_for_exec_exit(client, exec_id)
+            container = self._ensure_running(client, handle)
+            spec = {"id": execution_id, "argv": list(argv), "cwd": cwd,
+                    "timeout": timeout_seconds, "limit": output_limit}
+            # Detaching the watchdog from this daemon is the restart boundary.
+            container.exec_run(["python", "-c", SUPERVISOR, json.dumps(spec)],
+                               user=RUNNER_UID, detach=True,
+                               environment={"HOME":"/tmp", "XDG_CONFIG_HOME":"/tmp/.config", "XDG_CACHE_HOME":"/tmp/.cache"})
         finally:
-            if execution_id:
-                self._untrack_exec(execution_id)
-        latency_ms = int((time.monotonic() - started) * 1000)
-        return RuntimeExecResult(
-            exit_code=exit_code,
-            stdout=bytes(stdout),
-            stderr=bytes(stderr),
-            timed_out=timed_out,
-            truncated=truncated,
-            latency_ms=latency_ms,
-        )
+            self._close(client)
 
-    def _exec_and_stream(
-        self,
-        client: Any,
-        container: Any,
-        argv: tuple[str, ...],
-        *,
-        workdir: str,
-        environment: dict[str, str],
-        timeout_seconds: int,
-        deadline: float,
-        output_limit: int,
-    ) -> tuple[bool, bool, str, int | None, bytearray, bytearray]:
-        """Start one exec, stream its output with a bounded reader, and return
-        ``(timed_out, truncated, exec_id, pid, stdout, stderr)``."""
+    def execution_result(self, handle, execution_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", execution_id):
+            raise DockerRuntimeError("Invalid execution id")
+        client = self._client()
         try:
-            exec_id = self._exec_id(
-                client.api.exec_create(
-                    container.id,
-                    list(argv),
-                    user=RUNNER_UID,
-                    workdir=workdir,
-                    environment=environment,
-                    privileged=False,
-                    tty=False,
-                )
-            )
-        except Exception as exc:
-            raise DockerRuntimeError(f"failed to create exec: {type(exc).__name__}") from exc
-
-        stdout = bytearray()
-        stderr = bytearray()
-        timed_out = False
-        truncated = False
-        pid: int | None = None
-        socket = None
-        try:
-            socket = client.api.exec_start(exec_id, socket=True, demux=False)
-            # Best-effort PID capture right after start (only visible while the
-            # exec is running). Falls back to None, making cancel best-effort.
-            try:
-                inspect = client.api.exec_inspect(exec_id)
-                raw_pid = inspect.get("Pid") or inspect.get("pid")
-                pid = int(raw_pid) if raw_pid else None
-            except Exception:  # noqa: BLE001
-                pid = None
-            frames: list[tuple[int, bytes]] = []
-            process_done = threading.Event()
-
-            def _read_all() -> None:
-                while True:
-                    frame = self._read_frame(socket)
-                    if frame is None:
-                        # docker-py>=7.2's SocketIO returns empty reads while
-                        # the exec is still producing output (non-blocking), so
-                        # an empty read is NOT an EOF by itself. Only stop when
-                        # the process has actually finished (polled by the main
-                        # thread) AND the stream is drained.
-                        if process_done.is_set():
-                            return
-                        time.sleep(0.02)
-                        continue
-                    frames.append(frame)
-
-            reader = threading.Thread(target=_read_all, daemon=True)
-            reader.start()
-            # Wait for the process to finish (poll exec_inspect), not for the
-            # stream: the SocketIO can sit empty while output is still coming,
-            # and waiting on the reader alone would either truncate output or
-            # falsely report a timeout.
-            while time.monotonic() < deadline:
-                try:
-                    inspect = client.api.exec_inspect(exec_id)
-                except Exception:  # noqa: BLE001
-                    inspect = {}
-                if not inspect.get("Running", True):
-                    break
-                time.sleep(0.05)
-            timed_out = time.monotonic() >= deadline
-            process_done.set()
-            reader.join(timeout=2.0)
-            for stream_type, payload in frames:
-                if stream_type == 1:
-                    stdout.extend(payload)
-                elif stream_type == 2:
-                    stderr.extend(payload)
-                if len(stdout) + len(stderr) > output_limit:
-                    truncated = True
-                    break
-        except Exception as exc:  # noqa: BLE001
-            raise DockerRuntimeError(f"failed to stream exec output: {type(exc).__name__}") from exc
+            container = self._container(client, handle)
+            out = container.exec_run(['cat','/tmp/learngraph-exec-' + execution_id + '/result.json'],user=RUNNER_UID)
+            if out.exit_code != 0:
+                return None
+            if not out.output:
+                return None
+            return json.loads(out.output)
         finally:
-            if socket is not None:
-                try:
-                    socket.close()
-                except Exception:  # noqa: BLE001
-                    pass
-        return timed_out, truncated, exec_id, pid, stdout, stderr
+            self._close(client)
+
+    def _run_exec(self, client, container, argv, *, workdir, timeout_seconds, output_limit, execution_id=None):
+        ephemeral = execution_id is None
+        execution_id = execution_id or ("ex_" + uuid.uuid4().hex)
+        handle = RuntimeHandle("", container.id)
+        self.start_exec(handle, argv, execution_id=execution_id, cwd=workdir,
+                        timeout_seconds=timeout_seconds, output_limit=output_limit)
+        deadline = time.monotonic() + timeout_seconds + 10
+        while time.monotonic() < deadline:
+            result = self.execution_result(handle, execution_id)
+            if result and result["status"] not in {'running','launching'}:
+                if ephemeral:
+                    self.forget_exec(handle,execution_id,retain_replay_guard=False)
+                return RuntimeExecResult(result["exit_code"], result["stdout"].encode(),
+                    result["stderr"].encode(), result["timed_out"], result["truncated"], result["latency_ms"])
+            time.sleep(0.1)
+        raise DockerRuntimeError("Execution supervisor did not report completion")
+
+    def forget_exec(self, handle, execution_id, *, retain_replay_guard=True):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}",execution_id):
+            raise DockerRuntimeError('Invalid execution id')
+        client = self._client()
+        try:
+            container = self._container(client,handle)
+            result = container.exec_run(['python','-c',
+                "import shutil,sqlite3,sys;from pathlib import Path;"
+                "db=sqlite3.connect('/tmp/learngraph-completed.sqlite3',timeout=5);"
+                "db.execute('CREATE TABLE IF NOT EXISTS completed (execution_id TEXT PRIMARY KEY)');"
+                "db.execute('INSERT OR IGNORE INTO completed VALUES (?)',(sys.argv[1],));db.commit();"
+                "shutil.rmtree('/tmp/learngraph-exec-'+sys.argv[1],ignore_errors=True);"
+                "Path('/tmp/learngraph-cancel-'+sys.argv[1]).unlink(missing_ok=True);"
+                "db.execute('DELETE FROM completed WHERE execution_id=?',(sys.argv[1],)) if sys.argv[2]=='0' else None;"
+                "db.commit();db.close()",
+                execution_id,'1' if retain_replay_guard else '0'],user=RUNNER_UID)
+            if result.exit_code != 0:
+                raise DockerRuntimeError('Execution result cleanup did not complete')
+        finally:
+            self._close(client)
 
     @staticmethod
     def _sock_read(sock, size: int) -> bytes:
@@ -1236,25 +1133,31 @@ class DockerRuntimeBackend:
             self._close(client)
 
     def cancel_exec(self, handle: RuntimeHandle, execution_id: str) -> bool:
-        """Terminate the process group of a live execution (best-effort).
-
-        Returns True when the execution was tracked (and termination was
-        attempted); False when it already finished or is unknown.
-        """
-        entry = self._lookup_exec(execution_id)
-        if entry is None:
-            return False
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", execution_id):
+            raise DockerRuntimeError("Invalid execution id")
         client = self._client()
         try:
             container = self._container(client, handle)
-            self._terminate_process_group(client, container, entry.get("pid"))
-        except Exception:  # noqa: BLE001 - best-effort cancel
-            logger.exception("cancel failed for execution %s", execution_id)
+            out = container.exec_run(["python", "-c",
+                "from pathlib import Path; import sys; Path('/tmp/learngraph-cancel-'+sys.argv[1]).touch()",
+                execution_id], user=RUNNER_UID)
+            return out.exit_code == 0
         finally:
             self._close(client)
-        return True
 
     # --- files -------------------------------------------------------------
+
+    def ensure_directories(self, handle, prefix):
+        safe=validate_relative_path(prefix or '.', allow_dot=True).value
+        root=WORKSPACE_MOUNT if safe=='.' else WORKSPACE_MOUNT+'/'+safe
+        client=self._client()
+        try:
+            container=self._ensure_running(client,handle)
+            result=container.exec_run(['mkdir','-p','--',*(root+'/'+name for name in ('inputs','work','outputs'))],user=RUNNER_UID)
+            if result.exit_code != 0:
+                raise DockerRuntimeError('Cannot initialize workspace directories')
+        finally:
+            self._close(client)
 
     def write_file(self, handle: RuntimeHandle, path: str, data: bytes, *, mode: int = 0o644) -> None:
         safe = validate_relative_path(path)

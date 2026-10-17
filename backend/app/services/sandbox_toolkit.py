@@ -131,7 +131,7 @@ class SandboxToolkitMixin:
 
     # ── sandbox_bash ─────────────────────────────────────────────────────────
 
-    def toolkit_bash(self, payload: SandboxAgentBashRequest) -> dict[str, Any]:
+    def toolkit_bash(self, payload: SandboxAgentBashRequest, *, cancel_check=None) -> dict[str, Any]:
         if not self.settings.sandbox_bash_enabled:
             raise AppError(503, "sandbox_bash_disabled", "Sandbox shell execution is disabled by configuration")
         command = payload.command
@@ -142,12 +142,10 @@ class SandboxToolkitMixin:
         timeout = payload.timeout_seconds
         if timeout is not None:
             timeout = max(1, min(timeout, self.settings.sandbox_wall_time_seconds))
-        return self._run_exec_command(
-            chat_session_id=payload.chat_session_id,
-            argv=["bash", "-lc", command],
-            sandbox_session_id=payload.sandbox_session_id,
-            timeout_seconds=timeout,
-        )
+        return self.execute_agent_tool("sandbox_exec", {
+            "command": command, "sandbox_session_id": payload.sandbox_session_id,
+            "timeout_seconds": timeout,
+        }, chat_session_id=payload.chat_session_id, agent_authorized=True, cancel_check=cancel_check)
 
     # ── sandbox_todo ─────────────────────────────────────────────────────────
 
@@ -263,14 +261,11 @@ class SandboxToolkitMixin:
                 changed.append({"path": target, "action": "create", "lines": file.hunks[0].new_count if file.hunks else 0})
                 continue
             try:
-                current = str(
-                    self.read_file(
-                        SandboxAgentFileReadRequest(
-                            chat_session_id=payload.chat_session_id,
-                            path=target,
-                            sandbox_session_id=payload.sandbox_session_id,
-                        )
-                    ).get("content") or ""
+                # Agent-facing reads are paginated. A patch must load the
+                # complete mutation source or it can silently drop the tail.
+                current, _digest = self._read_text_for_mutation(
+                    chat_session_id=payload.chat_session_id, path=target,
+                    sandbox_session_id=payload.sandbox_session_id,
                 )
             except AppError as exc:
                 if exc.code != "sandbox_file_unavailable":
@@ -795,6 +790,7 @@ class SandboxToolkitMixin:
             ),
             "event_seq": task.event_seq,
             "latest_job_id": task.latest_job_id,
+            "agent_session_id": (task.spec_json or {}).get("agent_session_id"),
         }
         if include_events and after_seq is not None:
             rows = self.db.scalars(
@@ -960,6 +956,8 @@ class SandboxToolkitMixin:
             deadline_seconds=self.settings.sandbox_subagent_queue_deadline_seconds,
         )
         task.latest_job_id = job.id
+        from app.services.managed_agent_session import ensure_child_session
+        child = ensure_child_session(self.db, task, job)
         append_agent_event(
             self.db,
             task,
@@ -980,6 +978,7 @@ class SandboxToolkitMixin:
         self.db.commit()
         return {
             "subagent_id": task.task_id,
+            "agent_session_id": child.id,
             "task_id": task.task_id,
             "job_id": job.id,
             "status": "queued",
@@ -1108,9 +1107,16 @@ class SandboxToolkitMixin:
         if task is None:
             raise AppError(404, "sandbox_subagent_not_found", "Sub-agent was not found or already expired")
         spec = task.spec_json or {}
+        if task.status in {"RUNNING", "STARTING", "QUEUED"}:
+            raise AppError(409, "subagent_already_running", "Pause the task before retrying it")
+        if spec.get("voice_pause_requested"):
+            spec = {key: value for key, value in spec.items() if key not in {"voice_pause_requested", "voice_pause_requested_at"}}
+            task.spec_json = spec
         budget = spec.get("budget") or {}
         prompt = payload.prompt_override or spec.get("objective") or ""
         attempt_no = len(task.attempts_json or []) + 2
+        from app.domain.models import SandboxJob
+        previous_job = self.db.get(SandboxJob, task.latest_job_id) if task.latest_job_id else None
         scheduler = SandboxSchedulerService(self.db, self.settings)
         job = scheduler.submit_job(
             workspace_id=self.workspace_id,
@@ -1134,6 +1140,7 @@ class SandboxToolkitMixin:
                 "write_set": spec.get("write_set"),
                 "budget": budget,
                 "sandbox_session_id": task.sandbox_session_id,
+                "_resume_checkpoint": (previous_job.payload_json or {}).get("_resume_checkpoint") if previous_job else None,
             },
             idempotency_key=f"subagent:{task.id}:v{attempt_no}",
             deadline_seconds=self.settings.sandbox_subagent_queue_deadline_seconds,

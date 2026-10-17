@@ -38,6 +38,7 @@ ARG RUNNER_ABI
 # sandboxd verifies this label during prebuilt bootstrap
 # (install_runtime -> runner_abi_mismatch if missing or out of range).
 LABEL com.learngraph.runner-abi="${RUNNER_ABI}"
+LABEL com.learngraph.office-pdf-preview="true"
 
 # Copy the official Node runtime as a complete /usr/local tree: node, npm,
 # npx, corepack and their symlinks stay version-consistent without installing
@@ -54,9 +55,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Chromium-only browser stack plus the fixed task toolchain. Do not add
-# LibreOffice, Poppler, WPS tooling, Firefox, WebKit or OpenCV: the product
-# supports content-level legacy conversion via deterministic extractors and
-# agent reconstruction instead.
+# Poppler, WPS tooling, Firefox, WebKit or OpenCV. LibreOffice's headless
+# document filters provide the fixed, offline Office-to-PDF preview task.
 RUN set -eu; \
     apt_retry() { \
         attempts=4; \
@@ -89,6 +89,9 @@ RUN set -eu; \
         git \
         jq \
         libmagic1 \
+        libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-impress \
         libsndfile1 \
         p7zip-full \
         procps \
@@ -157,6 +160,7 @@ RUN set -eu; \
 COPY --from=toolchain /node_modules /node_modules
 COPY --chown=65532:65532 runner.py /opt/learngraph/runner.py
 COPY --chown=65532:65532 environment-manifest.json /opt/learngraph/environment-manifest.json
+COPY --chown=65532:65532 browser-launch.js /opt/learngraph/browser-launch.js
 COPY --chown=65532:65532 browser-smoke.js /opt/learngraph/browser-smoke.js
 COPY --chown=65532:65532 tasks/render.js /opt/learngraph/tasks/render.js
 COPY --chown=65532:65532 tasks/web_render.js /opt/learngraph/tasks/web_render.js
@@ -165,7 +169,7 @@ COPY tasks/learngraph_tasks /usr/local/lib/python3.12/site-packages/learngraph_t
 # Fail the build as soon as a dependency, browser executable or JavaScript
 # toolchain drifts. Browser launch itself is exercised by the hardened smoke
 # container because it must use the production seccomp profile.
-RUN chmod 0555 /opt/learngraph/runner.py /opt/learngraph/browser-smoke.js /opt/learngraph/tasks/render.js /opt/learngraph/tasks/web_render.js \
+RUN chmod 0555 /opt/learngraph/runner.py /opt/learngraph/browser-launch.js /opt/learngraph/browser-smoke.js /opt/learngraph/tasks/render.js /opt/learngraph/tasks/web_render.js \
     && test -s /opt/learngraph/environment-manifest.json \
     && chmod -R a+rX /usr/local/lib/python3.12/site-packages/learngraph_tasks /node_modules \
     && python --version \
@@ -174,6 +178,7 @@ RUN chmod 0555 /opt/learngraph/runner.py /opt/learngraph/browser-smoke.js /opt/l
     && chromium --version \
     && ffmpeg -version \
     && command -v antiword >/dev/null \
+    && command -v libreoffice >/dev/null \
     && command -v catppt >/dev/null \
     && command -v 7z >/dev/null \
     && python -c "import av, bs4, docx, fitz, mammoth, markdown_it, numpy, odf, openpyxl, pandas, pdfplumber, PIL, pydub, pypdf, pptx, pyxlsb, trafilatura, xlsxwriter, learngraph_tasks" \

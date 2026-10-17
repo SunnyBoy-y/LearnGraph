@@ -163,6 +163,10 @@ class SandboxdStore:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            if "result_json" not in {row[1] for row in conn.execute("PRAGMA table_info(executions)")}:
+                conn.execute("ALTER TABLE executions ADD COLUMN result_json TEXT")
+            if "supervisor_cleaned" not in {row[1] for row in conn.execute("PRAGMA table_info(executions)")}:
+                conn.execute("ALTER TABLE executions ADD COLUMN supervisor_cleaned INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2')"
             )
@@ -369,14 +373,34 @@ class SandboxdStore:
         truncated: bool,
         latency_ms: int | None,
         finished_reason: str | None = None,
+        result_json: str | None = None,
     ) -> None:
         now = _utc_now()
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE executions SET status = ?, exit_code = ?, timed_out = ?, truncated = ?, latency_ms = ?, finished_at = ?, finished_reason = ? "
+                "UPDATE executions SET status = ?, exit_code = ?, timed_out = ?, truncated = ?, latency_ms = ?, finished_at = ?, finished_reason = ?, result_json = COALESCE(?,result_json) "
                 "WHERE execution_id = ?",
-                (status, exit_code, 1 if timed_out else 0, 1 if truncated else 0, latency_ms, now, finished_reason, execution_id),
+                (status, exit_code, 1 if timed_out else 0, 1 if truncated else 0, latency_ms, now, finished_reason, result_json, execution_id),
             )
+            if result_json:
+                conn.execute("UPDATE idempotency SET state='succeeded',result_json=?,updated_at=? "
+                    "WHERE json_extract(result_json,'$.execution_id')=? AND operation IN ('agent.start','agent','fixed')",
+                    (result_json,now,execution_id))
+
+    def active_executions(self, deployment_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM executions WHERE deployment_id=? AND status IN ('running','cancelling')",
+                (deployment_id,))]
+
+    def execution_cleanup_pending(self, deployment_id):
+        with self._lock,self._connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM executions WHERE deployment_id=? "
+                "AND result_json IS NOT NULL AND supervisor_cleaned=0 LIMIT 32",(deployment_id,))]
+
+    def mark_execution_cleaned(self, execution_id):
+        with self._lock,self._connect() as conn:
+            conn.execute('UPDATE executions SET supervisor_cleaned=1 WHERE execution_id=?',(execution_id,))
 
     def get_execution(self, execution_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:

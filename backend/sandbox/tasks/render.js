@@ -4,6 +4,7 @@
 // The sandbox has no network; only file:// content is reachable by design.
 const path = require("path");
 const { chromium } = require("playwright-core");
+const { browserLaunchOptions } = require("../browser-launch");
 
 const [mode, input, output, widthArg, heightArg, fullPageArg] = process.argv.slice(2);
 
@@ -16,12 +17,7 @@ if (!["pdf", "png"].includes(mode)) fail("mode must be 'pdf' or 'png'");
 if (!input || !output) fail("usage: render.js <pdf|png> <input.html> <output>");
 
 (async () => {
-  const browser = await chromium.launch({
-    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium",
-    headless: true,
-    chromiumSandbox: false,
-    args: ["--no-sandbox", "--disable-gpu"],
-  });
+  const browser = await chromium.launch(browserLaunchOptions());
   try {
     const page = await browser.newPage({
       viewport: {

@@ -14,9 +14,9 @@ import threading
 import time
 from pathlib import Path
 from datetime import timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
@@ -30,6 +30,8 @@ from app.domain.models import (
     SandboxAgentCommand,
     SandboxExecution,
     SandboxInstance,
+    SandboxJob,
+    SandboxReservation,
     SandboxSession,
     SandboxTask,
     Workspace,
@@ -249,62 +251,15 @@ def _enforce_sandbox_capacity(
     actor_id: str,
     session: SandboxSession,
     backend,
+    reuse_instance_id: str | None = None,
 ) -> None:
-    active_states = ("STARTING", "RUNNING", "WARM_IDLE")
-    user_active = db.scalar(
-        select(func.count(SandboxSession.id)).where(
-            SandboxSession.owner_user_id == actor_id,
-            SandboxSession.lifecycle_state.in_(active_states),
-            SandboxSession.id != session.id,
-        )
-    ) or 0
-    if user_active >= settings.sandbox_active_per_user:
-        raise AppError(
-            429,
-            "sandbox_user_concurrency_limit",
-            "The active sandbox limit for this user has been reached",
-        )
-    host_active = db.scalar(
-        select(func.count(SandboxSession.id)).where(
-            SandboxSession.lifecycle_state.in_(active_states),
-            SandboxSession.id != session.id,
-        )
-    ) or 0
-    if host_active >= settings.sandbox_host_max_active:
-        raise AppError(
-            503,
-            "sandbox_host_capacity_exhausted",
-            "The deployment-wide active sandbox limit has been reached",
-        )
-    host_cpus, host_memory = backend.host_capacity()
-    requested_count = host_active + 1
-    if (
-        host_memory > 0
-        and requested_count * settings.sandbox_memory_bytes
-        > host_memory * settings.sandbox_host_max_allocated_memory_ratio
-    ):
-        raise AppError(
-            503,
-            "sandbox_host_memory_budget",
-            "The deployment-wide sandbox memory allocation budget has been reached",
-        )
-    if (
-        host_cpus > 0
-        and requested_count * settings.sandbox_cpu_count
-        > host_cpus * settings.sandbox_host_max_allocated_cpu_ratio
-    ):
-        raise AppError(
-            503,
-            "sandbox_host_cpu_budget",
-            "The deployment-wide sandbox CPU allocation budget has been reached",
-        )
-    free = shutil.disk_usage(_sandbox_workspace_root(settings)).free
-    if free < settings.sandbox_host_minimum_free_disk_bytes:
-        raise AppError(
-            503,
-            "sandbox_host_disk_reserve",
-            "The sandbox host free-disk reserve would be violated",
-        )
+    from app.services.sandbox_scheduler import evaluate_capacity
+
+    ok, reason, _ = evaluate_capacity(db, settings, actor_id,
+        exclude_session_id=session.id, workspace_id=session.workspace_id,
+        runtime_kind=session.runtime_kind, reuse_instance_id=reuse_instance_id)
+    if not ok:
+        raise AppError(429, "sandbox_user_concurrency_limit", reason or "Sandbox capacity is busy")
 
 
 def _enforce_retained_workspace_capacity(
@@ -866,6 +821,52 @@ class SandboxTaskService:
                 _sandbox_workspace_path(self.settings, workspace_relative_path),
                 ignore_errors=True,
             )
+
+    def office_pdf_preview(self, file: FileRecord) -> bytes:
+        """Run the fixed Office PDF converter offline and always remove its runtime."""
+        capability = self.backend.probe()
+        if not capability.available or "office_pdf_preview" not in capability.capabilities:
+            raise SandboxBackendUnavailable("Office preview requires the updated sandbox image with LibreOffice")
+        sandbox_id = f"preview-{new_id()}"
+        workspace_key = _initialize_workspace(self.settings, self.actor_id, sandbox_id)
+        handle: SandboxSessionHandle | None = None
+        try:
+            handle = self.backend.create(SandboxCreateSpec(
+                session_id=sandbox_id,
+                image_ref=resolve_sandbox_image(self.settings) or "",
+                memory_bytes=self.settings.sandbox_memory_bytes,
+                memory_swap_bytes=self.settings.sandbox_memory_swap_bytes,
+                cpu_count=self.settings.sandbox_cpu_count,
+                pids_max=self.settings.sandbox_pids_max,
+                disk_bytes=self.settings.sandbox_disk_bytes,
+                workspace_path=str(_sandbox_workspace_path(self.settings, workspace_key)),
+                workspace_key=workspace_key,
+                runtime_kind="python-node",
+            ))
+            source = f"input/source{Path(file.original_name).suffix.casefold()}"
+            target = "output/preview.pdf"
+            self.backend.write(handle, source, self.storage.read_bytes(
+                file.object_key, limit_bytes=self.settings.max_document_parse_bytes,
+            ))
+            result = self.backend.exec_fixed(
+                handle,
+                ("python", "/opt/learngraph/runner.py", "--task", "office_pdf_preview", "--input", source, "--output", target),
+                timeout_seconds=min(self.settings.sandbox_wall_time_seconds, 160),
+                output_limit=min(self.settings.sandbox_output_bytes, 64 * 1024),
+            )
+            if result.exit_code or result.timed_out or result.truncated:
+                raise SandboxBackendError("Office preview conversion failed; rebuild the sandbox image if LibreOffice is missing")
+            payload = self.backend.read(handle, target, self.settings.max_document_parse_bytes)
+            if not payload.startswith(b"%PDF-"):
+                raise SandboxBackendError("Office converter returned an invalid PDF")
+            return payload
+        finally:
+            if handle is not None:
+                try:
+                    self.backend.delete(handle)
+                except Exception:
+                    logger.exception("Failed to clean Office preview sandbox %s", sandbox_id)
+            shutil.rmtree(_sandbox_workspace_path(self.settings, workspace_key), ignore_errors=True)
 
     def create_task(
         self,
@@ -1464,13 +1465,14 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             session.backend_id, self.settings, session.runtime_kind
         )
 
-    def _ensure_runtime_capacity(self, session: SandboxSession) -> None:
+    def _ensure_runtime_capacity(self, session: SandboxSession, reuse_instance_id: str | None = None) -> None:
         _enforce_sandbox_capacity(
             self.db,
             self.settings,
             self.actor_id,
             session,
             self._runtime_backend(session),
+            reuse_instance_id=reuse_instance_id,
         )
 
     # ── execution-pool instance reuse (design doc §3.1, §5) ─────────────
@@ -1573,16 +1575,20 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         instance = self.db.get(SandboxInstance, instance_id)
         if instance is None:
             return
-        instance.active_executions = max(0, int(instance.active_executions or 0) - 1)
-        if instance.active_executions == 0:
-            if instance.idle_since is None:
-                instance.idle_since = utc_now()
-            instance.state = "READY"
-        else:
-            instance.state = "BUSY"
-            instance.idle_since = None
-        instance.last_health_check_at = utc_now()
+        count = SandboxInstance.active_executions
+        self.db.execute(update(SandboxInstance).where(SandboxInstance.id == instance_id).values(
+            active_executions=case((count > 0, count - 1), else_=0),
+            state=case((count <= 1, "READY"), else_="BUSY"),
+            idle_since=case((count <= 1, utc_now()), else_=None),
+            last_health_check_at=utc_now(),
+        ).execution_options(synchronize_session=False))
+        from app.services.sandbox_scheduler import wake_capacity_waiters
+
+        wake_capacity_waiters(self.db, instance.owner_user_id)
         self.db.commit()
+        self.db.refresh(instance)
+        from app.services.sandbox_scheduler import notify_job_change
+        notify_job_change()
 
     def _release_instance_for_session(self, session: SandboxSession) -> None:
         """Release the borrow taken by ``_borrow_instance`` (command runs).
@@ -1600,7 +1606,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         if instance is not None:
             self._release_instance(instance.id)
 
-    def _borrow_instance(self, session: SandboxSession) -> None:
+    def _borrow_instance(self, session: SandboxSession, command: SandboxAgentCommand | None = None) -> None:
         """Count one running command on the shared instance (parallelism)."""
         instance = self.db.scalar(
             select(SandboxInstance).where(
@@ -1609,9 +1615,17 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         )
         if instance is None:
             return
-        instance.active_executions = int(instance.active_executions or 0) + 1
-        instance.state = "BUSY"
-        instance.idle_since = None
+        claimed = self.db.execute(update(SandboxInstance).where(
+            SandboxInstance.id == instance.id,
+            SandboxInstance.active_executions < SandboxInstance.max_parallel_execs,
+            SandboxInstance.state.in_(("READY", "BUSY")),
+        ).values(active_executions=SandboxInstance.active_executions + 1,
+                 state="BUSY", idle_since=None).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            self.db.rollback()
+            raise AppError(429, "sandbox_instance_saturated", "All execution slots are busy")
+        if command is not None:
+            command.instance_id = instance.id
         self.db.commit()
 
     def _ensure_pooled_backend_session(
@@ -1641,9 +1655,12 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 # The workspace egress switch changed while this pooled
                 # instance was warm. Its container network is immutable, so
                 # discard it and create a new one with the current envelope.
+                if instance.active_executions:
+                    raise AppError(429, "sandbox_instance_saturated", "Waiting for running commands before rotating the runtime")
                 backend.delete(
                     SandboxSessionHandle(instance.id, instance.backend_resource_ref)
                 )
+                self._detach_retired_instance_sessions(instance.backend_resource_ref)
                 instance.backend_resource_ref = None
                 instance.resource_envelope = {
                     **(instance.resource_envelope or {}),
@@ -1651,16 +1668,30 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 }
                 instance.state = "PROVISIONING"
                 self.db.commit()
+            except SandboxBackendUnavailable:
+                raise
             except SandboxBackendError:
+                self._detach_retired_instance_sessions(instance.backend_resource_ref)
                 instance.backend_resource_ref = None
+                instance.state = "PROVISIONING"
+                # The capacity-lock path refreshes this row. Commit the retired
+                # reference first so refresh cannot resurrect a missing runtime.
+                self.db.commit()
         with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
             self.db.refresh(instance)
             if instance.backend_resource_ref:
                 handle = backend.resume(instance.id, instance.backend_resource_ref)
             else:
-                self._ensure_runtime_capacity(session)
+                try:
+                    self._ensure_runtime_capacity(session, reuse_instance_id=instance.id)
+                except AppError:
+                    instance.state = "ERROR"
+                    self.db.commit()
+                    raise
                 capability = backend.probe()
                 if not capability.available:
+                    instance.state = 'ERROR'
+                    self.db.commit()
                     raise SandboxBackendUnavailable(
                         capability.reason or "Sandbox backend is unavailable"
                     )
@@ -1717,6 +1748,15 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         self._ensure_chat_dir(backend, handle, session.chat_session_id, pooled=True)
         return handle
 
+    def _detach_retired_instance_sessions(self, backend_ref: str | None) -> None:
+        if backend_ref:
+            self.db.execute(update(SandboxSession).where(
+                SandboxSession.workspace_id == self.workspace_id,
+                SandboxSession.owner_user_id == self.actor_id,
+                SandboxSession.backend_session_ref == backend_ref,
+            ).values(backend_session_ref=None, lifecycle_state="COLD")
+                .execution_options(synchronize_session=False))
+
     def _ensure_chat_dir(
         self,
         backend,
@@ -1734,9 +1774,13 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         """
         try:
             prefix = self._container_prefix(chat_session_id) if pooled else ""
-            for subdir in ("inputs", "work", "outputs"):
-                path = f"{prefix}/{subdir}/.keep" if prefix else f"{subdir}/.keep"
-                backend.write_agent_file(handle, path, b"")
+            ensure=getattr(backend,'ensure_directories',None)
+            if callable(ensure):
+                ensure(handle,prefix or '.')
+            else:
+                for subdir in ("inputs", "work", "outputs"):
+                    path = f"{prefix}/{subdir}/.keep" if prefix else f"{subdir}/.keep"
+                    backend.write_agent_file(handle, path, b"")
         except (SandboxBackendUnavailable, SandboxBackendError):
             pass
         self._sync_chat_workspace_inputs(
@@ -1861,9 +1905,12 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     backend, handle, session.chat_session_id, pooled=False
                 )
                 return handle
+            except SandboxBackendUnavailable:
+                raise
             except SandboxBackendError:
                 session.backend_session_ref = None
                 session.lifecycle_state = "COLD"
+                self.db.commit()
         with _sandbox_capacity_lock, _sandbox_capacity_file_lock(self.settings):
             # This ORM object may have been loaded before another worker
             # completed the same cold start. Refresh under the process lock.
@@ -1974,7 +2021,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
     def _validate_command(
         self, payload: SandboxAgentCommandRequest
     ) -> tuple[tuple[str, ...], dict[str, Any] | None]:
-        raw = tuple(payload.argv)
+        raw = tuple(payload.argv or ())
+        if raw and raw[0] in {"bash", "sh"} and not self.settings.sandbox_bash_enabled:
+            raise AppError(503, "sandbox_bash_disabled", "Sandbox shell execution is disabled by configuration")
+        if len(raw) == 3 and raw[0] in {"bash", "sh"} and len(raw[2]) > self.settings.sandbox_bash_max_chars:
+            raise AppError(422, "sandbox_bash_too_long", "Sandbox shell command exceeds the configured length limit")
         try:
             argv = validate_agent_argv(
                 raw,
@@ -2104,6 +2155,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         *,
         idempotency_key: str | None,
         timeout_seconds: int | None = None,
+        job_id: str | None = None,
     ) -> SandboxAgentCommand:
         argv, _ = self._validate_command(payload)
         argv_digest = hashlib.sha256("\0".join(argv).encode()).hexdigest()
@@ -2160,16 +2212,15 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             argv_redacted=_redacted_agent_argv(argv),
             cwd_relative=payload.cwd,
             status="created",
+            job_id=job_id,
         )
         self.db.add(command)
         self.db.flush()
         lease_token_hash, command_generation = self._claim_command_lease(session, command)
+        borrowed_instance = False
+        durable_dispatched = False
         try:
             handle = self._ensure_backend_session(session)
-            if self._pooling_enabled(session):
-                self._borrow_instance(session)
-            command.status = "running"
-            self.db.commit()
             if self._pooling_enabled(session):
                 prefix = self._container_prefix(payload.chat_session_id)
                 cwd_relative = (
@@ -2180,11 +2231,40 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 )
             else:
                 cwd_relative = payload.cwd
+            backend = self._runtime_backend(session)
+            if callable(getattr(backend, 'start_agent_execution', None)):
+                command.resource_usage = {'execution_id':'ex_' + command.id.replace('-',''),
+                    'backend_ref':handle.backend_ref,'owner_session_id':handle.session_id,
+                    'cwd':cwd_relative,'timeout_seconds':min(timeout_seconds or payload.timeout_seconds or self.settings.sandbox_wall_time_seconds,
+                        self.settings.sandbox_wall_time_seconds)}
+                command.status = 'running'
+                if self._pooling_enabled(session):
+                    self._borrow_instance(session, command)
+                    borrowed_instance = True
+                else:
+                    self.db.commit()
+                # From this commit onward the reconciler owns the slot until
+                # the original native execution reaches a durable terminal state.
+                durable_dispatched = True
+                try:
+                    cancel_requested=bool(self.db.scalar(select(SandboxJob.cancel_requested).where(SandboxJob.id==job_id))) if job_id else False
+                    self.db.commit()
+                    backend.start_agent_execution(handle, command.resource_usage['execution_id'], argv,
+                        cwd=cwd_relative,timeout_seconds=command.resource_usage['timeout_seconds'],
+                        output_limit=self.settings.sandbox_output_bytes,cancel_requested=cancel_requested)
+                except SandboxBackendError:
+                    pass  # Ambiguous dispatch: recover the same stable execution id.
+                return self._wait_durable_command(command)
+            if self._pooling_enabled(session):
+                self._borrow_instance(session)
+                borrowed_instance = True
+            command.status = 'running'
+            self.db.commit()
             result = self._runtime_backend(session).exec_agent(
                 handle,
                 argv,
                 cwd_relative=cwd_relative,
-                timeout_seconds=timeout_seconds or self.settings.sandbox_wall_time_seconds,
+                timeout_seconds=min(timeout_seconds or payload.timeout_seconds or self.settings.sandbox_wall_time_seconds, self.settings.sandbox_wall_time_seconds),
                 output_limit=self.settings.sandbox_output_bytes,
                 destructive_path_prefixes=destructive_prefixes,
             )
@@ -2197,10 +2277,10 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "network_mode": "none",
             }
             command.stdout_summary = _redact_agent_text(
-                result.stdout.decode("utf-8", errors="replace")
+                result.stdout.decode("utf-8", errors="replace"), limit=self.settings.sandbox_output_bytes,
             )
             command.stderr_summary = _redact_agent_text(
-                result.stderr.decode("utf-8", errors="replace")
+                result.stderr.decode("utf-8", errors="replace"), limit=self.settings.sandbox_output_bytes,
             )
             if result.truncated:
                 raise SandboxOutputLimitExceeded(
@@ -2251,6 +2331,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             self.db.refresh(command)
             return command
         except AppError as exc:
+            from app.services.sandbox_scheduler import CAPACITY_CODES
             if exc.code in {
                 "sandbox_auth_required",
                 "sandbox_grant_already_consumed",
@@ -2266,8 +2347,17 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     command_generation,
                 )
                 self.db.commit()
+            if exc.code in CAPACITY_CODES:
+                # No process was launched. Keep the durable job, not a cached
+                # half-created command that would prevent its retry executing.
+                self.db.delete(command)
+                if not session.backend_session_ref:
+                    session.lifecycle_state = "COLD"
+                self.db.commit()
             raise
         except SandboxBackendUnavailable as exc:
+            if durable_dispatched:
+                return command
             return self._fail_command(
                 command,
                 session,
@@ -2316,7 +2406,89 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 type(exc).__name__,
             )
         finally:
-            self._release_instance_for_session(session)
+            if borrowed_instance and not durable_dispatched:
+                self._release_instance_for_session(session)
+
+    def _wait_durable_command(self, command):
+        deadline = time.monotonic() + self.settings.sandbox_wall_time_seconds + 30
+        while time.monotonic() < deadline:
+            try:
+                self.reconcile_command(command)
+            except SandboxBackendError:
+                self.db.rollback()
+            self.db.refresh(command)
+            if command.status not in {'created','running'}:
+                return command
+            self.db.commit()
+            time.sleep(0.25)
+        return command  # Periodic reconciliation continues without model polling.
+
+    def reconcile_command(self, command):
+        """Join the original execution; terminal CAS releases its slot exactly once."""
+        meta = dict(command.resource_usage or {})
+        if not meta.get('execution_id') or command.status != 'running':
+            return
+        session = self.db.get(SandboxSession,command.sandbox_session_id)
+        backend = self._runtime_backend(session)
+        handle = SandboxSessionHandle(meta['owner_session_id'],meta['backend_ref'])
+        self.db.commit()
+        result = backend.execution_result(handle,meta['execution_id'])
+        self.db.expire_all()
+        job = self.db.get(SandboxJob,command.job_id) if command.job_id else None
+        self.db.commit()
+        if job and job.cancel_requested and result is not None:
+            backend.cancel_execution(handle,meta['execution_id'])
+        if result is None or result.get('launch_pending'):
+            if job:
+                request = SandboxAgentCommandRequest.model_validate(job.payload_json)
+                result = backend.start_agent_execution(handle,meta['execution_id'],tuple(request.argv),
+                    cwd=meta['cwd'],timeout_seconds=meta['timeout_seconds'],output_limit=self.settings.sandbox_output_bytes,
+                    cancel_requested=job.cancel_requested)
+            else:
+                return
+        if result.get('status') in {'running','cancelling'}:
+            self.db.commit()
+            return
+        claimed = self.db.execute(update(SandboxAgentCommand).where(
+            SandboxAgentCommand.id == command.id, SandboxAgentCommand.status == 'running'
+        ).values(status='finalizing').execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            self.db.rollback(); self.db.refresh(command); return
+        self.db.refresh(command)
+        failed = result['status'] != 'succeeded'
+        command.status = 'failed' if failed else 'completed'
+        command.exit_code = result.get('exit_code')
+        command.timed_out = bool(result.get('timed_out'))
+        command.truncated = bool(result.get('truncated'))
+        command.latency_ms = result.get('latency_ms',0)
+        command.stdout_summary = _redact_agent_text(result.get('stdout',''),limit=self.settings.sandbox_output_bytes)
+        command.stderr_summary = _redact_agent_text(result.get('stderr',''),limit=self.settings.sandbox_output_bytes)
+        command.error_class = ('sandbox_cancelled' if result['status']=='cancelled' else
+            'sandbox_timeout' if command.timed_out else 'sandbox_output_limit_exceeded' if command.truncated else
+            'sandbox_command_failed') if failed else None
+        command.error_message = command.error_class
+        if command.instance_id:
+            count = SandboxInstance.active_executions
+            self.db.execute(update(SandboxInstance).where(SandboxInstance.id == command.instance_id).values(
+                active_executions=case((count>0,count-1),else_=0),
+                state=case((count<=1,'READY'),else_='BUSY'),idle_since=utc_now()))
+        self.db.execute(update(SandboxSession).where(SandboxSession.id==session.id,
+            SandboxSession.active_command_id==command.id).values(active_command_id=None,
+                lease_token_hash=None,lease_expires_at=None,status='ready',lifecycle_state='WARM_IDLE'))
+        if job:
+            job.status = 'CANCELLED' if result['status']=='cancelled' or job.cancel_requested else 'FAILED' if failed else 'SUCCEEDED'
+            job.reason = command.error_class
+            job.error_class = command.error_class
+            job.finished_at = utc_now()
+            self.db.execute(update(SandboxReservation).where(SandboxReservation.job_id==job.id,
+                SandboxReservation.status=='HELD').values(status='RELEASED',released_at=utc_now()))
+        from app.services.sandbox_scheduler import wake_capacity_waiters
+
+        wake_capacity_waiters(self.db, command.owner_user_id)
+        self.db.commit()
+        self.db.refresh(command)
+        from app.services.sandbox_scheduler import notify_job_change
+        notify_job_change()
 
     def _fail_command(
         self,
@@ -2410,21 +2582,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
     def publish_image(self, payload: SandboxAgentImagePublishRequest) -> dict[str, Any]:
         path = validate_agent_workspace_path(payload.path)
         session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
-        try:
-            data = self.workspace_files.materialize_bytes(payload.chat_session_id, path)
-        except AppError:
-            try:
-                handle = self._ensure_backend_session(session)
-                container_path = (
-                    self._container_path(payload.chat_session_id, path)
-                    if self._pooling_enabled(session)
-                    else path
-                )
-                data = self._runtime_backend(session).read(
-                    handle, container_path, self.settings.sandbox_agent_file_bytes
-                )
-            except (SandboxBackendUnavailable, SandboxBackendError) as exc:
-                raise AppError(422, "sandbox_file_unavailable", "Sandbox image file cannot be read") from exc
+        data = self._read_workspace_bytes(payload.chat_session_id, path, session)
         mime_type = mimetypes.guess_type(path)[0] or ""
         allowed = {"image/png", "image/jpeg", "image/webp", "image/gif"}
         if mime_type not in allowed or not data:
@@ -2456,7 +2614,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         published.update({"width": width, "height": height, "alt": payload.alt})
         return published
 
-    def write_file(self, payload: SandboxAgentFileWriteRequest) -> dict[str, Any]:
+    def write_file(self, payload: SandboxAgentFileWriteRequest, *, streamed_file=None) -> dict[str, Any]:
         try:
             path = validate_agent_workspace_path(payload.path)
         except SandboxCapabilityMismatch as exc:
@@ -2474,14 +2632,19 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 path=payload.path,
             )
             raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
-        session, handle = self._resolve_file_session(payload.sandbox_session_id, payload.chat_session_id)
+        if streamed_file is not None:
+            session, stream_chunks = streamed_file.materialize(payload)
+            handle = None
+        else:
+            session, handle = self._resolve_file_session(payload.sandbox_session_id, payload.chat_session_id)
         try:
             container_path = (
                 self._container_path(payload.chat_session_id, path)
                 if self._pooling_enabled(session)
                 else path
             )
-            self._runtime_backend(session).write_agent_file(handle, container_path, data)
+            if streamed_file is None:
+                self._runtime_backend(session).write_agent_file(handle, container_path, data)
         except SandboxWorkspaceQuotaExceeded as exc:
             self.db.commit()
             raise AppError(
@@ -2529,6 +2692,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             "file_id": workspace_view.get("file_id"),
             "role": workspace_view.get("role"),
         }
+        if streamed_file is not None:
+            result.update(streamed=True, stream_chunks=stream_chunks)
         if workspace_view.get("file_id"):
             result["artifact"] = {
                 "type": "sandbox_artifact",
@@ -2624,16 +2789,25 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
 
     def read_file(self, payload: SandboxAgentFileReadRequest) -> dict[str, Any]:
         session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
-        requested = payload.paths or ([payload.path] if payload.path else None)
+        requested = [item.path for item in payload.items] if payload.items else (payload.paths or ([payload.path] if payload.path else None))
         if not requested:
             raise AppError(422, "invalid_tool_arguments", "path or paths is required")
         if len(requested) > 16:
             raise AppError(422, "sandbox_too_many_paths", "paths supports at most 16 entries")
         results: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        for path in requested:
+        remaining = payload.max_total_chars
+        for index, path in enumerate(requested):
             try:
-                results.append(self._read_one_file(payload, path, session))
+                selected = payload
+                if payload.items:
+                    options = payload.items[index].model_dump(exclude_none=True)
+                    selected = payload.model_copy(update={**options, "paths": None, "items": None})
+                if len(requested) > 1:
+                    selected = selected.model_copy(update={"max_chars": min(selected.max_chars or 16384, max(1, remaining // (len(requested) - index)))})
+                result = self._read_one_file(selected, path, session)
+                remaining -= len(result["content"])
+                results.append(result)
             except AppError as exc:
                 # Single-path calls keep the legacy contract: raise the error
                 # instead of folding it into an errors list. Batch calls
@@ -2697,30 +2871,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 path=path,
             )
             raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
-        data: bytes | None = None
-        # Prefer the content-addressed session workspace so chat-seeded inputs/
-        # remain readable even when Docker is unavailable or not yet synced.
-        try:
-            data = self.workspace_files.materialize_bytes(chat_session_id, path)
-        except AppError:
-            data = None
-        if data is None:
-            try:
-                handle = self._ensure_backend_session(session)
-                container_path = (
-                    self._container_path(chat_session_id, path)
-                    if self._pooling_enabled(session)
-                    else path
-                )
-                data = self._runtime_backend(session).read(
-                    handle, container_path, self.settings.sandbox_agent_file_bytes
-                )
-            except SandboxBackendUnavailable as exc:
-                self._mark_session_failed(session)
-                self.db.commit()
-                raise AppError(503, "sandbox_backend_unavailable", str(exc)) from exc
-            except SandboxBackendError as exc:
-                raise AppError(422, "sandbox_file_unavailable", "Sandbox Agent file cannot be read") from exc
+        data = self._read_workspace_bytes(chat_session_id, path, session)
         try:
             content = data.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
@@ -2728,6 +2879,40 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         if len(data) > self.settings.sandbox_agent_file_bytes:
             raise AppError(422, "sandbox_file_too_large", "Sandbox Agent file exceeds the configured byte limit")
         return path, data, content
+
+    def _read_workspace_bytes(self, chat_session_id: str, path: str, session: Any,
+                              limit_bytes: int | None = None) -> bytes:
+        """Inputs/outputs are snapshots; active work is always read from execution's view.
+
+        Never resurrect a stale checkpoint when a live workspace deleted or
+        changed a file. Offline authored files remain readable before startup.
+        """
+        path = validate_agent_workspace_path(path)
+        limit = limit_bytes or self.settings.sandbox_agent_file_bytes
+        live_work = not path.startswith(("inputs/", "outputs/")) and bool(getattr(session, "backend_session_ref", None))
+        if live_work:
+            try:
+                handle = self._ensure_backend_session(session)
+                container_path = self._container_path(chat_session_id, path) if self._pooling_enabled(session) else path
+                return self._runtime_backend(session).read(handle, container_path, limit)
+            except SandboxBackendUnavailable as exc:
+                raise AppError(503, "sandbox_backend_unavailable", "Active workspace is unavailable; refusing a stale file checkpoint") from exc
+            except SandboxBackendError as exc:
+                raise AppError(422, "sandbox_file_unavailable", "File is unavailable in the active workspace") from exc
+        try:
+            data = self.workspace_files.materialize_bytes(chat_session_id, path)
+        except AppError:
+            try:
+                handle = self._ensure_backend_session(session)
+                container_path = self._container_path(chat_session_id, path) if self._pooling_enabled(session) else path
+                data = self._runtime_backend(session).read(handle, container_path, limit)
+            except SandboxBackendUnavailable as exc:
+                raise AppError(503, "sandbox_backend_unavailable", str(exc)) from exc
+            except SandboxBackendError as exc:
+                raise AppError(422, "sandbox_file_unavailable", "Sandbox Agent file cannot be read") from exc
+        if len(data) > limit:
+            raise AppError(422, "sandbox_file_too_large", "File exceeds the read limit")
+        return data
 
     def list_files(self, payload: SandboxAgentFileListRequest) -> dict[str, Any]:
         session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
@@ -2754,13 +2939,19 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 if self._pooling_enabled(session)
                 else None
             )
+            if session.backend_session_ref:
+                by_path = {p: item for p, item in by_path.items() if p.startswith(("inputs/", "outputs/"))}
             for item in self._runtime_backend(session).list_files(
-                handle, limit_entries=200
+                handle, limit_entries=10001
             ):
                 container_path = item.path
                 if prefix and container_path.startswith(prefix + "/"):
                     container_path = container_path[len(prefix) + 1 :]
                 elif prefix and container_path == prefix:
+                    continue
+                elif prefix:
+                    continue
+                if any(part.startswith(".lg-stream-") for part in container_path.split("/")):
                     continue
                 existing = by_path.get(container_path)
                 if existing is None:
@@ -2774,10 +2965,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     }
                 else:
                     existing["size_bytes"] = item.size_bytes or existing["size_bytes"]
-        except (SandboxBackendUnavailable, SandboxBackendError):
+        except (SandboxBackendUnavailable, SandboxBackendError) as exc:
             # Logical workspace alone is enough for list; agent can still read
             # materializable inputs without a live Docker handle.
-            pass
+            if session.backend_session_ref:
+                raise AppError(503, "sandbox_backend_unavailable", "Active workspace cannot be listed; refusing a stale file view") from exc
         pattern = payload.pattern
         if pattern:
             filtered = {
@@ -2805,11 +2997,10 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             "path": ".",
             "size_bytes": 0,
             "files": files,
+            "truncated": len(by_path) > limit,
         }
 
-    # Host-side content search over the durable session workspace. Container
-    # snapshots are deliberately not streamed here: per-file host materialization
-    # keeps the search fast, memory-bounded and Docker-independent.
+    # Bounded content search over the same workspace view used by execution.
     GREP_MAX_FILE_BYTES = 4 * 1024 * 1024
     GREP_MAX_TOTAL_BYTES = 64 * 1024 * 1024
     GREP_MAX_LINE_CHARS = 500
@@ -2841,16 +3032,23 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         total_scanned = 0
         content_budget = payload.content_max_chars or 8_000
 
-        for entry in self.workspace_files.list_entries(payload.chat_session_id):
+        from types import SimpleNamespace
+
+        indexed_view = self.list_files(SandboxAgentFileListRequest(
+            chat_session_id=payload.chat_session_id, sandbox_session_id=session.id,
+            pattern=path_filter, max_results=1000,
+        ))
+        indexed = indexed_view["files"]
+        index_truncated = bool(indexed_view.get("truncated"))
+        for item in indexed:
+            entry = SimpleNamespace(**item)
             if path_filter and not fnmatch.fnmatch(entry.path, path_filter):
                 continue
             if int(entry.size_bytes or 0) > self.GREP_MAX_FILE_BYTES:
                 skipped_large += 1
                 continue
             try:
-                data = self.workspace_files.materialize_bytes(
-                    payload.chat_session_id, entry.path
-                )
+                data = self._read_workspace_bytes(payload.chat_session_id, entry.path, session, self.GREP_MAX_FILE_BYTES)
             except AppError:
                 # exec-generated files live only inside the container; the
                 # durable logical store cannot materialize them host-side.
@@ -2927,7 +3125,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "searched_files": searched,
                 "match_files": len(file_counts),
                 "matches": len(matches),
-                "truncated": truncated,
+                "truncated": truncated or index_truncated,
             },
         )
         self.db.commit()
@@ -2942,7 +3140,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             "matches": matches,
             "file_counts": file_counts,
             "contents": contents,
-            "truncated": truncated,
+            "truncated": truncated or index_truncated,
         }
 
     def run_pipeline(self, payload: SandboxAgentPipelineRequest) -> dict[str, Any]:
@@ -2954,17 +3152,9 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         the deterministic-orchestration design). Items flow stage to stage.
         """
         session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
-        entries = self.workspace_files.list_entries(payload.chat_session_id)
-        items: list[dict[str, Any]] = [
-            {
-                "path": entry.path,
-                "size_bytes": int(entry.size_bytes or 0),
-                "role": entry.role,
-                "file_id": entry.file_id,
-                "source": entry.source,
-            }
-            for entry in entries
-        ]
+        items = self.list_files(SandboxAgentFileListRequest(
+            chat_session_id=payload.chat_session_id, sandbox_session_id=session.id, max_results=1000,
+        ))["files"]
         applied: list[str] = []
         for index, stage in enumerate(payload.stages):
             if not isinstance(stage, dict):
@@ -3096,9 +3286,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             paths=(path,),
             command_intent_digest=intent_digest,
         )
-        self.workspace_files.delete_entry(payload.chat_session_id, path)
-        # Best-effort container cleanup: the logical store is authoritative;
-        # Docker unavailability must not fail the durable delete.
+        was_live = bool(session.backend_session_ref)
         try:
             handle = self._ensure_backend_session(session)
             container_path = (
@@ -3107,8 +3295,14 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 else path
             )
             self._runtime_backend(session).delete_agent_file(handle, container_path)
-        except (SandboxBackendUnavailable, SandboxBackendError):
-            pass
+        except (SandboxBackendUnavailable, SandboxBackendError) as exc:
+            if was_live:
+                raise AppError(503, "sandbox_backend_unavailable", "Active workspace file could not be deleted") from exc
+        try:
+            self.workspace_files.delete_entry(payload.chat_session_id, path)
+        except AppError as exc:
+            if exc.code != "session_workspace_entry_not_found":
+                raise
         session.status = "ready"
         self._touch_session(session)
         session.lifecycle_state = "WARM_IDLE"
@@ -3202,35 +3396,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         except SandboxCapabilityMismatch as exc:
             raise AppError(422, "sandbox_path_blocked", str(exc)) from exc
         session = self._resolve_session(payload.sandbox_session_id, payload.chat_session_id)
-        data: bytes | None = None
-        try:
-            data = self.workspace_files.materialize_bytes(payload.chat_session_id, path)
-        except AppError:
-            data = None
-        if data is None:
-            if session.backend_id == "sandboxd":
-                # The sandboxd control plane has no host bind mount: read
-                # through the daemon File API with a bounded limit instead.
-                try:
-                    handle = self._ensure_backend_session(session)
-                    container_path = (
-                        self._container_path(payload.chat_session_id, path)
-                        if self._pooling_enabled(session)
-                        else path
-                    )
-                    data = self._runtime_backend(session).read(
-                        handle, container_path, self.settings.sandbox_agent_file_bytes
-                    )
-                except (SandboxBackendUnavailable, SandboxBackendError):
-                    data = None
-            else:
-                data = self._read_workspace_bytes_from_host(session, path)
-        if data is None:
-            raise AppError(
-                404,
-                "sandbox_file_unavailable",
-                "Workspace audio file was not found in the session workspace",
-            )
+        data = self._read_workspace_bytes(payload.chat_session_id, path, session)
         if len(data) > self.settings.max_upload_bytes:
             raise AppError(
                 413, "sandbox_file_too_large", "Workspace audio exceeds the upload limit"
@@ -3483,6 +3649,17 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         }
         return [
             {
+                "type": "function", "function": {
+                    "name": "sandbox_read_result",
+                    "description": "Read or search the complete result of an earlier tool call in this chat. Use result_ref from a truncated result; select stdout/stderr with field and continue using next_cursor.",
+                    "parameters": {"type": "object", "properties": {
+                        "result_ref": {"type": "string"}, "field": {"type": "string"},
+                        "cursor": {"type": "string"}, "pattern": {"type": "string", "description": "Optional literal text to find."},
+                        "max_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 16000},
+                    }, "required": ["result_ref"], "additionalProperties": False},
+                },
+            },
+            {
                 "type": "function",
                 "function": {
                     "name": "sandbox_env_info",
@@ -3549,7 +3726,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "type": "function",
                 "function": {
                     "name": "sandbox_edit_file",
-                    "description": "Atomically replace one unique UTF-8 string in a workspace file. First read the file and pass its SHA-256 as expected_sha256. Set replace_all=true only when the same change must be applied to every occurrence (capped at 100 replacements).",
+                    "description": "Atomically replace one unique UTF-8 string in a workspace file. Read the file first; the runtime automatically supplies the last observed version. You may optionally pass expected_sha256 explicitly. Set replace_all=true only when the same change must be applied to every occurrence (capped at 100 replacements).",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -3560,7 +3737,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                             "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one match (safety cap 100)."},
                             "sandbox_session_id": session_property,
                         },
-                        "required": ["path", "old_string", "new_string", "expected_sha256"],
+                        "required": ["path", "old_string", "new_string"],
                         "additionalProperties": False,
                     },
                 },
@@ -3569,10 +3746,12 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "type": "function",
                 "function": {
                     "name": "sandbox_read_file",
-                    "description": "Read UTF-8 files from the isolated Agent workspace. Pass paths (list) to read several files in one call instead of looping read_file calls; pass start_line/end_line to read only a line range (1-based, inclusive) and max_chars to bound each file's returned text; the response reports total_lines/total_bytes so you can page through large files without re-reading everything.",
+                    "description": "Read UTF-8 files from the isolated Agent workspace. Pass paths (list) to read several files in one call instead of looping read_file calls; pass start_line/end_line to read only a line range (1-based, inclusive) and max_chars to bound each file's returned text; the response reports total_lines/total_bytes so you can page through large files without re-reading everything. Reads and searches see live files changed by sandbox_exec.",
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "items": {"type": "array", "minItems": 1, "maxItems": 16, "description": "Read multiple paths or ranges in one call, each with its own line range/cursor.", "items": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}, "cursor": {"type": "string"}, "max_chars": {"type": "integer", "minimum": 1}}, "required": ["path"], "additionalProperties": False}},
+                            "max_total_chars": {"type": "integer", "minimum": 256, "maximum": 64000, "default": 16000, "description": "Total text budget across a batch; each file retains its continuation cursor."},
                             "path": {"type": "string", "minLength": 1, "maxLength": 255, "description": "Single file; provide exactly one of path or paths."},
                             "cursor": {"type": "string", "minLength": 1, "maxLength": 2048, "description": "Continue one path using its next_cursor; do not use with paths."},
                             "paths": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 255}, "minItems": 1, "maxItems": 16, "uniqueItems": True, "description": "Batch read; mutually exclusive with path."},
@@ -3581,7 +3760,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                             "max_chars": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 16384, "description": "Character limit per page. Continue truncated reads with next_cursor."},
                             "sandbox_session_id": session_property,
                         },
-                        "oneOf": [{"required": ["path"], "not": {"required": ["paths"]}}, {"required": ["paths"], "not": {"anyOf": [{"required": ["path"]}, {"required": ["cursor"]}]}}],
+                        "oneOf": [{"required": ["path"], "not": {"anyOf": [{"required": ["paths"]}, {"required": ["items"]}]}}, {"required": ["paths"], "not": {"anyOf": [{"required": ["path"]}, {"required": ["items"]}, {"required": ["cursor"]}]}}, {"required": ["items"], "not": {"anyOf": [{"required": ["path"]}, {"required": ["paths"]}, {"required": ["cursor"]}]}}],
                         "additionalProperties": False,
                     },
                 },
@@ -3660,23 +3839,14 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "type": "function",
                 "function": {
                     "name": "sandbox_exec",
-                    "description": (
-                        "【批量/多文件操作首选】Run a workspace Python (.py) or Node (.js/.mjs/.cjs) file "
-                        "in the isolated, offline sandbox (argv is never evaluated by a shell; pip/npm "
-                        "install and internet access fail by design). For batch work (looping over many "
-                        "files, filtering, dedup, aggregation), write one script and run it once instead "
-                        "of repeated sandbox_read_file / sandbox_grep calls. Prefer the dedicated sandbox_write_file / "
-                        "sandbox_edit_file / sandbox_read_file / sandbox_grep / sandbox_list_files "
-                        "tools for single-file operations — sandbox_exec is for scripts that need "
-                        "Chromium, ffmpeg, the Python/Node toolchain, or batch/multi-file work. "
-                        "Installed capabilities are summarized by sandbox_env_info; the "
-                        "learngraph_tasks library and file-workflow guidance live in the sandbox_files "
-                        "skill. Host-path deletes are blocked; session work/ deletes are allowed directly "
-                        "(approval-free)."
-                    ),
+                    "description": "Execute a shell command or an existing Python/Node script in the isolated workspace. Use command for inline code, pipes, file inspection and batch work; argv for a saved script. Choose exactly one. By default the server waits through busy capacity and returns final stdout/stderr in THIS call; do not poll or resubmit. Only set yield_time_ms for explicit background execution; then sandbox_get_job waits for the final result by default. Large output includes result_ref for sandbox_read_result. Runtime and sandbox session are selected automatically.",
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "command": {"type": "string", "description": "Shell script, including inline Python/Node via heredoc."},
+                            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600},
+                            "yield_time_ms": {"type": "integer", "minimum": 0, "maximum": 10000},
+                            "max_output_tokens": {"type": "integer", "minimum": 256, "maximum": 16000, "default": 4000},
                             "argv": {
                                 "type": "array",
                                 "items": {"type": "string"},
@@ -3694,7 +3864,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                             },
                             "sandbox_session_id": session_property,
                         },
-                        "required": ["argv"],
+                        "oneOf": [{"required": ["command"], "not": {"required": ["argv"]}}, {"required": ["argv"], "not": {"required": ["command"]}}],
                         "additionalProperties": False,
                     },
                 },
@@ -3704,9 +3874,9 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "function": {
                     "name": "sandbox_get_job",
                     "description": (
-                        "Query the status of a previously submitted sandbox job "
-                        "(returned as job_id by sandbox_exec when the execution pool "
-                        "queues the command because capacity is busy). Status values: "
+                        "Wait for the final result of an explicitly backgrounded sandbox job. "
+                        "Omit wait_seconds to wait through queueing and execution in one call. "
+                        "Use wait_seconds=0 only for an intentional immediate snapshot. Status values: "
                         "QUEUED / STARTING / RUNNING / SUCCEEDED / FAILED / CANCELLED / "
                         "EXPIRED. When queued, wait before retrying instead of "
                         "re-submitting the command."
@@ -3714,6 +3884,9 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "output_cursor": {"type": "object", "properties": {"stdout": {"type": "integer", "minimum": 0}, "stderr": {"type": "integer", "minimum": 0}}, "additionalProperties": False, "description": "Use next_output_cursor from the same job to receive only new output."},
+                            "wait_seconds": {"type": "number", "minimum": 0, "maximum": 3600, "description": "Omit to wait until completion or the server queue deadline. Set 0 only for a nonblocking snapshot."},
+                            "max_output_tokens": {"type": "integer", "minimum": 256, "maximum": 16000, "default": 4000},
                             "job_id": {
                                 "type": "string",
                                 "description": "The job_id returned by sandbox_exec.",
@@ -4245,6 +4418,16 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 },
             },
             {
+                "type": "function", "function": {
+                    "name": "sandbox_subagent_control",
+                    "description": "Manage the ordinary child Agent conversation: pause at a safe checkpoint, resume it, or request user takeover. Returns agent_session_id for viewing the full conversation. Takeover is ready only when controller=user.",
+                    "parameters": {"type": "object", "properties": {
+                        "subagent_id": {"type": "string"},
+                        "operation": {"type": "string", "enum": ["pause", "resume", "takeover"]}
+                    }, "required": ["subagent_id", "operation"], "additionalProperties": False}
+                }
+            },
+            {
                 "type": "function",
                 "function": {
                     "name": "sandbox_subagent_wait",
@@ -4386,6 +4569,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         *,
         chat_session_id: str,
         agent_authorized: bool,
+        streamed_file=None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Execute one allow-listed tool for a caller-authorized Chat Agent.
 
@@ -4426,7 +4611,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             if name == "sandbox_env_info":
                 return self.environment_info(SandboxAgentEnvironmentRequest.model_validate(payload))
             if name == "sandbox_write_file":
-                return self.write_file(SandboxAgentFileWriteRequest.model_validate(payload))
+                return self.write_file(SandboxAgentFileWriteRequest.model_validate(payload), streamed_file=streamed_file)
             if name == "sandbox_append_file":
                 return self.append_file(SandboxAgentFileAppendRequest.model_validate(payload))
             if name == "sandbox_edit_file":
@@ -4445,75 +4630,17 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 from app.services.sandbox_scheduler import CAPACITY_CODES, SandboxSchedulerService
 
                 request = SandboxAgentCommandRequest.model_validate(payload)
-                try:
-                    command = self.execute_command(request, idempotency_key=None)
-                except AppError as exc:
-                    if exc.code not in CAPACITY_CODES:
-                        raise
-                    # Capacity shortage → queue the command instead of failing
-                    # the Agent. The unified scheduler resumes it when capacity
-                    # frees up; the caller follows job state via sandbox_get_job.
-                    scheduler = SandboxSchedulerService(self.db, self.settings)
-                    job = scheduler.submit_job(
-                        workspace_id=self.workspace_id,
-                        owner_user_id=self.actor_id,
-                        chat_session_id=request.chat_session_id,
-                        kind="agent_command",
-                        payload=request.model_dump(mode="json"),
-                        workload_class=_workload_class_for_argv(request.argv),
-                        idempotency_key=None,
-                    )
-                    self.db.refresh(job)
-                    return {
-                        "id": job.id,
-                        "job_id": job.id,
-                        "sandbox_session_id": None,
-                        "status": "queued",
-                        "reason": job.reason or "waiting_capacity",
-                        "exit_code": None,
-                        "error_class": None,
-                        "stdout": "",
-                        "stderr": "",
-                        "timed_out": False,
-                        "truncated": False,
-                        "summary": {
-                            "type": "sandbox_status",
-                            "status": "queued",
-                            "data": {
-                                "phase": "queued",
-                                "job_id": job.id,
-                                "reason": job.reason or "waiting_capacity",
-                                "argv_redacted": _redacted_agent_argv(request.argv),
-                                "chat_session_id": request.chat_session_id,
-                            },
-                        },
-                    }
-                return {
-                    "id": command.id,
-                    "job_id": getattr(command, "job_id", None),
-                    "sandbox_session_id": command.sandbox_session_id,
-                    "status": command.status,
-                    "exit_code": command.exit_code,
-                    "error_class": command.error_class,
-                    "stdout": command.stdout_summary,
-                    "stderr": command.stderr_summary,
-                    "timed_out": command.timed_out,
-                    "truncated": command.truncated,
-                    "summary": {
-                        "type": "sandbox_status",
-                        "status": command.status,
-                        "data": {
-                            "phase": "completed" if command.status == "completed" else "failed",
-                            "argv_redacted": command.argv_redacted,
-                            "exit_code": command.exit_code,
-                            "latency_ms": command.latency_ms,
-                            "stdout_summary": (command.stdout_summary or "")[:400],
-                            "stderr_summary": (command.stderr_summary or "")[:400],
-                            "sandbox_session_id": command.sandbox_session_id,
-                            "chat_session_id": command.chat_session_id,
-                        },
-                    },
-                }
+                self._validate_command(request)
+                scheduler = SandboxSchedulerService(self.db, self.settings)
+                job = scheduler.submit_job(workspace_id=self.workspace_id,owner_user_id=self.actor_id,
+                    chat_session_id=chat_session_id,kind='agent_command',payload=request.model_dump(mode='json'),
+                    workload_class=_workload_class_for_argv(request.argv))
+                scheduler.schedule_once()
+                wait_args = {'job_id':job.id,'max_output_tokens':request.max_output_tokens}
+                if request.yield_time_ms is not None:
+                    wait_args['wait_seconds'] = request.yield_time_ms / 1000
+                return self.execute_agent_tool('sandbox_get_job',wait_args,chat_session_id=chat_session_id,
+                    agent_authorized=True,cancel_check=cancel_check)
             if name == "sandbox_get_job":
                 from app.services.sandbox_scheduler import SandboxSchedulerService
 
@@ -4528,7 +4655,32 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     workspace_id=self.workspace_id,
                     owner_user_id=self.actor_id,
                 )
+                if job.chat_session_id != chat_session_id:
+                    raise AppError(404, "sandbox_job_not_found", "Job was not found in this chat")
+                from app.services.sandbox_scheduler import foreground_wait_seconds
+                wait_seconds = min(foreground_wait_seconds(self.settings), max(0,
+                    float(payload.get("wait_seconds", foreground_wait_seconds(self.settings)))))
+                job = scheduler.wait_job(job, wait_seconds, cancel_check=cancel_check)
+                command = self.db.scalar(select(SandboxAgentCommand).where(
+                    SandboxAgentCommand.job_id == job.id,
+                    SandboxAgentCommand.workspace_id == self.workspace_id,
+                    SandboxAgentCommand.owner_user_id == self.actor_id,
+                ))
+                streams = self._format_command_result(command) if command else {}
+                cursor = payload.get("output_cursor") or {}
+                if not isinstance(cursor, dict) or any(k not in {"stdout", "stderr"} or type(v) is not int or v < 0 for k, v in cursor.items()):
+                    raise AppError(422, "invalid_output_cursor", "Use next_output_cursor from this job")
+                next_cursor = {}
+                for field in ("stdout", "stderr"):
+                    output = str(streams.get(field) or "")
+                    offset = cursor.get(field, 0)
+                    if offset > len(output):
+                        raise AppError(422, "invalid_output_cursor", "Output cursor exceeds this job's output")
+                    next_cursor[field] = len(output)
+                    streams[field] = output[offset:]
                 return {
+                    **streams,
+                    "next_output_cursor": next_cursor,
                     "job_id": job.id,
                     "status": job.status,
                     "reason": job.reason,
@@ -4563,6 +4715,8 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     workspace_id=self.workspace_id,
                     owner_user_id=self.actor_id,
                 )
+                if job.chat_session_id != chat_session_id:
+                    raise AppError(404, "sandbox_job_not_found", "Job was not found in this chat")
                 job = scheduler.cancel_job(job)
                 return {
                     "job_id": job.id,
@@ -4633,7 +4787,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             # ── Sandbox toolkit (bash / todo / patch / git / search / fetch /
             #    subagent / skills / notebook) ──────────────────────────────
             if name == "sandbox_bash":
-                return self.toolkit_bash(SandboxAgentBashRequest.model_validate(payload))
+                return self.toolkit_bash(SandboxAgentBashRequest.model_validate(payload), cancel_check=cancel_check)
             if name == "sandbox_todo":
                 return self.toolkit_todo(SandboxAgentTodoRequest.model_validate(payload))
             if name == "sandbox_apply_patch":
@@ -4652,6 +4806,12 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 return self.toolkit_subagent(SandboxAgentSubagentRequest.model_validate(payload))
             if name == "sandbox_subagent_status":
                 return self.toolkit_subagent_status(SandboxAgentSubagentStatusRequest.model_validate(payload))
+            if name == "sandbox_subagent_control":
+                from app.services.managed_agent_session import control_child_session
+                task = self._load_agent_task(str(payload.get("subagent_id") or ""), chat_session_id=chat_session_id)
+                if task is None:
+                    raise AppError(404, "sandbox_subagent_not_found", "Task was not found")
+                return control_child_session(self.db, self.settings, task, payload.get("operation"))
             if name == "sandbox_subagent_wait":
                 from app.domain.schemas.sandbox import SandboxAgentSubagentWaitRequest
                 return self.toolkit_subagent_wait(SandboxAgentSubagentWaitRequest.model_validate(payload))
@@ -4758,21 +4918,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             except (SandboxBackendUnavailable, SandboxBackendError):
                 pass
         else:
-            try:
-                data = self.workspace_files.materialize_bytes(chat_session_id, path)
-            except AppError:
-                try:
-                    handle = self._ensure_backend_session(session)
-                    container_path = (
-                        self._container_path(chat_session_id, path)
-                        if self._pooling_enabled(session)
-                        else path
-                    )
-                    data = self._runtime_backend(session).read(
-                        handle, container_path, self.settings.sandbox_agent_file_bytes
-                    )
-                except (SandboxBackendUnavailable, SandboxBackendError) as exc:
-                    raise AppError(422, "sandbox_file_unavailable", "Sandbox Agent file cannot be read") from exc
+            data = self._read_workspace_bytes(chat_session_id, path, session)
         published = self.workspace_files.publish_path(
             chat_session_id=chat_session_id,
             path=path if path.startswith("outputs/") else f"outputs/{path.rsplit('/', 1)[-1]}",

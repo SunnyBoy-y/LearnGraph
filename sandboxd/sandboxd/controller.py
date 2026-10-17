@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -140,6 +141,8 @@ class SandboxController:
         self.store = store
         self.runtime = runtime
         self._lock = threading.RLock()
+        self._capacity_lock = threading.Lock()
+        self._capacity_snapshot: tuple[float, Capacity] | None = None
         self._reconcile_status = "not_run"
         self._reconcile_reason: list[str] = []
         # kernel_id -> {kernel_id, sandbox_id, scope, interpreter, workspace_relative}
@@ -158,7 +161,21 @@ class SandboxController:
         )
 
     def capacity(self) -> Capacity:
-        cpu, memory = self.runtime.capacity()
+        # Hard admission limits are enforced transactionally by the backend.
+        # This supplementary pressure sample can be shared for one second;
+        # single-flight refresh prevents concurrent callers sampling the same
+        # runners repeatedly. Never cache a failed refresh.
+        with self._capacity_lock:
+            now = time.monotonic()
+            if self._capacity_snapshot is not None:
+                sampled_at, snapshot = self._capacity_snapshot
+                if now - sampled_at < 1.0:
+                    return snapshot
+            snapshot = self._read_capacity()
+            self._capacity_snapshot = (time.monotonic(), snapshot)
+            return snapshot
+
+    def _read_capacity(self) -> Capacity:
         observed: dict[str, Any] = {}
         observe = getattr(self.runtime, "observe", None)
         if callable(observe):
@@ -166,6 +183,10 @@ class SandboxController:
                 observed = observe() or {}
             except Exception:  # noqa: BLE001 - probe never fails the endpoint
                 observed = {}
+        cpu = int(observed.get("host_cpu_count") or 0)
+        memory = int(observed.get("host_memory_bytes") or 0)
+        if not cpu or not memory:
+            cpu, memory = self.runtime.capacity()
         return Capacity(
             cpu_count=cpu,
             memory_bytes=memory,
@@ -248,6 +269,10 @@ class SandboxController:
                 "runner_abi": record["runner_abi"],
                 "source": record["source"],
                 "smoke_status": record["smoke_status"],
+                # Installation records outlive images removed from the engine.
+                # Probe each digest so browser readiness is independent of the
+                # code-only /health/ready runtime verdict.
+                "image_present": self.runtime.artifact_present(record["image_digest"]),
             }
             for record in self.store.list_runtimes()
         ]
@@ -721,10 +746,11 @@ class SandboxController:
     def _validate_argv(self, argv: list[str]) -> tuple[str, ...]:
         if not argv or len(argv) > 64:
             raise SandboxdError("command_rejected", "argv must contain 1..64 arguments")
-        for item in argv:
+        for index, item in enumerate(argv):
             if not isinstance(item, str) or not item:
                 raise SandboxdError("command_rejected", "argv entries must be non-empty strings")
-            if len(item) > 1024:
+            maximum = 16384 if index == 2 and argv[0] in {"bash", "sh"} and argv[1] in {"-c", "-lc"} else 1024
+            if len(item) > maximum:
                 raise SandboxdError("command_rejected", "argv entry exceeds the length limit")
             if "\x00" in item:
                 raise SandboxdError("command_rejected", "argv entry contains a NUL byte")
@@ -807,7 +833,7 @@ class SandboxController:
                     validated_argv,
                     execution_id=execution_id,
                     timeout_seconds=timeout_seconds,
-                    output_limit=output_limit,
+                    output_limit=min(output_limit, self.config.max_stdout_bytes),
                 )
             else:
                 result = self.runtime.exec_agent(
@@ -816,7 +842,7 @@ class SandboxController:
                     execution_id=execution_id,
                     cwd=cwd,
                     timeout_seconds=timeout_seconds,
-                    output_limit=output_limit,
+                    output_limit=min(output_limit, self.config.max_stdout_bytes),
                 )
         except DockerRuntimeUnavailable as exc:
             with self._lock:
@@ -842,7 +868,7 @@ class SandboxController:
                 execution_id=execution_id,
                 exit_code=result.exit_code,
                 timed_out=result.timed_out,
-                truncated=result.truncated,
+                truncated=result.truncated or len(result.stdout.decode("utf-8", errors="replace")) > max_transport or len(result.stderr.decode("utf-8", errors="replace")) > max_transport,
                 stdout=stdout_text,
                 stderr=stderr_text,
                 latency_ms=result.latency_ms,
@@ -853,24 +879,117 @@ class SandboxController:
                 status=status,
                 exit_code=result.exit_code,
                 timed_out=result.timed_out,
-                truncated=result.truncated,
+                truncated=exec_result.truncated,
                 latency_ms=result.latency_ms,
                 finished_reason=status,
+                result_json=exec_result.model_dump_json(),
             )
             self.store.complete_idempotent(
                 key_scope, idempotency_key, state="succeeded", result_json=exec_result.model_dump_json()
             )
+            self._forget_execution(handle, execution_id)
             return ExecOutcome(result=exec_result)
 
-    def cancel_execution(self, execution_id: str, scope: str) -> dict[str, Any]:
-        """Request cancellation of a live execution.
+    def ensure_directories(self,sandbox_id,scope,prefix,*,fence=None):
+        prefix=_safe_path(prefix,allow_dot=True)
+        record=self._require(sandbox_id,scope,fence=fence)
+        handle=self._ensure_runtime(record)
+        ensure=getattr(self.runtime,'ensure_directories',None)
+        if callable(ensure):
+            ensure(handle,prefix)
+        else:
+            for name in ('inputs','work','outputs'):
+                self.runtime.write_file(handle,(prefix+'/' if prefix!='.' else '')+name+'/.keep',b'')
 
-        Marks the execution ``cancelling`` durably and best-effort asks the
-        runtime to stop the process tree. The synchronous exec path cannot be
-        interrupted mid-flight without a container supervisor; the mark is what
-        the scheduler and operators observe, and the supervisor phase (task
-        cgroup / process-group TERM→KILL) plugs in at ``runtime.cancel_exec``.
-        """
+    def start_agent_execution(self, sandbox_id: str, scope: str, body: AgentExecRequest, *, fence=None) -> dict:
+        """Durable admission plus idempotent container-owned dispatch."""
+        if not body.execution_id or not callable(getattr(self.runtime, 'start_exec', None)):
+            raise SandboxdError('capability_missing', 'Durable execution requires a stable execution id and supervisor')
+        argv = self._validate_argv(body.argv)
+        cwd = _safe_path(body.cwd or '.', allow_dot=True)
+        with self._lock:
+            sandbox = self._require(sandbox_id, scope, fence=fence)
+            key_scope = f'{scope}|{sandbox_id}'
+            digest = _payload_hash(body.model_dump(exclude={'cancel_requested'}))
+            proceed, replay = self.store.begin_idempotent(key_scope, body.idempotency_key, 'agent.start', digest)
+            if not proceed and replay.payload_hash != digest:
+                raise SandboxdError('idempotency_conflict', 'Execution key has a different payload')
+            old = self.store.get_execution(body.execution_id)
+            if old and old['sandbox_id'] != sandbox_id:
+                raise SandboxdError('owner_mismatch', 'Execution belongs to a different sandbox')
+            if old and old.get('result_json'):
+                return json.loads(old['result_json'])
+            if old is None:
+                self.store.create_execution(execution_id=body.execution_id, sandbox_id=sandbox_id,
+                    deployment_id=self.config.deployment_id, operation='agent',
+                    argv_digest=hashlib.sha256('\0'.join(argv).encode()).hexdigest())
+            self.store.complete_idempotent(key_scope, body.idempotency_key, state='in_progress',
+                result_json=json.dumps({'execution_id':body.execution_id}))
+            handle = self._ensure_runtime(sandbox)
+            cancelled = body.cancel_requested or bool(old and old.get('cancel_requested_at'))
+            if cancelled:
+                self.store.cancel_execution(body.execution_id)
+        if cancelled:
+            self.runtime.cancel_exec(handle,body.execution_id)
+        self.runtime.start_exec(handle, argv, execution_id=body.execution_id,
+            cwd='/workspace' if cwd == '.' else '/workspace/' + cwd,
+            timeout_seconds=body.timeout_seconds, output_limit=min(body.output_limit, self.config.max_stdout_bytes))
+        return self.get_execution(body.execution_id, scope)
+
+    def get_execution(self, execution_id: str, scope: str) -> dict:
+        record = self.store.get_execution(execution_id)
+        if record is None:
+            raise SandboxdError('sandbox_not_found', 'Execution was not found')
+        sandbox = self.store.get_sandbox(record['sandbox_id'])
+        if sandbox is None or sandbox.owner_scope != scope or sandbox.deployment_id != self.config.deployment_id:
+            raise SandboxdError('owner_mismatch', 'Execution belongs to a different scope')
+        if record.get('result_json'):
+            return json.loads(record['result_json'])
+        read = getattr(self.runtime, 'execution_result', None)
+        native = read(RuntimeHandle(sandbox.sandbox_id, sandbox.container_id), execution_id) if callable(read) else None
+        if native is None:
+            refreshed = self.store.get_execution(execution_id)
+            if refreshed and refreshed.get('result_json'):
+                return json.loads(refreshed['result_json'])
+        if native and native['status'] not in {'running','launching'}:
+            result = {'execution_id':execution_id, **native}
+            self.store.finish_execution(execution_id=execution_id, status=result['status'],
+                exit_code=result['exit_code'], timed_out=result['timed_out'], truncated=result['truncated'],
+                latency_ms=result['latency_ms'], finished_reason=result['status'], result_json=json.dumps(result))
+            self._forget_execution(RuntimeHandle(sandbox.sandbox_id, sandbox.container_id), execution_id)
+            return result
+        # The backend can replay admission with the original stable id/payload.
+        # An exclusive supervisor mkdir prevents a second native launch. Do not
+        # declare an uncertain dispatch stopped merely because a timer elapsed.
+        return {'execution_id':execution_id,'status':record['status'],'sandbox_id':record['sandbox_id'],
+                'launch_pending':native is None and callable(read)}
+
+    def reconcile_executions(self) -> None:
+        for record in self.store.active_executions(self.config.deployment_id):
+            sandbox = self.store.get_sandbox(record['sandbox_id'])
+            if sandbox is not None:
+                try:
+                    self.get_execution(record['execution_id'], sandbox.owner_scope)
+                except Exception:
+                    logger.exception('Execution reconciliation failed for %s', record['execution_id'])
+        for record in self.store.execution_cleanup_pending(self.config.deployment_id):
+            sandbox=self.store.get_sandbox(record['sandbox_id'])
+            if sandbox is None:
+                self.store.mark_execution_cleaned(record['execution_id'])
+            else:
+                self._forget_execution(RuntimeHandle(sandbox.sandbox_id,sandbox.container_id),record['execution_id'])
+
+    def _forget_execution(self, handle, execution_id):
+        forget = getattr(self.runtime, 'forget_exec', None)
+        if callable(forget):
+            try:
+                forget(handle, execution_id)
+                self.store.mark_execution_cleaned(execution_id)
+            except Exception:
+                logger.exception('Supervisor cleanup failed for %s', execution_id)
+
+    def cancel_execution(self, execution_id: str, scope: str) -> dict[str, Any]:
+        """Persist cancellation and signal the container-owned watchdog."""
         record = self.store.get_execution(execution_id)
         if record is None:
             raise SandboxdError("sandbox_not_found", "execution was not found")

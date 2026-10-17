@@ -72,6 +72,7 @@ class FakeProvider:
         self.last_usage = usage or {}
         self.provider_id = "fake"
         self.model_id = "fake-model"
+        self.remote_capability = False  # Scripted unit provider has no remote billing/database.
 
     def stream_chat(self, messages: list[ProviderChatMessage], *, tools: list[dict] | None = None):
         assert self.calls < len(self.script), "provider script exhausted"

@@ -30,6 +30,36 @@ def _headers(token="test-token", scope="deploy-test|ses-1", **extra):
     return headers
 
 
+def test_durable_execution_replay_result_and_owner_scope(config,store,runtime):
+    native={}; launches=[]
+    def start(handle,argv,*,execution_id,**kwargs):
+        if execution_id not in native:
+            launches.append(execution_id);native[execution_id]={'status':'running'}
+    runtime.start_exec=start
+    runtime.execution_result=lambda handle,eid:native.get(eid)
+    runtime.cancel_exec=lambda handle,eid:True
+    client=_client(config,runtime,store)
+    created=client.post('/v1/sandboxes',headers=_headers(),json=_create_payload())
+    assert created.status_code==200
+    sandbox=created.json()['sandbox_id'];eid='ex_'+'a'*32
+    body={'argv':['python','main.py'],'cwd':'.','timeout_seconds':5,'output_limit':4096,
+          'idempotency_key':eid,'execution_id':eid}
+    url='/v1/sandboxes/'+sandbox+'/executions/agent/start'
+    assert client.post(url,headers=_headers(),json=body).json()['status']=='running'
+    assert client.post(url,headers=_headers(),json=body).status_code==200
+    assert launches==[eid]
+    assert client.get('/v1/executions/'+eid,headers=_headers(scope='deploy-test|other')).status_code==403
+    native[eid]={'status':'succeeded','exit_code':0,'stdout':'COMPLETE','stderr':'',
+                 'timed_out':False,'truncated':False,'latency_ms':12}
+    completed=client.get('/v1/executions/'+eid,headers=_headers()).json()
+    assert completed['stdout']=='COMPLETE'
+    # A new controller joins the persisted result even with no runtime-local map.
+    native.clear()
+    restarted=_client(config,runtime,store)
+    assert restarted.get('/v1/executions/'+eid,headers=_headers()).json()==completed
+    assert restarted.post(url,headers=_headers(),json=body).json()==completed
+
+
 def _create_payload(**overrides):
     payload = dict(
         protocol_version="1.0",

@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -558,6 +559,44 @@ def extract_legacy_doc(path: Path) -> dict:
     }
 
 
+def office_pdf_preview(source: Path, target: Path) -> None:
+    """Convert only document formats in the fixed, network-disabled sandbox."""
+    if source.suffix.casefold() not in {".doc", ".xls", ".ppt", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".rtf"}:
+        raise ValueError("Unsupported Office preview format")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="office-preview-", dir="/tmp") as scratch:
+        profile = Path(scratch) / "profile"
+        user = profile / "user"
+        user.mkdir(parents=True)
+        # A fresh profile has no trusted locations/certificates and cannot run macros.
+        (user / "registrymodifications.xcu").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+            '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+            '<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>'
+            '<prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop>'
+            '</item></oor:items>', encoding="utf-8",
+        )
+        converted = Path(scratch) / "out"
+        converted.mkdir()
+        result = subprocess.run(
+            ["/usr/bin/libreoffice", f"-env:UserInstallation={profile.as_uri()}",
+             "--headless", "--nologo", "--nodefault", "--norestore",
+             "--convert-to", "pdf", "--outdir", str(converted), str(source)],
+            capture_output=True, timeout=150, check=False,
+        )
+        pdf = converted / f"{source.stem}.pdf"
+        if result.returncode or not pdf.is_file():
+            raise ValueError("Office preview conversion failed; the file may be encrypted or invalid")
+        if pdf.stat().st_size > 200 * 1024 * 1024:
+            raise ValueError("Converted Office preview exceeds the 200 MiB limit")
+        with pdf.open("rb") as stream:
+            if stream.read(5) != b"%PDF-":
+                raise ValueError("Office converter did not produce a PDF")
+        import shutil
+        shutil.copyfile(pdf, target)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
@@ -566,6 +605,7 @@ def main() -> int:
             "file_inspect",
             "extract_inert_text",
             "extract_legacy_doc",
+            "office_pdf_preview",
             "render_component",
             "mcp_stdio",
             "web_fetch",
@@ -587,6 +627,9 @@ def main() -> int:
         return 0
     if not source.is_file():
         raise ValueError("authorized input file does not exist")
+    if args.task == "office_pdf_preview":
+        office_pdf_preview(source, target)
+        return 0
     if args.task == "file_inspect":
         result = inspect_file(source)
     elif args.task == "extract_inert_text":

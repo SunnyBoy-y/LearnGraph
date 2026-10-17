@@ -987,11 +987,10 @@ async def sandbox_execution_scheduler(
     stop: asyncio.Event,
     interval_seconds: int | None = None,
 ) -> None:
-    """Periodic unified-scheduler tick for queued sandbox jobs.
+    """Run queue ticks; job admission and finalization are protected by DB CAS.
 
-    Only one process runs each tick (advisory lock); the DB CAS inside
-    ``SandboxSchedulerService.schedule_once`` is the authoritative guard
-    against concurrent workers.
+    Foreground submissions already tick concurrently. A process-wide advisory
+    lease would delay crash recovery until the dead process's lease expires.
     """
     interval = max(
         1,
@@ -1000,26 +999,14 @@ async def sandbox_execution_scheduler(
         else get_settings().sandbox_scheduler_interval_seconds,
     )
     while not stop.is_set():
-        lock_token = await asyncio.to_thread(
-            _acquire_advisory_lock_in_worker,
-            "sweep.sandbox_execution",
-            ttl_seconds=60,
-        )
-        if lock_token is not None:
-            try:
-                from app.services.sandbox_scheduler import run_scheduler_tick
+        try:
+            from app.services.sandbox_scheduler import run_scheduler_tick
 
-                counters = await asyncio.to_thread(run_scheduler_tick)
-                if counters.get("claimed"):
-                    logger.debug("sandbox execution tick counters=%s", counters)
-            except Exception:
-                logger.exception("Sandbox execution scheduler tick failed")
-            finally:
-                await asyncio.to_thread(
-                    _release_advisory_lock_in_worker,
-                    "sweep.sandbox_execution",
-                    lock_token,
-                )
+            counters = await asyncio.to_thread(run_scheduler_tick)
+            if counters.get("claimed"):
+                logger.debug("sandbox execution tick counters=%s", counters)
+        except Exception:
+            logger.exception("Sandbox execution scheduler tick failed")
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except TimeoutError:

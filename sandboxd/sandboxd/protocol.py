@@ -90,6 +90,8 @@ class AgentExecRequest(BaseModel):
     timeout_seconds: int = Field(ge=1, le=3600)
     output_limit: int = Field(ge=1024, le=512 * 1024 * 1024)
     idempotency_key: str = Field(min_length=1, max_length=128)
+    execution_id: str | None = Field(default=None, pattern=r"^ex_[a-z0-9]{16,64}$")
+    cancel_requested: bool = False
 
 
 class ExecResult(BaseModel):
@@ -156,6 +158,9 @@ class Capabilities(BaseModel):
             "per_sandbox_egress_network",
             "resource_usage",
             "kernels",
+            "durable_execution",
+            "execution_watchdog",
+            "workspace_directories",
         ]
     )
     limits: dict[str, int] = Field(

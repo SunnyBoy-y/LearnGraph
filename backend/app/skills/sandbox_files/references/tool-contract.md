@@ -1,8 +1,10 @@
 # 工具输入输出契约（sandbox_* 文件工具）
 
-所有工具都接受可选的 `sandbox_session_id`；省略时自动复用/创建本聊天的会话，回传上一次结果里的 `sandbox_session_id` 可保持会话。
+会话与 runtime 由宿主绑定；普通调用不需要传 ID。旧调用中的 `sandbox_session_id` 仍接受并校验。子代理会话由编排器绑定。
 
 ## sandbox_list_files
+
+前台 `sandbox_exec` 遇到容量满额时由服务端持有等待，容量释放后继续执行，同一次调用返回最终结果。排队有服务端截止时间且支持用户取消，不需要模型轮询。显式 `yield_time_ms` 保留后台语义；后台 job 的 `sandbox_get_job` 默认等待完成，不传 `wait_seconds` 即可。`wait_seconds=0` 只用于主动查询即时状态；`output_cursor` 仍可增量回读。
 
 - 入参：`pattern`（可选 glob，如 `work/**/*.py`）、`max_results`（默认 200，上限 1000）
 - 出参：`files: [{path, size_bytes, role, source, mtime, file_id}]`
@@ -14,11 +16,12 @@
 - 入参：`pattern`（正则，必填）、`path`（可选 glob）、`case_sensitive`、`context_lines`(0-5)、`max_matches`(默认 50，上限 500)
 - 出参：`matches: [{path, line_number, text, context:[{line_number, text}]}]`、`file_counts`、`searched_files`、`skipped_binary/skipped_large/skipped_container_only`、`truncated`
 - 语义：按行匹配；`context_lines` 重叠窗口自动合并；匹配行数达到上限即停并置 `truncated=true`
-- 约束：单文件 > 4 MiB 跳过（`skipped_large`）；非 UTF-8 跳过（`skipped_binary`）；仅容器内文件跳过（`skipped_container_only`）
+- 约束：单文件 > 4 MiB 跳过（`skipped_large`）；非 UTF-8 跳过（`skipped_binary`）；包含 exec 生成的活跃文件。
 
 ## sandbox_read_file
 
-- 入参：`path`、`start_line`(≥1)、`end_line`(≥start_line，超出自动钳制)、`max_chars`
+- 入参：单文件 `path` 加行范围/游标；批量用 `paths`，或 `items:[{path,start_line,end_line,cursor,max_chars}]` 为每项指定不同范围；三者择一。
+- 批量总文本预算用 `max_total_chars`（默认 16000），每项保留独立 `next_cursor`，不需要多轮调用来读取不同文件的不同段落。
 - 出参：`content`、`total_lines`、`total_bytes`、`start_line`、`end_line`、`truncated`
 - 语义：1-based 闭区间；不传则读全文件；`start_line` 超过文件行数报 `sandbox_file_range_out_of_bounds`
 - 错误：非 UTF-8 → `sandbox_file_not_text`；超过字节上限 → `sandbox_file_too_large`
@@ -28,10 +31,11 @@
 - 入参：`path`、`content`（append 可选 `expected_sha256` 并发校验）
 - 出参：`sha256`、`size_bytes`、`file_id`（仅 outputs 下生成可下载产物）
 - 写 `outputs/` 路径会登记为可下载 artifact
+- 新写入只需调用一次 write_file；支持参数流的 Provider 会提前将片段送入沙箱暂存，完整参数校验后原子提交。中断不覆盖旧文件。append 保留兼容，不用它模拟 Token 流。
 
 ## sandbox_edit_file
 
-- 入参：`path`、`old_string`、`new_string`、`expected_sha256`（必填，来自 read 的 sha256）、`replace_all`(默认 false)
+- 入参：`path`、`old_string`、`new_string`、`expected_sha256`（模型工具可省略，由当前运行已读取的版本填入；直接 HTTP 接口仍必填）、`replace_all`(默认 false)
 - 语义：先校验 sha256（变了报 409 `sandbox_file_changed`）；唯一匹配否则 422 `sandbox_edit_match_invalid`；`replace_all` 允许全部替换但上限 100 次（超出报 `sandbox_edit_too_many_matches`）
 - 出参：额外含 `replaced_count`
 
@@ -44,9 +48,16 @@
 
 ## sandbox_exec
 
-- 入参：`argv`（如 `["python", "main.py"]`）、`cwd`（仅 "."）、`runtime`（已废弃，统一镜像）
-- 出参：`exit_code`、`stdout`（截断展示）、`stderr`、`timed_out`、`truncated`、`latency_ms`
-- 约束：只执行工作区内 .py/.js；argv 不进 shell；输出受 `sandbox_output_bytes` 截断；壁钟时间受 `sandbox_wall_time_seconds`
+- 入参：`command`（shell 字符串，支持内联脚本）或 `argv`（已有脚本），两者择一；可选 `timeout_seconds`、`yield_time_ms`、`max_output_tokens`；cwd 固定为工作区根。
+- 出参：`exit_code`、`stdout`、`stderr`、`timed_out`、`truncated`。超过模型预算时仍保留控制字段与 stderr，并返回 `result_ref`。
+- `yield_time_ms` 启用持久后台任务；短等待内完成则直接返回结果，否则返回 `job_id`。
+- 容器内执行；输出和执行时间受资源上限约束。模型 Token 预算不影响资源上限内完整结果留存。
+
+## sandbox_get_job / sandbox_read_result
+
+- get_job：`job_id`、`wait_seconds`（0..10）、`output_cursor`（上次 next_output_cursor），返回状态与新增输出。不同聊天的任务 ID 不可混用。
+- read_result：`result_ref`、可选 `field`（stdout/stderr 等）、`cursor`、`max_chars`（1..16000）、`pattern`（字面文本搜索）。返回 content、has_more、next_cursor、版本与总长度。
+- 结果按工作区、用户与聊天隔离；已截断结果无需重新执行命令即可恢复。
 
 ## sandbox_bash
 

@@ -757,22 +757,41 @@ class SandboxBootstrapService:
                 if daemon_detail is None:
                     daemon_detail = str(exc)
 
-        record = next(
-            (r for r in runtimes if r.get("runtime_kind") == "python-node"),
-            None,
-        )
-        image_digest = (
-            str(record["image_digest"])
-            if record and image_ref_is_pinned(str(record.get("image_digest") or ""))
-            else None
-        )
-        record_ready = bool(record and record.get("smoke_status") == "passed")
-        # The daemon's health verdict owns "runtime environment" truth: a
-        # surviving store record is not enough — the image must still exist in
-        # Docker Engine. Deleting the sandbox environment while running (e.g.
-        # docker rmi) must flip the UI from 已就绪 back to 未就绪.
-        runtime_ok = bool(ready.get("runtime")) if ready is not None else False
-        image_ready = runtime_ok and record_ready
+        records = {r.get("runtime_kind"): r for r in runtimes}
+        code_record = records.get(CODE_RUNTIME_KIND)
+        code_digest = str((code_record or {}).get("image_digest") or "")
+
+        def runtime_status(kind: str) -> tuple[str | None, bool]:
+            record = records.get(kind) or {}
+            digest = str(record.get("image_digest") or "")
+            if not image_ref_is_pinned(digest):
+                return None, False
+            present = record.get("image_present")
+            if present is None:
+                # Older daemons only health-check the code image. That check
+                # also proves presence for a registered browser using the same
+                # digest, but says nothing about a different browser image.
+                present = bool(ready and ready.get("runtime") and digest == code_digest)
+            available = (
+                daemon_reachable
+                and docker_reachable
+                and bool(ready and ready.get("store", True))
+                and present is True
+                and record.get("smoke_status") == "passed"
+            )
+            return digest, available
+
+        image_digest, image_ready = runtime_status(CODE_RUNTIME_KIND)
+        browser_image_digest, browser_image_ready = runtime_status(BROWSER_RUNTIME_KIND)
+        all_ready = image_ready and browser_image_ready
+        if all_ready:
+            runtime_message = "沙箱运行环境已就绪"
+        elif image_ready:
+            runtime_message = "普通代码沙箱已就绪，浏览器沙箱尚未就绪"
+        elif browser_image_ready:
+            runtime_message = "浏览器沙箱已就绪，普通代码沙箱尚未就绪"
+        else:
+            runtime_message = "尚未初始化沙箱运行环境"
 
         try:
             _, effective_prebuilt = effective_bootstrap_source(settings)
@@ -812,21 +831,23 @@ class SandboxBootstrapService:
                 + daemon_reasons
             )
             can_initialize = False
-        elif image_ready:
+        elif all_ready:
             remediation.append("沙箱运行环境已就绪，可直接在会话中使用 Agent 文件与代码能力")
             can_initialize = True
         else:
             remediation.extend(
                 [
-                    "点击「初始化沙箱」让 sandboxd 拉取并冒烟检查预构建 Runner 镜像",
+                    "点击「初始化沙箱」让 sandboxd 注册并检查普通代码与浏览器运行时",
                     "sandboxd 模式只支持 prebuilt 镜像；本地构建仅在 docker backend 下可用",
                 ]
                 + daemon_reasons
             )
             if prebuilt_ref is None:
                 remediation.append("请先配置 LEARNGRAPH_SANDBOX_PREBUILT_IMAGE")
-            if record is not None and record.get("smoke_status") not in (None, "passed"):
-                remediation.append(f"最近一次运行环境状态：{record.get('smoke_status')}")
+            for kind in (CODE_RUNTIME_KIND, BROWSER_RUNTIME_KIND):
+                record = records.get(kind)
+                if record is not None and record.get("smoke_status") not in (None, "passed"):
+                    remediation.append(f"{kind} 最近一次运行环境状态：{record.get('smoke_status')}")
 
         return {
             "docker_installed": daemon_reachable,
@@ -835,8 +856,8 @@ class SandboxBootstrapService:
             "sandbox_enabled": settings.sandbox_enabled,
             "image_ready": image_ready,
             "image_digest": image_digest,
-            "browser_image_ready": image_ready,
-            "browser_image_digest": image_digest,
+            "browser_image_ready": browser_image_ready,
+            "browser_image_digest": browser_image_digest,
             "member_bootstrap_allowed": effective_member_bootstrap_allowed(settings),
             "bootstrap_policy": load_bootstrap_policy(settings).to_dict()
             if load_bootstrap_policy(settings)
@@ -845,12 +866,12 @@ class SandboxBootstrapService:
             "prebuilt_image_ref": _friendly_image_ref(prebuilt_ref) if prebuilt_ref else None,
             "bootstrap_mode": effective_bootstrap_source(settings)[0],
             "image_source": "sandboxd",
-            "phase": active["phase"] if active else ("ready" if image_ready else "idle"),
-            "progress_percent": active["progress_percent"] if active else (100 if image_ready else 0),
+            "phase": active["phase"] if active else ("ready" if all_ready else "idle"),
+            "progress_percent": active["progress_percent"] if active else (100 if all_ready else 0),
             "message": (
                 active["message"]
                 if active
-                else ("沙箱运行环境已就绪" if image_ready else "尚未初始化沙箱运行环境")
+                else runtime_message
             ),
             "detail": active["detail"] if active else None,
             "can_initialize": bool(can_initialize and active is None),
@@ -947,10 +968,19 @@ class SandboxBootstrapService:
             self._set_phase(job, "pull_runner", 45, "由 sandboxd 拉取预构建 Runner 镜像…")
 
         try:
-            result = client.install_runtime("python-node", prebuilt_ref)
+            result = client.install_runtime(CODE_RUNTIME_KIND, prebuilt_ref)
             digest = str(result.get("image_digest") or "")
+            if not image_ref_is_pinned(digest):
+                raise SandboxdUnavailable("sandboxd returned an unpinned code runtime image")
+            self._set_phase(job, "smoke_test", 75, "由 sandboxd 注册并检查浏览器运行时…")
+            # Resolve the mutable release tag only once. Both runtime kinds
+            # must refer to the same image even if the tag changes mid-job.
+            browser_result = client.install_runtime(BROWSER_RUNTIME_KIND, digest)
+            browser_digest = str(browser_result.get("image_digest") or "")
+            if browser_digest != digest:
+                raise SandboxdUnavailable("sandboxd returned a different browser runtime image")
             with self._lock:
-                self._succeed(job, digest=digest, browser_digest=digest)
+                self._succeed(job, digest=digest, browser_digest=browser_digest)
         except (SandboxdUnavailable, SandboxdProtocolError) as exc:
             with self._lock:
                 self._fail(job, "sandboxd_bootstrap_failed", str(exc))

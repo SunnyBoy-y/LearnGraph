@@ -75,23 +75,26 @@ def _daemon_available() -> bool:
         return False
 
 
-def _ensure_runtime(client) -> None:
+def _ensure_runtime(client, runtime_kind: str = "python-node") -> None:
     try:
         runtimes = client.list_runtimes()
     except Exception:  # noqa: BLE001
         runtimes = []
-    if any(r.get("runtime_kind") == "python-node" for r in runtimes):
+    if any(r.get("runtime_kind") == runtime_kind for r in runtimes):
         return
-    client.install_runtime("python-node", _IMAGE)
+    client.install_runtime(runtime_kind, _IMAGE)
 
 
 @pytest.mark.skipif(not _daemon_available(), reason="sandboxd is not reachable")
-def test_sandboxd_roundtrip_create_write_exec_read_stop_resume_delete():
+@pytest.mark.parametrize("runtime_kind", ["python-node", "python-node-browser"])
+def test_sandboxd_roundtrip_create_write_exec_read_stop_resume_delete(runtime_kind):
     from app.providers.remote.sandboxd_client import SandboxdProtocolError
 
     client, errors = _client()
-    _ensure_runtime(client)
+    _ensure_runtime(client, runtime_kind)
     session_id = f"it-roundtrip-{uuid.uuid4().hex[:10]}"
+    memory_bytes = (2 * 1024**3) if runtime_kind == "python-node-browser" else (512 * 1024**2)
+    pids_max = 512 if runtime_kind == "python-node-browser" else 128
     sandbox_id: str | None = None
     try:
         view = client.create_sandbox(
@@ -100,11 +103,11 @@ def test_sandboxd_roundtrip_create_write_exec_read_stop_resume_delete():
                 "session_id": session_id,
                 "workspace_key": session_id,
                 "owner": {"deployment_id": _DEPLOYMENT_ID, "workspace_id": "", "session_id": session_id},
-                "runtime_kind": "python-node",
-                "memory_bytes": 512 * 1024 * 1024,
-                "memory_swap_bytes": 512 * 1024 * 1024,
+                "runtime_kind": runtime_kind,
+                "memory_bytes": memory_bytes,
+                "memory_swap_bytes": memory_bytes,
                 "cpu_count": 1.0,
-                "pids_max": 128,
+                "pids_max": pids_max,
                 "disk_bytes": 128 * 1024 * 1024,
                 "egress": None,
                 "ttl_seconds": 3600,
@@ -121,11 +124,11 @@ def test_sandboxd_roundtrip_create_write_exec_read_stop_resume_delete():
                 "session_id": session_id,
                 "workspace_key": session_id,
                 "owner": {"deployment_id": _DEPLOYMENT_ID, "workspace_id": "", "session_id": session_id},
-                "runtime_kind": "python-node",
-                "memory_bytes": 512 * 1024 * 1024,
-                "memory_swap_bytes": 512 * 1024 * 1024,
+                "runtime_kind": runtime_kind,
+                "memory_bytes": memory_bytes,
+                "memory_swap_bytes": memory_bytes,
                 "cpu_count": 1.0,
-                "pids_max": 128,
+                "pids_max": pids_max,
                 "disk_bytes": 128 * 1024 * 1024,
                 "egress": None,
                 "ttl_seconds": 3600,
@@ -152,6 +155,20 @@ def test_sandboxd_roundtrip_create_write_exec_read_stop_resume_delete():
         )
         assert result["exit_code"] == 0, result
         assert "hello-from-sandbox" in result["stdout"]
+
+        if runtime_kind == "python-node-browser":
+            browser = client.exec_agent(
+                sandbox_id,
+                session_id,
+                {
+                    "argv": ["node", "/opt/learngraph/browser-smoke.js"],
+                    "cwd": ".",
+                    "timeout_seconds": 60,
+                    "output_limit": 1024 * 1024,
+                    "idempotency_key": f"browser-{session_id}",
+                },
+            )
+            assert browser["exit_code"] == 0, browser
 
         # Read + list the file.
         data = client.get_file(sandbox_id, session_id, "hello.py", 1024 * 1024)

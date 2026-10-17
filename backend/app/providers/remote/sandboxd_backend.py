@@ -57,6 +57,7 @@ _CORE_CAPABILITIES = (
     "resource_limits",
     "cold_resume",
     "legacy_doc_extract",
+    "office_pdf_preview",
 )
 
 
@@ -211,6 +212,13 @@ class SandboxdBackend(SandboxBackendPort):
         except (SandboxdUnavailable, SandboxdProtocolError):
             return {}
 
+    def host_capacity_snapshot(self) -> dict[str, Any]:
+        """Host totals and pressure from the same daemon sample / HTTP call."""
+        try:
+            return self._daemon().capacity_detail()
+        except (SandboxdUnavailable, SandboxdProtocolError) as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+
     def runtime_image_pinned(self, runtime_kind: str = "python-node") -> bool | None:
         """Report whether the daemon has an installed (smoke-passed) runtime.
 
@@ -226,7 +234,7 @@ class SandboxdBackend(SandboxBackendPort):
             if record.get("runtime_kind") == runtime_kind:
                 return bool(record.get("image_digest")) and (
                     record.get("smoke_status") == "passed"
-                )
+                ) and record.get("image_present", True) is True
         return False
 
     # --- lifecycle ---------------------------------------------------------
@@ -340,16 +348,25 @@ class SandboxdBackend(SandboxBackendPort):
         self, session: SandboxSessionHandle, limit_entries: int
     ) -> list[SandboxWorkspaceFile]:
         try:
-            body = self._daemon().file_index(
-                session.backend_ref, session.session_id, "", max(1, limit_entries), None
-            )
+            entries = []
+            cursor = None
+            seen = set()
+            while len(entries) < max(1, limit_entries):
+                body = self._daemon().file_index(
+                    session.backend_ref, session.session_id, "", min(1000, max(1, limit_entries) - len(entries)), cursor
+                )
+                entries.extend(body.get("entries") or [])
+                cursor = body.get("cursor")
+                if not cursor or cursor in seen:
+                    break
+                seen.add(cursor)
         except SandboxdUnavailable as exc:
             raise SandboxBackendUnavailable(str(exc)) from exc
         except SandboxdProtocolError as exc:
             raise _map_protocol_error(exc) from exc
         return [
             SandboxWorkspaceFile(path=str(entry["path"]), size_bytes=int(entry["size_bytes"]))
-            for entry in body.get("entries") or []
+            for entry in entries[:limit_entries]
         ]
 
     # --- exec --------------------------------------------------------------
@@ -404,6 +421,42 @@ class SandboxdBackend(SandboxBackendPort):
         except SandboxdProtocolError as exc:
             raise _map_protocol_error(exc) from exc
         return _exec_result(result)
+
+    def ensure_directories(self,session,prefix):
+        try:
+            return self._daemon().ensure_directories(session.backend_ref,session.session_id,prefix)
+        except SandboxdUnavailable as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+        except SandboxdProtocolError as exc:
+            raise _map_protocol_error(exc) from exc
+
+    def start_agent_execution(self, session, execution_id, argv, *, cwd, timeout_seconds, output_limit, cancel_requested=False):
+        try:
+            return self._daemon().start_agent_execution(session.backend_ref, session.session_id, {
+                'execution_id':execution_id,'idempotency_key':execution_id,'argv':list(argv),
+                'cwd':cwd,'timeout_seconds':timeout_seconds,'output_limit':output_limit,'cancel_requested':cancel_requested})
+        except SandboxdUnavailable as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+        except SandboxdProtocolError as exc:
+            raise _map_protocol_error(exc) from exc
+
+    def execution_result(self, session, execution_id):
+        try:
+            return self._daemon().get_execution(execution_id, session.session_id)
+        except SandboxdUnavailable as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+        except SandboxdProtocolError as exc:
+            if exc.code == 'sandbox_not_found':
+                return None
+            raise _map_protocol_error(exc) from exc
+
+    def cancel_execution(self, session, execution_id):
+        try:
+            return self._daemon().cancel_execution(execution_id, session.session_id)
+        except SandboxdUnavailable as exc:
+            raise SandboxBackendUnavailable(str(exc)) from exc
+        except SandboxdProtocolError as exc:
+            raise _map_protocol_error(exc) from exc
 
     def kernel_open(
         self,

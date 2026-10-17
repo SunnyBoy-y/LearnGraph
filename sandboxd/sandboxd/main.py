@@ -88,7 +88,17 @@ def create_app(
             except Exception:  # noqa: BLE001
                 logger.exception("startup reconciliation failed")
         sweep_thread: threading.Thread | None = None
+        execution_thread: threading.Thread | None = None
         if start_workers:
+            def recover_executions():
+                while not stop_event.is_set():
+                    try:
+                        controller.reconcile_executions()
+                    except Exception:
+                        logger.exception('Execution reconciliation tick failed')
+                    stop_event.wait(1)
+            execution_thread = threading.Thread(target=recover_executions, name='sandboxd-executions', daemon=True)
+            execution_thread.start()
             sweep_thread = threading.Thread(
                 target=_ttl_sweep_loop,
                 args=(controller, config.ttl_sweep_interval_seconds, stop_event),
@@ -102,6 +112,8 @@ def create_app(
             stop_event.set()
             if sweep_thread is not None:
                 sweep_thread.join(timeout=2)
+            if execution_thread is not None:
+                execution_thread.join(timeout=2)
 
     app.router.lifespan_context = _lifespan
 

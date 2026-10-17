@@ -38,6 +38,83 @@ ACTOR = "user-sandbox-agent-files"
 CHAT_SESSION_ID = "chat-sandbox-agent-files"
 
 
+def test_retired_pool_sessions_do_not_block_replacement_capacity(db, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from app.providers.sandbox_registry import get_sandbox_backend_registry
+    from app.services.sandbox_scheduler import evaluate_capacity
+    settings = get_settings().model_copy(update={"sandbox_workspace_root": str(tmp_path),
+        "sandbox_active_per_user": 1,"sandbox_default_max_instances_per_user": 1,
+        "sandbox_host_minimum_free_disk_bytes": 0})
+    monkeypatch.setattr(get_sandbox_backend_registry(), "default", lambda *a,**kw:
+        SimpleNamespace(host_capacity=lambda:(0,0),observed_pressure=lambda:{}))
+    old = m.SandboxSession(workspace_id=WORKSPACE,owner_user_id=ACTOR,chat_session_id=CHAT_SESSION_ID,
+        backend_id="sandboxd",backend_session_ref="retired-ref",lifecycle_state="WARM_IDLE",
+        manifest_hash="x"*64,expires_at=datetime.now(timezone.utc)+timedelta(hours=1))
+    replacement = m.SandboxInstance(workspace_id=WORKSPACE,owner_user_id=ACTOR,state="PROVISIONING",
+        runtime_profile="python-node",active_executions=0,max_parallel_execs=1)
+    db.add_all([old,replacement]); db.commit()
+    service = object.__new__(SandboxAgentWorkspaceService)
+    service.db, service.workspace_id, service.actor_id = db, WORKSPACE, ACTOR
+    assert not evaluate_capacity(db,settings,ACTOR,workspace_id=WORKSPACE,reuse_instance_id=replacement.id)[0]
+    service._detach_retired_instance_sessions("retired-ref"); db.commit()
+    assert evaluate_capacity(db,settings,ACTOR,workspace_id=WORKSPACE,reuse_instance_id=replacement.id)[0]
+
+
+def test_missing_pool_reference_is_committed_before_capacity_refresh(db, tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from app.providers.remote.sandbox import SandboxBackendError
+    from app.services import sandbox as module
+    settings = get_settings().model_copy(update={"sandbox_workspace_root": str(tmp_path)})
+    instance = m.SandboxInstance(workspace_id=WORKSPACE, owner_user_id=ACTOR,
+        backend_resource_ref="missing-runtime", state="READY", runtime_profile="python-node",
+        resource_envelope={"network_policy": module._effective_network_policy(None)}, active_executions=0)
+    session = m.SandboxSession(workspace_id=WORKSPACE, owner_user_id=ACTOR, chat_session_id=CHAT_SESSION_ID,
+        backend_id="sandboxd", backend_session_ref="missing-runtime", lifecycle_state="WARM_IDLE",
+        manifest_hash="x" * 64, expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    db.add_all([instance, session]); db.commit()
+    service = object.__new__(SandboxAgentWorkspaceService)
+    service.db, service.settings, service.workspace_id, service.actor_id = db, settings, WORKSPACE, ACTOR
+    monkeypatch.setattr(service, "_acquire_instance", lambda runtime: instance)
+    monkeypatch.setattr(service, "_egress_envelope", lambda: None)
+    monkeypatch.setattr(service, "_ensure_runtime_capacity", lambda *a, **k: None)
+    monkeypatch.setattr(service, "_ensure_chat_dir", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_sandbox_capacity_file_lock", lambda settings: nullcontext())
+    monkeypatch.setattr(module, "resolve_sandbox_image_for_runtime", lambda *a: "test-image")
+    resumes, creates = [], []
+    class Backend:
+        def resume(self, session_id, ref):
+            resumes.append(ref)
+            raise SandboxBackendError("sandbox_not_found")
+        def probe(self): return SimpleNamespace(available=True)
+        def create(self, spec):
+            creates.append(spec)
+            return SandboxSessionHandle(instance.id, "replacement-runtime")
+    result = service._ensure_pooled_backend_session(session, Backend())
+    assert result.backend_ref == session.backend_session_ref == "replacement-runtime"
+    assert resumes == ["missing-runtime"]
+    assert len(creates) == 1
+    db.refresh(instance)
+    assert instance.backend_resource_ref == "replacement-runtime"
+
+
+def test_transient_backend_outage_does_not_discard_existing_session(db, monkeypatch):
+    session = m.SandboxSession(workspace_id=WORKSPACE, owner_user_id=ACTOR, chat_session_id=CHAT_SESSION_ID,
+        backend_id="sandboxd", backend_session_ref="existing-runtime", lifecycle_state="WARM_IDLE",
+        manifest_hash="x" * 64, expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    db.add(session); db.commit()
+    service = object.__new__(SandboxAgentWorkspaceService)
+    service.db, service.settings = db, get_settings().model_copy(update={"sandbox_agent_enabled": True})
+    class Backend:
+        def resume(self, *args): raise SandboxBackendUnavailable("temporary disconnect")
+    monkeypatch.setattr(service, "_runtime_backend", lambda session: Backend())
+    monkeypatch.setattr(service, "_pooling_enabled", lambda session: False)
+    with pytest.raises(SandboxBackendUnavailable):
+        service._ensure_backend_session(session)
+    db.refresh(session)
+    assert session.backend_session_ref == "existing-runtime"
+
+
 @pytest.fixture()
 def db() -> Session:
     engine = create_engine(
@@ -108,6 +185,63 @@ def _read(service: SandboxAgentWorkspaceService, path: str, **extra) -> dict:
 
 
 class TestWriteReadRoundtrip:
+    def test_batch_ranges_have_independent_selection_and_one_total_budget(self, service):
+        _write(service, "work/a.txt", "a1\na2\na3\na4\n")
+        _write(service, "work/b.txt", "b1\nb2\nb3\nb4\n")
+        result = service.execute_agent_tool("sandbox_read_file", {"items": [
+            {"path": "work/a.txt", "start_line": 1, "end_line": 2},
+            {"path": "work/b.txt", "start_line": 3, "end_line": 4},
+        ]}, chat_session_id=CHAT_SESSION_ID, agent_authorized=True)
+        assert [row["content"] for row in result["files"]] == ["a1\na2\n", "b3\nb4\n"]
+        _write(service, "work/large-a.txt", "a" * 2000)
+        _write(service, "work/large-b.txt", "b" * 2000)
+        result = service.execute_agent_tool("sandbox_read_file", {"paths": ["work/large-a.txt", "work/large-b.txt"],
+            "max_total_chars": 256}, chat_session_id=CHAT_SESSION_ID, agent_authorized=True)
+        assert sum(len(row["content"]) for row in result["files"]) <= 256
+        assert all(row["next_cursor"] for row in result["files"])
+
+    def test_patch_preserves_tail_beyond_default_read_page(self, service):
+        content = "old\n" + "unchanged\n" * 4000
+        _write(service, "work/large.txt", content)
+        service.execute_agent_tool("sandbox_apply_patch", {
+            "patch": "--- a/work/large.txt\n+++ b/work/large.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        }, chat_session_id=CHAT_SESSION_ID, agent_authorized=True)
+        result = _read(service, "work/large.txt", max_chars=100000)
+        assert result["content"] == "new\n" + "unchanged\n" * 4000
+
+    def test_active_work_reads_searches_and_publishes_same_container_bytes(self, db, service, monkeypatch):
+        from types import SimpleNamespace
+        from app.providers.remote.sandbox import SandboxBackendError
+
+        written = _write(service, "work/live.txt", "OLD")
+        session = db.get(m.SandboxSession, written["sandbox_session_id"])
+        session.backend_session_ref = "live-runtime"
+        db.commit()
+        data = {"work/live.txt": b"NEW", "work/generated.txt": b"GENERATED"}
+
+        class LiveBackend(_FakeBackend):
+            def read(self, handle, path, limit_bytes):
+                if path not in data:
+                    raise SandboxBackendError("missing")
+                return data[path]
+
+            def list_files(self, handle, limit_entries):
+                return [SimpleNamespace(path=p, size_bytes=len(v)) for p, v in data.items()]
+
+        monkeypatch.setattr(service, "_runtime_backend", lambda session: LiveBackend())
+        monkeypatch.setattr(service, "_pooling_enabled", lambda session: False)
+        assert _read(service, "work/live.txt")["content"] == "NEW"
+        found = service.execute_agent_tool("sandbox_grep", {"pattern": "GENERATED"},
+                    chat_session_id=CHAT_SESSION_ID, agent_authorized=True)
+        assert found["matches"][0]["path"] == "work/generated.txt"
+        published = service.publish_workspace_file(chat_session_id=CHAT_SESSION_ID,
+            path="work/live.txt", content=None, title=None, sandbox_session_id=session.id)
+        assert published["size_bytes"] == 3
+        del data["work/live.txt"]
+        with pytest.raises(AppError) as exc:
+            _read(service, "work/live.txt")
+        assert exc.value.code == "sandbox_file_unavailable"
+
     def test_write_then_read(self, db: Session, service) -> None:
         written = _write(service, "work/hello.txt", "hello\nworld\n")
         assert written["sha256"] == written["blob_sha256"]

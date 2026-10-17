@@ -44,6 +44,7 @@ DEFAULT_SUBAGENT_TOOLS = frozenset(
         "sandbox_list_files",
         "sandbox_grep",
         "sandbox_read_file",
+        "sandbox_read_result",
         "sandbox_write_file",
         "sandbox_append_file",
         "sandbox_edit_file",
@@ -215,6 +216,7 @@ def _run_subagent(
     deadline = job.started_at + spec.max_seconds
     db: Any = None
     final_text = ""
+    stream_runtime = None
     try:
         if sandbox_service is None or provider is None:
             db = SessionLocal()
@@ -225,6 +227,12 @@ def _run_subagent(
             settings,
         )
         model_provider = provider or model_provider_for_workspace(db, spec.workspace_id, settings)
+        from types import SimpleNamespace
+        from app.services.agent_runtime import AgentToolRuntime
+
+        stream_runtime = AgentToolRuntime(workspace_id=spec.workspace_id, actor_id=spec.actor_id,
+            search_provider=None, extensions=SimpleNamespace(db=db), sandbox=sandbox,
+            sandbox_authorized=True, settings=settings)
         allowed = (
             frozenset(spec.tools)
             if spec.tools
@@ -264,7 +272,8 @@ def _run_subagent(
             job.rounds = _round
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
-            for event in model_provider.stream_chat(messages, tools=definitions):
+            for event in stream_runtime.stream_chat(model_provider, messages, tools=definitions,
+                    chat_session_id=spec.chat_session_id, sandbox_session_id=spec.sandbox_session_id):
                 if event.type == "text_delta" and event.content:
                     text_parts.append(event.content)
                 elif event.type == "tool_calls":
@@ -323,22 +332,14 @@ def _run_subagent(
                         )
                     else:
                         try:
-                            outcome = sandbox.execute_agent_tool(
-                                name,
-                                arguments,
-                                chat_session_id=spec.chat_session_id,
-                                agent_authorized=True,
-                            )
-                            result_text = json.dumps(
-                                outcome, ensure_ascii=False, default=str
-                            )
+                            result_text, _meta, _sources = stream_runtime.execute({
+                                "id": call_id, "function": {"name": name, "arguments": json.dumps(arguments)}},
+                                chat_session_id=spec.chat_session_id, allowed_domains=[], disclosed_tool_names=set(tool_names))
                         except Exception as exc:  # noqa: BLE001 - surfaced to the model
                             result_text = json.dumps(
                                 {"error": type(exc).__name__, "message": str(exc)[:500]},
                                 ensure_ascii=False,
                             )
-                if len(result_text) > 8_000:
-                    result_text = result_text[:8_000] + "\n...[truncated]"
                 messages.append(
                     ProviderChatMessage(
                         role="tool",
@@ -372,6 +373,8 @@ def _run_subagent(
             error_message=str(exc)[:500],
         )
     finally:
+        if stream_runtime is not None:
+            stream_runtime.discard_streamed_writes()
         job.finished_at = time.time()
         if db is not None:
             db.close()

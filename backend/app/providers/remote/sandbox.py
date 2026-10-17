@@ -443,6 +443,8 @@ class DockerSandboxBackend(SandboxBackendPort):
         ]
         if image_labels.get("com.learngraph.legacy-doc-extract") == "true":
             capabilities.append("legacy_doc_extract")
+        if image_labels.get("com.learngraph.office-pdf-preview") == "true":
+            capabilities.append("office_pdf_preview")
         return SandboxCapabilitySnapshot(
             available=True,
             backend_id=self.backend_id,
@@ -939,12 +941,13 @@ class DockerSandboxBackend(SandboxBackendPort):
         destructive_path_prefixes: tuple[str, ...] = (),
     ) -> SandboxExecResult:
         argv = validate_agent_argv(argv)
-        _safe_agent_cwd(cwd_relative)
+        if cwd_relative != ".":
+            _safe_workspace_path(cwd_relative)  # Internal pool prefix; public cwd stays root-only.
         # Do not let a user image's site-packages or a generated pycache alter
         # the command environment.  The runner image has no injected secrets,
         # and the container itself has no network or host bind mount.
         executable = PurePosixPath(argv[0].replace("\\", "/")).name.casefold()
-        if executable in {"node", "nodejs"}:
+        if executable not in {"python", "python3"}:
             effective_argv = argv
         else:
             effective_argv = (
@@ -980,7 +983,7 @@ class DockerSandboxBackend(SandboxBackendPort):
                     client,
                     container,
                     argv=effective_argv,
-                    workdir="/workspace",
+                    workdir="/workspace" if cwd_relative == "." else f"/workspace/{cwd_relative}",
                     user="65532:65532",
                     environment=environment,
                     timeout_seconds=timeout_seconds,

@@ -23,6 +23,7 @@
 //     than falling back to arbitrary fetching.
 
 const { chromium } = require("playwright-core");
+const { browserLaunchOptions } = require("../browser-launch");
 const http = require("http");
 const net = require("net");
 const fs = require("fs");
@@ -136,12 +137,9 @@ async function main() {
   let browser = null;
   try {
     forwarder = await startLocalForwarder(proxyUrl, digest);
-    browser = await chromium.launch({
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium",
-      headless: true,
-      chromiumSandbox: false,
-      args: ["--no-sandbox", "--disable-gpu", `--proxy-server=http://127.0.0.1:${forwarder.port}`],
-    });
+    browser = await chromium.launch(browserLaunchOptions([
+      `--proxy-server=http://127.0.0.1:${forwarder.port}`,
+    ]));
     const page = await browser.newPage();
     page.on("download", (download) => {
       download.cancel().catch(() => {});

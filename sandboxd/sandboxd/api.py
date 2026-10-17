@@ -248,6 +248,16 @@ class SandboxAPI:
             except SandboxdError as exc:
                 return _error_response(exc, request_id_header(request))
 
+        @router.post('/sandboxes/{sandbox_id}/directories', dependencies=[Depends(self.service_auth)])
+        def ensure_directories(sandbox_id: str, request: Request, body: dict[str,str],
+                               x_sandbox_scope: str | None = Header(default=None, alias='X-Sandbox-Scope')) -> dict:
+            try:
+                scope=self._scope(request,x_sandbox_scope)
+                self.controller.ensure_directories(sandbox_id,scope,body.get('prefix','.'),fence=self._fence(request))
+                return {'ready':True}
+            except SandboxdError as exc:
+                return _error_response(exc,request_id_header(request))
+
         # --- executions ----------------------------------------------------
 
         @router.post("/sandboxes/{sandbox_id}/executions/fixed", dependencies=[Depends(self.service_auth)])
@@ -276,28 +286,21 @@ class SandboxAPI:
                 return _error_response(exc, request_id_header(request))
             return outcome.result
 
+        @router.post("/sandboxes/{sandbox_id}/executions/agent/start", dependencies=[Depends(self.service_auth)])
+        def start_execution(sandbox_id: str, body: AgentExecRequest, request: Request,
+                            x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope")) -> dict:
+            try:
+                return self.controller.start_agent_execution(sandbox_id, self._scope(request, x_sandbox_scope), body, fence=self._fence(request))
+            except SandboxdError as exc:
+                return _error_response(exc, request_id_header(request))
+
         @router.get("/executions/{execution_id}", dependencies=[Depends(self.service_auth)])
-        def get_execution(execution_id: str, request: Request) -> dict:
-            record = self.controller.store.get_execution(execution_id)
-            if record is None:
-                return _error_response(
-                    SandboxdError("sandbox_not_found", "execution was not found"),
-                    request_id_header(request),
-                )
-            return {
-                "execution_id": record["execution_id"],
-                "sandbox_id": record["sandbox_id"],
-                "status": record["status"],
-                "exit_code": record["exit_code"],
-                "timed_out": bool(record["timed_out"]),
-                "truncated": bool(record["truncated"]),
-                "latency_ms": record["latency_ms"],
-                "argv_digest": record["argv_digest"],
-                "cancel_requested_at": record.get("cancel_requested_at"),
-                "finished_reason": record.get("finished_reason"),
-                "started_at": record["started_at"],
-                "finished_at": record["finished_at"],
-            }
+        def get_execution(execution_id: str, request: Request,
+                          x_sandbox_scope: str | None = Header(default=None, alias="X-Sandbox-Scope")) -> dict:
+            try:
+                return self.controller.get_execution(execution_id, self._scope(request, x_sandbox_scope))
+            except SandboxdError as exc:
+                return _error_response(exc, request_id_header(request))
 
         @router.post("/executions/{execution_id}/cancel", dependencies=[Depends(self.service_auth)])
         def cancel_execution(

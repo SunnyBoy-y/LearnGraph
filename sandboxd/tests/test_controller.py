@@ -331,3 +331,16 @@ def test_list_runtimes(config, store, runtime):
     ctrl.install_runtime("python-node", "cr.example/learngraph-sandbox:1.0.0")
     records = ctrl.list_runtimes()
     assert len(records) == 1 and records[0]["runtime_kind"] == "python-node"
+    assert records[0]["image_present"] is True
+
+
+def test_list_runtimes_checks_image_presence_per_kind(config, store, runtime, monkeypatch):
+    ctrl = _controller(config, store, runtime)
+    code = ctrl.install_runtime("python-node", "cr.example/runner:code")
+    browser = ctrl.install_runtime("python-node-browser", "cr.example/runner:browser")
+    monkeypatch.setattr(runtime, "artifact_present", lambda digest: digest != browser["image_digest"])
+    records = {r["runtime_kind"]: r for r in ctrl.list_runtimes()}
+    assert records["python-node"]["image_present"] is True
+    assert records["python-node"]["image_digest"] == code["image_digest"]
+    assert records["python-node-browser"]["image_present"] is False
+    assert records["python-node-browser"]["smoke_status"] == "passed"

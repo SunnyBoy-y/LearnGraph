@@ -284,8 +284,19 @@ class SandboxdClient:
         )
         return response.json()
 
-    def get_execution(self, execution_id: str) -> dict[str, Any]:
-        response = self._request("GET", f"/v1/executions/{execution_id}")
+    def ensure_directories(self,sandbox_id,session_id,prefix):
+        return self._request('POST',f'/v1/sandboxes/{sandbox_id}/directories',session_id=session_id,
+                             json_body={'prefix':prefix}).json()
+
+    def start_agent_execution(self, sandbox_id: str, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._request('POST', f'/v1/sandboxes/{sandbox_id}/executions/agent/start',
+                             session_id=session_id, json_body=body).json()
+
+    def cancel_execution(self, execution_id: str, session_id: str) -> dict[str, Any]:
+        return self._request('POST', f'/v1/executions/{execution_id}/cancel',session_id=session_id).json()
+
+    def get_execution(self, execution_id: str, session_id: str | None = None) -> dict[str, Any]:
+        response = self._request("GET", f"/v1/executions/{execution_id}", session_id=session_id)
         return response.json()
 
     # --- kernels -------------------------------------------------------------
