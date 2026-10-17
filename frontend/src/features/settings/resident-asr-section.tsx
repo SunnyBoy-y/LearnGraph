@@ -24,6 +24,9 @@ import type {
 } from "@/types/providers";
 
 import { speechModelsForRole } from "./speech-provider-config";
+import type { ApiRequestOptions } from '@/api/client';
+import { useSettingsDirty } from '@/lib/settings-dirty';
+import { workspaceQueryKey } from '@/lib/query-keys';
 
 /**
  * 语音服务（全双工通话）专用的实时 ASR 常驻配置项。
@@ -136,10 +139,12 @@ function readVoiceAsrBinding(
  * 写入专用绑定。`models.functional_defaults` 是整值替换的 workspace setting，
  * 所以必须先把当前值读出来再合并，否则会抹掉其他能力位（chat/vision/...）。
  */
-function writeVoiceAsrBinding(
-  settings: WorkspaceSetting[] | undefined,
+async function writeVoiceAsrBinding(
   target: VoiceAsrBinding | null,
+  options: ApiRequestOptions,
 ) {
+  // Re-read before replacing the whole value so other capability bindings survive.
+  const settings = await listSettings(options);
   const raw = settings?.find((item) => item.key === FUNCTIONAL_DEFAULTS_KEY)?.value;
   const next: Record<string, unknown> =
     raw && typeof raw === "object" ? { ...(raw as Record<string, unknown>) } : {};
@@ -151,7 +156,7 @@ function writeVoiceAsrBinding(
   } else {
     delete next[VOICE_ASR_CAPABILITY];
   }
-  return updateSetting(FUNCTIONAL_DEFAULTS_KEY, next);
+  return updateSetting(FUNCTIONAL_DEFAULTS_KEY, next, options);
 }
 
 function assertAddress(value: string, model: SpeechModelPreset): void {
@@ -179,11 +184,13 @@ async function upsertRow({
   row,
   address,
   key,
+  options,
 }: {
   model: SpeechModelPreset;
   row: Provider | undefined;
   address: string;
   key: string;
+  options: ApiRequestOptions;
 }): Promise<string> {
   const trimmed = address.trim();
   if (!trimmed) throw new Error(`请填写${addressLabel(model)}。`);
@@ -197,8 +204,8 @@ async function upsertRow({
       base_url: httpBaseFor(model, trimmed),
       ...designation,
       ...(isRealtime ? { realtime_ws_url: trimmed } : {}),
-    });
-    if (key.trim()) await rotateProviderSecret(row.id, key.trim());
+    }, options);
+    if (key.trim()) await rotateProviderSecret(row.id, key.trim(), options);
     return row.id;
   }
   if (!key.trim()) throw new Error("首次配置需要填写 API Key。");
@@ -215,7 +222,7 @@ async function upsertRow({
     base_url: httpBaseFor(model, trimmed),
     api_key: key.trim(),
     capabilities,
-  });
+  }, options);
   return created.id;
 }
 
@@ -232,6 +239,7 @@ export function ResidentAsrSection({
 }) {
   const queryClient = useQueryClient();
   const settingsQueryKey = currentWorkspaceQueryKey("settings");
+  const workspaceId = String(settingsQueryKey[1]);
   const settings = useQuery({
     queryKey: settingsQueryKey,
     queryFn: listSettings,
@@ -262,6 +270,10 @@ export function ResidentAsrSection({
     [settings.data],
   );
   const [drafts, setDrafts] = useState<Record<string, AsrDraft>>({});
+  useSettingsDirty('resident-asr', slots.some(({ model, row }) => {
+    const draft = drafts[model.id];
+    return Boolean(draft && (draft.key || draft.address !== rowAddress(row, model)));
+  }));
   // 只在 providers 首轮落地后水合草稿，避免把已有行的地址覆盖成预设值。
   useEffect(() => {
     if (providersPending) return;
@@ -276,19 +288,20 @@ export function ResidentAsrSection({
       return changed ? next : current;
     });
   }, [providersPending, slots]);
-  const cacheSetting = (setting: WorkspaceSetting) => {
-    queryClient.setQueryData<WorkspaceSetting[]>(settingsQueryKey, (current) => [
+  const cacheSetting = (setting: WorkspaceSetting, originWorkspaceId: string) => {
+    queryClient.setQueryData<WorkspaceSetting[]>(workspaceQueryKey(originWorkspaceId, 'settings'), (current) => [
       ...(current ?? []).filter((item) => item.key !== setting.key),
       setting,
     ]);
   };
   const save = useMutation({
+    onMutate: () => workspaceId,
     mutationFn: (input: {
       model: SpeechModelPreset;
       row: Provider | undefined;
       address: string;
       key: string;
-    }) => upsertRow(input),
+    }) => upsertRow({ ...input, options: { headers: { 'X-Workspace-ID': workspaceId } } }),
     onSuccess: (_rowId, variables) => {
       setDrafts((current) => ({
         ...current,
@@ -298,11 +311,12 @@ export function ResidentAsrSection({
         },
       }));
       toast.success(`${variables.model.label} 配置已保存`);
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
     },
+    onSettled: (_data, _error, _variables, originWorkspaceId) => queryClient.invalidateQueries({ queryKey: workspaceQueryKey(originWorkspaceId!, 'providers') }),
     onError: (error) => toast.error(error.message),
   });
   const toggle = useMutation({
+    onMutate: () => workspaceId,
     mutationFn: async (input: {
       model: SpeechModelPreset;
       row: Provider | undefined;
@@ -311,21 +325,22 @@ export function ResidentAsrSection({
       enabled: boolean;
     }) => {
       const { model, row, enabled } = input;
+      const options = { headers: { 'X-Workspace-ID': workspaceId } };
       if (!enabled) {
-        if (row) await updateProvider(row.id, { enabled: false });
-        const setting = await writeVoiceAsrBinding(settings.data, null);
+        if (row) await updateProvider(row.id, { enabled: false }, options);
+        const setting = await writeVoiceAsrBinding(null, options);
         return setting;
       }
-      const rowId = await upsertRow(input);
-      await updateProvider(rowId, { enabled: true });
-      const setting = await writeVoiceAsrBinding(settings.data, {
+      const rowId = await upsertRow({ ...input, options });
+      await updateProvider(rowId, { enabled: true }, options);
+      const setting = await writeVoiceAsrBinding({
         providerId: rowId,
         modelId: model.id,
-      });
+      }, options);
       return setting;
     },
-    onSuccess: (setting, variables) => {
-      cacheSetting(setting);
+    onSuccess: (setting, variables, originWorkspaceId) => {
+      cacheSetting(setting, originWorkspaceId!);
       setDrafts((current) => ({
         ...current,
         [variables.model.id]: { address: variables.address, key: "" },
@@ -335,12 +350,17 @@ export function ResidentAsrSection({
           ? `${variables.model.label} 已启用，语音服务将固定使用该模型`
           : `${variables.model.label} 已停用，语音服务回到默认转写解析`,
       );
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+    },
+    onSettled: async (_data, _error, _variables, originWorkspaceId) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(originWorkspaceId!, 'providers') }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(originWorkspaceId!, 'settings') }),
+      ]);
     },
     onError: (error) => toast.error(error.message),
   });
   if (!models.length) return null;
-  const locked = !secretStoreAvailable || settings.isPending;
+  const locked = !secretStoreAvailable || settings.isPending || settings.isError;
   const busy = save.isPending || toggle.isPending;
   return (
     <Surface>
@@ -358,6 +378,7 @@ export function ResidentAsrSection({
         ) : null}
       </div>
       <div className="divide-y">
+        {settings.error ? <p role="alert" className="p-5 text-sm text-destructive">无法读取语音模型绑定：{settings.error.message}</p> : null}
         {slots.map(({ model, row }) => {
           const draft = drafts[model.id] ?? {
             address: defaultAddress(model),
@@ -410,6 +431,7 @@ export function ResidentAsrSection({
                     {addressLabel(model)}
                   </Label>
                   <Input
+                    disabled={rowBusy || locked}
                     aria-label={`${model.label} ${addressLabel(model)}`}
                     className="h-8 font-mono text-xs"
                     onChange={(event) =>
@@ -425,6 +447,7 @@ export function ResidentAsrSection({
                     {row?.api_key_masked ? `（已保存 ${row.api_key_masked}）` : ""}
                   </Label>
                   <Input
+                    disabled={rowBusy || locked}
                     aria-label={`${model.label} API Key`}
                     autoComplete="off"
                     className="h-8 font-mono text-xs"

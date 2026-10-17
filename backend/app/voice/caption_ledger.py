@@ -26,6 +26,7 @@ class VoiceLedgerFrame(DataFrame):
         audio_cursor_ms: 句首在整轮回答音频里的偏移（``start``）。
         audio_end_cursor_ms: 句尾偏移（``end``），句内位置估算的分母。
         generation_id: 音频闸门代次（沿用 TTS 适配器的语义，可为 None）。
+        turn_final: 此 context 是否结束整轮回答；提示语的中间 context 为 False。
     """
 
     kind: str
@@ -36,6 +37,7 @@ class VoiceLedgerFrame(DataFrame):
     audio_cursor_ms: int | None = None
     audio_end_cursor_ms: int | None = None
     generation_id: int | None = None
+    turn_final: bool = True
 
 
 class VoiceLedgerRelay(FrameProcessor):
@@ -96,6 +98,9 @@ class VoiceLedgerRelay(FrameProcessor):
             if frame.turn_id and frame.turn_id != journal.current_turn_id():
                 return
             if frame.kind == "turn-end":
+                if not frame.turn_final:
+                    await journal.playback_ended(turn_final=False)
+                    return
                 callback = self._on_playback_ended
                 if callback is not None:
                     try:

@@ -26,6 +26,7 @@ import {
 } from "./voice-latency";
 import { resetVoiceLatency, useVoiceLatency } from "./voice-latency-store";
 import { voiceSessionController } from "./voice-session-controller";
+import { useVoiceNoiseStatus } from "./voice-noise-store";
 
 function voiceTransportLabel(transport: string, state: string): string {
   if (transport === "idle" || state === "closed") return "未连接";
@@ -42,6 +43,7 @@ function deliveryTimeLabel(value: string | null): string {
 
 export function VoiceLatencyRail() {
   const latency = useVoiceLatency();
+  const noise = useVoiceNoiseStatus();
   const voice = useSyncExternalStore(
     voiceSessionController.subscribe,
     voiceSessionController.getSnapshot,
@@ -91,6 +93,29 @@ export function VoiceLatencyRail() {
         全双工各环节耗时，全部按本机收到的时刻计（刷新即清空）。每条记号按服务端回合身份
         归位：身份比信号后到（打字回合就是这样）也会补记，不会被扔掉或算错轮。
       </p>
+
+      <section
+        aria-label="麦克风降噪状态"
+        className="rounded-xl border bg-card p-2"
+      >
+        <p className="font-medium">麦克风降噪 · {noise.mode === "rnnoise" ? "RNNoise" : noise.mode === "browser" ? noise.browserNsEnabled === false ? "原始输入" : "浏览器降噪" : noise.mode === "calibrating" ? "检测设备性能中" : "未启动"}</p>
+        <p className="mt-1 text-muted-foreground">
+          {noise.cores === null ? "核心数未知" : `浏览器报告 ${noise.cores} 个逻辑核心`} · {noise.execution === "worker" ? "音频线程 + DSP Worker" : "单路音频独立线程"}
+        </p>
+        {noise.calibration && <p className="text-muted-foreground">
+          预检 P95 {noise.calibration.p95Ms.toFixed(2)} ms / 帧 · 10 ms 音频帧
+        </p>}
+        {noise.mode === "rnnoise" && noise.calibration?.model === "lightweight" && <p className="text-muted-foreground">
+          轻量 RNNoise · {noise.calibration.simd ? "SIMD 已启用" : "标量运算"}
+        </p>}
+        {noise.mode === "rnnoise" && <p className="text-muted-foreground">
+          已处理 {noise.processedFrames} 帧 · 重分帧缓冲 {noise.bufferMs} ms（另有模型延迟）
+        </p>}
+        {noise.mode === "rnnoise" && noise.browserNsEnabled === true && <p className="text-muted-foreground">
+          浏览器仍启用内置降噪；当前为叠加处理
+        </p>}
+        {noise.reason && <p className="break-words text-muted-foreground">{noise.mode === "rnnoise" ? "处理备注" : "回退原因"}：{noise.reason}</p>}
+      </section>
 
       <section
         aria-label="已播字幕实时投递"

@@ -5,7 +5,6 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleDashed,
-  LoaderCircle,
   Search,
   Wrench,
   XCircle,
@@ -13,6 +12,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import { TaskStatusIcon } from "@/components/shared/task-status-icon";
 import {
   voiceTaskActivityText,
   voiceTaskArtifactIsVerified,
@@ -22,11 +22,15 @@ import {
   voiceTaskSourceLabel,
   voiceTaskStatusLabel,
   voiceTaskPlaybackLabel,
+  voiceTaskTitle,
   type VoiceTask,
 } from "./voice-tasks";
 
 function taskIcon(task: VoiceTask) {
-  if (task.status === "ready" || task.status === "partial") {
+  if (task.status === "ready" || voiceTaskIsActive(task)) {
+    return <TaskStatusIcon taskKey={task.taskId} status={task.status === "ready" ? "succeeded" : "running"} className="size-3.5" />;
+  }
+  if (task.status === "partial") {
     return <CheckCircle2 aria-hidden="true" className="size-3.5" />;
   }
   if (task.status === "failed" || task.status === "interrupted") {
@@ -34,9 +38,6 @@ function taskIcon(task: VoiceTask) {
   }
   if (task.status === "cancelled" || task.status === "stale") {
     return <XCircle aria-hidden="true" className="size-3.5" />;
-  }
-  if (voiceTaskIsActive(task)) {
-    return <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />;
   }
   if (task.kind === "research") return <Search aria-hidden="true" className="size-3.5" />;
   if (task.kind === "reasoning") return <Brain aria-hidden="true" className="size-3.5" />;
@@ -64,7 +65,7 @@ function taskSummary(task: VoiceTask, now: number): string {
         practice_prepare: "练习",
         learning_evidence: "学习证据",
         graph_proposal: "图谱提案",
-        artifact_create: "学习产物",
+        artifact_create: "子线程产物",
         workspace_task: "工作区任务",
         research: "资料研究",
         reasoning: "深度分析",
@@ -114,7 +115,7 @@ export function VoiceTaskChip({ tasks, onCancel, onApprove, onReject, onRetryApp
         <Popover key={task.taskId}>
           <PopoverTrigger asChild>
             <button
-              aria-label={`${task.title}：${taskSummary(task, now)}`}
+              aria-label={`${voiceTaskTitle(task)}：${taskSummary(task, now)}`}
               className={cn(
                 "inline-flex h-7 max-w-56 items-center gap-1.5 rounded-full border border-border/70 bg-background/90 px-2.5 text-xs text-muted-foreground shadow-sm backdrop-blur transition-colors hover:bg-muted hover:text-foreground",
                 task.status === "failed" && "border-destructive/40 text-destructive",
@@ -127,7 +128,7 @@ export function VoiceTaskChip({ tasks, onCancel, onApprove, onReject, onRetryApp
               <span className="min-w-0 truncate">
                 <span className="font-medium">{taskSummary(task, now)}</span>
                 <span className="mx-1 opacity-50">·</span>
-                <span>{task.title}</span>
+                <span>{voiceTaskTitle(task)}</span>
               </span>
               <ChevronDown aria-hidden="true" className="size-3 shrink-0 opacity-60" />
             </button>
@@ -136,7 +137,7 @@ export function VoiceTaskChip({ tasks, onCancel, onApprove, onReject, onRetryApp
             <div className="flex items-start gap-2">
               <span className="mt-0.5 text-muted-foreground">{taskIcon(task)}</span>
               <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-medium">{task.title}</p>
+                <p className="truncate text-sm font-medium">{voiceTaskTitle(task)}</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">{taskSummary(task, now)}</p>
               </div>
             </div>
@@ -317,7 +318,7 @@ export function VoiceTaskChip({ tasks, onCancel, onApprove, onReject, onRetryApp
               return (
                 <section key={`details-${task.taskId}`}>
                   <div className="flex items-center justify-between gap-2">
-                    <p className="truncate text-xs font-medium text-foreground">{task.title}</p>
+                    <p className="truncate text-xs font-medium text-foreground">{voiceTaskTitle(task)}</p>
                     <span className="shrink-0 text-[0.68rem] text-muted-foreground">
                       {voiceTaskStatusLabel(task)}
                     </span>

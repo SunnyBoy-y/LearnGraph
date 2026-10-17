@@ -7,9 +7,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
 
 VOICE_EVENT_TYPES = (
+    "scene.focus", "artifact.upsert", "task.pausing", "task.paused", "task.resumed",
     "session.created", "session.ready", "session.reconnecting", "session.closed",
     "user.started", "user.interim", "user.final", "turn.accepted", "turn.finalized",
-    "turn.interrupted", "assistant.llm.delta", "assistant.sentence.queued",
+    "turn.interrupted", "assistant.llm.delta", "assistant.activity", "assistant.sentence.queued",
     "assistant.sentence.ended", "assistant.playback.ack",
     "assistant.sentence.playback_started", "assistant.sentence.playback_ended",
     "processor.error", "processor.retry_scheduled", "processor.notice",
@@ -113,6 +114,9 @@ class VoiceResultDeliveryRequest(BaseModel):
 class VoiceTaskCancelRequest(BaseModel):
     reason: str = Field(default="user_requested", max_length=160)
 
+class VoiceTaskDeliveryPolicyRequest(BaseModel):
+    auto_delivery: bool
+
 
 class VoiceTaskApprovalRequest(BaseModel):
     approved: bool = True
@@ -137,6 +141,7 @@ class VoiceSession(BaseModel):
     session_epoch: int = 1
     peer_generation: int = 0
     context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    scene_presentation: dict[str, Any] | None = None
     tasks: list[VoiceTaskLink] = Field(default_factory=list)
     results: list[VoiceResultView] = Field(default_factory=list)
     ready_result_count: int = 0
@@ -193,6 +198,7 @@ class VoiceTaskView(BaseModel):
     status: str
     thinking_mode: ThinkingMode
     title: str = ""
+    auto_delivery: bool = True
     prompt: str = ""
     capability_id: str | None = None
     approval_status: str = "none"

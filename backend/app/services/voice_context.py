@@ -106,7 +106,10 @@ class VoiceContextService:
             effective_query,
             node_ids=node_ids,
             additional_context="",
-            agent_mode=False,
+            # Voice's low-latency model still has real delegation/control
+            # tools. A text fast-mode policy would explicitly forbid calling
+            # them and let spoken acknowledgements replace actual execution.
+            agent_mode=True,
             # Label every retrieval this snapshot causes as voice: the trace takes
             # its agent from the scope, so without this a spoken recall and a
             # typed one are the same row in ``memory_retrieval_traces``.

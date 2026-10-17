@@ -136,10 +136,15 @@ def resolve_voice_write_policy(
 
 
 def _task_fingerprint(task: SandboxAgentTask) -> str:
+    finished_at = task.finished_at
+    if finished_at is not None and finished_at.tzinfo is not None:
+        # SQLite reloads UTC datetimes without tzinfo. Fingerprints must match
+        # the in-memory completion row and a later poll/reconnect projection.
+        finished_at = finished_at.astimezone(timezone.utc).replace(tzinfo=None)
     payload = {
         "task_id": task.task_id,
         "status": task.status,
-        "finished_at": task.finished_at.isoformat() if task.finished_at else None,
+        "finished_at": finished_at.isoformat() if finished_at else None,
         "result_text": task.result_text or "",
         "deliverables": task.deliverables_json or {},
     }
@@ -630,6 +635,8 @@ class VoiceTaskCoordinator:
                     "subagent_id": result.subagent_id,
                     "link_id": result.task_link_id,
                     "result_id": result.id,
+                    "requirement_version": result.requirement_version,
+                    "result_version": result.result_version,
                     "speech_id": delivery.speech_id,
                     "playback_status": state,
                     "playback_ended_at": (
@@ -651,6 +658,14 @@ class VoiceTaskCoordinator:
         request_id: str,
     ) -> tuple[VoiceResultInboxRecord, VoiceSpeechDeliveryRecord, bool]:
         result = self.get_result(voice_session_id, result_id)
+        link = self.db.get(VoiceTaskLinkRecord, result.task_link_id)
+        if result.status == "stale" or (link is not None and int(result.requirement_version) < int(link.requirement_version or 1)):
+            result.status = "stale"
+            result.stale_at = utc_now()
+            self.db.commit()
+            raise AppError(409, "voice_result_stale", "Voice result is stale")
+        if result.status == "dismissed":
+            raise AppError(409, "voice_result_dismissed", "Voice result was dismissed")
         existing = self.deliveries.get_by_idempotency_key(
             request_id, tenant_id=self.tenant_id
         )
@@ -661,34 +676,22 @@ class VoiceTaskCoordinator:
                     "voice_delivery_idempotency_conflict",
                     "Delivery idempotency key was already used for another result",
                 )
-            if existing.playback_status != "interrupted" and existing.status != "interrupted" and str(
+            if existing.playback_status not in {"interrupted", "failed"} and existing.status != "interrupted" and str(
                 (existing.snapshot or {}).get("playback_state") or ""
             ) != "interrupted":
                 return result, existing, False
             self.db.delete(existing)
             self.db.flush()
-        if result.status == "stale":
-            raise AppError(409, "voice_result_stale", "Voice result is stale")
-        if result.status == "dismissed":
-            raise AppError(409, "voice_result_dismissed", "Voice result was dismissed")
         delivered = self.deliveries.get_by_result(
             result.id, tenant_id=self.tenant_id
         )
         if delivered is not None:
-            if delivered.playback_status != "interrupted" and delivered.status != "interrupted" and str(
+            if delivered.playback_status not in {"interrupted", "failed"} and delivered.status != "interrupted" and str(
                 (delivered.snapshot or {}).get("playback_state") or ""
             ) != "interrupted":
                 return result, delivered, False
             self.db.delete(delivered)
             self.db.flush()
-        link = self.db.get(VoiceTaskLinkRecord, result.task_link_id)
-        if link is not None and int(result.requirement_version) < int(
-            link.requirement_version or 1
-        ):
-            result.status = "stale"
-            result.stale_at = utc_now()
-            self.db.commit()
-            raise AppError(409, "voice_result_stale", "Voice result is stale")
         now = utc_now()
         delivery = VoiceSpeechDeliveryRecord(
             workspace_id=self.workspace_id,

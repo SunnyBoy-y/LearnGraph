@@ -16,10 +16,36 @@ function toggle(id: string, open: boolean) {
 }
 
 describe('task expansion intent', () => {
+  it('temporarily reveals a speaking task then restores its collapsed preference', () => {
+    const a = task('A'); const view = render(<VoiceTaskCanvas tasks={[a]} />);
+    view.rerender(<VoiceTaskCanvas tasks={[{...a,focusId:'focus',focusTurnId:'turn',focusAnchor:'summary'}]} />);
+    expect(detail('A')).toHaveAttribute('open');
+    expect(detail('A')).toHaveAttribute('data-voice-revealed','true');
+    view.rerender(<VoiceTaskCanvas tasks={[a]} />);
+    expect(detail('A')).not.toHaveAttribute('open');
+  });
+  it('preserves a previously expanded task after the explanation finishes', () => {
+    const a = task('A'); const view = render(<VoiceTaskCanvas tasks={[a]} />);
+    toggle('A',true);
+    view.rerender(<VoiceTaskCanvas tasks={[{...a,focusId:'focus',focusTurnId:'turn',focusAnchor:'summary'}]} />);
+    view.rerender(<VoiceTaskCanvas tasks={[a]} />);
+    expect(detail('A')).toHaveAttribute('open');
+  });
+  it('honors manual changes during speech without reopening on the next component', () => {
+    const a = task('A'); const view = render(<VoiceTaskCanvas tasks={[{...a,focusId:'one',focusTurnId:'turn',focusAnchor:'summary'}]} />);
+    toggle('A',false);
+    view.rerender(<VoiceTaskCanvas tasks={[{...a,focusId:'two',focusTurnId:'turn',focusAnchor:'visual-table'}]} />);
+    expect(detail('A')).not.toHaveAttribute('open');
+    toggle('A',true);
+    view.rerender(<VoiceTaskCanvas tasks={[a]} />);
+    expect(detail('A')).toHaveAttribute('open');
+  });
   it('preserves manual collapse on both own progress and unrelated updates', () => {
     const a = task('A'), b = task('B');
     const view = render(<VoiceTaskCanvas tasks={[a, b]} />);
-    expect(detail('A')).toHaveAttribute('open');
+    expect(detail('A')).not.toHaveAttribute('open');
+    toggle('B', true);
+    toggle('A', true);
     toggle('A', false);
     view.rerender(<VoiceTaskCanvas tasks={[a, { ...b, progress: 0.4 }]} />);
     expect(detail('A')).not.toHaveAttribute('open');
@@ -27,19 +53,20 @@ describe('task expansion intent', () => {
     expect(detail('A')).not.toHaveAttribute('open');
     expect(detail('B')).toHaveAttribute('open');
   });
-  it('automatically opens new active tasks without reopening old ones', () => {
+  it('keeps new active tasks collapsed and preserves the original order', () => {
     const a = task('A'); const view = render(<VoiceTaskCanvas tasks={[a]} />);
     toggle('A', false);
     view.rerender(<VoiceTaskCanvas tasks={[task('B'), a]} />);
     expect(detail('A')).not.toHaveAttribute('open');
-    expect(detail('B')).toHaveAttribute('open');
+    expect(detail('B')).not.toHaveAttribute('open');
     expect([...view.container.querySelectorAll('h3')].map((node) => node.textContent)).toEqual(['Task A', 'Task B']);
   });
-  it('opens a newly active task only if the user has not chosen its state', () => {
+  it('does not open a task when its status changes', () => {
     const a = task('A', { status: 'ready' }); const view = render(<VoiceTaskCanvas tasks={[a]} />);
     expect(detail('A')).not.toHaveAttribute('open');
     view.rerender(<VoiceTaskCanvas tasks={[{ ...a, status: 'running' }]} />);
-    expect(detail('A')).toHaveAttribute('open');
+    expect(detail('A')).not.toHaveAttribute('open');
+    toggle('A', true);
     toggle('A', false);
     view.rerender(<VoiceTaskCanvas tasks={[{ ...a, status: 'ready' }]} />);
     view.rerender(<VoiceTaskCanvas tasks={[{ ...a, status: 'running' }]} />);
@@ -48,7 +75,7 @@ describe('task expansion intent', () => {
   it('forgets removed task preferences and keeps inactive new tasks last', () => {
     const a = task('A'); const view = render(<VoiceTaskCanvas tasks={[a]} />);
     toggle('A', false); view.rerender(<VoiceTaskCanvas tasks={[]} />);
-    view.rerender(<VoiceTaskCanvas tasks={[a]} />); expect(detail('A')).toHaveAttribute('open');
+    view.rerender(<VoiceTaskCanvas tasks={[a]} />); expect(detail('A')).not.toHaveAttribute('open');
     view.rerender(<VoiceTaskCanvas tasks={[task('B', { status: 'ready' }), a]} />);
     expect([...view.container.querySelectorAll('h3')].map((node) => node.textContent)).toEqual(['Task A', 'Task B']);
   });

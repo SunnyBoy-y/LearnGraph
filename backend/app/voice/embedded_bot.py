@@ -26,7 +26,7 @@ from typing import Any, Awaitable, Callable, Literal, Mapping
 from dotenv import load_dotenv
 from loguru import logger
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
+from app.voice.embedded_input_frames import BatchedSileroVADAnalyzer as SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -87,6 +87,7 @@ from app.voice.embedded_memory import VoiceMemoryBridge, voice_memory_llm_servic
 from app.voice.embedded_result_bridge import VoiceResultDeliveryProcessor
 from app.voice.embedded_timeline import insert_timeline_probes, timeline_enabled
 from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
+from app.voice.embedded_turn_stop import GuardedSmartTurnStopStrategy
 from app.voice.embedded_volcengine_tts import VolcengineTTSService
 from app.voice.journal import (
     STAGE_LLM,
@@ -161,6 +162,7 @@ _BASE_SYSTEM_INSTRUCTION = (
     "你是前台中文全双工语音 Tutor，也是任务协调器，不是代码执行器。回答会被直接朗读，"
     "所以使用自然、精准、信息充分且不重复的中文，不使用 emoji、特殊符号、列表或 Markdown。"
     "先判断用户本轮的主要意图，只按一个主分类处理；若同时存在彼此独立的任务，可以并行创建。"
+    "系统会在本轮处理较慢时自动播放一次简短回应，你无需重复说嗯、让我想一想或我看看，继续给出答案或真实任务状态。"
     "\n\n意图一，直接回答：适用于简单事实、解释、建议和闲聊。先给结论，只补充理解结论所必需的信息。"
     "不要复述问题，不要先声明准备怎么回答，不要主动扩展用户未要求的背景。"
     "\n\n意图二，立即委派：适用于需要联网研究、深度分析、读取工作区、写代码、修改文件、执行命令、"
@@ -174,8 +176,15 @@ _BASE_SYSTEM_INSTRUCTION = (
     "\n\n意图四，任务控制：查询状态用 get_background_task，取消用 cancel_background_task，"
     "修改需求用 revise_background_task，自动播报用 set_background_delivery，用户明确要求听取完成结果时"
     "才用 get_ready_results。不要反复轮询。"
+    "用户只是打断说话时后台任务继续。只有明确要求暂停任务时用 pause_background_task；"
+    "暂停在本轮工具执行结束后的安全检查点生效，不能承诺立即停止外部操作。继续任务用 resume_background_task。"
     "\n\n意图五，结果播报：accepted 或 queued 只表示已受理，不能说已经完成。"
     "任务完成时先说最终结论或产物，仅补充影响理解或使用的必要依据、限制和行动；无须行动时不强加下一步。详细来源、过程、文件和代码留在画布任务卡中。"
+    "只有工具返回 scene.status=rendered 且对应 anchors 存在时才能说请看页面；未确认或渲染失败就直接口述。"
+    "用户要求讲解子 Agent 或后台任务的结果、表格、图表时，必须先用 focus_background_scene 定位对应组件；"
+    "从 scene.available_anchors 选择匹配的 visual- 锚点，只有纯文字结果时才选 summary。页面收起也可以请求定位，前端会临时展开并高亮；"
+    "requested 只表示已请求展开，不能声称用户已看见；失败就口述。讲完或被打断后前端恢复用户的折叠选择。"
+    "任务未结束时可用 get_background_task 读取 partial_results，但 worker_reported 只表示后台已产出，不能说成独立验证的事实。"
     "\n\n执行边界：前台不得直接写代码、修改文件、执行 shell、调用补丁工具、读取或解析源码或网页代码；"
     "这些工作必须委派后台 Agent。委派必须快速返回，不等待后台结束，用户继续说话时保持可打断。"
     "不得臆造工具结果、文件内容、来源、状态或完成时间。"
@@ -600,7 +609,22 @@ class TutorAgent(LLMWorker):
         # durable backend.
         if self._delegation_port is None:
             return []
-        return super().build_tools()
+        from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
+        tools = super().build_tools()
+        for index, function in enumerate(tools):
+            if function.__name__ == "delegate_tool_task":
+                # Pipecat's direct-function converter currently drops Literal
+                # annotations. Advertise the real capability boundary explicitly.
+                schema = DirectFunctionWrapper(function).to_function_schema()
+                schema.properties["capability_id"] = {
+                    "type": "string", "enum": ["workspace_read", "learning_read", "practice_prepare",
+                        "learning_evidence", "graph_proposal", "artifact_create", "workspace_task"],
+                    "description": "artifact_create: 生成交互表格和图表；workspace_task: 编程、计算、执行命令；workspace_read: 只读工作区。必须选择枚举中的值，不得自行创造能力名。",
+                }
+                if "capability_id" not in schema.required:
+                    schema.required.append("capability_id")
+                tools[index] = schema
+        return tools
 
     @tool(cancel_on_interruption=False, timeout_secs=5)
     async def get_agent_runtime_status(self, params: FunctionCallParams) -> None:
@@ -767,6 +791,8 @@ class TutorAgent(LLMWorker):
                     "agent_result": row.get("agent_result") or {},
                 }
             )
+            if isinstance(row.get("scene"), dict):
+                results[-1]["scene"] = {"status": row["scene"].get("status"), "anchors": row["scene"].get("anchors", [])}
         await params.result_callback({"results": results})
         for task_id in task_ids:
             try:
@@ -783,6 +809,21 @@ class TutorAgent(LLMWorker):
     ) -> None:
         """Request cancellation of a specific background task."""
         await self._control(params, operation="cancel", task_id=task_id)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def pause_background_task(self, params: FunctionCallParams, task_id: str) -> None:
+        """Pause execution at the next safe tool/round boundary, preserving work."""
+        await self._control(params, operation="pause", task_id=task_id)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def resume_background_task(self, params: FunctionCallParams, task_id: str) -> None:
+        """Resume a paused task from persisted tool results and remaining budget."""
+        await self._control(params, operation="resume", task_id=task_id)
+
+    @tool(cancel_on_interruption=False, timeout_secs=5)
+    async def focus_background_scene(self, params: FunctionCallParams, task_id: str, anchor_id: str) -> None:
+        """Temporarily reveal and highlight an available result anchor, including a collapsed component."""
+        await self._control(params, operation="focus", task_id=task_id, instruction=anchor_id)
 
     @tool(cancel_on_interruption=False, timeout_secs=5)
     async def set_background_delivery(
@@ -912,6 +953,7 @@ def build_pipeline_steps(
     generation_gate: FrameProcessor | None = None,
     ledger_relay: FrameProcessor | None = None,
     context_playback_guard: FrameProcessor | None = None,
+    response_feedback: FrameProcessor | None = None,
 ) -> list[FrameProcessor]:
     """Assemble the main worker's pipeline in one testable place."""
     steps: list[FrameProcessor] = [transport_input, stt]
@@ -920,6 +962,8 @@ def build_pipeline_steps(
     steps.extend([user_aggregator, bridge])
     if result_delivery is not None:
         steps.append(result_delivery)
+    if response_feedback is not None:
+        steps.append(response_feedback)
     if assistant_journal is not None:
         steps.append(assistant_journal)
     steps.append(tts)
@@ -1435,6 +1479,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         api_key=llm_api_key,
         base_url=llm_base_url,
         memory_bridge=memory_bridge,
+        task_session_id=session_id or '',
         settings=OpenAILLMService.Settings(
             model=llm_model,
             system_instruction=SYSTEM_INSTRUCTION,
@@ -1511,6 +1556,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         if smart_turn_overrides
         else None
     )
+    quiet_guard_ms=max(0.0,min(2000.0,float(os.getenv('VOICE_SMART_TURN_QUIET_GUARD_MS','0'))))
+    if quiet_guard_ms:
+        stop_strategies=[GuardedSmartTurnStopStrategy(
+            min_quiet_secs=quiet_guard_ms/1000,
+            turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(**smart_turn_overrides)),
+        )]
+        logger.info('Voice experimental Smart Turn quiet confirmation: {} ms; incomplete fallback: {} ms',
+                    max(quiet_guard_ms,1500.),max(quiet_guard_ms,2500.))
     if vad_params or smart_turn_overrides:
         logger.info(
             "Voice turn tuning: vad_stop_secs={} smart_turn={} turn_stop_timeout={}",
@@ -1524,17 +1577,55 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         initial_messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
     context = LLMContext(messages=initial_messages)
     turn_strategy = AdaptiveUserTurnStartStrategy()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
+    user_params = LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(params=vad_params),
             user_turn_stop_timeout=settings.voice_turn_stop_timeout,
             user_turn_strategies=UserTurnStrategies(
                 start=[turn_strategy],
                 stop=stop_strategies,
             ),
-        ),
     )
+    if stt.review_answers_enabled:
+        from app.voice.embedded_reviewed_turn import ReviewedUserAggregator
+        from pipecat.processors.aggregators.llm_response_universal import LLMAssistantAggregator
+        user_aggregator = ReviewedUserAggregator(
+            context, stt=stt, journal=journal, params=user_params,
+            review_wait_secs=stt.review_answer_wait_secs,
+        )
+        assistant_aggregator = LLMAssistantAggregator(context, _paired_user_aggregator=user_aggregator)
+    else:
+        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context, user_params=user_params)
+    if journal is not None:
+        def _pipeline_diagnostic():
+            controller = user_aggregator._user_turn_controller
+            def processor_state(processor):
+                def awaiting(task):
+                    coroutine = task.get_coro() if task else None
+                    chain = []
+                    for _ in range(16):
+                        if coroutine is None:
+                            break
+                        code = getattr(coroutine, 'cr_code', None)
+                        chain.append(code.co_name if code else type(coroutine).__name__)
+                        coroutine = getattr(coroutine, 'cr_await', None)
+                    return chain
+                return {"input": getattr(processor, "_FrameProcessor__input_queue").qsize(),
+                    "current": type(getattr(processor, "_FrameProcessor__process_current_frame", None)).__name__,
+                    "input_wait": awaiting(getattr(processor, "_FrameProcessor__input_frame_task", None)),
+                    "process_wait": awaiting(getattr(processor, "_FrameProcessor__process_frame_task", None))}
+            return {"user_turn": controller._user_turn, "physical_speech": controller._user_speaking,
+                "user_processor": processor_state(user_aggregator),
+                "journal_processor": processor_state(user_journal),
+                "aggregated_parts": len(user_aggregator._aggregation),
+                "user_frames_queued": getattr(user_aggregator, "_FrameProcessor__process_queue").qsize(),
+                "journal_frames_queued": getattr(user_journal, "_FrameProcessor__process_queue").qsize() if user_journal else -1,
+                "stop_strategies": [{"type": type(strategy).__name__,
+                    "turn_complete": getattr(strategy, "_turn_complete", None),
+                    "vad_speech": getattr(strategy, "_vad_user_speaking", None),
+                    "finalized": getattr(strategy, "_transcript_finalized", None)}
+                    for strategy in controller.user_turn_strategies.stop]}
+        # Only emitted after an actual idle failure; contains no transcript or secrets.
+        journal._pipeline_diagnostic = _pipeline_diagnostic
 
     latency = LatencyPercentileProcessor(
         # 只有"真的要求了关闭思考"才谈得上违约。表达不出时上游按自己的默认走，
@@ -1573,6 +1664,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
 
     playback_context = VoicePlaybackContext(context) if journal is not None else None
+    from app.voice.response_feedback import VoiceResponseFeedback
+    response_feedback = VoiceResponseFeedback(journal) if journal is not None else None
     if journal is not None and playback_context is not None:
         journal.set_playback_context_hook(playback_context.update_spoken)
 
@@ -1585,6 +1678,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         assistant_journal=assistant_journal,
         tts=tts,
         result_delivery=result_delivery,
+        response_feedback=response_feedback,
         generation_gate=generation_gate,
         latency=latency,
         transport_output=transport.output(),
@@ -1644,7 +1738,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         chat_session_id=str(getattr(providers.session, "chat_session_id", "") or ""),
         owner_user_id=str(getattr(providers.session, "owner_user_id", "") or ""),
         runtime_owner_id=owner_id,
-        processors=[stt, tts, generation_gate, worker, agent] + ([result_delivery] if result_delivery is not None else []),
+        processors=[stt, tts, generation_gate, worker, agent] + ([result_delivery] if result_delivery is not None else []) + ([response_feedback] if response_feedback is not None else []),
         transports=[transport],
         task=current_task,
     )

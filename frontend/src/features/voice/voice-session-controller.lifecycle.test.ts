@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const api = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn(), baseUrl: '/api/v1' }));
 const voice = vi.hoisted(() => ({ getVoiceCapabilities: vi.fn(), getVoiceIceServers: vi.fn(), getVoiceSession: vi.fn(), getVoiceTask: vi.fn(), startVoiceTask: vi.fn(), cancelVoiceTask: vi.fn(), approveVoiceTask: vi.fn(), reviseVoiceTask: vi.fn(), deliverVoiceResult: vi.fn() }));
+const noise = vi.hoisted(() => ({ createVoiceNoiseInput: vi.fn() }));
 vi.mock('@/api/client', () => ({ apiClient: api, ApiError: class ApiError extends Error {} }));
 vi.mock('@/api/voice', () => voice);
+vi.mock('./rnnoise/input', () => ({ ...noise, idleNoiseStatus: { mode: 'idle' } }));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -53,6 +55,8 @@ beforeEach(async () => {
   localStorage.clear();
   Peer.instances = [];
   mic = media();
+  noise.createVoiceNoiseInput.mockReset();
+  noise.createVoiceNoiseInput.mockImplementation(async (stream: MediaStream) => ({ stream, close: vi.fn() }));
   getUserMedia = vi.fn().mockResolvedValue(mic.stream);
   vi.stubGlobal('RTCPeerConnection', Peer);
   Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
@@ -70,6 +74,61 @@ beforeEach(async () => {
 afterEach(() => { controller?.disconnect(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('voice connection ownership', () => {
+  it('ends scene focus with its playback turn and ignores a stale focus replay', async () => {
+    await controller.connect(); await flush();
+    controller.upsertTask({taskId:'task-A',title:'result',status:'ready'});
+    const peer = Peer.instances[0];
+    peer.event('scene.focus','remote-A',10,{task_id:'task-A',anchor_id:'visual-table',turn_id:'explain'});
+    expect(controller.getSnapshot().tasks[0].focusId).toBe('remote-A-10');
+    peer.event('turn.finalized','remote-A',11,{turn_id:'older',role:'assistant'});
+    expect(controller.getSnapshot().tasks[0].focusId).toBe('remote-A-10');
+    peer.event('turn.finalized','remote-A',12,{turn_id:'explain',role:'assistant'});
+    expect(controller.getSnapshot().tasks[0].focusId).toBeUndefined();
+    peer.event('scene.focus','remote-A',13,{task_id:'task-A',anchor_id:'visual-table',turn_id:'explain'});
+    expect(controller.getSnapshot().tasks[0].focusId).toBeUndefined();
+  });
+  it('publishes the denoised track and releases both capture and processing on disconnect', async () => {
+    const processed = media(); const closeNoise = vi.fn();
+    noise.createVoiceNoiseInput.mockResolvedValueOnce({ stream: processed.stream, close: closeNoise });
+    await controller.connect();
+    expect(getUserMedia).toHaveBeenCalledWith({ audio: {
+      channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 },
+      echoCancellation: true, noiseSuppression: true, autoGainControl: false,
+    } });
+    expect(Peer.instances[0].addTrack).toHaveBeenCalledWith(processed.track, processed.stream);
+    expect(Peer.instances[0].addTrack).not.toHaveBeenCalledWith(mic.track, mic.stream);
+    controller.setMuted(true);
+    expect(mic.track.enabled).toBe(false);
+    expect(processed.track.enabled).toBe(false);
+    controller.setMuted(false);
+    expect(mic.track.enabled).toBe(true);
+    expect(processed.track.enabled).toBe(true);
+    controller.disconnect();
+    expect(closeNoise).toHaveBeenCalled();
+    expect(mic.track.stop).toHaveBeenCalled();
+    expect(processed.track.stop).toHaveBeenCalled();
+  });
+
+  it('closes a late noise graph after a session switch without publishing its track', async () => {
+    const gate = deferred<{ stream: MediaStream; close: () => void }>();
+    const processed = media(); const closeNoise = vi.fn();
+    noise.createVoiceNoiseInput.mockReturnValueOnce(gate.promise);
+    const pending = controller.connect(); await flush();
+    controller.open('workspace', 'B');
+    gate.resolve({ stream: processed.stream, close: closeNoise }); await pending;
+    expect(closeNoise).toHaveBeenCalled();
+    expect(Peer.instances[0].addTrack).not.toHaveBeenCalled();
+    expect(controller.getSnapshot().sessionId).toBe('B');
+  });
+
+  it('does not let a reconnect journal replay demote a healthy live peer', async () => {
+    await controller.connect(); await flush();
+    Peer.instances[0].event('session.reconnecting');
+    expect(controller.getSnapshot().transport).toBe('connected');
+    Peer.instances[0].state('disconnected');
+    Peer.instances[0].event('session.reconnecting', 'remote-A', 2);
+    expect(controller.getSnapshot().transport).toBe('reconnecting');
+  });
   it.each(['approveTask', 'cancelTask'] as const)('releases %s locks during a same-remote reconnect', async (method) => {
     await controller.connect();
     const old = deferred<Record<string, unknown>>();

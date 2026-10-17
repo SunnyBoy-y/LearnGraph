@@ -69,6 +69,12 @@ class VoiceDelegationPort(Protocol):
 
     async def cancel_task(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
 
+    async def pause_task(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
+
+    async def resume_task(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
+
+    async def focus_scene(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
+
     async def revise_task(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
 
     async def set_task_delivery(self, request: TaskControlRequest) -> Mapping[str, Any]: ...
@@ -192,6 +198,9 @@ async def dispatch_task_control(
         "revise": port.revise_task,
         "delivery": port.set_task_delivery,
         "confirm": port.confirm_task,
+        "pause": getattr(port, "pause_task", None),
+        "resume": getattr(port, "resume_task", None),
+        "focus": getattr(port, "focus_scene", None),
     }.get(operation)
     if method is None:
         return {

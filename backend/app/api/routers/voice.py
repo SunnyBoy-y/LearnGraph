@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Header, Query
+from typing import Literal
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.voice.schemas import (
@@ -9,7 +10,9 @@ from app.voice.schemas import (
     VoiceResultDeliveryRequest, VoiceResultDeliveryView, VoiceResultListResponse,
     VoiceTaskCancelRequest, VoiceTaskRevisionRequest,
     VoiceTaskApprovalRequest,
+    VoiceTaskDeliveryPolicyRequest,
 )
+from app.voice.scene import SceneReceipt
 from app.voice.service import VoiceSessionService
 from app.voice.runtime import runtime_info
 from app.voice.availability import inspect_voice_capabilities, inspect_voice_provider_status
@@ -50,7 +53,7 @@ def create_voice_session(payload: VoiceSessionCreateRequest, db: DB, context: Cu
         from app.services.voice_context import VoiceContextService
         chat = build_chat_service(db, workspace_context=context, settings=settings,
             model_id=payload.model_id, provider_id=payload.provider_id,
-            thinking_mode=payload.max_thinking_mode, agent_mode=False)
+            thinking_mode=payload.max_thinking_mode, agent_mode=True)
         snapshot = VoiceContextService(chat).load_snapshot(payload.chat_session_id)
         session = service.update_context_snapshot(session.id, snapshot.to_dict())
     except Exception:
@@ -214,6 +217,21 @@ def deliver_voice_result(
 @router.post("/sessions/{voice_session_id}/results/{result_id}/dismiss")
 def dismiss_voice_result(voice_session_id: str, result_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings):
     return svc(db, context, settings).dismiss_result(voice_session_id, result_id)
+
+
+@router.post("/sessions/{voice_session_id}/results/{result_id}/scene")
+def acknowledge_voice_scene(voice_session_id: str, result_id: str, payload: SceneReceipt, db: DB, context: CurrentWorkspace, settings: AppSettings):
+    return svc(db, context, settings).acknowledge_scene(voice_session_id, result_id, payload)
+
+
+@router.post("/sessions/{voice_session_id}/tasks/{subagent_id}/delivery", response_model=VoiceTaskView)
+def set_voice_task_delivery(voice_session_id: str, subagent_id: str, payload: VoiceTaskDeliveryPolicyRequest, db: DB, context: CurrentWorkspace, settings: AppSettings):
+    return svc(db, context, settings).set_task_delivery(voice_session_id, subagent_id, payload.auto_delivery)
+
+
+@router.post("/sessions/{voice_session_id}/tasks/{subagent_id}/execution/{operation}", response_model=VoiceTaskView)
+def control_voice_task_execution(voice_session_id: str, subagent_id: str, operation: Literal["pause", "resume"], db: DB, context: CurrentWorkspace, settings: AppSettings):
+    return svc(db, context, settings).control_task_execution(voice_session_id, subagent_id, operation)
 
 @router.post("/sessions/{voice_session_id}/interrupt", response_model=VoiceSession)
 def interrupt_voice_session(voice_session_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings):

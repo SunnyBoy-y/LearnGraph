@@ -213,3 +213,37 @@ def _query_events(voice_id: str) -> list[VoiceEventRecord]:
             .order_by(VoiceEventRecord.event_seq)
             .all()
         )
+
+
+def test_foreground_activity_survives_real_event_validation_and_replay(
+    client, register_user, auth_headers
+):
+    token, workspace_id, *_ = register_user("voice_activity")
+    headers = auth_headers(token, workspace_id)
+    voice_id = _create_voice_session(client, headers, _make_chat_session(client, headers))
+
+    async def run() -> str:
+        journal = VoiceTurnJournal(voice_id, idle_timeout_secs=30.0)
+        await journal.user_final("请在后台整理表格")
+        turn_id = journal.current_turn_id()
+        assert turn_id
+        await journal.assistant_activity("thinking", turn_id=turn_id)
+        await journal.assistant_activity("thinking", turn_id=turn_id)
+        await journal.assistant_activity("delegating", turn_id="old-turn")
+        await journal.assistant_activity("delegating", turn_id=turn_id)
+        await journal.assistant_activity("idle", turn_id=turn_id)
+        await journal.drain_persistence()
+        await journal.close_open_turns_on_session_end()
+        return turn_id
+
+    turn_id = asyncio.run(run())
+    rows = [row for row in _query_events(voice_id) if row.event_type == "assistant.activity"]
+    assert [row.payload["state"] for row in rows] == ["thinking", "delegating", "idle"]
+    assert all(row.turn_id == turn_id for row in rows)
+    replay = client.get(f"/api/v1/voice/sessions/{voice_id}/events", headers=headers)
+    assert replay.status_code == 200, replay.text
+    activity = [item for item in replay.json()["events"] if item["type"] == "assistant.activity"]
+    assert [item["payload"]["state"] for item in activity] == ["thinking", "delegating", "idle"]
+    from app.voice.events import VOICE_EVENT_TYPES as persisted_types
+    from app.voice.schemas import VOICE_EVENT_TYPES as wire_types
+    assert set(persisted_types) == set(wire_types)

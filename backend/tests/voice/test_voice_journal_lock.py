@@ -60,6 +60,19 @@ def _journal(monkeypatch):
     return journal, fake, emitted
 
 
+def test_reviewed_complete_turns_do_not_merge_before_assistant_starts(monkeypatch):
+    async def run():
+        journal, fake, emitted = _journal(monkeypatch)
+        await journal.user_final('第一轮复核', source_id='review:1', new_turn=True)
+        await journal.user_final('第二轮复核', source_id='review:2', new_turn=True)
+        await journal.user_final('第二轮复核', source_id='review:2', new_turn=True)
+        await journal.drain_persistence()
+        assert [r['text'] for r in fake.accepted]==['第一轮复核','第二轮复核']
+        assert journal._turn.user_text=='第二轮复核'
+        assert not journal._lock.locked()
+    asyncio.run(run())
+
+
 def test_user_final_after_the_assistant_started_does_not_wedge_the_journal(monkeypatch):
     """助手已在说话时用户又开口：必须收尾上一回合、开新回合，并且不锁死日志。"""
 

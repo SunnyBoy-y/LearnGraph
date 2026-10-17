@@ -1,3 +1,5 @@
+import { LoadingState, ErrorState } from '@/components/shared/page-elements';
+import { useSettingsDirty } from '@/lib/settings-dirty';
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CircleAlert, ServerCog } from "lucide-react";
@@ -92,6 +94,8 @@ export function VoiceRelayPage() {
     enabled: isAdmin,
   });
 
+  const [edited, setEdited] = useState(false);
+  useSettingsDirty("voice-relay", edited);
   const [mode, setMode] = useState<"cloudflare" | "manual">("cloudflare");
   const [stunText, setStunText] = useState("");
   const [stunFallback, setStunFallback] = useState(false);
@@ -108,7 +112,7 @@ export function VoiceRelayPage() {
 
   useEffect(() => {
     const data = relay.data;
-    if (!data) return;
+    if (!data || edited) return;
     setMode(data.mode === "manual" ? "manual" : "cloudflare");
     setStunText((data.stun_urls?.length ? data.stun_urls : data.defaults.stun_urls ?? []).join("\n"));
     setStunFallback(Boolean(data.stun_fallback_enabled));
@@ -124,7 +128,7 @@ export function VoiceRelayPage() {
     setTransports(found.length ? [...new Set(found)] : ["tcp"]);
     const firstTurn = urls.find((url) => transportOf(url) !== null);
     setPreferred((firstTurn && transportOf(firstTurn)) || "udp");
-  }, [relay.data]);
+  }, [relay.data, edited]);
 
   const stunUrls = useMemo(() => parseStunText(stunText), [stunText]);
   const payload = useMemo<VoiceRelaySaveWire>(
@@ -155,6 +159,7 @@ export function VoiceRelayPage() {
     mutationFn: async () => {
       const saved = await saveVoiceRelay(payload);
       queryClient.setQueryData(["voice-relay"], saved);
+      setEdited(false);
       setToken("");
       setResult(null);
       try {
@@ -164,6 +169,7 @@ export function VoiceRelayPage() {
       }
     },
     onSuccess: (tested) => {
+      setEdited(false);
       setResult(tested);
       setToken("");
       void queryClient.invalidateQueries({ queryKey: ["voice-relay"] });
@@ -198,6 +204,8 @@ export function VoiceRelayPage() {
   const removeConfig = useMutation({
     mutationFn: () => clearVoiceRelay(),
     onSuccess: () => {
+      setEdited(false);
+      setToken("");
       setConfirmClear(false);
       setResult(null);
       void queryClient.invalidateQueries({ queryKey: ["voice-relay"] });
@@ -205,6 +213,11 @@ export function VoiceRelayPage() {
     },
     onError: (error: Error) => toast.error(error.message),
   });
+
+  if (currentUser.isPending) return <LoadingState/>;
+  if (currentUser.error) return <ErrorState message={currentUser.error.message}/>;
+  if (isAdmin && relay.isPending) return <LoadingState/>;
+  if (isAdmin && relay.error) return <ErrorState message={relay.error.message}/>;
 
   if (!currentUser.isLoading && !isAdmin) {
     return (
@@ -218,10 +231,10 @@ export function VoiceRelayPage() {
   }
 
   const data = relay.data;
-  const busy = saveAndTest.isPending || runTest.isPending;
+  const busy = saveAndTest.isPending || runTest.isPending || toggleEnabled.isPending || removeConfig.isPending;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" onChangeCapture={() => setEdited(true)} onClickCapture={(event) => { if ((event.target as HTMLElement).closest('[role="switch"], [role="radio"]')) setEdited(true); }}>
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <ServerCog className="h-4 w-4" />
@@ -244,7 +257,7 @@ export function VoiceRelayPage() {
         </div>
       ) : null}
 
-      <section className="space-y-4 rounded-md border p-4">
+      <fieldset disabled={busy} className="min-w-0 space-y-4 rounded-md border p-4">
         <div className="space-y-2">
           <Label>连接配置模式</Label>
           <RadioGroup value={mode} onValueChange={(value) => { setMode(value as typeof mode); setResult(null); }}>
@@ -282,7 +295,7 @@ export function VoiceRelayPage() {
               onChange={(event) => setStunText(event.target.value)}
               placeholder="stun:stun.miwifi.com:3478"
             />
-            <Button type="button" variant="outline" size="sm" onClick={() => setStunText((relay.data?.defaults.stun_urls ?? []).join("\n"))}>
+            <Button type="button" variant="outline" size="sm" onClick={() => { setEdited(true); setStunText((relay.data?.defaults.stun_urls ?? []).join("\n")); }}>
               填入国内候选（小米 / 芒果 / B 站）
             </Button>
             <p className="text-xs text-muted-foreground">
@@ -467,7 +480,7 @@ export function VoiceRelayPage() {
             )
           ) : null}
         </div>
-      </section>
+      </fieldset>
 
       {result ? (
         <section className="space-y-3 rounded-md border p-4">

@@ -7,9 +7,13 @@
  * testable without a browser or network.
  */
 
+import { parseUISnapshot, type UISnapshot } from "@/lib/stream-ui";
+
 export type VoiceTaskStatus =
   | "queued"
   | "running"
+  | "pausing"
+  | "paused"
   | "waiting_approval"
   | "finalizing"
   | "ready"
@@ -42,6 +46,7 @@ export type VoiceTaskKind = "research" | "reasoning" | "tool" | "unknown";
 export interface VoiceTaskSource {
   id: string;
   title: string;
+  url?: string;
   prompt?: string;
   domain?: string;
   snippet?: string;
@@ -63,8 +68,16 @@ export interface VoiceTaskArtifact {
 
 export interface VoiceTask {
   taskId: string;
+  agentSessionId?: string;
   linkId?: string;
   resultId?: string;
+  resultVersion?: number;
+  autoDelivery?: boolean;
+  focusAnchor?: string;
+  focusId?: string;
+  focusTurnId?: string;
+  findings?: string[];
+  visuals?: UISnapshot[];
   speechId?: string;
   capabilityId?: string;
   reason?: string;
@@ -132,6 +145,7 @@ const TERMINAL_STATUSES = new Set<VoiceTaskStatus>([
 const ACTIVE_STATUSES = new Set<VoiceTaskStatus>([
   "queued",
   "running",
+  "pausing",
   "waiting_approval",
   "finalizing",
   "cancel_requested",
@@ -155,6 +169,8 @@ const STATUS_ALIASES: Record<string, VoiceTaskStatus> = {
   READY: "ready",
   RESULT_READY: "ready",
   RUNNING: "running",
+  PAUSING: "pausing",
+  PAUSED: "paused",
   STALE: "stale",
   STARTED: "running",
   SUCCEEDED: "ready",
@@ -231,6 +247,7 @@ function taskIdOf(raw: Record<string, unknown>, fallbackTaskId?: string): string
   const payload = recordOrEmpty(raw.payload);
   const result = recordOrEmpty(raw.result);
   return firstString(
+    fallbackTaskId,
     raw.task_id,
     raw.taskId,
     raw.subagent_id,
@@ -240,7 +257,6 @@ function taskIdOf(raw: Record<string, unknown>, fallbackTaskId?: string): string
     payload.taskId,
     result.task_id,
     result.taskId,
-    fallbackTaskId,
   );
 }
 
@@ -342,6 +358,7 @@ function parseSource(value: unknown, index: number): VoiceTaskSource | null {
   return {
     id: firstString(value.id, value.source_ref, value.sourceRef, url, title) ?? `source-${index}`,
     title,
+    url: url && /^https?:\/\//i.test(url) ? url : undefined,
     domain: normalizedText(value.domain, 120) ?? domainOf(url),
     snippet: normalizedText(value.snippet, 600) ?? normalizedText(value.summary, 600),
     retrievedAt: firstString(value.retrieved_at, value.retrievedAt, value.updated_at, value.updatedAt),
@@ -525,6 +542,12 @@ function statusFromEvent(eventType: string, rawStatus: unknown): VoiceTaskStatus
     case "tool_call":
     case "network_policy":
       return "running";
+    case "task.pausing":
+      return "pausing";
+    case "task.paused":
+      return "paused";
+    case "task.resumed":
+      return "queued";
     case "task.approval_required":
     case "task.blocked":
       return "waiting_approval";
@@ -705,6 +728,8 @@ function normalizeTask(
   const result = resultRecord(raw, payload);
   const incomingRevision = requirementVersionOf(raw, payload, result);
   const currentRevision = Math.max(existing?.requirementVersion ?? 1, incomingRevision ?? 1);
+  const newRequirement = Boolean(existing && incomingRevision !== undefined && incomingRevision > existing.requirementVersion);
+  const previousResult = newRequirement ? undefined : existing;
   const explicitStatus = statusFromEvent(eventType, raw.status);
   const incomingStatus = raw.status ?? payload.status;
   let status =
@@ -723,7 +748,7 @@ function normalizeTask(
     ),
   );
   const playbackStatus = incomingPlaybackStatus === undefined
-    ? existing?.playbackStatus
+    ? previousResult?.playbackStatus
     : incomingPlaybackStatus;
   let resultAvailable =
     booleanValue(raw.result_available ?? raw.resultAvailable ?? payload.result_available ?? payload.resultAvailable) ??
@@ -742,7 +767,7 @@ function normalizeTask(
     status = existing?.status ?? "running";
   }
 
-  if (existing && TERMINAL_STATUSES.has(existing.status)) {
+  if (existing && !newRequirement && TERMINAL_STATUSES.has(existing.status)) {
     if ((existing.status === "cancelled" || existing.status === "failed") && !TERMINAL_STATUSES.has(status)) {
       status = existing.status;
       deliveryStatus = existing.deliveryStatus;
@@ -755,13 +780,26 @@ function normalizeTask(
   }
 
   if (!["ready", "partial"].includes(status)) {
-    resultAvailable = existing?.resultAvailable ?? resultAvailable;
+    resultAvailable = previousResult?.resultAvailable ?? resultAvailable;
   }
 
   const sources = parseSources(raw, payload, result);
   const artifacts = parseArtifacts(raw, payload, result);
   const limitations = parseLimitations(raw, payload, result);
-  const summary = summaryOf(raw, payload, result) ?? existing?.summary;
+  const incomingVisuals = [
+    ...arrayValue(raw.visuals), ...arrayValue(payload.visuals),
+    ...arrayValue(result.visuals), ...arrayValue(recordOrEmpty(raw.deliverables).visuals),
+    ...(eventType === "artifact.upsert" ? [payload.snapshot] : []),
+  ].map(parseUISnapshot).filter((item): item is UISnapshot => item !== null);
+  const visuals = new Map((previousResult?.visuals ?? []).map((item) => [item.block_id, item]));
+  for (const item of incomingVisuals) {
+    const previous = visuals.get(item.block_id);
+    if (!previous || item.revision > previous.revision || (item.revision === previous.revision
+      && previous.state !== "completed" && item.state === "completed")) visuals.set(item.block_id, item);
+  }
+  const findings = arrayValue(result.findings ?? payload.findings ?? raw.findings)
+    .slice(0, 20).filter((item): item is string => typeof item === "string").map((item) => item.slice(0, 2000));
+  const summary = summaryOf(raw, payload, result) ?? previousResult?.summary;
   const approvalRequest = recordOrEmpty(
     raw.approval_request ?? raw.approvalRequest ?? raw.approval_request_json ?? raw.approvalRequestJson ?? payload.approval_request ?? payload.approvalRequest ?? payload.approval_request_json ?? payload.approvalRequestJson,
   );
@@ -784,10 +822,18 @@ function normalizeTask(
 
   return {
     taskId,
+    agentSessionId: firstString(recordOrEmpty(raw.spec_json).agent_session_id, raw.agent_session_id, payload.agent_session_id) ?? existing?.agentSessionId,
+    resultVersion: firstNumber(raw.result_version, raw.resultVersion, payload.result_version) ?? previousResult?.resultVersion,
+    autoDelivery: booleanValue(raw.auto_delivery ?? raw.autoDelivery ?? payload.auto_delivery) ?? existing?.autoDelivery ?? true,
+    focusAnchor: firstString(raw.focusAnchor, payload.focusAnchor, eventType === "scene.focus" ? payload.anchor_id : undefined) ?? previousResult?.focusAnchor,
+    focusId: eventType === "scene.focus" ? firstString(raw.event_id, raw.id) : previousResult?.focusId,
+    focusTurnId: eventType === "scene.focus" ? firstString(raw.turn_id, payload.turn_id) : previousResult?.focusTurnId,
+    findings: findings.length ? findings : previousResult?.findings ?? [],
+    visuals: [...visuals.values()].slice(0, 8),
     linkId:
       firstString(raw.link_id, raw.linkId, payload.link_id, payload.linkId, result.link_id, result.linkId) ?? existing?.linkId,
     resultId:
-      firstString(raw.result_id, raw.resultId, payload.result_id, payload.resultId, result.result_id, result.resultId) ?? existing?.resultId,
+      firstString(raw.result_id, raw.resultId, payload.result_id, payload.resultId, result.result_id, result.resultId) ?? previousResult?.resultId,
     speechId:
       firstString(raw.speech_id, raw.speechId, payload.speech_id, payload.speechId, result.speech_id, result.speechId) ?? existing?.speechId,
     capabilityId:
@@ -846,10 +892,10 @@ function normalizeTask(
     playbackEndedAt:
       timeValue(raw, payload, "playback_ended_at", "playbackEndedAt", "delivered_at", "deliveredAt") ??
       existing?.playbackEndedAt,
-    evidenceRefs: mergeUnique(existing?.evidenceRefs ?? [], evidenceRefs, (value) => value),
-    sources: mergeUnique(existing?.sources ?? [], sources, sourceKey),
-    artifacts: mergeUnique(existing?.artifacts ?? [], artifacts, artifactKey),
-    limitations: mergeUnique(existing?.limitations ?? [], limitations, (value) => value),
+    evidenceRefs: mergeUnique(previousResult?.evidenceRefs ?? [], evidenceRefs, (value) => value),
+    sources: mergeUnique(previousResult?.sources ?? [], sources, sourceKey),
+    artifacts: mergeUnique(previousResult?.artifacts ?? [], artifacts, artifactKey),
+    limitations: mergeUnique(previousResult?.limitations ?? [], limitations, (value) => value),
     resultAvailable,
     eventSeq: eventSeqOf(raw) ?? existing?.eventSeq,
   };
@@ -871,6 +917,10 @@ export function voiceTaskActivityText(task: VoiceTask, eventType = ""): string {
       return "已接受任务，正在排队…";
     case "running":
       return activityKind(task.kind);
+    case "pausing":
+      return "正在保存安全检查点，本轮工具执行结束后暂停。";
+    case "paused":
+      return "任务已暂停，已完成的工具结果和页面已保留。";
     case "waiting_approval":
       return "等待你确认后继续。";
     case "finalizing":
@@ -921,12 +971,16 @@ export function voiceTaskPlaybackLabel(task: VoiceTask): string | null {
     case "played":
       return "服务端已播放完成";
     case "interrupted":
-      return "播报被打断，等待重播";
+      return "播报被打断，可继续讲解";
     case "failed":
       return "播报失败，可重试";
     default:
       return null;
   }
+}
+
+export function voiceTaskTitle(task: VoiceTask): string {
+  return task.title === "artifact_create" ? "子线程产物" : task.title;
 }
 
 export function voiceTaskStatusLabel(task: VoiceTask): string {
@@ -941,6 +995,10 @@ export function voiceTaskStatusLabel(task: VoiceTask): string {
           : task.kind === "tool"
             ? "正在处理"
             : "进行中";
+    case "pausing":
+      return "正在暂停";
+    case "paused":
+      return "已暂停";
     case "waiting_approval":
       return "等待确认";
     case "finalizing":
@@ -986,6 +1044,16 @@ export function emptyVoiceTaskState(): VoiceTaskState {
     seenEventIds: [],
     activityByTask: {},
   };
+}
+
+export function mergeVoiceScenePresentation(state: VoiceTaskState, value: unknown): VoiceTaskState {
+  const presentation = recordOrEmpty(value);
+  return { ...state, tasks: state.tasks.map(task => {
+    const matches = presentation.task_id === task.taskId && presentation.requirement_version === task.requirementVersion
+      && (!presentation.result_version || presentation.result_version === task.resultVersion);
+    return { ...task, focusAnchor: matches ? firstString(presentation.anchor_id) : undefined,
+      focusId: matches ? firstString(presentation.id) : undefined, focusTurnId: matches ? firstString(presentation.turn_id) : undefined };
+  }) };
 }
 
 function rememberTaskEvent(state: VoiceTaskState, eventId: string | undefined): VoiceTaskState {
@@ -1103,6 +1171,9 @@ export function mergeVoiceTaskSnapshots(
     const payload = payloadOf(raw);
     const result = resultRecord(raw, payload);
     const rawRevision = requirementVersionOf(raw, payload, result);
+    const incomingResultVersion = firstNumber(raw.result_version, raw.resultVersion, payload.result_version);
+    if (existing && rawRevision === existing.requirementVersion && incomingResultVersion !== undefined
+        && incomingResultVersion < (existing.resultVersion ?? 0)) continue;
     const normalized = normalizeTask(raw, existing, taskId, "", new Date().toISOString());
     if (!normalized) continue;
     const next =
@@ -1163,6 +1234,7 @@ export function mergeVoiceTaskResults(
         latest_result_version: result.result_version,
         summary: result.summary ?? result.safe_error,
         result: agentResult,
+        visuals: resultPayload.visuals,
         deliverables: resultPayload,
         source_count: result.source_count,
         evidence_refs: result.evidence_refs ?? result.evidenceRefs ?? resultPayload.evidence_refs ?? resultPayload.evidenceRefs,

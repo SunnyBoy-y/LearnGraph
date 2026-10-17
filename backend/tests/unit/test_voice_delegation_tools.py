@@ -69,7 +69,11 @@ def test_tutor_delegation_tools_return_quick_receipt():
             voice_session_id="vs-1",
             delegation_port=port,
         )
-        names = {getattr(item, "__name__", "") for item in agent.build_tools()}
+        names = {getattr(item, "__name__", getattr(item, "name", "")) for item in agent.build_tools()}
+        delegation = next(item for item in agent.build_tools() if getattr(item, "name", "") == "delegate_tool_task")
+        assert delegation.properties["capability_id"]["enum"] == ["workspace_read", "learning_read", "practice_prepare",
+            "learning_evidence", "graph_proposal", "artifact_create", "workspace_task"]
+        assert "capability_id" in delegation.required
         assert {
             "delegate_research",
             "delegate_reasoning",

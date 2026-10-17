@@ -277,7 +277,7 @@ class VoiceAgentCoordinator:
             "capability_id": spec.get("capability_id"),
             "approval_status": spec.get("approval_status"),
             "approval_expires_at": spec.get("approval_expires_at"),
-            "status": task.status.casefold(),
+            "status": "pausing" if task.status_reason == "pause_requested" and task.status in {"QUEUED", "RUNNING", "STARTING"} else task.status.casefold(),
             "status_reason": task.status_reason,
             "result_text": task.result_text,
             "agent_result": result,

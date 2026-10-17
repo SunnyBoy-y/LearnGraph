@@ -1,5 +1,12 @@
 """DashScope 实时语音识别（qwen3-asr-flash-realtime）— Pipecat STTService 适配。
 
+本地实验开关（默认关闭）：``DASHSCOPE_ASR_FULL_TURN_AUDIO=1`` 在开口后连续
+送真实 PCM 到 Smart Turn 的 UserStoppedSpeakingFrame，不再裁掉句内弱音/停顿。
+``DASHSCOPE_ASR_REVIEW=1`` 同时保留完整回合并异步整句复核，仅记录本地结果；
+复核不会生成转录/打断帧，也不阻塞实时 ASR 或 LLM。最多保留 60 秒，超长明确跳过复核。
+``DASHSCOPE_ASR_REVIEW_FOR_ANSWERS=1`` 则由 ReviewedUserAggregator 在真实回合结束后
+限时等待复核，单次提交最终对话文本与回答；快速打断仍由实时 ASR 原路径负责。
+
 协议（阿里云百炼 Qwen-ASR-Realtime，与忆伴 Agent/src/voice/stt.py 同源）：
   -> session.update（turn_detection=null → Manual；server_vad → 云端 VAD）
   -> input_audio_buffer.append(base64 16k PCM)
@@ -91,8 +98,6 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
-    InterimTranscriptionFrame,
-    TranscriptionFrame,
     UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
@@ -105,7 +110,12 @@ from pipecat.utils.time import time_now_iso8601
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
 
 from app.voice.embedded_timeline import timeline_mark
+from app.voice.embedded_input_frames import (
+    RealtimeTranscriptionFrame as TranscriptionFrame,
+    RealtimeInterimTranscriptionFrame as InterimTranscriptionFrame,
+)
 from app.voice.embedded_turn_intent import is_asr_filler, is_backchannel
+from app.voice.embedded_asr_review import TurnAudioBuffer, WholeTurnASRReviewer, review_url, pcm_peak_dbfs
 
 
 # interim 字幕单条长度上限：partial 的 ``text`` 是整段单调增长的假设文本，
@@ -236,6 +246,7 @@ class DashScopeSTTService(STTService):
         settings: DashScopeSTTSettings | None = None,
         ttfs_p99_latency: float | None = DEFAULT_TTFS_P99,
         journal: Any = None,
+        turn_reviewer: WholeTurnASRReviewer | None = None,
         **kwargs,
     ):
         if settings is None:
@@ -385,6 +396,49 @@ class DashScopeSTTService(STTService):
         # 云端"，不决定"要不要 commit"——权威判定留给云端的识别器，别把音量偏小的
         # 说话挡在门外。
         self._signal_rms = _env_float("DASHSCOPE_ASR_SIGNAL_RMS", DEFAULT_SIGNAL_RMS)
+        # Preserve quiet consonants before the energy gate opens. Bounded PCM,
+        # never enough by itself to connect/commit an idle microphone.
+        self._preroll_limit = int(max(0, min(500, _env_float("DASHSCOPE_ASR_PREROLL_MS", 240))) * 32)
+        self._preroll = bytearray()
+        # Local experiments only. Neither knob changes production unless
+        # explicitly enabled on that runtime. Reviews imply lossless turn PCM.
+        self.review_answers_enabled = os.getenv("DASHSCOPE_ASR_REVIEW_FOR_ANSWERS", "0").lower() in ("1", "true", "yes", "on")
+        self.review_on_vad_stop = self.review_answers_enabled and os.getenv("DASHSCOPE_ASR_REVIEW_ON_VAD_STOP", "0").lower() in ("1", "true", "yes", "on")
+        self._early_review = None  # (immutable PCM prefix, future); never an admission
+        self._early_review_delay: asyncio.Task | None = None
+        self._review_canonical_weak = (os.getenv("DASHSCOPE_ASR_REVIEW_CANONICAL_WEAK_AUDIO", "0").lower() in ("1", "true", "yes", "on")
+            or bool(getattr(turn_reviewer, "canonical_weak_audio", False)))
+        self.review_grace_secs = max(0., min(.4, _env_float("DASHSCOPE_ASR_REVIEW_GRACE_MS", 160 if self._review_canonical_weak else 0) / 1000))
+        self._review_revision = 0
+        self.review_events: deque[dict] = deque(maxlen=64)
+        self.review_answer_wait_secs = max(.05, min(5., _env_float("DASHSCOPE_ASR_REVIEW_ANSWER_TIMEOUT_SECS", 1.5)))
+        self.review_weak_answer_wait_secs = max(.05, min(5., _env_float("DASHSCOPE_ASR_REVIEW_WEAK_ANSWER_TIMEOUT_SECS", 3.0)))
+        review_enabled = self.review_answers_enabled or os.getenv("DASHSCOPE_ASR_REVIEW", "0").lower() in ("1", "true", "yes", "on")
+        self.audio_turn_started = None
+        self._review_handles: OrderedDict[int, asyncio.Future] = OrderedDict()
+        self._review_item_turns: OrderedDict[str, int | None] = OrderedDict()
+        self._last_closed_audio_turn: int | None = None
+        self._notified_audio_turn: int | None = None
+        full_turn_enabled = review_enabled or turn_reviewer is not None or os.getenv(
+            "DASHSCOPE_ASR_FULL_TURN_AUDIO", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._turn_audio = TurnAudioBuffer(
+            preroll_bytes=self._preroll_limit,
+            max_bytes=int(max(1, min(60, _env_float("DASHSCOPE_ASR_MAX_TURN_SECS", 60))) * 32000),
+        ) if full_turn_enabled else None
+        self._turn_reviewer = turn_reviewer
+        if review_enabled and self._turn_reviewer is None:
+            endpoint = os.getenv("DASHSCOPE_ASR_REVIEW_URL", "").strip() or review_url(settings.ws_url)
+            weak_model = os.getenv("DASHSCOPE_ASR_REVIEW_WEAK_MODEL", "").strip() or None
+            weak_endpoint = (os.getenv("DASHSCOPE_ASR_REVIEW_WEAK_URL", "").strip()
+                or review_url(settings.ws_url, api_format="dashscope_flash")) if weak_model else None
+            self._turn_reviewer = WholeTurnASRReviewer(
+                api_key=api_key, url=endpoint, language=settings.asr_language or "zh",
+                weak_model=weak_model, weak_url=weak_endpoint,
+                weak_peak_dbfs=_env_float("DASHSCOPE_ASR_REVIEW_WEAK_PEAK_DBFS", -24.),
+                canonical_weak_audio=self._review_canonical_weak,
+                timeout=_env_float("DASHSCOPE_ASR_REVIEW_TIMEOUT_SECS", 5),
+            )
         self._energy_onset_secs = _env_float(
             "DASHSCOPE_ASR_ENERGY_ONSET_SECS", DEFAULT_ENERGY_ONSET_SECS
         )
@@ -700,6 +754,10 @@ class DashScopeSTTService(STTService):
             yield None
             return
         signal, speaking = await self._note_audio(audio)
+        if self._turn_audio is not None:
+            if speaking:
+                self._begin_audio_turn(notify=False)
+            self._turn_audio.append(audio)
         if self._cloud_vad_enabled:
             # 云端 VAD 模式：静音一律不外送。
             #
@@ -714,7 +772,14 @@ class DashScopeSTTService(STTService):
             keep = speaking
         else:
             keep = signal or self._recent_signal()
+        if self._turn_audio is not None and self._turn_audio.preserve:
+            # Once onset opens a turn, preserve every real PCM frame, including
+            # weak words and long intra-sentence pauses, until Smart Turn ends it.
+            keep = True
         if not keep:
+            if self._preroll_limit:
+                self._preroll.extend(audio)
+                del self._preroll[:-self._preroll_limit]
             # 静音：不进云端缓冲，也就不需要任何连接。
             yield None
             return
@@ -727,6 +792,11 @@ class DashScopeSTTService(STTService):
         ws = self._ws
         if ws is not None:
             try:
+                # Flush the exact preceding PCM once; do not repeat the current
+                # frame or discard quiet syllable onsets during cloud reconnect.
+                if self._preroll:
+                    audio = bytes(self._preroll) + audio
+                    self._preroll.clear()
                 await ws.send(
                     json.dumps(
                         {
@@ -763,6 +833,9 @@ class DashScopeSTTService(STTService):
         frame_secs = len(audio) / 2 / 16000.0
         rms = _pcm16_rms(audio)
         if rms >= self._signal_rms:
+            # Fence synchronously, before any energy-onset/network await can
+            # let an endpoint task seal a stale prefix. Quiet tail is retained.
+            self._invalidate_early_review("audio-resumed")
             self._last_signal_at = now
         loud = rms >= self._energy_rms
         if loud:
@@ -794,7 +867,8 @@ class DashScopeSTTService(STTService):
                     timeline_mark("stt", "能量判定收口")
                     # 与 VAD 停止帧同一条收尾路径：谁先到谁收尾，`_speech_since_commit`
                     # 门闩保证一次语音只收尾一次。
-                    await self._finish_segment("energy-stop")
+                    if self._turn_audio is None or not self._turn_audio.preserve:
+                        await self._finish_segment("energy-stop")
         return rms >= self._signal_rms, loud or self._energy_speech
 
     async def _note_vad_missing(self) -> None:
@@ -876,6 +950,16 @@ class DashScopeSTTService(STTService):
         Manual 模式下服务端不会自行断句，因此 commit 是产生 final 转录的唯一
         触发点。
         """
+        # Snapshot at the actual boundary, before yielding to other tasks. A VAD
+        # pause, cloud final, or interruption is NOT a full-turn boundary.
+        if self._turn_audio is not None:
+            if isinstance(frame, VADUserStartedSpeakingFrame):
+                self._invalidate_early_review("vad-resumed")
+                self._begin_audio_turn()
+            elif isinstance(frame, VADUserStoppedSpeakingFrame):
+                self._start_early_review()
+            elif isinstance(frame, UserStoppedSpeakingFrame) and not self.review_answers_enabled:
+                self._finish_audio_turn()
         await super().process_frame(frame, direction)
         now = time.monotonic()
         # 机器人是否正在出声/正在作答：背声词门闩的判据（见 _is_backchannel_filler）。
@@ -921,6 +1005,115 @@ class DashScopeSTTService(STTService):
             if not self._commit_on_vad_stop:
                 timeline_mark("stt", "收到回合结束帧")
                 await self._finish_segment("turn-stopped")
+
+    @property
+    def current_audio_turn(self) -> int | None:
+        return self._turn_audio.current_sequence if self._turn_audio else None
+
+    def _begin_audio_turn(self, *, notify: bool = True) -> None:
+        if self._turn_audio is None:
+            return
+        if not self._turn_audio.active:
+            self._turn_audio.begin()
+        # A single loud frame opens retention, but must not cancel an answer.
+        # Confirmed VAD onset (or the original final-only strategy) owns that.
+        if notify and self.current_audio_turn != self._notified_audio_turn and self.audio_turn_started is not None:
+            self._notified_audio_turn = self.current_audio_turn
+            self.audio_turn_started(self.current_audio_turn)
+
+    def seal_audio_turn(self) -> tuple[int, asyncio.Future | None] | None:
+        self._finish_audio_turn()
+        sequence = self._last_closed_audio_turn
+        return (sequence, self._review_handles.get(sequence)) if sequence is not None else None
+
+    def _invalidate_early_review(self, reason: str) -> None:
+        delay, self._early_review_delay = self._early_review_delay, None
+        candidate, self._early_review = self._early_review, None
+        if candidate is None and delay is None:
+            return
+        sequence = candidate[0].sequence if candidate else self.current_audio_turn
+        revision = candidate[0].revision if candidate else self._review_revision
+        self._review_revision += 1
+        self.review_events.append({"event": "invalidated", "sequence": sequence,
+            "revision": revision, "reason": reason})
+        if delay is not None:
+            delay.cancel()
+        if candidate and not candidate[1].done():
+            candidate[1].cancel()
+
+    def _start_early_review(self) -> None:
+        if not self.review_on_vad_stop or self._turn_reviewer is None or self._early_review is not None or self._early_review_delay is not None:
+            return
+        recording = self._turn_audio.snapshot(revision=self._review_revision)
+        if recording is None or recording.overflow or not recording.pcm:
+            return
+        if self.review_grace_secs:
+            deadline = time.monotonic() + self.review_grace_secs
+            async def prepare():
+                try:
+                    weak = True
+                    if self._review_canonical_weak:
+                        peak = await asyncio.to_thread(pcm_peak_dbfs, recording.pcm)
+                        weak = peak is not None and peak < getattr(self._turn_reviewer, "weak_peak_dbfs", -24.)
+                    if weak:
+                        await asyncio.sleep(max(0., deadline - time.monotonic()))
+                    if (self._closed or self.current_audio_turn != recording.sequence
+                            or self._review_revision != recording.revision):
+                        return
+                    # Normal speech keeps the EXACT original VAD-stop prefix.
+                    # Only weak speech collects the small real-audio tail.
+                    current = self._turn_audio.snapshot(revision=recording.revision) if weak else recording
+                    if current is not None and not current.overflow:
+                        self._submit_early_review(current)
+                finally:
+                    if self._early_review_delay is asyncio.current_task():
+                        self._early_review_delay = None
+            self._early_review_delay = asyncio.create_task(prepare(), name=f"asr-review-grace-{recording.sequence}")
+            return
+        self._submit_early_review(recording)
+
+    def _submit_early_review(self, recording) -> None:
+        future = self._turn_reviewer.submit(recording)
+        if future is not None:
+            self._early_review = (recording, future)
+            self.review_events.append({"event": "started", "sequence": recording.sequence,
+                "revision": recording.revision, "audioMs": recording.total_bytes / 32})
+
+    def _finish_audio_turn(self) -> None:
+        if self._turn_audio is None:
+            return
+        delay, self._early_review_delay = self._early_review_delay, None
+        if delay is not None:
+            delay.cancel()
+        recording = self._turn_audio.finish(revision=self._review_revision)
+        if recording is None:
+            return
+        self._last_closed_audio_turn = recording.sequence
+        # An overlong turn may have fallen back to energy gating and left a
+        # preroll tail. Never prepend that old turn to the next recording.
+        self._preroll.clear()
+        # The completed turn's energy tail must not re-open its capture buffer.
+        self._energy_speech = False
+        self._energy_speech_secs = self._energy_silence_secs = 0.0
+        if recording is not None and self._turn_reviewer is not None:
+            # No await, no transcription/control frames, and no LLM callback.
+            candidate, self._early_review = self._early_review, None
+            if (candidate is not None and not recording.overflow
+                    and candidate[0].sequence == recording.sequence
+                    and candidate[0].revision == self._review_revision
+                    and not candidate[1].cancelled()):
+                prefix, future = candidate
+                self.review_events.append({"event": "reused", "sequence": recording.sequence,
+                    "revision": prefix.revision, "audioMs": prefix.total_bytes / 32,
+                    "fullAudioMs": recording.total_bytes / 32, "ready": future.done()})
+            else:
+                if candidate is not None and not candidate[1].done():
+                    candidate[1].cancel()
+                future = self._turn_reviewer.submit(recording)
+            if self.review_answers_enabled and future is not None:
+                self._review_handles[recording.sequence] = future
+                while len(self._review_handles) > 4:
+                    self._review_handles.popitem(last=False)
 
     def _mark_pending_commits_superseded(self) -> None:
         for commit in self._pending_commits:
@@ -1219,6 +1412,14 @@ class DashScopeSTTService(STTService):
                 self._last_upstream_event_at = time.monotonic()
                 payload = self._parse(raw)
                 etype = str(payload.get("type") or "")
+                if self.review_answers_enabled and etype in (
+                    "input_audio_buffer.speech_started", "conversation.item.input_audio_transcription.text"
+                ):
+                    identity = str(payload.get("item_id") or "")
+                    if identity and identity not in self._review_item_turns:
+                        self._review_item_turns[identity] = self.current_audio_turn
+                        while len(self._review_item_turns) > 512:
+                            self._review_item_turns.popitem(last=False)
                 if self._raw_event_logging:
                     logger.info("[DashScopeRaw] %s", json.dumps(payload, ensure_ascii=False, default=str))
                 if etype not in seen_types:
@@ -1324,6 +1525,11 @@ class DashScopeSTTService(STTService):
         item_id = str(payload.get("item_id") or "").strip()
         event_id = str(payload.get("event_id") or "").strip()
         final_identity = item_id or event_id
+        review_sequence = self._review_item_turns.get(item_id) if self.review_answers_enabled else None
+        review_stale = self.review_answers_enabled and (
+            review_sequence is None or review_sequence != self.current_audio_turn
+        )
+        review_details = ({"review_pending": True, "audio_turn": review_sequence} if self.review_answers_enabled else {})
         if final_identity and final_identity in self._seen_final_items:
             logger.debug("[DashScopeEvt] duplicate final ignored identity=%s", final_identity)
             return
@@ -1380,9 +1586,10 @@ class DashScopeSTTService(STTService):
                         "commit_trigger": "server_vad",
                         "connection_generation": self._connection_generation,
                         "utterance_generation": self._utterance_generation,
-                        "superseded": False,
+                        "superseded": bool(review_stale),
+                        **review_details,
                     },
-                    finalized=True,
+                    finalized=not review_stale,
                 )
             )
             return
@@ -1412,11 +1619,12 @@ class DashScopeSTTService(STTService):
                     "commit_trigger": commit.trigger,
                     "connection_generation": commit.connection_generation,
                     "utterance_generation": commit.utterance_generation,
-                    "superseded": commit.superseded,
+                    "superseded": commit.superseded or bool(review_stale),
+                    **review_details,
                 },
                 # A superseded final belongs to an earlier pause in the same
                 # turn: keep its text, but do not let it trigger end-of-turn.
-                finalized=not commit.superseded,
+                finalized=not (commit.superseded or review_stale),
             )
         )
 
@@ -1439,6 +1647,14 @@ class DashScopeSTTService(STTService):
         # 而一场正在进行的重连可以在这个窗口里建出一条新的连接——它随后既不在
         # ``_ws`` 里、也没人能关掉它（孤儿会话，靠 20s 一次的 ping 一直活着）。
         self._closed = True
+        review_delay = self._early_review_delay
+        self._invalidate_early_review("cleanup")
+        if self._turn_audio is not None:
+            self._turn_audio.clear()
+        if review_delay is not None:
+            await asyncio.gather(review_delay, return_exceptions=True)
+        if self._turn_reviewer is not None:
+            await self._turn_reviewer.close()
         self._connection_generation += 1
         self._pending_commits.clear()
         idle_task, self._idle_task = self._idle_task, None

@@ -419,11 +419,13 @@ def voice_memory_llm_service_class() -> Any:
         supports_developer_role = False
 
         def __init__(
-            self, *, memory_bridge: VoiceMemoryBridge | None = None, **kwargs: Any
+            self, *, memory_bridge: VoiceMemoryBridge | None = None, task_session_id: str = '', **kwargs: Any
         ) -> None:
             super().__init__(**kwargs)
             self._memory_bridge = memory_bridge
             self._pending_memory: VoiceMemoryRecall | None = None
+            self._task_session_id = task_session_id
+            self._pending_tasks = ''
 
         @property
         def memory_bridge(self) -> VoiceMemoryBridge | None:
@@ -443,16 +445,28 @@ def voice_memory_llm_service_class() -> Any:
                     logger.warning("voice memory injection skipped", exc_info=True)
                     recall = None
             self._pending_memory = recall
+            if self._task_session_id:
+                try:
+                    from app.voice.task_context import load_task_context
+                    getter = getattr(context, "get_messages", None)
+                    task_messages = getter() if callable(getter) else []
+                    query = last_user_text(task_messages) if answers_the_user_turn(task_messages) else ''
+                    self._pending_tasks = await asyncio.wait_for(asyncio.to_thread(load_task_context, self._task_session_id, query), timeout=1.0)
+                except Exception:
+                    self._pending_tasks = ''
             try:
                 return await super().get_chat_completions(context)
             finally:
                 self._pending_memory = None
+                self._pending_tasks = ''
 
         def build_chat_completion_params(self, params_from_context: Any) -> dict:
             params = super().build_chat_completion_params(params_from_context)
             recall = self._pending_memory
             if recall is not None:
                 _install_memory_injection(params, recall)
+            if self._pending_tasks:
+                params['messages'] = [*params.get('messages', []), {'role':'system', 'content':self._pending_tasks}]
             return params
 
     _LLM_SERVICE_CLASS = VoiceMemoryLLMService

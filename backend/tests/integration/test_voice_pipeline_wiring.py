@@ -68,6 +68,7 @@ def test_pipeline_topology_places_taps_where_the_design_requires():
     latency = Stub("latency")
     transport_output = Stub("transport_output")
     assistant_aggregator = Stub("assistant_aggregator")
+    response_feedback = Stub("response_feedback")
 
     steps = build_pipeline_steps(
         transport_input=transport_input,
@@ -80,6 +81,7 @@ def test_pipeline_topology_places_taps_where_the_design_requires():
         latency=latency,
         transport_output=transport_output,
         assistant_aggregator=assistant_aggregator,
+        response_feedback=response_feedback,
     )
     labels = [step.label for step in steps]
     assert labels == [
@@ -88,6 +90,7 @@ def test_pipeline_topology_places_taps_where_the_design_requires():
         "user_journal",
         "user_aggregator",
         "bridge",
+        "response_feedback",
         "assistant_journal",
         "tts",
         "latency",
@@ -109,7 +112,7 @@ def test_pipeline_topology_places_taps_where_the_design_requires():
 
     # The retry hook pushes LLMRunFrame UPSTREAM from the assistant tap; the
     # bridge must be its upstream neighbour for that frame to reach the LLM.
-    assert assistant_journal._prev is bridge, (
+    assert assistant_journal._prev is response_feedback and response_feedback._prev is bridge, (
         "LLMRunFrame 反向回送的目标不是总线桥，LLM 重试将无法到达模型"
     )
     assert assistant_journal._next is tts

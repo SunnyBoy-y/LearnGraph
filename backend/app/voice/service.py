@@ -47,6 +47,7 @@ from .schemas import (
     VoiceTaskView,
 )
 from .schemas import VoiceResultDeliveryView, VoiceResultView
+from .scene import SceneReceipt, project_scene
 from .turns import (
     accept_turn as accept_voice_turn,
     close_voice_session,
@@ -194,6 +195,7 @@ class VoiceSessionService:
         return session
 
     def _to_schema(self, row: VoiceSessionRecord) -> VoiceSession:
+        from app.voice.scene import current_scene_presentation
         links = self.db.scalars(
             select(VoiceTaskLinkRecord).where(
                 VoiceTaskLinkRecord.voice_session_id == row.id,
@@ -213,6 +215,14 @@ class VoiceSessionService:
                 .limit(50)
             ).all()
         )
+        presentation = current_scene_presentation(self.db, row)
+        if presentation and not any(
+            result.id == presentation.get("result_id") and result.result_version == presentation.get("result_version")
+            and result.status not in {"stale", "dismissed"} and any(
+                link.subagent_id == result.subagent_id and link.requirement_version == result.requirement_version for link in links)
+            for result in results
+        ):
+            presentation = None
         return VoiceSession(
             id=row.id, session_id=row.id, chat_session_id=row.chat_session_id,
             workspace_id=row.workspace_id, owner_user_id=row.owner_user_id,
@@ -223,6 +233,7 @@ class VoiceSessionService:
             model_id=row.model_id, provider_id=row.provider_id,
             runtime_ready=row.runtime_ready, signaling_url=row.signaling_url,
             context_snapshot=row.context_snapshot or {},
+            scene_presentation=presentation,
             tasks=[
                 VoiceTaskLink(
                     link_id=x.id,
@@ -604,9 +615,14 @@ class VoiceSessionService:
             link_id=link.id,
             voice_session_id=link.voice_session_id,
             subagent_id=link.subagent_id,
-            status=str(snapshot.get("status") or link.status or "queued"),
+            status=("cancel_requested" if snapshot.get("status_reason") == "cancel_requested"
+                    and str(snapshot.get("status") or "").casefold() in {"queued", "running", "starting", "paused"}
+                    else "pausing" if snapshot.get("status_reason") == "pause_requested"
+                    and str(snapshot.get("status") or "").casefold() in {"queued", "running", "starting"}
+                    else str(snapshot.get("status") or link.status or "queued")),
             thinking_mode=link.thinking_mode,
             title=str(snapshot.get("title") or link.title or ""),
+            auto_delivery=bool(link.auto_delivery),
             prompt=str(snapshot.get("prompt") or link.current_prompt or link.original_prompt or ""),
             capability_id=(
                 str(snapshot.get("capability_id") or "")
@@ -907,6 +923,45 @@ class VoiceSessionService:
             voice_session_id=voice_session_id, result_id=result_id
         )
         return self._result_view(result)
+
+    def acknowledge_scene(self, voice_session_id: str, result_id: str, receipt: SceneReceipt) -> dict[str, Any]:
+        session = self.get_session(voice_session_id, write=True)
+        result = self._coordinator().get_result(voice_session_id, result_id)
+        link = self._coordinator().required_link(voice_session_id, result.subagent_id)
+        if (receipt.session_epoch != session.session_epoch
+                or receipt.requirement_version != result.requirement_version
+                or receipt.result_version != result.result_version
+                or result.requirement_version < int(link.requirement_version or 1)
+                or result.status in {"stale", "dismissed"}):
+            raise AppError(409, "voice_scene_stale", "Scene receipt belongs to an obsolete version")
+        payload = dict(result.payload_json or {})
+        allowed = project_scene(payload, result.summary or "")["anchors"]
+        if any(anchor not in allowed for anchor in receipt.anchors):
+            raise AppError(422, "voice_scene_anchor_unknown", "Scene anchor does not exist")
+        payload["_scene_receipt"] = {
+            **receipt.model_dump(), "at": datetime.now(timezone.utc).isoformat(),
+        }
+        result.payload_json = payload
+        self.db.commit()
+        return {"result_id": result.id, "status": receipt.status}
+
+    def set_task_delivery(self, voice_session_id: str, task_id: str, auto_delivery: bool) -> VoiceTaskView:
+        self.get_session(voice_session_id, write=True)
+        link = self._coordinator().required_link(voice_session_id, task_id)
+        link.auto_delivery = auto_delivery
+        self.db.commit()
+        return self._task_view(link)
+
+    def control_task_execution(self, voice_session_id: str, task_id: str, operation: str) -> VoiceTaskView:
+        self.get_session(voice_session_id, write=True)
+        from .task_control import control_task
+        coordinator = self._coordinator()
+        link = coordinator.required_link(voice_session_id, task_id)
+        capability = resolve_voice_capability(link.capability_id) if link.capability_id else None
+        self.context.require_permission(capability.required_permission if capability else "workspace.manage")
+        snapshot = control_task(coordinator, voice_session_id=voice_session_id,
+                                task_id=task_id, operation=operation, actor_id=self.context.principal.user_id)
+        return self._task_view(link, snapshot)
 
     def interrupt(self, voice_session_id: str) -> VoiceSession:
         """Interrupt the current speech only; background tasks are untouched."""

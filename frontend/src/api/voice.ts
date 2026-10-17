@@ -65,6 +65,21 @@ export function deliverVoiceResult(
   );
 }
 
+export function acknowledgeVoiceScene(voiceSessionId: string, resultId: string, receipt: {
+  requirement_version: number; result_version: number; session_epoch: number;
+  status: "rendered" | "failed"; anchors: string[];
+}) {
+  return apiClient.post(`/voice/sessions/${encodeURIComponent(voiceSessionId)}/results/${encodeURIComponent(resultId)}/scene`, receipt);
+}
+
+export function setVoiceTaskDelivery(voiceSessionId: string, taskId: string, autoDelivery: boolean): Promise<VoiceTaskWire> {
+  return apiClient.post(`/voice/sessions/${encodeURIComponent(voiceSessionId)}/tasks/${encodeURIComponent(taskId)}/delivery`, { auto_delivery: autoDelivery });
+}
+
+export function controlVoiceTaskExecution(voiceSessionId: string, taskId: string, operation: "pause" | "resume"): Promise<VoiceTaskWire> {
+  return apiClient.post(`/voice/sessions/${encodeURIComponent(voiceSessionId)}/tasks/${encodeURIComponent(taskId)}/execution/${operation}`, {});
+}
+
 export interface VoiceCapabilityWire {
   id: string;
   description: string;

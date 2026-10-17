@@ -289,6 +289,7 @@ class VolcengineTTSService(TTSService):
         # 单点计时用：本 turn 是否已发过第一个 TaskRequest。
         self._first_task_sent = False
         self._audio_cursor_ms = 0
+        self._caption_turn_id: str | None = None
         # 句子合成按序串联：后一句等前一句收完音频再开自己的 session。任务放在
         # 后台（不阻塞 process_frame），否则打断帧会被"正在合成的那一句"挡住。
         self._session_chain: asyncio.Task | None = None
@@ -591,6 +592,9 @@ class VolcengineTTSService(TTSService):
         # 这一步（以及它的合成任务）就会发现自己是旧句子并放弃，不再领新回合的序号。
         epoch = self._caption_epoch
         turn_id = self._journal.current_turn_id() if self._journal else None
+        if turn_id and turn_id != self._caption_turn_id:
+            self._begin_turn_captions()
+            self._caption_turn_id = turn_id
         self._context_turns.setdefault(context_id, turn_id)
 
         async def _run_after_previous() -> None:
@@ -628,7 +632,7 @@ class VolcengineTTSService(TTSService):
         self._session_chain.add_done_callback(self._sentence_tasks.discard)
 
     async def _close_turn_context(
-        self, context_id: str | None, chain: asyncio.Task | None
+        self, context_id: str | None, chain: asyncio.Task | None, *, turn_final: bool = True
     ) -> None:
         """After the last sentence drains: close the context and reset the cursor.
 
@@ -643,10 +647,14 @@ class VolcengineTTSService(TTSService):
                 kind="turn-end", token=f"end:{context_id}", context_id=context_id,
                 turn_id=self._context_turns.get(context_id),
                 generation_id=self._current_generation(),
+                turn_final=turn_final,
             ))
             await self.remove_audio_context(context_id)
             timeline_mark("tts", "audio context 已收尾（文本结束）")
-        self._begin_turn_captions()
+        # Several model/tool rounds may belong to the same durable user turn.
+        # Keep its audio cursor after the acknowledgement context drains.
+        if self._journal is None:
+            self._begin_turn_captions()
 
     def _begin_turn_captions(self) -> None:
         """Reset the per-turn caption cursor.
@@ -660,6 +668,7 @@ class VolcengineTTSService(TTSService):
         """
         self._audio_cursor_ms = 0
         self._first_task_sent = False
+        self._caption_turn_id = None
 
     async def flush_audio(self, context_id: str | None = None) -> None:
         """文本结束（基类在 LLMFullResponseEndFrame 后调用）：收尾本 turn 的 context。
@@ -678,7 +687,9 @@ class VolcengineTTSService(TTSService):
         # Hand off: the remaining sentence still has to drain before the context can
         # be closed, and blocking the frame loop here would delay a barge-in that
         # arrives while the last sentence is still being synthesised.
-        self.create_task(self._close_turn_context(target, chain))
+        busy = getattr(self._journal, "foreground_busy", None)
+        turn_final = not (busy() if callable(busy) else False)
+        self.create_task(self._close_turn_context(target, chain, turn_final=turn_final))
 
     async def _ensure_upstream(self) -> bool:
         """Reuse the live TTS websocket, or rebuild it with bounded backoff.

@@ -151,6 +151,8 @@ class _TurnState:
     playback_anchor_at: float | None = None
     audio_cursor_ms: int = 0
     llm_closed: bool = False
+    foreground_busy: bool = False
+    foreground_status: str = "idle"
     finalized: bool = False
     retry_attempt: int = 0
 
@@ -287,6 +289,12 @@ class VoiceTurnJournal:
         state = self._turn
         if state is None or state.finalized:
             return
+        diagnostic = getattr(self, "_pipeline_diagnostic", None)
+        if diagnostic is not None:
+            try:
+                logger.warning("voice idle pipeline state %s", diagnostic())
+            except Exception:
+                logger.debug("voice pipeline diagnostic unavailable", exc_info=True)
         if state.playback_active:
             # Audio is still being played, so the turn IS making progress even
             # though no event has been emitted for a while -- a single sentence
@@ -407,6 +415,8 @@ class VoiceTurnJournal:
     async def user_interim(self, text: str) -> None:
         if not str(text or "").strip():
             return
+        if self._turn and not self._turn.assistant_text and not self._turn.playback_observed:
+            self._touch_turn()
         await self._playback_event(
             "user.interim",
             payload={"text": text},
@@ -421,11 +431,14 @@ class VoiceTurnJournal:
         *,
         client_message_id: str | None = None,
         source_id: str | None = None,
+        new_turn: bool = False,
     ) -> None:
         """A finalized ASR segment: merge into the open turn, never duplicate.
 
         Consecutive finals inside one turn are concatenated (the user paused
         mid-sentence); a final after the turn was finalized opens a new turn.
+        ``new_turn`` is reserved for an already complete reviewed audio turn:
+        it cannot be concatenated to an earlier unanswered question.
         """
         segment = str(text or "").strip()
         if not segment:
@@ -438,7 +451,7 @@ class VoiceTurnJournal:
                     return
                 if identity:
                     self._turn.seen_user_final_ids.add(identity)
-                if (
+                if (not new_turn and
                     not self._turn.assistant_text
                     and not self._turn.sentence_seq
                     and not self._turn.playback_observed
@@ -449,6 +462,7 @@ class VoiceTurnJournal:
                     # The recall started for the first segment; restart it for the
                     # longer utterance so the query is the whole question.
                     self._note_user_text(state.user_text)
+                    self._touch_turn()
                     await self._emit(
                         "user.final",
                         payload={
@@ -509,6 +523,7 @@ class VoiceTurnJournal:
                 if identity:
                     state.seen_user_final_ids.add(identity)
                 state.user_text = (state.user_text + (" " if state.user_text[-1:].isascii() and state.user_text[-1:].isalnum() and segment[:1].isascii() and segment[:1].isalnum() else "") + segment)
+                self._touch_turn()
                 await self._emit(
                     "user.final",
                     payload={
@@ -779,6 +794,25 @@ class VoiceTurnJournal:
         if state is None or state.finalized:
             return None
         return state.turn_id
+
+    async def assistant_activity(self, status: str, *, turn_id: str | None) -> None:
+        """Publish execution state, never reasoning content or speculative text."""
+        async with self._lock:
+            state = self._turn
+            if state is None or state.finalized or state.turn_id != turn_id:
+                return
+            if state.foreground_status == status:
+                return
+            state.foreground_status = status
+            state.foreground_busy = status != "idle"
+            if state.foreground_busy:
+                state.llm_closed = False
+                self._touch_turn()
+            await self._emit("assistant.activity", turn_id=turn_id,
+                             payload={"state": status}, phase="authoritative")
+
+    def foreground_busy(self) -> bool:
+        return bool(self._turn and not self._turn.finalized and self._turn.foreground_busy)
 
     async def sentence_queued(
         self,
@@ -1087,6 +1121,10 @@ class VoiceTurnJournal:
         return state.sentence_seq
 
     async def playback_ended(self, *, turn_final: bool = True) -> None:
+        # A brief acknowledgement can finish while inference/tool dispatch is
+        # still running. Its audio ending must not finalize the user's answer.
+        if self._turn is not None and self._turn.foreground_busy:
+            turn_final = False
         if not turn_final:
             if self._turn is not None:
                 self._turn.playback_active = False
@@ -1135,6 +1173,8 @@ class VoiceTurnJournal:
         if self._turn is None or self._turn.finalized:
             return
         if not self._turn.llm_closed:
+            return
+        if self._turn.foreground_busy:
             return
         if self._turn.playback_observed:
             # Playback was observed, so TTS is demonstrably alive and this timer
@@ -1723,6 +1763,10 @@ class VoiceJournalProcessor(FrameProcessor):
             await self._journal.user_interim(frame.text)
         elif isinstance(frame, TranscriptionFrame):
             result = getattr(frame, "result", None)
+            if isinstance(result, dict) and result.get("review_pending"):
+                if not result.get("superseded"):
+                    await self._journal.user_interim(frame.text)
+                return
             source_id = ""
             if isinstance(result, dict):
                 source_id = str(
@@ -1770,7 +1814,8 @@ class VoiceJournalProcessor(FrameProcessor):
             # Downstream only: the upstream copy is the echo of a spoken frame.
             # Generated text stays process-local until playback authorizes it.
             if direction == FrameDirection.DOWNSTREAM:
-                self._journal.note_assistant_text(frame.text)
+                if not frame.metadata.get("voice_acknowledgement"):
+                    self._journal.note_assistant_text(frame.text)
             return
         if isinstance(frame, LLMFullResponseEndFrame):
             self._journal.llm_closed()

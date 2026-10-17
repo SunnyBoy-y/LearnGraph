@@ -203,6 +203,31 @@ def _build_service(
     return service
 
 
+def test_acknowledgement_and_answer_contexts_share_one_turn_audio_cursor():
+    async def run():
+        journal = _FakeJournal(turn_id="turn-a")
+        service = _build_service(journal=journal)
+        service._audio_cursor_ms = 500
+        service._caption_turn_id = "turn-a"
+        await service._close_turn_context(None, None)
+        assert service._audio_cursor_ms == 500
+        starts = []
+        async def synthesize(text, context_id, **kwargs):
+            starts.append(service._audio_cursor_ms)
+            service._audio_cursor_ms += 100
+        service._synthesize_sentence = synthesize
+        service.create_task = asyncio.create_task
+        service._enqueue_sentence("答案。", "answer-context")
+        await service._session_chain
+        assert starts == [500]
+        journal.turn_id = "turn-b"
+        service._enqueue_sentence("下一轮。", "next-context")
+        await service._session_chain
+        assert starts == [500, 0]
+        await service.cleanup()
+    asyncio.run(run())
+
+
 def _stub_upstream(service: VolcengineTTSService) -> None:
     """桩掉真实 websocket 的三个动作，但在 StartSession 时把假连接绑到该 session。"""
 
@@ -324,6 +349,7 @@ def test_ledger_frame_fields_are_exactly_the_frozen_set():
         "audio_cursor_ms",
         "audio_end_cursor_ms",
         "generation_id",
+        "turn_final",
     }
     # 必须是普通数据帧：SystemFrame 会被输出传输直接下发、绕过媒体队列，"到点"保证就没了。
     assert not issubclass(VoiceLedgerFrame, SystemFrame)

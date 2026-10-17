@@ -9,6 +9,7 @@ import {
 import { apiClient, ApiError } from "@/api/client";
 import { createUuid } from "@/lib/uuid";
 import { loadIceServers } from "./voice-ice";
+import { voiceSceneExplanation } from "./voice-scene-explanation";
 import {
   cancelVoiceTask as requestVoiceTaskCancel,
   approveVoiceTask as requestVoiceTaskApproval,
@@ -18,6 +19,9 @@ import {
   getVoiceSession as requestVoiceSession,
   getVoiceTask as requestVoiceTask,
   startVoiceTask as requestVoiceTaskStart,
+  acknowledgeVoiceScene,
+  setVoiceTaskDelivery,
+  controlVoiceTaskExecution,
   type VoiceCapabilityWire,
 } from "@/api/voice";
 import { clearVoiceSessionResumable, markVoiceSessionResumable, setVoiceSessionActive } from "./voice-session-markers";
@@ -40,6 +44,7 @@ import {
   mergeVoiceTaskPatches,
   mergeVoiceTaskSnapshots,
   mergeVoiceTaskResults,
+  mergeVoiceScenePresentation,
   reduceVoiceTaskEvent,
   voiceTaskIsActive,
   type VoiceTask,
@@ -55,6 +60,9 @@ import {
 import { markVoiceLatency, resetVoiceLatency } from "./voice-latency-store";
 import { VoicePlaybackTranscript } from "./voice-playback";
 import { VoiceUserTranscript } from "./voice-user-transcript";
+import { createVoiceNoiseInput, type VoiceNoiseInput } from "./rnnoise/input";
+import { resetVoiceNoiseStatus, setVoiceNoiseStatus } from "./voice-noise-store";
+import { fastBargeInEnabled, VoiceBargeIn } from './voice-barge-in';
 
 export type VoiceTransportState = "idle" | "connecting" | "connected" | "reconnecting" | "error";
 export type VoiceSessionState = "closed" | "ready" | "listening" | "thinking" | "speaking" | "error";
@@ -157,6 +165,8 @@ export interface VoiceRealtimeDeliveryStats {
 }
 export interface VoiceSessionSnapshot {
   workspaceId: string; sessionId: string; transport: VoiceTransportState; state: VoiceSessionState;
+  foregroundActivity: "idle" | "thinking" | "delegating";
+  activityTurnId: string | null;
   thinkingLimit: ThinkingLimit; transcript: VoiceTranscript[]; tasks: VoiceTask[]; error: string | null;
   modelId: string | null; providerId: string | null;
   sessionIdRemote: string | null;
@@ -290,13 +300,15 @@ const defaultRealtimeDelivery: VoiceRealtimeDeliveryStats = {
   lastDropReason: null,
   lastDropAt: null,
 };
-const defaultSnapshot: VoiceSessionSnapshot = { workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, realtimeDelivery: defaultRealtimeDelivery, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, pipelineNotice: null, textFallback: false, icePath: null, playbackBlocked: false, agentCapabilities: [], capabilitiesLoaded: false, capabilitiesError: null, voiceProviderReady: null, voiceProviderReason: null, busyTaskIds: [] };
+const defaultSnapshot: VoiceSessionSnapshot = { foregroundActivity: "idle", activityTurnId: null, workspaceId: "", sessionId: "", transport: "idle", state: "closed", thinkingLimit: "high", transcript: [], tasks: [], error: null, modelId: null, providerId: null, sessionIdRemote: null, signalingUrl: null, muted: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle", lastEventSeq: 0, sessionEpoch: 0, realtimeDelivery: defaultRealtimeDelivery, effectiveModelId: null, modelPin: null, degradedStages: [], degradedNotice: null, pipelineNotice: null, textFallback: false, icePath: null, playbackBlocked: false, agentCapabilities: [], capabilitiesLoaded: false, capabilitiesError: null, voiceProviderReady: null, voiceProviderReason: null, busyTaskIds: [] };
 let snapshot: VoiceSessionSnapshot = { ...defaultSnapshot };
 const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
 let abortController: AbortController | null = null;
 let peerConnection: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
+let localNoiseInput: VoiceNoiseInput | null = null;
+let rawMicrophoneStream: MediaStream | null = null;
 let dataChannel: RTCDataChannel | null = null;
 // Every async continuation belongs to one connection, not the mutable singleton.
 let connectionGeneration = 0;
@@ -468,6 +480,7 @@ let lastPlaybackCaptionTurnId: string | null = null;
  */
 let transcriptState: TranscriptState = emptyTranscriptState();
 let taskState: VoiceTaskState = emptyVoiceTaskState();
+const sceneReceipts = new Map<string, Promise<unknown>>();
 let taskPollTimer: number | null = null;
 let taskPollDelayMs = 2000;
 const cancellingTaskIds = new Set<string>();
@@ -480,6 +493,8 @@ let eventPollDelayMs = 1500;
 let remoteAudio: HTMLAudioElement | null = null;
 /** Mirrors `snapshot.playbackBlocked` so the `ontrack` closure can compare. */
 let remoteAudioBlocked = false;
+let localBargeIn: VoiceBargeIn | null = null;
+let localBargeTimer: number | null = null;
 /** Idempotency guard: DELETE runs at most once per remote session. */
 let closedRemoteSession: string | null = null;
 /** Pending typed bubbles awaiting their `turn.accepted` echo. */
@@ -574,6 +589,7 @@ function applyTaskEvent(raw: Record<string, unknown>, fallbackTaskId?: string): 
 }
 
 function resetTranscriptState() {
+  finishedActivityTurns.clear();
   transcriptState = emptyTranscriptState();
   seenEventIds.clear();
   renderedLiveEventIds.clear();
@@ -822,13 +838,17 @@ async function recoverVoiceSessionState(): Promise<void> {
     );
     syncTaskState();
   }
+  if (sessionResult && "scene_presentation" in sessionResult) {
+    taskState = mergeVoiceScenePresentation(taskState, sessionResult.scene_presentation);
+    syncTaskState();
+  }
 }
 
 async function pollVoiceTasks(): Promise<boolean> {
   const current = captureVoiceOwner();
   const remote = snapshot.sessionIdRemote;
   if (!remote) return false;
-  const activeTasks = taskState.tasks.filter(voiceTaskIsActive);
+  const activeTasks = taskState.tasks.filter((task) => voiceTaskIsActive(task) || task.status === "paused");
   if (!activeTasks.length) return true;
   const results = await Promise.all(
     activeTasks.map(async (task) => {
@@ -1013,8 +1033,19 @@ function isVoiceTaskEventType(type: string): boolean {
     type.startsWith("task.") ||
     type.startsWith("result.") ||
     type.startsWith("speech.") ||
+    type.startsWith("artifact.") ||
+    type.startsWith("scene.") ||
     type.startsWith("requirement.")
   );
+}
+
+const finishedActivityTurns = new Set<string>();
+function finishForegroundActivity(turnId?: string | null) {
+  if (turnId) {
+    finishedActivityTurns.add(turnId);
+    if (finishedActivityTurns.size > 256) finishedActivityTurns.delete(finishedActivityTurns.values().next().value!);
+  }
+  if (!turnId || snapshot.activityTurnId === turnId) update({ foregroundActivity: "idle", activityTurnId: null });
 }
 
 function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
@@ -1022,6 +1053,15 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
   const type = event.type || event.phase;
   const turnId = event.turn_id || String(payload.turn_id ?? payload.turnId ?? "") || undefined;
   const text = String(payload.text ?? payload.content ?? payload.delta ?? "");
+  const endingPresentation = type === "user.started" || type === "session.closed" || (type === "session.reconnecting" && snapshot.transport !== "connected")
+    || ((type === "turn.finalized" || type === "turn.interrupted") && payload.role !== "user");
+  if (endingPresentation) {
+    taskState = { ...taskState, tasks: taskState.tasks.map(task => {
+      if (!task.focusId || (!["user.started", "session.closed", "session.reconnecting"].includes(type) && task.focusTurnId && task.focusTurnId !== turnId)) return task;
+      return { ...task, focusId: undefined, focusAnchor: undefined, focusTurnId: undefined };
+    }) };
+    syncTaskState();
+  }
   // Single ordering authority: every durable event is folded into the pure
   // reducer, which decides identity and monotonicity from server ids.
   if (!live) applyDurableEvent({
@@ -1063,6 +1103,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
     noteRealtimeDelivery(type, "replayed", turnId);
   }
   if (isVoiceTaskEventType(type)) {
+    if (type === "scene.focus" && turnId && finishedActivityTurns.has(turnId)) return;
     const previousTaskId = String(payload.previous_task_id ?? payload.previousTaskId ?? "");
     const currentTaskId = String(payload.task_id ?? payload.taskId ?? payload.subagent_id ?? payload.subagentId ?? "");
     if (previousTaskId && currentTaskId && previousTaskId !== currentTaskId) {
@@ -1095,6 +1136,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       event_id: event.event_id,
       ...(Number.isFinite(taskEventSeq) ? { event_seq: taskEventSeq } : {}),
       type,
+      ...(type === "scene.focus" ? { turn_id: turnId } : {}),
     });
     return;
   }
@@ -1104,6 +1146,17 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
     turnAudioCursors.set(turnId, event.audio_cursor_ms);
   }
   switch (type) {
+    case "assistant.activity": {
+      const activity = payload.state;
+      if (!turnId || finishedActivityTurns.has(turnId)
+        || !["idle", "thinking", "delegating"].includes(String(activity))) return;
+      const busy = activity !== "idle";
+      update({ foregroundActivity: activity as VoiceSessionSnapshot["foregroundActivity"],
+        activityTurnId: busy ? turnId : null,
+        ...(snapshot.state === "speaking" ? {} : { state: busy ? "thinking" as const : "listening" as const }),
+      });
+      return;
+    }
     case "session.created":
       // 新一通电话：上一通的提示（例如"这个模型关不掉思考"）是旧 Provider 解析的
       // 产物，必须清掉，否则会挂在新通话上误导用户。
@@ -1139,6 +1192,9 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       return;
     }
     case "session.reconnecting":
+      // A replayed disconnect describes the previous peer. The live media
+      // connection and open data channel own current transport readiness.
+      if (peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open") return;
       update({ transport: "reconnecting", error: null });
       return;
     case "session.closed":
@@ -1148,6 +1204,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       update({ pipelineNotice: null });
       return;
     case "user.started":
+      finishForegroundActivity(snapshot.activityTurnId);
       // The journal may still be pointing at the previous turn when speech
       // starts. Never adopt that id for the new utterance.
       activeUserTurnId = createUuid();
@@ -1202,6 +1259,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       return;
     }
     case "turn.accepted": {
+      if (snapshot.activityTurnId && snapshot.activityTurnId !== turnId) finishForegroundActivity(snapshot.activityTurnId);
       markVoiceLatency({ stage: "turnAccepted", source: "ledger", turnId });
       if (turnId) activeUserTurnId = turnId;
       const clientId = String(payload.client_message_id ?? payload.clientMessageId ?? "");
@@ -1227,6 +1285,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       if (String(payload.role ?? "") === "user") {
         renderAuthoritativeUserTurn(turnId || ensureUserTurnId(), text);
       } else {
+        finishForegroundActivity(turnId);
         if (turnId && typeof payload.user_text === "string" && payload.user_text.trim()) {
           renderAuthoritativeUserTurn(turnId, payload.user_text);
         }
@@ -1236,6 +1295,8 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       }
       return;
     case "turn.interrupted":
+      localBargeIn?.confirm(performance.now());
+      finishForegroundActivity(turnId);
       renderPlaybackEvent(event);
       update({ state: "listening" });
       markVoiceLatency({ stage: "answerDone", source: "barge-in", turnId });
@@ -1255,6 +1316,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       markVoiceLatency({ stage: "sentenceEnded", source: "ledger", detail: text, turnId });
       return;
     case "assistant.sentence.playback_started":
+      localBargeIn?.botStarted(performance.now());
       markVoiceLatency({ stage: "botSpeaking", source: "ledger", turnId });
       return;
     case "assistant.sentence.playback_ended":
@@ -1273,6 +1335,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       return;
     }
     case "processor.error": {
+      finishForegroundActivity(snapshot.activityTurnId);
       const stages = deriveDegradedStages(snapshot.degradedStages, payload);
       const textFallback = requiresTextFallback(stages);
       update({
@@ -1432,6 +1495,7 @@ function handleRtviMessage(raw: string) {
       // durable ``user.interim`` event; the final durable event still owns
       // identity and persistence, so this cannot create a second bubble.
       const legacyText = String(observerData.text ?? observerData.transcript ?? "").trim();
+      localBargeIn?.transcription(legacyText,performance.now());
       const isFinal = observerData.final === true || observerData.is_final === true;
       activeUserTurnId = activeUserTurnId || createUuid();
       update({ interimUserText: isFinal ? "" : legacyText });
@@ -1546,6 +1610,11 @@ function isRuntimeOwnerConflict(error: unknown): boolean {
   );
 }
 function cleanupAudioTransport() {
+  localBargeIn?.reset('disconnect'); localBargeIn = null;
+  if(remoteAudio)remoteAudio.muted=false;
+  window.dispatchEvent(new CustomEvent('learngraph:voice-playback-gate',{detail:{muted:false,reason:'disconnect',at:performance.now()}}));
+  if(localBargeTimer!==null)window.clearInterval(localBargeTimer);
+  localBargeTimer=null;
   stopTaskPolling();
   if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
   iceRecoveryTimer = null;
@@ -1570,8 +1639,13 @@ function cleanupAudioTransport() {
     dataChannel.close();
     dataChannel = null;
   }
+  localNoiseInput?.close();
+  localNoiseInput = null;
+  rawMicrophoneStream?.getTracks().forEach((track) => track.stop());
+  rawMicrophoneStream = null;
   localStream?.getTracks().forEach((track) => track.stop());
   localStream = null;
+  resetVoiceNoiseStatus();
   remoteAudioBlocked = false;
   // The remote <audio> element keeps playing if it is not explicitly released.
   if (remoteAudio) {
@@ -1609,6 +1683,7 @@ function closeRemoteSession(remoteId: string | null | undefined) {
 let audioContext: AudioContext | null = null;
 let analyserTimer: number | null = null;
 let userAudioContext: AudioContext | null = null;
+let userAudioContextOwned = false;
 let userAnalyserTimer: number | null = null;
 let lastBotLoudAt = 0;
 let botAudioLevel = 0;
@@ -1645,8 +1720,9 @@ function stopUserAudioLevelMonitor() {
     window.clearInterval(userAnalyserTimer);
     userAnalyserTimer = null;
   }
-  void userAudioContext?.close().catch(() => undefined);
+  if (userAudioContextOwned) void userAudioContext?.close().catch(() => undefined);
   userAudioContext = null;
+  userAudioContextOwned = false;
   userAudioLevel = 0;
   publishAudioLevel();
 }
@@ -1659,10 +1735,11 @@ function stopUserAudioLevelMonitor() {
  * `user.started` 与 RTVI 的 `vad-user-stopped-speaking` / `user-stopped-speaking`。
  * 曾经在这里用 RMS 阈值猜"用户说完了"当兜底锚点，那是拿响度冒充 VAD。
  */
-function startUserAudioLevelMonitor(stream: MediaStream) {
+function startUserAudioLevelMonitor(stream: MediaStream, sharedContext?: AudioContext) {
   try {
     const Ctor = window.AudioContext;
-    userAudioContext = new Ctor();
+    userAudioContext = sharedContext ?? new Ctor();
+    userAudioContextOwned = !sharedContext;
     const analyser = userAudioContext.createAnalyser();
     analyser.fftSize = 512;
     userAudioContext.createMediaStreamSource(stream).connect(analyser);
@@ -1718,8 +1795,7 @@ function startBotAudioLevelMonitor(stream: MediaStream) {
           update({ state: "speaking" });
         }
       } else if (snapshot.state === "speaking" && now - lastBotLoudAt > 450) {
-        update({ state: "listening" });
-
+        update({ state: snapshot.foregroundActivity !== "idle" ? "thinking" : "listening" });
       }
     }, 100);
   } catch {
@@ -1732,6 +1808,9 @@ function startBotAudioLevelMonitor(stream: MediaStream) {
  * the pipeline is never told, so no extra data-channel topic is needed.
  */
 function applyMutedToLocalStream() {
+  rawMicrophoneStream?.getAudioTracks().forEach((track) => {
+    track.enabled = !snapshot.muted;
+  });
   localStream?.getAudioTracks().forEach((track) => {
     track.enabled = !snapshot.muted;
   });
@@ -1839,7 +1918,9 @@ export const voiceSessionController = {
     connectingRemoteCloser = () => closeOwnedRemote();
     let ownedPeer: RTCPeerConnection | null = null;
     let ownedStream: MediaStream | null = null;
+    let ownedNoiseInput: VoiceNoiseInput | null = null;
     const releaseOwned = () => {
+      ownedNoiseInput?.close();
       ownedStream?.getTracks().forEach((track) => track.stop());
       if (ownedPeer) {
         ownedPeer.ontrack = null;
@@ -2045,19 +2126,43 @@ export const voiceSessionController = {
         });
         flushIceCandidates();
       };
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      ownedStream = stream;
+      const rawStream = await navigator.mediaDevices.getUserMedia({ audio: {
+        channelCount: { ideal: 1 }, sampleRate: { ideal: 48_000 },
+        echoCancellation: true, noiseSuppression: true, autoGainControl: false,
+      } });
+      ownedStream = rawStream;
       checkCurrent();
+      rawMicrophoneStream = rawStream;
+      applyMutedToLocalStream();
+      if(fastBargeInEnabled()){
+        localBargeIn=new VoiceBargeIn((muted,reason)=>{
+          if(!current())return;
+          if(remoteAudio)remoteAudio.muted=muted;
+          window.dispatchEvent(new CustomEvent('learngraph:voice-playback-gate',{detail:{muted,reason,at:performance.now()}}));
+        });
+        localBargeTimer=window.setInterval(()=>localBargeIn?.tick(performance.now()),50);
+      }
+      ownedNoiseInput = await createVoiceNoiseInput(rawStream, {
+        signal: connectionController.signal,
+        onStatus: (status) => { if (current()) setVoiceNoiseStatus(status); },
+        onSpeech: localBargeIn ? evidence=>{
+          if(current()&&!snapshot.muted)localBargeIn?.frame(evidence,performance.now(),snapshot.state==='speaking'||botAudioLevel>0.01);
+        } : undefined,
+      });
+      checkCurrent();
+      localNoiseInput = ownedNoiseInput;
+      const stream = ownedNoiseInput.stream;
       localStream = stream;
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
       applyMutedToLocalStream();
-      startUserAudioLevelMonitor(stream);
+      startUserAudioLevelMonitor(stream, ownedNoiseInput.audioContext);
       pc.ontrack = (event) => {
         if (!current() || peerConnection !== pc) return;
         // Retain the element: releasing `srcObject` and pausing on teardown is
         // the only reliable way to stop the bot's audio when the PC closes.
         const audio = remoteAudio ?? new Audio();
         remoteAudio = audio;
+        audio.muted = localBargeIn?.muted ?? false;
         audio.autoplay = true;
         audio.srcObject = event.streams[0];
         // Autoplay policy: a `play()` that rejects means the tutor's audio never
@@ -2170,7 +2275,7 @@ export const voiceSessionController = {
     if (pendingRemote !== remote) closeRemoteSession(pendingRemote);
     setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, false);
     clearVoiceSessionResumable(snapshot.workspaceId, snapshot.sessionId);
-    const next = { ...snapshot, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, playbackBlocked: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const, busyTaskIds: [] };
+    const next = { ...snapshot, foregroundActivity: "idle" as const, activityTurnId: null, transport: "idle" as const, state: "closed" as const, sessionIdRemote: null, signalingUrl: null, muted: false, playbackBlocked: false, interimUserText: "", streamingAssistantText: "", audioLevel: 0, audioSource: "idle" as const, busyTaskIds: [] };
     sessionCache.set(`${snapshot.workspaceId}:${snapshot.sessionId}`, next);
     update(next);
     if (wasConnected) playVoiceCue(440);
@@ -2188,7 +2293,10 @@ export const voiceSessionController = {
     }
     if (!current()) return false;
     if (sendRtvi({ type: "client-message", data: { t: VOICE_INTERRUPT_MESSAGE, d: null } })) delivered = true;
-    if (delivered) update({ state: "ready" });
+    if (delivered) {
+      finishForegroundActivity(snapshot.activityTurnId);
+      update({ state: "ready" });
+    }
     return delivered;
   },
   /**
@@ -2325,6 +2433,72 @@ export const voiceSessionController = {
       if (current()) cancellingTaskIds.delete(taskId);
     }
   },
+  async acknowledgeScene(taskId: string, anchors: string[], status: "rendered" | "failed" = "rendered"): Promise<void> {
+    const task = snapshot.tasks.find((item) => item.taskId === taskId);
+    const remote = snapshot.sessionIdRemote;
+    if (!remote || !task?.resultId || !task.resultVersion || !snapshot.sessionEpoch) return;
+    const current = captureVoiceOwner();
+    const receipt = {
+      requirement_version: task.requirementVersion, result_version: task.resultVersion,
+      session_epoch: snapshot.sessionEpoch, status, anchors,
+    };
+    const resultId = task.resultId;
+    const key = `${remote}:${resultId}`;
+    // Order visibility changes after in-flight render receipts; a late HTTP
+    // response must not restore a scene that has already been collapsed.
+    const pending = (sceneReceipts.get(key) ?? Promise.resolve()).catch(() => {}).then(() => {
+      if (current()) return acknowledgeVoiceScene(remote, resultId, receipt);
+    });
+    sceneReceipts.set(key, pending);
+    try { await pending; }
+    finally { if (sceneReceipts.get(key) === pending) sceneReceipts.delete(key); }
+  },
+  async setTaskAutoDelivery(taskId: string, autoDelivery: boolean): Promise<boolean> {
+    const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
+    if (!remote || busyTaskIds.has(taskId)) return false;
+    setTaskBusy(taskId, true);
+    try {
+      const task = await setVoiceTaskDelivery(remote, taskId, autoDelivery);
+      if (!current()) return false;
+      taskState = mergeVoiceTaskSnapshots(taskState, [task]);
+      syncTaskState();
+      return true;
+    } catch (error) {
+      if (current()) update({ error: error instanceof Error ? error.message : "播报设置失败" });
+      return false;
+    } finally {
+      if (current()) setTaskBusy(taskId, false);
+    }
+  },
+  async controlTaskExecution(taskId: string, operation: "pause" | "resume"): Promise<boolean> {
+    const remote = snapshot.sessionIdRemote;
+    const current = captureVoiceOwner();
+    if (!remote || busyTaskIds.has(taskId)) return false;
+    setTaskBusy(taskId, true);
+    try {
+      const task = await controlVoiceTaskExecution(remote, taskId, operation);
+      if (!current()) return false;
+      taskState = mergeVoiceTaskSnapshots(taskState, [task]);
+      syncTaskState();
+      return true;
+    } catch (error) {
+      if (current()) update({ error: error instanceof Error ? error.message : "任务控制失败" });
+      return false;
+    } finally {
+      if (current()) setTaskBusy(taskId, false);
+    }
+  },
+  async explainTask(taskId: string, anchor: string): Promise<boolean> {
+    const task = snapshot.tasks.find((item) => item.taskId === taskId);
+    if (!task || task.status === "stale") return false;
+    const findingIndex = /^finding-(\d+)$/.exec(anchor);
+    const visual = task.visuals?.find((item) => `visual-${item.block_id}` === anchor);
+    const content = findingIndex ? task.findings?.[Number(findingIndex[1])] : visual ? voiceSceneExplanation(visual) : task.summary;
+    if (!content) return false;
+    voiceSessionController.upsertTask({taskId, focusAnchor: anchor});
+    return voiceSessionController.sendText(`请先用 focus_background_scene 定位任务 ${taskId} 的 ${anchor}，然后解释「${task.title}」中的这项结果，并说明依据和限制：\n${content.slice(0, 8000)}`);
+  },
   async approveTask(taskId: string, approved = true): Promise<boolean> {
     const remote = snapshot.sessionIdRemote;
     const current = captureVoiceOwner();
@@ -2378,6 +2552,7 @@ export const voiceSessionController = {
     const remote = snapshot.sessionIdRemote;
     const current = captureVoiceOwner();
     const task = snapshot.tasks.find((item) => item.taskId === taskId);
+    if (task?.playbackStatus === "played") return voiceSessionController.explainTask(taskId, "summary");
     if (!remote || !task?.resultId || busyTaskIds.has(taskId)) return false;
     setTaskBusy(taskId, true);
     try {

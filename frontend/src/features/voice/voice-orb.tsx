@@ -11,6 +11,7 @@ import {
 } from "./voice-session-controller";
 import { voiceStatusText } from "./voice-status";
 import { readVoiceSessionResumable } from "./voice-session-markers";
+import { createOrbRhythm, stepOrbRhythm, orbBodyScale, orbHaloFrame, type OrbRhythm } from "./voice-orb-motion";
 
 /**
  * The composer's voice controls -- and the only place a call's connection state
@@ -84,8 +85,8 @@ export interface VoiceOrbProps {
  * Everything it produces is consumed by drawing to the canvas, so the loop still
  * never triggers a React render.
  */
-interface OrbEngine {
-  /** Frame clock in seconds: drives the breath, the hue drift and the halos. */
+interface OrbEngine extends OrbRhythm {
+  /** Frame clock in seconds, used only for the fixed-frequency glow. */
   time: number;
   /** Low-passed raw loudness 0..1 (the envelope). */
   level: number;
@@ -171,9 +172,6 @@ const ORB_STRETCH_REACH = 260;
 const ORB_MAX_STRETCH = 0.5;
 /** Kept clear of the viewport edge (× radius) so a bouncing sphere stays whole. */
 const ORB_EDGE_MARGIN = 1.4;
-/** The two slow rings the CSS orb ran at 3.8s, the second offset by 1.2s. */
-const ORB_HALO_SECONDS = 3.8;
-const ORB_HALO_DELAY_SECONDS = 1.2;
 /** Ring radii as a fraction of the sphere radius (the old 37% / 50% of an
     84px-wide orb box). */
 const ORB_HALO_RADIUS_RATIOS = [0.62, 0.83] as const;
@@ -187,11 +185,12 @@ const ORB_TAP_RING_GROWTH = 2.2;
 
 const ORB_ENVELOPE_SECONDS = 0.35;
 /** Rise is quicker than fall: the ball reacts to speech but settles gently. */
-const ORB_ATTACK_SECONDS = 0.14;
-const ORB_RELEASE_SECONDS = 0.42;
+const ORB_ATTACK_SECONDS = 0.22;
+const ORB_RELEASE_SECONDS = 0.6;
 
 function createOrbEngine(): OrbEngine {
   return {
+    ...createOrbRhythm(),
     time: 0,
     level: 0,
     energy: 0,
@@ -232,7 +231,7 @@ function createOrbEngine(): OrbEngine {
 
 /** The level the sphere is being asked to show, before any smoothing. */
 function orbTargetLevel(level: number, signal: OrbSignal, syllable: number): number {
-  const botPulse = signal.speaking ? 0.32 + 0.22 * syllable : 0;
+  const botPulse = signal.speaking ? 0.32 + 0.1 * syllable : 0;
   const userPulse = signal.listening ? 0.2 : 0;
   return Math.min(1, Math.max(level, botPulse, userPulse));
 }
@@ -278,6 +277,7 @@ function stepOrbEngine(engine: OrbEngine, dt: number, signal: OrbSignal): void {
   const target = orbTargetLevel(engine.level, signal, engine.syllable);
   const tau = target > engine.energy ? ORB_ATTACK_SECONDS : ORB_RELEASE_SECONDS;
   engine.energy += (target - engine.energy) * (1 - Math.exp(-dt / tau));
+  stepOrbRhythm(engine, dt, engine.energy, signal.listening || signal.speaking);
 
   // Tap envelopes. Three different decay speeds on purpose: a flash that snaps,
   // sparks that streak away, and a shockwave that lingers just long enough for the
@@ -381,7 +381,6 @@ function stepOrbMotion(engine: OrbEngine, dt: number): void {
 function drawOrb(
   context: CanvasRenderingContext2D,
   engine: OrbEngine,
-  signal: OrbSignal,
   animate: boolean,
 ): void {
   const { x, y } = engine;
@@ -407,17 +406,9 @@ function drawOrb(
 
   // The two slow rings the CSS orb used to animate. They were a fixed blue-grey
   // whatever the sphere was doing; on a drifting hue they follow it instead.
-  const haloPeriod =
-    signal.listening || signal.speaking ? 2.2 - engine.energy * 1.1 : ORB_HALO_SECONDS;
   ORB_HALO_RADIUS_RATIOS.forEach((ratio, index) => {
-    const phase = animate
-      ? ((engine.time + index * ORB_HALO_DELAY_SECONDS) % haloPeriod) / haloPeriod
-      : 0;
-    const eased = animate ? 1 - Math.pow(1 - phase, 3) : 0;
-    // `animation: none` under reduced motion leaves a ring at its static style
-    // (scale .7, full opacity) rather than at the keyframe's start.
-    const ringRadius = ORB_RADIUS * ratio * (animate ? 0.58 + 0.42 * eased : 0.7);
-    const alpha = animate ? 0.18 * 0.65 * (1 - eased) : 0.18;
+    const { radius, alpha } = orbHaloFrame(engine, index, animate);
+    const ringRadius = ORB_RADIUS * ratio * radius;
     context.strokeStyle = `hsla(${hue}, 80%, 68%, ${alpha})`;
     context.lineWidth = 1;
     context.beginPath();
@@ -493,13 +484,7 @@ function drawOrb(
     }
   }
 
-  const amplitude = 0.04 + engine.energy * 0.14;
-  const frequency = 0.9 + engine.energy;
-  const scale =
-    1 +
-    (animate ? amplitude * Math.sin(engine.time * frequency) : 0) +
-    engine.energy * 0.24 +
-    (animate ? engine.pop * 0.45 : 0);
+  const scale = orbBodyScale(engine, engine.energy, engine.pop, animate);
   // The bounce keeps the sphere off the walls, but a breathing, stretched sphere
   // is larger than its resting size, so the drawn radius is capped by the room it
   // actually has. Guarded: a negative gradient radius throws, and an exception in
@@ -759,7 +744,7 @@ export function VoiceOrb({
         sync();
         engine.energy = orbTargetLevel(Math.max(0, Math.min(1, signal.audioLevel)), signal, 0);
         context.setTransform(engine.dpr, 0, 0, engine.dpr, 0, 0);
-        drawOrb(context, engine, signal, false);
+        drawOrb(context, engine, false);
       };
       paintRef.current = paint;
       paint();
@@ -782,7 +767,7 @@ export function VoiceOrb({
       }
       context.setTransform(engine.dpr, 0, 0, engine.dpr, 0, 0);
       stepOrbEngine(engine, dt, signalRef.current);
-      drawOrb(context, engine, signalRef.current, true);
+      drawOrb(context, engine, true);
       frame = window.requestAnimationFrame(tick);
     });
     return () => {

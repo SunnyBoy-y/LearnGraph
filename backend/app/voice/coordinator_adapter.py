@@ -16,13 +16,13 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.errors import AppError
 from app.services.authorization import AuthorizationService
-from app.domain.models import SandboxAgentTask
+from app.domain.models import SandboxAgentTask, SandboxAgentEvent, VoiceSpeechDeliveryRecord, VoiceTurnRecord
 from app.services.chat_service_factory import (
     build_background_workspace_context,
     build_voice_chat_service,
@@ -43,6 +43,7 @@ from app.voice.embedded_delegation import (
 )
 from app.voice.events import emit_event, load_session
 from app.voice.turns import open_turn
+from app.voice.scene import scene_grounding, speech_brief, valid_visuals
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,52 @@ class CoordinatorDelegationPort:
             request.task_id,
             request.instruction,
         )
+
+    async def pause_task(self, request: TaskControlRequest) -> Mapping[str, Any]:
+        return await asyncio.to_thread(self._control_execution_sync, request.task_id, "pause")
+
+    async def resume_task(self, request: TaskControlRequest) -> Mapping[str, Any]:
+        return await asyncio.to_thread(self._control_execution_sync, request.task_id, "resume")
+
+    async def focus_scene(self, request: TaskControlRequest) -> Mapping[str, Any]:
+        return await asyncio.to_thread(self._focus_scene_sync, request.task_id, request.instruction)
+
+    def _focus_scene_sync(self, task_id: str, anchor_id: str, *, expected_turn_id: str | None = None) -> dict[str, Any]:
+        with self._coordinator() as (_coordinator, reliability, _chat, turn_id):
+            if expected_turn_id is not None and turn_id != expected_turn_id:
+                return {"task_id": task_id, "status": "unavailable"}
+            link = reliability.required_link(self.voice_session_id, task_id)
+            row = next((item for item in reliability.list_results(self.voice_session_id, include_terminal=True, limit=200)
+                        if item.subagent_id == task_id and item.requirement_version == link.requirement_version
+                        and item.status not in {"stale", "dismissed"}), None)
+            if row is None:
+                return {"task_id": task_id, "status": "unavailable"}
+            handle = load_session(self.voice_session_id)
+            scene = scene_grounding(dict(row.payload_json or {}), summary=row.summary or "",
+                session_epoch=int(getattr(handle, "session_epoch", 1)), requirement_version=row.requirement_version,
+                result_version=row.result_version)
+            if anchor_id not in scene["available_anchors"]:
+                return {"task_id": task_id, "status": "unconfirmed", "instruction": "页面位置未确认，请直接口述。"}
+            emit_event(self.voice_session_id, "scene.focus", payload={
+                "task_id": task_id, "result_id": row.id, "requirement_version": row.requirement_version,
+                "result_version": row.result_version,
+                "anchor_id": anchor_id,
+            }, turn_id=turn_id, request_id="scene-focus:" + hashlib.sha256(
+                f"{getattr(handle, 'session_epoch', 1)}:{turn_id}:{row.id}:{row.result_version}:{anchor_id}".encode()).hexdigest()[:40])
+            rendered = anchor_id in scene["anchors"]
+            return {"task_id": task_id, "status": "focused" if rendered else "requested", "anchor_id": anchor_id,
+                    "instruction": "已定位到已显示组件。" if rendered else "已请求临时展开和定位，收到页面显示回执前不要声称用户已看见；可以依据结果口述。"}
+
+    def _control_execution_sync(self, task_id: str, operation: str) -> dict[str, Any]:
+        from app.voice.task_control import control_task
+        with self._coordinator() as (coordinator, reliability, _chat, _turn):
+            link = reliability.required_link(self.voice_session_id, task_id)
+            if link.capability_id:
+                self._require_capability_permission(coordinator, link.capability_id)
+            else:
+                coordinator._require_workspace_manage()
+            return control_task(reliability, voice_session_id=self.voice_session_id, task_id=task_id,
+                                operation=operation, actor_id=coordinator.actor_id)
 
     async def confirm_task(self, request: TaskControlRequest) -> Mapping[str, Any]:
         return await asyncio.to_thread(
@@ -379,8 +426,62 @@ class CoordinatorDelegationPort:
             return dict(result)
 
     def _task_status_sync(self, task_id: str) -> dict[str, Any]:
-        with self._coordinator() as (coordinator, _reliability, _chat_session_id, _turn_id):
-            return coordinator.get_background_task(task_id)
+        with self._coordinator() as (coordinator, reliability, _chat_session_id, _turn_id):
+            reliability.required_link(self.voice_session_id, task_id)
+            result = coordinator.get_background_task(task_id)
+            result["agent_result"] = speech_brief(result.get("agent_result"))
+            result.pop("deliverables", None)
+            result["events"] = list(result.get("events") or [])[-5:]
+            row = next((item for item in reliability.list_results(self.voice_session_id, include_terminal=True, limit=200)
+                        if item.subagent_id == task_id and item.status not in {"stale", "dismissed"}), None)
+            if row is not None:
+                handle = load_session(self.voice_session_id)
+                result["scene"] = scene_grounding(dict(row.payload_json or {}), summary=row.summary or "",
+                    session_epoch=int(getattr(handle, "session_epoch", 1)),
+                    requirement_version=row.requirement_version, result_version=row.result_version)
+                result["scene"] = {key: result["scene"][key] for key in ("status", "anchors", "available_anchors")}
+            else:
+                # Published intermediate scenes live in the durable event log,
+                # independently of terminal results. Expose bounded data rather
+                # than tool transcripts or speculative hidden reasoning.
+                task = coordinator._load_task(task_id)
+                events = reliability.db.scalars(select(SandboxAgentEvent).where(
+                    SandboxAgentEvent.workspace_id == reliability.workspace_id,
+                    SandboxAgentEvent.task_id == task.id,
+                    SandboxAgentEvent.event_type == "artifact.upsert",
+                ).order_by(SandboxAgentEvent.seq.desc()).limit(40)).all()
+                blocks: dict[str, Any] = {}
+                removed_blocks: set[str] = set()
+                for event in events:
+                    payload = dict(event.payload or {})
+                    if int(payload.get("requirement_version") or 1) != int(result.get("requirement_version") or 1):
+                        continue
+                    raw_scene = payload.get("snapshot")
+                    if isinstance(raw_scene, dict) and raw_scene.get("state") == "removed" and raw_scene.get("block_id") not in blocks:
+                        removed_blocks.add(str(raw_scene.get("block_id") or ""))
+                    for scene in valid_visuals([payload.get("snapshot")]):
+                        if scene["block_id"] in blocks or scene["block_id"] in removed_blocks or len(blocks) >= 8:
+                            continue
+                        blocks[scene["block_id"]] = {
+                            "anchor_id": f"visual-{scene['block_id']}", "revision": scene["revision"],
+                            "title": scene["props"]["title"], "source_note": scene["props"]["source_note"],
+                            "state": scene["state"], "evidence_status": "worker_reported",
+                            "columns": scene["props"]["columns"][:5],
+                            "rows": [{"id": item["id"], "label": item["label"][:120],
+                                      "values": {key: value[:120] if isinstance(value, str) else value
+                                                 for key, value in list(item["values"].items())[:5]}}
+                                     for item in scene["rows"][:5]],
+                            "items": [{"id": item["id"], "label": item["label"], "value": str(item["value"])[:120]}
+                                      for item in scene["items"][:5]],
+                            "nodes": [{"id": item["id"], "label": item["label"]} for item in scene["nodes"][:5]],
+                            "truncated": True,
+                        }
+                result["partial_results"] = list(blocks.values())
+                while len(json.dumps(result["partial_results"], ensure_ascii=False)) > 12_000:
+                    result["partial_results"].pop()
+                result["scene"] = {"status": "unconfirmed", "anchors": []}
+            result["events"] = []  # execution logs belong in the task UI, not speech context
+            return result
 
     def _cancel_task_sync(self, task_id: str) -> dict[str, Any]:
         with self._coordinator() as (coordinator, reliability, _chat_session_id, _turn_id):
@@ -625,18 +726,28 @@ class CoordinatorDelegationPort:
             reliability.db.commit()
             rows = reliability.list_results(
                 self.voice_session_id,
-                include_terminal=False,
-                limit=limit,
+                include_terminal=True,
+                limit=200,
             )
+            handle = load_session(self.voice_session_id)
+            latest_turn = reliability.db.scalar(select(VoiceTurnRecord.id).where(
+                VoiceTurnRecord.voice_session_id == self.voice_session_id,
+            ).order_by(VoiceTurnRecord.created_at.desc()).limit(1))
             by_task = {link.subagent_id: link for link in links}
             results: list[dict[str, Any]] = []
             for row in rows:
                 payload = dict(row.payload_json or {})
                 link = by_task.get(row.subagent_id)
+                if link is not None and int(row.requirement_version) < int(link.requirement_version or 1):
+                    continue
                 delivery = reliability.deliveries.get_by_result(
                     row.id,
                     tenant_id=reliability.tenant_id,
                 )
+                manual_delivery = bool(delivery and delivery.playback_status == "claimed"
+                                       and not str(delivery.idempotency_key).startswith("voice-auto:"))
+                if row.status not in {"ready", "failed", "stale"} and not manual_delivery:
+                    continue
                 results.append(
                     {
                         "task_id": row.subagent_id,
@@ -649,13 +760,21 @@ class CoordinatorDelegationPort:
                         "summary": str(row.summary or ""),
                         "source_count": int(row.source_count or 0),
                         "safe_error": str(row.safe_error or ""),
-                        "agent_result": payload.get("agent_result") or payload,
+                        "agent_result": speech_brief(payload.get("agent_result") or payload),
                         "auto_delivery": bool(getattr(link, "auto_delivery", True)),
+                        "manual_delivery": manual_delivery,
+                        "scene": scene_grounding(
+                            payload, summary=row.summary or "",
+                            session_epoch=int(getattr(handle, "session_epoch", 1)),
+                            requirement_version=int(row.requirement_version or 1),
+                            result_version=int(row.result_version or 1),
+                        ),
+                        "topic_current": not getattr(link, "trigger_turn_id", None) or getattr(link, "trigger_turn_id", None) == latest_turn,
                         "playback_status": delivery.playback_status if delivery else None,
                         "deliveries": payload.get("deliveries") or {},
                     }
                 )
-            return results
+            return sorted(results, key=lambda item: not item["manual_delivery"])[:limit]
 
     def _acknowledge_result_sync(
         self,
@@ -686,6 +805,19 @@ class CoordinatorDelegationPort:
                     "voice_result_not_found",
                     "Voice result was not found",
                 )
+            link = reliability.required_link(self.voice_session_id, task_id)
+            if row.status in {"stale", "dismissed"} or row.requirement_version < int(link.requirement_version or 1):
+                raise AppError(409, "voice_result_stale", "Voice result is no longer current")
+            existing = reliability.deliveries.get_by_result(row.id, tenant_id=reliability.tenant_id)
+            if (delivery_state == "delivered" and existing is not None
+                    and existing.playback_status == "claimed"
+                    and not str(existing.idempotency_key).startswith("voice-auto:")):
+                adopted = reliability.db.execute(update(VoiceSpeechDeliveryRecord).where(
+                    VoiceSpeechDeliveryRecord.id == existing.id,
+                    VoiceSpeechDeliveryRecord.playback_status == "claimed",
+                ).values(playback_status="enqueued")).rowcount
+                reliability.db.commit()
+                return {"result_id": row.id, "speech_id": existing.speech_id, "created": bool(adopted)}
             if delivery_state == "dismissed":
                 dismissed = reliability.dismiss_result(
                     voice_session_id=self.voice_session_id,
@@ -694,6 +826,8 @@ class CoordinatorDelegationPort:
                 return {"result_id": dismissed.id, "status": dismissed.status}
             request_id = f"voice-auto:{row.id}:{int(row.result_version or 1)}"
             if delivery_state == "released":
+                if existing is not None:
+                    request_id = existing.idempotency_key
                 released = reliability.release_delivery(
                     voice_session_id=self.voice_session_id,
                     result_id=row.id,

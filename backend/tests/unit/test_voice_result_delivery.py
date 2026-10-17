@@ -241,3 +241,64 @@ def test_interruption_boundary_marks_active_result_interrupted() -> None:
         ]
 
     asyncio.run(run())
+
+
+def test_silent_or_old_topic_result_cannot_block_another_ready_task():
+    async def run():
+        port, agent = _Port(), _Agent()
+        processor = VoiceResultDeliveryProcessor(agent=agent, result_port=port, poll_interval=0.25)
+        await processor.start()
+        port.results = [_result("silent", auto_delivery=False), {**_result("old-topic"), "topic_current": False}, _result("current")]
+        await asyncio.sleep(0.35)
+        assert port.acknowledged == [("current", "delivered")]
+        await processor.stop()
+    asyncio.run(run())
+
+
+def test_two_ready_tasks_cannot_overlap_while_first_audio_is_pending():
+    async def run():
+        port, agent = _Port(), _Agent()
+        processor = VoiceResultDeliveryProcessor(agent=agent, result_port=port, poll_interval=0.25)
+        await processor.start()
+        port.results = [_result("first"), _result("second")]
+        await asyncio.sleep(0.35)
+        processor._cooldown_until = 0
+        await asyncio.sleep(0.35)
+        assert len(agent.frames) == 1
+        await processor.playback_ended()
+        await asyncio.sleep(0.35)
+        assert len(agent.frames) == 2
+        await processor.stop()
+    asyncio.run(run())
+
+
+def test_interrupted_result_waits_for_explicit_request_even_after_reconnect():
+    async def run():
+        port, agent = _Port(), _Agent()
+        processor = VoiceResultDeliveryProcessor(agent=agent, result_port=port, poll_interval=0.25)
+        await processor.start()
+        port.results = [_result("first")]
+        await asyncio.sleep(0.35)
+        await processor.playback_ended(interrupted=True)
+        processor._cooldown_until = 0
+        await asyncio.sleep(0.35)
+        assert len(agent.frames) == 1
+        await processor.stop()
+        port.results[0]["playback_status"] = "interrupted"
+        restarted = VoiceResultDeliveryProcessor(agent=agent, result_port=port, poll_interval=0.25)
+        await restarted.start()
+        await asyncio.sleep(0.35)
+        assert len(agent.frames) == 1
+        # A user claim can wake even a silent task from before reconnect.
+        port.results[0].update(manual_delivery=True, auto_delivery=False, topic_current=False, playback_status="claimed")
+        await asyncio.sleep(0.35)
+        assert len(agent.frames) == 2
+        await restarted.stop()
+    asyncio.run(run())
+
+
+def test_tutor_packet_exposes_only_acknowledged_scene_anchors_and_preserves_limits():
+    message = VoiceResultDeliveryProcessor._build_tutor_message({**_result("a"), "scene": {"status": "unconfirmed", "anchors": []}})
+    assert '"status": "unconfirmed"' in message["content"]
+    assert "不得声称页面已展示" in message["content"]
+    assert "来源存在不等于结论已独立验证" in message["content"]

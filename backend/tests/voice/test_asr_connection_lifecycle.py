@@ -272,7 +272,7 @@ def test_energy_fallback_carries_the_turn_when_vad_frames_are_absent():
         assert upstream.commits == 3, "每段语音收口都应提交一次"
         assert upstream.appended_audio >= 3
         assert any(
-            type(frame).__name__ == "InterimTranscriptionFrame" for frame in pushed
+            isinstance(frame, mod.InterimTranscriptionFrame) for frame in pushed
         ), "能量兜底期间 partial 必须仍然可达前端"
         assert journal.notices[0][:2] == ("asr", "vad_frames_missing")
         assert journal.errors == [], "能量兜底不是错误，不得降级"
@@ -506,7 +506,7 @@ def test_late_final_after_turn_boundary_still_becomes_text():
 
         async def _record_push(frame, *_args, **_kwargs) -> None:
             # 只认转录帧：用量指标等旁路帧不计入这里的时序断言。
-            if type(frame).__name__ == "TranscriptionFrame":
+            if isinstance(frame, mod.TranscriptionFrame):
                 transcripts.append(frame)
 
         service.push_frame = _record_push  # type: ignore[method-assign]
@@ -587,7 +587,7 @@ def test_duplicate_dashscope_final_item_is_ignored_without_consuming_next_commit
         frames: list[object] = []
 
         async def _record_push(frame, *_args, **_kwargs) -> None:
-            if type(frame).__name__ == "TranscriptionFrame":
+            if isinstance(frame, mod.TranscriptionFrame):
                 frames.append(frame)
 
         service.push_frame = _record_push  # type: ignore[method-assign]
@@ -808,7 +808,7 @@ def test_cloud_vad_final_without_a_commit_becomes_text():
         transcripts: list[object] = []
 
         async def _record_push(frame, *_args, **_kwargs) -> None:
-            if type(frame).__name__ == "TranscriptionFrame":
+            if isinstance(frame, mod.TranscriptionFrame):
                 transcripts.append(frame)
 
         service.push_frame = _record_push  # type: ignore[method-assign]
@@ -901,3 +901,4 @@ def test_pcm_rms_separates_silence_from_speech():
     loud = mod._pcm16_rms(_pcm(0.05, 0.2))
     assert 0.15 < loud <= 0.25
     assert mod._pcm16_rms(b"") == 0.0
+

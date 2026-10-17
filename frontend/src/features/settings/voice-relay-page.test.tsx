@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getCurrentUser } from "@/api/control";
 import { getVoiceRelay, saveVoiceRelay, testVoiceRelay, type VoiceRelayConfigWire } from "@/api/voice";
 import { VoiceRelayPage } from "./voice-relay-page";
+import { SettingsDirtyContext } from '@/lib/settings-dirty';
 
 vi.mock("@/api/control", () => ({ getCurrentUser: vi.fn() }));
 vi.mock("@/api/voice", () => ({
@@ -25,11 +26,11 @@ function config(mode: "manual" | "cloudflare" = "manual"): VoiceRelayConfigWire 
   };
 }
 
-function mount(data = config()) {
+function mount(data = config(), registerDirty = (_id: string, _dirty: boolean) => {}) {
   vi.mocked(getVoiceRelay).mockResolvedValue(data);
   vi.mocked(saveVoiceRelay).mockImplementation(async (payload) => ({ ...data, ...payload } as VoiceRelayConfigWire));
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  render(<QueryClientProvider client={client}><VoiceRelayPage /></QueryClientProvider>);
+  render(<QueryClientProvider client={client}><SettingsDirtyContext.Provider value={registerDirty}><VoiceRelayPage /></SettingsDirtyContext.Provider></QueryClientProvider>);
 }
 
 beforeEach(() => {
@@ -40,6 +41,25 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("voice relay settings", () => {
+  it("protects a draft populated by the preset button", async () => {
+    const dirty = vi.fn();
+    mount(config(), dirty);
+    await screen.findByLabelText('手动 STUN 地址池');
+    fireEvent.click(screen.getByRole('button', { name: '填入国内候选（小米 / 芒果 / B 站）' }));
+    await waitFor(() => expect(dirty).toHaveBeenLastCalledWith('voice-relay', true));
+  });
+
+  it("locks edits and destructive actions while a connection probe is pending", async () => {
+    mount();
+    vi.mocked(testVoiceRelay).mockImplementationOnce(() => new Promise(() => {}));
+    const input = await screen.findByLabelText('手动 STUN 地址池');
+    fireEvent.click(screen.getByRole('button', { name: '仅测试' }));
+    await waitFor(() => expect(testVoiceRelay).toHaveBeenCalledOnce());
+    expect(input).toBeDisabled();
+    expect(screen.getByRole('button', { name: '删除配置' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '紧急停用' })).toBeDisabled();
+  });
+
   it("saves manual STUN without rendering or submitting Cloudflare secrets", async () => {
     mount();
     const textbox = await screen.findByLabelText("手动 STUN 地址池");

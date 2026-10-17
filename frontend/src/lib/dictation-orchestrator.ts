@@ -108,7 +108,8 @@ export function startDictationOrchestrator(
       adaptiveVad: options.adaptiveVad,
       onLevel: options.onLevel,
       onSegmentText: (text) => {
-        if (stopped || aborted) return;
+        // stop() drains the last recorded segment; only abort discards it.
+        if (aborted) return;
         options.onFinal(text);
       },
       onPendingChange: options.onPendingChange,
@@ -133,11 +134,11 @@ export function startDictationOrchestrator(
       hotwords: realtime.hotwords,
       onLevel: options.onLevel,
       onPartial: (text) => {
-        if (stopped || aborted) return;
+        if (aborted) return;
         options.onPartial(text);
       },
       onFinal: (text) => {
-        if (stopped || aborted) return;
+        if (aborted) return;
         options.onFinal(text);
       },
       onFatal: (message, code) => {

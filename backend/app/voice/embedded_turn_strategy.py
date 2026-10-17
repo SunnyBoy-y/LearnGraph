@@ -107,18 +107,26 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
     async def _trigger_normal_turn(self) -> None:
         self._clear_pending()
         await self.trigger_user_turn_started(
-            enable_interruptions=self._enable_interruptions
+            enable_interruptions=self._enable_interruptions,
+            # ASR final can arrive after physical VAD-stop. Re-broadcasting
+            # UserStartedSpeaking here would mark Pipecat's controller as
+            # audibly speaking again, with no later VAD transition to clear it.
+            enable_user_speaking_frames=False,
         )
 
     async def _trigger_interrupt_turn(self) -> None:
         self._clear_pending()
         if self._bot_speaking and self._interrupt_callback is not None:
+            # Cloud ASR may finalize several segments before BotStoppedSpeaking
+            # propagates back here. Stop playback once; repeated fast interrupts
+            # would cancel the replacement answer that is already starting.
+            self._bot_speaking = False
             self._decision_task = None
             try:
                 await self._interrupt_callback()
             except Exception:
                 logger.debug("fast voice interrupt callback failed", exc_info=True)
-        await self.trigger_user_turn_started(enable_interruptions=True)
+        await self.trigger_user_turn_started(enable_interruptions=True, enable_user_speaking_frames=False)
 
     async def _suppress_backchannel(self) -> None:
         self._clear_pending()
@@ -158,6 +166,10 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
             # final. Never irreversibly cancel TTS/LLM based on a hypothesis.
             # Button interrupts bypass this strategy entirely.
             if isinstance(frame, InterimTranscriptionFrame):
+                return ProcessFrameResult.STOP
+            if not frame.finalized and isinstance(frame.result, dict) and frame.result.get('superseded'):
+                # Retain text in aggregation/journal, but an old commit cannot
+                # open another turn or interrupt the replacement generation.
                 return ProcessFrameResult.STOP
             if not normalize_transcript(text) or is_asr_filler(text):
                 await self._cancel_decision()
