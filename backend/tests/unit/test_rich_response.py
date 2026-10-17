@@ -50,11 +50,12 @@ def test_first_text_and_placeholder_do_not_wait_for_json():
 
 
 @pytest.mark.parametrize("body", ["{bad json}", '{"upsert":{"blocks":[{"id":"x","type":"html"}]}}', '{"props":{"title":"X","onClick":"alert(1)"}}'])
-def test_invalid_and_incomplete_declarations_fall_back_to_inert_source(body):
+def test_invalid_and_incomplete_declarations_fall_back_to_readable_notice(body):
     for ending in ["\n:::\n", ""]:
         events, snapshots = consume(["前文\n:::ui bad\n", body + ending])
         assert next(iter(snapshots.values()))["state"] == "removed"
-        assert body in "".join(event.content or "" for event in events if event.type == "text_delta")
+        prose = "".join(event.content or "" for event in events if event.type == "text_delta")
+        assert body not in prose and "这部分图文未能生成" in prose
 
 
 def test_literal_examples_inside_code_are_not_interpreted():

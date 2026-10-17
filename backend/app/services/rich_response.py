@@ -63,6 +63,7 @@ class InlineUIParser:
         self.line_head = ""
         self.fence: tuple[str, int] | None = None
         self.created: list[str] = []
+        self.failed_declaration = False
 
     def _track(self, char: str):
         if char == "\n":
@@ -79,9 +80,9 @@ class InlineUIParser:
 
     @staticmethod
     def _fallback(body: str):
-        # A failed declaration remains readable as inert Markdown source.
-        fence = "`" * max(3, max((len(m.group()) + 1 for m in re.finditer(r"`+", body)), default=3))
-        return ProviderStreamEvent("text_delta", content=f"\n{fence}json\n{body}\n{fence}\n")
+        # A rejected document is not a deliverable. Do not expose its internal
+        # JSON, SVG or partial parameters as though they were answer content.
+        return ProviderStreamEvent("text_delta", content="\n\n这部分图文未能生成，请重试。\n")
 
     def _close(self):
         body = "".join(self.body or [])
@@ -92,12 +93,21 @@ class InlineUIParser:
             if not isinstance(raw, dict) or set(raw) - {"props", "upsert"}:
                 raise ValueError("Unexpected declaration fields")
             mount = {"op": "mount", "block_id": self.block_id, "component": "document", **raw}
-            compile_command(mount)
+            snapshot = compile_command(mount)
+            if not any(
+                node.text.strip()
+                or (node.type in {"image", "image_group", "gallery"} and (node.query or node.fallback_svg))
+                or node.type in {"simulation", "interactive"}
+                or (node.visual and any(node.visual.get(key) for key in ("rows", "nodes", "items")))
+                for node in snapshot.blocks
+            ):
+                raise ValueError("A finished inline document must contain useful content")
             patch = {"op": "patch", "block_id": self.block_id, "base_revision": 0,
                      "props": raw.get("props", {}), "upsert": raw.get("upsert", {})}
             yield UICommandEvent(patch)
             yield UICommandEvent({"op": "complete", "block_id": self.block_id, "base_revision": 1})
         except (ValueError, TypeError, RecursionError, AppError):
+            self.failed_declaration = True
             yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": 0})
             yield self._fallback(body)
 
@@ -118,6 +128,7 @@ class InlineUIParser:
                     self.body.append(line)
                     self.body_line = []
                 if self.body_bytes > MAX_UI_BYTES:
+                    self.failed_declaration = True
                     body = "".join(self.body) + "".join(self.body_line)
                     self.body = None; self.body_line = []
                     yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": 0})
@@ -157,6 +168,7 @@ class InlineUIParser:
         if self.body is not None and "".join(self.body_line).strip() == ":::":
             yield from self._close()
         elif self.body is not None:
+            self.failed_declaration = True
             body = "".join(self.body) + "".join(self.body_line)
             self.body = None
             yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": 0})
@@ -195,7 +207,7 @@ def rich_events(events, *, tool_names=(), allow_tool_calls=True):
         if guard is not None:
             yield from record(parser.feed(guard.finish()))
         yield from record(parser.finish())
-        if guard is not None and guard.suppressed and not completed_document:
+        if guard is not None and guard.suppressed and not completed_document and not parser.failed_declaration:
             yield ProviderStreamEvent("text_delta", content="\n\n这部分内容未能生成，本轮没有执行相应操作。请重试。\n")
 
     try:

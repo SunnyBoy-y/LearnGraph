@@ -78,6 +78,15 @@ def test_agent_tool_frames_are_unchanged():
     assert list(rich_events([event])) == [event]
 
 
+@pytest.mark.parametrize("blocks", [[], [{"id": "root", "type": "section"}], [{"id": "p", "type": "paragraph", "text": ""}]])
+def test_empty_inline_document_is_not_a_completed_deliverable(blocks):
+    text = ":::ui empty\n" + json.dumps({"upsert": {"blocks": blocks}}) + "\n:::\n"
+    events = list(rich_events([ProviderStreamEvent("text_delta", content=text)], allow_tool_calls=False))
+    assert [event.command["op"] for event in events if isinstance(event, UICommandEvent)] == ["mount", "remove"]
+    prose = "".join(event.content or "" for event in events if event.type == "text_delta")
+    assert "图文未能生成" in prose and '"blocks"' not in prose
+
+
 def test_large_unclosed_call_has_bounded_memory_and_does_not_delay_normal_prose():
     guard = ToolProtocolGuard()
     assert guard.feed("立即显示") == "立即显示"
