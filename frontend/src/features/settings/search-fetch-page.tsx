@@ -1,7 +1,9 @@
+import { useSettingsDirty } from '@/lib/settings-dirty';
+import { AdvancedSettings, SettingsSection } from './settings-primitives';
 import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CircleAlert, Plus, RefreshCcw } from "lucide-react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import {
@@ -222,6 +224,7 @@ function EgressApprovalQueue() {
   const [statusFilter, setStatusFilter] = useState("");
   const [hostname, setHostname] = useState("");
   const [purpose, setPurpose] = useState("");
+  useSettingsDirty("egress-request", Boolean(hostname.trim() || purpose.trim()));
   const queryPrefix = workspaceResourcePrefix(workspaceId, "egress-approvals");
   const approvals = useQuery({
     queryKey: [...queryPrefix, statusFilter],
@@ -656,13 +659,7 @@ export function SearchFetchPage() {
         eyebrow="Search, fetch & egress"
         title="搜索与抓取"
       />
-      <Surface className="space-y-5 p-5">
-        <SectionHeading
-          description="控制沙箱（Agent 代码执行环境）的出站网络。关闭时沙箱完全断网，仅能按白名单审批出网。"
-          title="沙箱联网"
-        />
-        <SandboxEgressSwitch />
-      </Surface>
+      <SettingsSection title="搜索能力" description="搜索服务连接统一在模型与服务中管理。"><Button asChild variant="outline" size="sm"><Link to={`/w/${workspaceId}/settings/models`}>管理搜索服务连接</Link></Button></SettingsSection>
       <Surface className="space-y-5 p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <SectionHeading
@@ -699,8 +696,13 @@ export function SearchFetchPage() {
         <FetchChannelSettings />
       </Surface>
       <EgressApprovalQueue />
-      <FetchApprovalHistory />
-      <SandboxNetAuditHistory />
+      <AdvancedSettings title="高级工具设置" description="沙箱联网控制、抓取审批历史与出站诊断"><Surface className="space-y-5 p-5">
+        <SectionHeading
+          description="控制沙箱（Agent 代码执行环境）的出站网络。关闭时沙箱完全断网，仅能按白名单审批出网。"
+          title="沙箱联网"
+        />
+        <SandboxEgressSwitch />
+      </Surface><FetchApprovalHistory/><SandboxNetAuditHistory/></AdvancedSettings>
     </PageFrame>
   );
 }

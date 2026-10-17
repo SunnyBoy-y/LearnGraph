@@ -3,6 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { toast } from "sonner";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
 import {
   acknowledgeBudgetAlert, clearUsageEvents, createBudgetPolicy, deleteBudgetPolicy, getAlertEmailConfig,
   getModelsDevStatus, getUsageSummary, listBudgetAlerts, listBudgetPolicies, listBudgetStatuses, listManualPrices,
@@ -186,13 +187,14 @@ function UsageWindow({ scope }: { scope: UsageScope }) {
   </>;
 }
 function Overview({ data, onExport }: { data: UsageSummary; onExport: () => void }) {
+  const reducedMotion = useReducedMotionPreference();
   const days = (data.breakdown.day ?? []).map((row) => ({ ...row, chart_amount: Number(row.cost_amount) }));
   return <div className="space-y-4">
     <Surface className="p-4"><SectionHeading title={data.currency + " 每日费用"} description="统计包含全部筛选记录与归档记录，日期按 UTC。" action={<Button variant="outline" onClick={onExport}>导出概览</Button>} />
       {days.length ? <div className="mt-4 h-64"><ResponsiveContainer width="100%" height="100%"><AreaChart data={days}>
         <CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="label" /><YAxis />
         <Tooltip content={({ active, payload }) => active && payload?.[0] ? <div className="rounded border bg-background p-2 text-sm">{payload[0].payload.label}<br />{nativeMoney(payload[0].payload.cost_amount, data.currency)}</div> : null} />
-        <Area dataKey="chart_amount" stroke="var(--color-primary)" fill="var(--color-primary)" fillOpacity={0.12} />
+        <Area isAnimationActive={!reducedMotion} dataKey="chart_amount" stroke="var(--color-primary)" fill="var(--color-primary)" fillOpacity={0.12} />
       </AreaChart></ResponsiveContainer></div> : <p className="py-8 text-center text-sm text-muted-foreground">当前范围暂无已结算用量</p>}
     </Surface>
     <div className="grid gap-4 lg:grid-cols-3">{([["provider_id", "供应商统计"], ["model_id", "模型统计"], ["feature", "功能统计"]] as const).map(([dimension, title]) =>

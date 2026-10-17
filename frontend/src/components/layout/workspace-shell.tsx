@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -34,7 +35,6 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
-  GitBranch,
   GraduationCap,
   Home,
   ListChecks,
@@ -65,7 +65,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -77,8 +77,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
+  DropdownMenuPortal,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -96,8 +95,18 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { withScrollLockBypass } from "@/lib/scroll-lock";
+import { defaultUserAvatar } from "@/lib/user-avatar";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { SessionGraphBindingMenu } from "@/components/layout/session-graph-binding";
+import {
+  useSessionGraphBinding,
+  publishLearningNodeContext,
+  type LearningNodeContext,
+} from "@/lib/session-graph-binding";
 import { SettingsModal } from "@/components/layout/settings-modal";
+import { WorkspaceSearchDialog } from "@/components/layout/workspace-search-dialog";
+import { SidebarVersion } from "@/components/layout/sidebar-version";
 import { RouteMotion } from "@/components/shared/route-motion";
 import { NativeActions } from "@/features/mobile/NativeActions";
 import { PendingShareConsumer } from "@/features/mobile/PendingShareConsumer";
@@ -115,14 +124,6 @@ import {
   useAllPreviewsPaused,
 } from "@/lib/preview-pause-controller";
 import { isVoiceSessionActive } from "@/features/voice/voice-session-markers";
-// F1-2/P0-1: the selection-explanation panel pulls the whole chat renderer
-// (streamdown/hast/parse5/mermaid/d3 subtree) into the first-screen entry
-// chunk, which rolldown mis-orders at module eval (TDZ crash). Load it lazily.
-const SelectionExplanationPanel = lazy(() =>
-  import("@/features/chat/selection-explanation-panel").then((module) => ({
-    default: module.SelectionExplanationPanel,
-  })),
-);
 import {
   consumePendingSelectionExplanation,
   selectionExplanationOpenEventName,
@@ -175,10 +176,6 @@ import {
 import { createSession } from "@/api/sessions";
 import {
   clearDraftSessionId,
-  draftSessionScope,
-  getDraftSessionCreationKey,
-  getDraftSessionProjectId,
-  getOrCreateDraftSession,
   getDraftSessionId,
   isDefaultDraftTitle,
   setDraftSessionId,
@@ -288,15 +285,6 @@ type SidebarDeleteTarget =
       sessionImpact?: DeleteImpact;
     };
 
-type LearningNodeContext = {
-  graphId: string;
-  nodeId?: string;
-  nodeLabel?: string;
-  sessionId?: string;
-  learningPackage?: boolean;
-  openKey?: string;
-};
-
 type LearningProjectRequest = {
   graphId?: string;
   title?: string;
@@ -312,7 +300,6 @@ type LearningProjectRequest = {
   onError?: (message: string) => void;
 };
 
-const LEARNING_NODE_CONTEXT_STORAGE_KEY = "learngraph:active-learning-node";
 let learningPackageOpenSequence = 0;
 
 function nextLearningPackageOpenKey() {
@@ -462,52 +449,6 @@ function branchRowDisplayTitle(
   return legacyBranchIndex ? `${base}（${legacyBranchIndex}）` : base;
 }
 
-/**
- * Keep a parent visible when a child title matches the search query, and
- * prune non-matching children when the parent itself does not match.
- */
-function filterSidebarSessionTree(
-  sessions: SidebarSession[],
-  query: string,
-  activity: ReturnType<typeof getSessionActivitySnapshot>,
-): SidebarSession[] {
-  if (!query) return sortSidebarSessions(sessions, activity);
-  const next: SidebarSession[] = [];
-  for (const session of sessions) {
-    const selfMatch = session.title.toLocaleLowerCase().includes(query);
-    const children = session.children?.length
-      ? filterSidebarSessionTree(session.children, query, activity)
-      : [];
-    if (selfMatch || children.length) {
-      next.push({
-        ...session,
-        children: selfMatch
-          ? session.children?.length
-            ? sortSidebarSessions(session.children, activity)
-            : undefined
-          : children.length
-            ? children
-            : undefined,
-      });
-    }
-  }
-  return sortSidebarSessions(next, activity);
-}
-
-function publishLearningNodeContext(context: LearningNodeContext) {
-  try {
-    window.sessionStorage.setItem(
-      LEARNING_NODE_CONTEXT_STORAGE_KEY,
-      JSON.stringify(context),
-    );
-  } catch {
-    // The in-page event remains enough for the current chat surface.
-  }
-  window.dispatchEvent(
-    new CustomEvent("learngraph:learning-node-selected", { detail: context }),
-  );
-}
-
 const LAST_LEARNED_NODE_STORAGE_KEY = "learngraph:last-learned-nodes";
 
 function readLastLearnedNode(graphId: string): string | undefined {
@@ -586,6 +527,7 @@ function SidebarNav({
   onCollapse?: () => void;
   onNavigate?: () => void;
 }) {
+  const { isSystemAdmin } = useAuth();
   const { pathname, search } = useLocation();
   const { workspaceId = "" } = useParams();
   const navigate = useNavigate();
@@ -767,17 +709,16 @@ function SidebarNav({
       pathname.match(/\/chat\/([^/]+)/)?.[1];
     if (!currentSessionId) return;
     setActiveSessionId(currentSessionId);
-    const currentProject = findProjectForSession(projects, currentSessionId);
+    const draftProjectId = new URLSearchParams(search).get("project");
+    const currentProject = currentSessionId === "new"
+      ? projects.find((project) => project.id === draftProjectId)
+      : findProjectForSession(projects, currentSessionId);
     publishProjectContext(currentProject, currentSessionId);
-    // `/chat/new` is a standalone blank canvas. Do not carry a project target
-    // from the last historical session into it, otherwise the shell can create
-    // a project draft while the canvas is creating its root draft at the same
-    // time.
+    // The blank canvas carries only its explicitly selected folder. It has no
+    // persisted session or sidebar row until the user sends content.
     if (currentSessionId === "new") {
-      if (routedSessionIdRef.current !== currentSessionId) {
-        routedSessionIdRef.current = currentSessionId;
-        setSelectedProjectId(undefined);
-      }
+      routedSessionIdRef.current = currentSessionId;
+      setSelectedProjectId(draftProjectId ?? undefined);
       return;
     }
     // A route change means the user selected a conversation, so its parent
@@ -1047,72 +988,42 @@ function SidebarNav({
       const options =
         typeof input === "string" ? { projectId: input } : (input ?? {});
       const projectId = options.projectId;
-      const draftScope = draftSessionScope(workspaceId, projectId);
-      const draftProjectId = getDraftSessionProjectId();
-      const canReuseDraft = Boolean(
+      const project = options.project ?? projects.find((entry) => entry.id === projectId);
+      const isEmptyDraftRequest = Boolean(
         !options.forceNew &&
           !options.pendingPrompt &&
           !options.learningNode &&
-          !options.learningPackage &&
-          draftSessionId.current &&
-          (draftProjectId ?? null) === (projectId ?? null),
+          !options.learningPackage,
       );
-      const reusableDraftId = canReuseDraft ? draftSessionId.current : null;
-      const isNewRouteAction = Boolean(
-        options.fromNewConversationNav &&
-          pathname.endsWith("/chat/new") &&
-          !new URLSearchParams(search).has("mode"),
-      );
+      if (isEmptyDraftRequest) {
+        const currentParams = new URLSearchParams(search);
+        // Repeated clicks keep the same canvas and any unsent input intact.
+        if (
+          pathname === `${base}/chat/new` &&
+          (currentParams.get("project") ?? undefined) === projectId &&
+          !currentParams.has("mode")
+        ) {
+          onNavigate?.();
+          return;
+        }
+        window.dispatchEvent(new CustomEvent("learngraph:new-conversation"));
+        releaseDraftSession();
+        setActiveSessionId("new");
+        setSelectedProjectId(projectId);
+        publishProjectContext(project, "new");
+        const query = projectId ? `?project=${encodeURIComponent(projectId)}` : "";
+        navigate(`${base}/chat/new${query}`);
+        onNavigate?.();
+        return;
+      }
       // 「新会话」是一次会话切换，不是"在同一个会话里继续"：通话属于它所在的那个会话，
       // 必须先挂断再建新的。不这么做，新会话会被上一通电话的自动拨号带走（语音页
       // 监听这个事件做挂断与退出语音模式）。
       window.dispatchEvent(new CustomEvent("learngraph:new-conversation"));
-      if (
-        isNewRouteAction &&
-        !options.forceNew &&
-        !options.pendingPrompt &&
-        !options.learningNode &&
-        !options.learningPackage
-      ) {
-        onNavigate?.();
-        return;
-      }
-      // Reuse the single empty draft so multi-click "新对话" never spawns duplicates.
-      if (reusableDraftId) {
-        // Empty drafts opened via "新对话" should always present the workspace
-        // default response mode, even if an earlier race polluted localStorage.
-        // If the workspace setting is still loading, fetch it first so we do
-        // not silently seed the product default (agentic) over a 思考/极速 default.
-        let resolvedMode = workspaceDefaultResponseMode;
-        if (settingsQuery.isPending) {
-          try {
-            const settings =
-              (await queryClient.fetchQuery({
-                queryKey: workspaceQueryKey(workspaceId, "settings"),
-                queryFn: listSettings,
-                staleTime: 30_000,
-              })) as WorkspaceSetting[] | undefined;
-            resolvedMode = readChatDefaultResponseMode(settings);
-          } catch {
-            // Fall back to the memoized value; the chat canvas will re-seed
-            // once settings resolve.
-          }
-        }
-        setSessionComposerPrefs(
-          reusableDraftId,
-          defaultComposerPrefsForResponseMode(resolvedMode),
-        );
-        setActiveSessionId(reusableDraftId);
-        navigate(`${base}/chat/${reusableDraftId}`);
-        onNavigate?.();
-        return;
-      }
       if (creatingConversationRef.current) return;
       creatingConversationRef.current = true;
       setCreatingConversation(true);
       try {
-        const project =
-          options.project ?? projects.find((entry) => entry.id === projectId);
         const payload = {
           memory_enabled: true,
           title: "新会话",
@@ -1121,21 +1032,7 @@ function SidebarNav({
           current_node_id: options.learningNode?.nodeId ?? null,
           project_id: project?.id ?? null,
         };
-        const isEmptyDraftRequest = Boolean(
-          !options.forceNew &&
-            !options.pendingPrompt &&
-            !options.learningNode &&
-            !options.learningPackage,
-        );
-        const session = await (isEmptyDraftRequest
-          ? getOrCreateDraftSession(draftScope, () =>
-              createSession(payload, {
-                headers: {
-                  "Idempotency-Key": getDraftSessionCreationKey(draftScope),
-                },
-              }),
-            )
-          : createSession(payload));
+        const session = await createSession(payload);
         // Seed the workspace default response mode before the chat canvas
         // hydrates, so a new draft does not inherit another session's "极速".
         // If the workspace setting is still loading (e.g. the user clicked
@@ -1169,12 +1066,6 @@ function SidebarNav({
           ...(current ?? []).filter((item) => item.id !== session.id),
         ]);
         const sidebarSession = toSidebarSession(session);
-        if (isEmptyDraftRequest) {
-          // Keep the current empty draft reusable even when it belongs to a
-          // project. A second click in the same project must switch back to
-          // this draft instead of creating another blank row.
-          trackDraftSession(session.id, session.project_id ?? null);
-        }
         if (projectId) {
           // Project-scoped chats appear immediately under the project.
           setProjects((current) =>
@@ -1202,20 +1093,6 @@ function SidebarNav({
         ) {
           // Learning-entry paths already have content intent — list them.
           releaseDraftSession();
-          setUngroupedSessions((current) =>
-            nestSidebarSessions(
-              [
-                sidebarSession,
-                ...flattenSidebarSessions(current)
-                  .filter((item) => item.id !== session.id)
-                  .map(({ children: _children, ...item }) => item),
-              ],
-              sessionActivity,
-            ),
-          );
-        } else if (isEmptyDraftRequest) {
-          // Empty draft: track for reuse; show while viewing, hide after leave.
-          trackDraftSession(session.id, session.project_id ?? null);
           setUngroupedSessions((current) =>
             nestSidebarSessions(
               [
@@ -1275,7 +1152,6 @@ function SidebarNav({
       releaseDraftSession,
       settingsQuery.isPending,
       sessionActivity,
-      trackDraftSession,
       search,
       workspaceId,
       workspaceDefaultResponseMode,
@@ -1905,6 +1781,7 @@ function SidebarNav({
             <TooltipContent side="right">展开侧边栏</TooltipContent>
           </Tooltip>
         ) : (
+          <div className="sidebar-brand-group">
           <Link
             className="sidebar-brand flex items-center gap-2 px-2 py-2"
             onClick={onNavigate}
@@ -1924,6 +1801,8 @@ function SidebarNav({
               LearnGraph
             </span>
           </Link>
+          <SidebarVersion isSystemAdmin={isSystemAdmin} />
+          </div>
         )}
         {!mobile && !collapsed ? (
           <Button
@@ -1997,6 +1876,7 @@ function SidebarNav({
 
         <SessionProjects
           activeSessionId={activeSessionId}
+          creatingConversation={creatingConversation}
           folderState={folderState}
           selectedProjectId={selectedProjectId}
           onToggleFolder={setFolderOpen}
@@ -2004,9 +1884,9 @@ function SidebarNav({
           workspaceId={workspaceId}
           onCreateConversation={(projectId) => {
             const targetProjectId = projectId ?? selectedProjectId;
-            return targetProjectId
-              ? createConversation(targetProjectId)
-              : createConversation();
+            return createConversation({
+              projectId: targetProjectId,
+            });
           }}
           onCreateProject={async (title) => {
             const created = await createProjectRecord({ title });
@@ -2126,6 +2006,7 @@ const MemoSidebarNav = memo(SidebarNav);
 function SessionProjects({
   workspaceId,
   activeSessionId,
+  creatingConversation,
   folderState,
   selectedProjectId,
   onToggleFolder,
@@ -2150,6 +2031,7 @@ function SessionProjects({
 }: {
   workspaceId: string;
   activeSessionId: string;
+  creatingConversation: boolean;
   /** 项目和父会话文件夹共用的前端本地开合状态。 */
   folderState: SidebarFolderState;
   /** 当前新建会话要落入的项目文件夹。 */
@@ -2195,7 +2077,6 @@ function SessionProjects({
   const [creatingProject, setCreatingProject] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
-  const [sessionQuery, setSessionQuery] = useState("");
   const [renamingSessionId, setRenamingSessionId] = useState("");
   const [renameValue, setRenameValue] = useState("");
   const [renamePending, setRenamePending] = useState(false);
@@ -2245,29 +2126,20 @@ function SessionProjects({
     ],
     [projects, ungroupedSessions],
   );
-  const normalizedQuery = sessionQuery.trim().toLocaleLowerCase();
+  const recentSessionsId = useId();
+  const recentOpen =
+    folderState[sidebarFolderStateKey("section", "recent")] !== false;
   const visibleProjects = useMemo(
     () =>
-      projects.flatMap((project) => {
-        const sessions = filterSidebarSessionTree(
-          project.sessions,
-          normalizedQuery,
-          sessionActivity,
-        );
-        return sessions.length || !normalizedQuery
-          ? [{ ...project, sessions }]
-          : [];
-      }),
-    [normalizedQuery, projects, sessionActivity],
+      projects.map((project) => ({
+        ...project, sessions: sortSidebarSessions(project.sessions, sessionActivity),
+      })),
+    [projects, sessionActivity],
   );
   const visibleUngroupedSessions = useMemo(
     () =>
-      filterSidebarSessionTree(
-        ungroupedSessions,
-        normalizedQuery,
-        sessionActivity,
-      ),
-    [normalizedQuery, sessionActivity, ungroupedSessions],
+      sortSidebarSessions(ungroupedSessions, sessionActivity),
+    [sessionActivity, ungroupedSessions],
   );
   const activeProjectId = useMemo(
     () => findProjectForSession(projects, activeSessionId)?.id,
@@ -2481,11 +2353,7 @@ function SessionProjects({
   }
 
   function toggleSessionFolder(sessionId: string) {
-    // Search temporarily reveals matching children; treat that visual state
-    // as open so clicking the chevron can still save an intentional collapse.
-    const current = normalizedQuery
-      ? true
-      : (sessionFolderOpen[sessionId] ?? false);
+    const current = sessionFolderOpen[sessionId] ?? false;
     onToggleFolder("session", sessionId, !current);
   }
 
@@ -2515,14 +2383,11 @@ function SessionProjects({
       flattenSidebarSessions(children).some(
         (child) => child.id === activeSessionId,
       );
-    // Search reveals matching children, while an explicit local false still
-    // wins over the active-child convenience expansion.
+    // An explicit local false wins over active-child convenience expansion.
     const hasStoredOpen =
       typeof folderState[sidebarFolderStateKey("session", session.id)] ===
       "boolean";
-    const effectivelyOpen = normalizedQuery
-      ? true
-      : hasStoredOpen
+    const effectivelyOpen = hasStoredOpen
         ? open
         : open || childActive;
     // Read the marker during render so active voice sessions are identifiable
@@ -2721,41 +2586,45 @@ function SessionProjects({
                     {session.status === "archived" ? "恢复" : "归档"}
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
-                  {options.project ? (
-                    <>
-                      <DropdownMenuItem
-                        onSelect={() => onMoveSession(session.id)}
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger
+                      disabled={!options.project && projects.length === 0}
+                    >
+                      <Folder className="size-3.5" />
+                      移动到
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuPortal>
+                      <DropdownMenuSubContent
+                        className="max-h-[min(20rem,var(--radix-dropdown-menu-content-available-height))] w-60 max-w-[calc(100vw-2rem)] overflow-x-hidden overflow-y-auto"
+                        onTouchMove={withScrollLockBypass()}
+                        onWheel={withScrollLockBypass()}
                       >
-                        <Folder className="size-3.5" />
-                        移出项目
-                      </DropdownMenuItem>
-                      {projects
-                        .filter((entry) => entry.id !== options.project!.id)
-                        .map((target) => (
-                          <DropdownMenuItem
-                            key={target.id}
-                            onSelect={() =>
-                              onMoveSession(session.id, target.id)
-                            }
-                          >
-                            <Folder className="size-3.5" />
-                            移至「{target.title}」
-                          </DropdownMenuItem>
-                        ))}
-                    </>
-                  ) : (
-                    projects.map((project) => (
-                      <DropdownMenuItem
-                        key={project.id}
-                        onSelect={() =>
-                          onMoveSession(session.id, project.id)
-                        }
-                      >
-                        <Folder className="size-3.5" />
-                        {project.title}
-                      </DropdownMenuItem>
-                    ))
-                  )}
+                        {options.project ? (
+                          <>
+                            <DropdownMenuItem
+                              onSelect={() => onMoveSession(session.id)}
+                            >
+                              <Folder className="size-3.5" />
+                              移出项目
+                            </DropdownMenuItem>
+                            {projects.length > 1 ? <DropdownMenuSeparator /> : null}
+                          </>
+                        ) : null}
+                        {projects
+                          .filter((entry) => entry.id !== options.project?.id)
+                          .map((target) => (
+                            <DropdownMenuItem
+                              key={target.id}
+                              onSelect={() => onMoveSession(session.id, target.id)}
+                              title={target.title}
+                            >
+                              <Folder className="size-3.5" />
+                              <span className="min-w-0 truncate">{target.title}</span>
+                            </DropdownMenuItem>
+                          ))}
+                      </DropdownMenuSubContent>
+                    </DropdownMenuPortal>
+                  </DropdownMenuSub>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     onSelect={() => onRequestSessionDeletion(session)}
@@ -2823,7 +2692,6 @@ function SessionProjects({
                 className="sidebar-sessions__search-trigger"
                 onClick={() => {
                   setSearchOpen((open) => !open);
-                  if (searchOpen) setSessionQuery("");
                 }}
                 size="icon-xs"
                 variant="ghost"
@@ -2831,7 +2699,7 @@ function SessionProjects({
                 <Search className="size-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="right">搜索会话</TooltipContent>
+            <TooltipContent side="right">搜索文件、会话和消息</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -2892,28 +2760,7 @@ function SessionProjects({
           </Tooltip>
         </div>
       </div>
-      {searchOpen ? (
-        <div className="sidebar-sessions__search">
-          <Search aria-hidden="true" className="size-3.5" />
-          <Input
-            aria-label="搜索会话标题"
-            autoFocus
-            onChange={(event) => setSessionQuery(event.currentTarget.value)}
-            placeholder="按标题关键词搜索"
-            value={sessionQuery}
-          />
-          {sessionQuery ? (
-            <Button
-              aria-label="清空会话搜索"
-              onClick={() => setSessionQuery("")}
-              size="icon-xs"
-              variant="ghost"
-            >
-              <X className="size-3" />
-            </Button>
-          ) : null}
-        </div>
-      ) : null}
+      <WorkspaceSearchDialog open={searchOpen} onOpenChange={setSearchOpen} workspaceId={workspaceId} />
       {creatingProject ? (
         <form
           className="sidebar-sessions__project-form"
@@ -2936,10 +2783,7 @@ function SessionProjects({
       ) : null}
       <div className="sidebar-sessions__list mt-2 space-y-2">
         {visibleProjects.map((project) => {
-          // 默认折叠；搜索时强制展开，否则命中的会话被文件夹挡住看不见。
-          const open = normalizedQuery
-            ? true
-            : (projectFolderOpen[project.id] ?? false);
+          const open = projectFolderOpen[project.id] ?? false;
           return (
             <section className="sidebar-project" key={project.id}>
               <div
@@ -2985,12 +2829,26 @@ function SessionProjects({
                     <Folder aria-hidden="true" className="size-3.5" />
                   )}
                   <span>{project.title}</span>
-                  <small>
-                    {project.status === "archived"
-                      ? "已归档"
-                      : project.sessions.length}
-                  </small>
+                  {project.status === "archived" ? <small>已归档</small> : null}
                 </button>
+                {!selectionMode && project.status !== "archived" ? (
+                  <Button
+                    aria-label={`在文件夹 ${project.title} 中新建会话`}
+                    className="sidebar-project__new-session"
+                    disabled={creatingConversation}
+                    onClick={() => {
+                      onSelectProject(project.id);
+                      onToggleFolder("project", project.id, true);
+                      void onCreateConversation(project.id);
+                    }}
+                    size="icon-xs"
+                    title="新建会话"
+                    type="button"
+                    variant="ghost"
+                  >
+                    <Plus className="size-3.5" />
+                  </Button>
+                ) : null}
                 {!selectionMode ? (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -3059,14 +2917,36 @@ function SessionProjects({
           );
         })}
         {visibleUngroupedSessions.length ? (
-          <div className="sidebar-sessions__ungrouped">
-            {visibleUngroupedSessions.map((session) =>
-              renderSessionRow(session, { ungrouped: true }),
-            )}
-          </div>
-        ) : null}
-        {normalizedQuery && !visibleSessionIds.size ? (
-          <p className="sidebar-sessions__no-results">没有匹配的会话</p>
+          <section aria-label="最近" className="sidebar-sessions__ungrouped">
+            <h3 className="sidebar-sessions__recent-heading">
+              <button
+                aria-controls={recentSessionsId}
+                aria-expanded={recentOpen}
+                aria-label={recentOpen ? "折叠最近会话" : "展开最近会话"}
+                className="sidebar-sessions__recent-toggle"
+                onClick={() => onToggleFolder("section", "recent", !recentOpen)}
+                type="button"
+              >
+                <span>最近</span>
+                <ChevronDown
+                  aria-hidden="true"
+                  className={cn(
+                    "sidebar-sessions__recent-chevron size-3.5",
+                    !recentOpen && "-rotate-90",
+                  )}
+                />
+              </button>
+            </h3>
+            <div
+              className="sidebar-sessions__recent-list"
+              hidden={!recentOpen}
+              id={recentSessionsId}
+            >
+              {visibleUngroupedSessions.map((session) =>
+                renderSessionRow(session, { ungrouped: true }),
+              )}
+            </div>
+          </section>
         ) : null}
       </div>
       {selectionMode ? (
@@ -3154,20 +3034,9 @@ function UserMenu({
   /** 手机抽屉里由外壳传入：菜单项跳转前先收起抽屉，别让抽屉留在设置面板背后。 */
   onNavigate?: () => void;
 }) {
-  const { logout, username, workspaceId, workspaceName } = useAuth();
+  const { logout, username, avatarUrl, workspaceId, workspaceName } = useAuth();
   const navigate = useNavigate();
-  // Primer/GitHub-inspired muted accents: blue, green, purple, amber and teal.
-  // The stable hash means an account keeps the same friendly avatar colour.
-  const avatarTones = [
-    { backgroundColor: "#ddf4ff", color: "#0969da" },
-    { backgroundColor: "#dafbe1", color: "#1a7f37" },
-    { backgroundColor: "#fbefff", color: "#8250df" },
-    { backgroundColor: "#fff1e5", color: "#bc4c00" },
-    { backgroundColor: "#ddf7f4", color: "#0f766e" },
-  ];
-  const avatarTone = avatarTones[
-    [...username].reduce((total, character) => total + character.codePointAt(0)!, 0) % avatarTones.length
-  ];
+  const defaultAvatar = defaultUserAvatar(username);
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -3185,8 +3054,9 @@ function UserMenu({
               collapsed && !mobile ? "size-6" : "size-8",
             )}
           >
-            <AvatarFallback className="sidebar-user-avatar text-xs font-semibold" style={avatarTone}>
-              {username.slice(0, 1).toUpperCase()}
+            {avatarUrl ? <AvatarImage alt={`${username}的头像`} src={avatarUrl} /> : null}
+            <AvatarFallback className="sidebar-user-avatar text-xs font-semibold" style={defaultAvatar.style}>
+              {defaultAvatar.initial}
             </AvatarFallback>
           </Avatar>
           <span className="sidebar-text min-w-0 flex-1 overflow-hidden text-left">
@@ -3214,7 +3084,7 @@ function UserMenu({
         <DropdownMenuItem
           onSelect={() => {
             onNavigate?.();
-            navigate(`/w/${workspaceId}/settings/workspace`);
+            navigate(`/w/${workspaceId}/settings/general`);
           }}
         >
           <Settings />
@@ -3377,14 +3247,12 @@ function TopBarStatusMenuBody({
   chatHeader,
   contextActive,
   isChat,
-  onClearLearningNode,
   systemStatuses,
   workspaceName,
 }: {
   chatHeader?: ChatHeaderInfo;
   contextActive: boolean;
   isChat: boolean;
-  onClearLearningNode: () => void;
   systemStatuses: [string, string][];
   workspaceName: string;
 }) {
@@ -3402,12 +3270,6 @@ function TopBarStatusMenuBody({
             <Bot className="size-4" />
             {chatHeader?.modelConnected ? "模型已连接" : "模型不可用"}
           </DropdownMenuItem>
-          {!chatHeader?.graphTitle ? (
-            <DropdownMenuItem disabled>
-              <Network className="size-4" />
-              未绑定图谱
-            </DropdownMenuItem>
-          ) : null}
           {contextActive ? (
             <>
               <DropdownMenuSeparator />
@@ -3416,34 +3278,6 @@ function TopBarStatusMenuBody({
                 <div className="chat-context-menu__row">
                   <Target className="size-3.5" />
                   <span className="min-w-0 flex-1 truncate">已绑定目标</span>
-                </div>
-              ) : null}
-              {chatHeader?.graphTitle ? (
-                <div className="chat-context-menu__row" title={chatHeader.graphTitle}>
-                  <Network className="size-3.5" />
-                  <span className="min-w-0 flex-1 truncate">
-                    图谱 · {chatHeader.graphTitle}
-                  </span>
-                </div>
-              ) : null}
-              {chatHeader?.learningNodeActive ? (
-                <div className="chat-context-menu__row chat-context-menu__row--node">
-                  <GitBranch className="size-3.5" />
-                  <span
-                    className="min-w-0 flex-1 truncate"
-                    title={chatHeader.learningNodeLabel ?? "已选择学习节点"}
-                  >
-                    节点 · {chatHeader.learningNodeLabel ?? "已选择学习节点"}
-                  </span>
-                  <button
-                    aria-label="移除当前学习节点上下文"
-                    className="chat-context-menu__clear"
-                    onClick={onClearLearningNode}
-                    title="本轮后续消息不再绑定此节点"
-                    type="button"
-                  >
-                    <X className="size-3" />
-                  </button>
                 </div>
               ) : null}
             </>
@@ -3481,8 +3315,9 @@ function TopBar({
   railCollapsed?: boolean;
   onToggleRail?: () => void;
 }) {
-  const { pathname } = useLocation();
+  const { pathname, search } = useLocation();
   const { workspaceId = "" } = useParams();
+  const sessionId = new URLSearchParams(search).get("sidebarSession") ?? pathname.match(/\/chat\/([^/]+)/)?.[1];
   const auth = useAuth();
   const isChat = pathname.includes("/chat/");
   const isMemory = pathname.includes("/memory");
@@ -3514,19 +3349,9 @@ function TopBar({
   const systemHealthy = isChat
     ? Boolean(chatHeader?.modelConnected)
     : systemStatuses.length > 0 && systemStatuses.every(([, value]) => statusIsHealthy(value));
-  // Merged status+context trigger state: the green dot always shows system
-  // health; once a goal/graph/node is bound, the trigger grows the compact
-  // "上下文" pill and the dropdown shows both sections.
-  const contextActive =
-    isChat &&
-    Boolean(
-      chatHeader?.goalBound ||
-        chatHeader?.graphTitle ||
-        chatHeader?.learningNodeActive,
-    );
-  const clearLearningNode = useCallback(() => {
-    window.dispatchEvent(new CustomEvent("learngraph:learning-node-clear"));
-  }, []);
+  // Graph and node bindings live in the menu's binding card; goal context
+  // remains beside the connection status.
+  const contextActive = isChat && Boolean(chatHeader?.goalBound);
   return (
     <header className="workspace-topbar">
       <div className="workspace-topbar__left">
@@ -3628,7 +3453,7 @@ function TopBar({
               aria-label="打开页面工具"
               className="topbar-status relative shrink-0"
               size="icon-sm"
-              title="系统状态、上下文与学习活动"
+              title="图谱绑定、系统状态与学习活动"
               variant="ghost"
             >
               <SlidersHorizontal className="size-4" />
@@ -3641,7 +3466,11 @@ function TopBar({
               />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="chat-context-menu w-64">
+          <DropdownMenuContent align="end" className="chat-context-menu w-72">
+            {isChat ? <>
+              <SessionGraphBindingMenu key={sessionId} workspaceId={workspaceId} sessionId={sessionId} />
+              <DropdownMenuSeparator />
+            </> : null}
             <DropdownMenuItem onSelect={onOpenActivity}>
               <CalendarDays className="size-4" />
               学习活动
@@ -3651,7 +3480,6 @@ function TopBar({
               chatHeader={chatHeader}
               contextActive={contextActive}
               isChat={isChat}
-              onClearLearningNode={clearLearningNode}
               systemStatuses={systemStatuses}
               workspaceName={auth.workspaceName}
             />
@@ -3659,42 +3487,6 @@ function TopBar({
         </DropdownMenu>
       </div>
     </header>
-  );
-}
-
-function SelectionExplanationRail({
-  detail,
-  onClose,
-  parentSessionId,
-  creationParentSessionId,
-  workspaceId,
-}: {
-  detail: SelectionExplanationOpenDetail;
-  onClose: () => void;
-  parentSessionId: string;
-  creationParentSessionId: string;
-  workspaceId: string;
-}) {
-  return (
-    <section aria-label="独立解释" className="selection-explanation-rail">
-      <header className="selection-explanation-rail__header">
-        <div>
-          <span>独立画布</span>
-          <strong>划词解释</strong>
-        </div>
-        <Button aria-label="关闭独立解释" onClick={onClose} size="icon-xs" variant="ghost">
-          <X className="size-3.5" />
-        </Button>
-      </header>
-      <div className="selection-explanation-rail__canvas selection-explanation-rail__canvas--live">
-        <SelectionExplanationPanel
-          detail={detail}
-          parentSessionId={parentSessionId}
-          creationParentSessionId={creationParentSessionId}
-          workspaceId={workspaceId}
-        />
-      </div>
-    </section>
   );
 }
 
@@ -3866,20 +3658,15 @@ function ContextRail({
       // Collapsed rail stays mounted for CSS slide; inert keeps it out of tab order.
       inert={collapsed || undefined}
     >
-      {selectionExplanation && isChat && sessionId ? (
-        <SelectionExplanationRail
-          detail={selectionExplanation}
-          onClose={() => setSelectionExplanation(null)}
-          parentSessionId={sessionId}
-          creationParentSessionId={creationParentSessionId ?? sessionId}
-          workspaceId={workspaceId}
-        />
-      ) : isGoalClarify || isGoalMode ? (
+      {(isGoalClarify || isGoalMode) && !selectionExplanation ? (
         <GoalGraphPreviewRail />
       ) : isGraph ? (
         <GraphWorkspaceRail />
       ) : isChat ? (
         <ChatGraphRail
+          selectionExplanation={selectionExplanation}
+          onCloseExplanation={() => setSelectionExplanation(null)}
+          creationParentSessionId={creationParentSessionId}
           project={activeProject}
           session={activeSession}
           sessionId={sessionId}
@@ -3939,11 +3726,17 @@ function ActivityRail() {
 }
 
 function ChatGraphRail({
+  selectionExplanation,
+  onCloseExplanation,
+  creationParentSessionId,
   project,
   session,
   sessionId,
   workspaceId,
 }: {
+  selectionExplanation?: SelectionExplanationOpenDetail | null;
+  onCloseExplanation?: () => void;
+  creationParentSessionId?: string;
   project?: SidebarProject;
   session?: Session;
   sessionId?: string;
@@ -3963,58 +3756,12 @@ function ChatGraphRail({
   useEffect(() => {
     setSideConversationFocusId(undefined);
   }, [sessionId]);
-  // undefined = follow server data, null = optimistic explicit unbind.
-  const [boundOverride, setBoundOverride] = useState<
-    { graphId: string; graphTitle: string } | null | undefined
-  >();
-  const [nodeOverride, setNodeOverride] = useState<
-    string | null | undefined
-  >();
-  const [bindingPending, setBindingPending] = useState(false);
+  const { binding: sessionBinding, boundNodeId, bindingPending, bindGraph: bindSessionGraph, bindNode } = useSessionGraphBinding(workspaceId, sessionId);
+  const binding = sessionBinding ?? (!session && project?.graphId ? {
+    graphId: project.graphId,
+    graphTitle: project.graphTitle || project.title,
+  } : undefined);
   const isLearning = view === "learning";
-  const graphs = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "graphs"),
-    queryFn: listGraphs,
-    staleTime: 30_000,
-  });
-  const serverBinding = session?.graph_id
-    ? {
-        graphId: session.graph_id,
-        graphTitle:
-          graphs.data?.find((graph) => graph.id === session.graph_id)?.title ||
-          (project?.graphId === session.graph_id
-            ? project.graphTitle || project.title
-            : "当前会话图谱"),
-      }
-    : !session && project?.graphId
-      ? {
-          graphId: project.graphId,
-          graphTitle: project.graphTitle || project.title,
-        }
-      : undefined;
-  const binding =
-    boundOverride === undefined ? serverBinding : boundOverride ?? undefined;
-  const boundNodeId =
-    nodeOverride === undefined
-      ? session?.current_node_id ?? null
-      : nodeOverride;
-  const boundGraph = useQuery({
-    queryKey: workspaceQueryKey(
-      workspaceId,
-      "graph",
-      binding?.graphId ?? "unbound",
-    ),
-    queryFn: () => getGraph(binding!.graphId),
-    staleTime: 30_000,
-    enabled: Boolean(binding?.graphId),
-  });
-  const boundNode = boundGraph.data?.nodes.find(
-    (node) => node.id === boundNodeId,
-  );
-  useEffect(() => {
-    setBoundOverride(undefined);
-    setNodeOverride(undefined);
-  }, [session?.graph_id, session?.id, session?.current_node_id]);
 
   const settings = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "settings"),
@@ -4057,17 +3804,6 @@ function ChatGraphRail({
     }
   }, [view]);
 
-  const cacheSession = useCallback(
-    (updated: Session) => {
-      queryClient.setQueryData<Session[]>(
-        workspaceQueryKey(workspaceId, "sessions"),
-        (current) =>
-          current?.map((item) => (item.id === updated.id ? updated : item)),
-      );
-    },
-    [queryClient, workspaceId],
-  );
-
   const createSideConversation = useCallback(async () => {
     setView("conversation");
     if (creatingSideConversationRef.current) return;
@@ -4089,6 +3825,7 @@ function ChatGraphRail({
           ...(current ?? []).filter((item) => item.id !== created.id),
         ],
       );
+      onCloseExplanation?.();
       setSideConversationFocusId(created.id);
       toast.success("已创建侧边会话");
     } catch (error) {
@@ -4101,120 +3838,24 @@ function ChatGraphRail({
     }
   }, [
     queryClient,
+    onCloseExplanation,
     session?.parent_session_id,
     sessionId,
     workspaceId,
   ]);
 
-  const clearNodeContext = useCallback(() => {
-    window.dispatchEvent(
-      new CustomEvent("learngraph:learning-node-clear", {
-        detail: { sessionId },
-      }),
-    );
-  }, [sessionId]);
+  useEffect(() => {
+    if (selectionExplanation) setView("conversation");
+  }, [selectionExplanation]);
 
-  const bindGraph = async (graph: GraphSummary) => {
+  const bindGraph = (graph: GraphSummary) => {
     if (!sessionId || !session) {
-      window.dispatchEvent(
-        new CustomEvent("learngraph:open-learning-project", {
-          detail: { graphId: graph.id, title: graph.title },
-        }),
-      );
+      window.dispatchEvent(new CustomEvent("learngraph:open-learning-project", {
+        detail: { graphId: graph.id, title: graph.title },
+      }));
       return;
     }
-    if (graph.status !== "published") {
-      toast.error("当前会话只能绑定已发布的图谱");
-      return;
-    }
-    if (session.goal_id && session.goal_id !== graph.goal_id) {
-      toast.error("该图谱与当前会话的学习目标不一致");
-      return;
-    }
-    if (bindingPending || graph.id === binding?.graphId) return;
-    const previousBinding = binding ?? null;
-    const previousNodeId = boundNodeId;
-    setBoundOverride({ graphId: graph.id, graphTitle: graph.title });
-    setNodeOverride(null);
-    setBindingPending(true);
-    try {
-      const updated = await updateSession(sessionId, {
-        graph_id: graph.id,
-        goal_id: session.goal_id ?? graph.goal_id,
-        current_node_id: null,
-      });
-      cacheSession(updated);
-      clearNodeContext();
-      toast.success(`当前会话已绑定「${graph.title}」`);
-    } catch (error) {
-      setBoundOverride(previousBinding);
-      setNodeOverride(previousNodeId);
-      toast.error(error instanceof Error ? error.message : "图谱绑定失败");
-    } finally {
-      setBindingPending(false);
-    }
-  };
-
-  const clearGraph = async () => {
-    if (!sessionId || !session || !binding || bindingPending) return;
-    const previousBinding = binding;
-    const previousNodeId = boundNodeId;
-    setBoundOverride(null);
-    setNodeOverride(null);
-    setBindingPending(true);
-    try {
-      const updated = await updateSession(sessionId, {
-        graph_id: null,
-        current_node_id: null,
-      });
-      cacheSession(updated);
-      clearNodeContext();
-      toast.success("已取消当前会话的图谱与节点绑定");
-    } catch (error) {
-      setBoundOverride(previousBinding);
-      setNodeOverride(previousNodeId);
-      toast.error(error instanceof Error ? error.message : "取消绑定失败");
-    } finally {
-      setBindingPending(false);
-    }
-  };
-
-  const bindNode = async (nodeId: string | null) => {
-    if (!sessionId || !session || !binding || bindingPending) return;
-    if (nodeId === boundNodeId) return;
-    const node = nodeId
-      ? boundGraph.data?.nodes.find((item) => item.id === nodeId)
-      : undefined;
-    if (nodeId && !node) {
-      toast.error("所选节点不属于当前图谱");
-      return;
-    }
-    const previousNodeId = boundNodeId;
-    setNodeOverride(nodeId);
-    setBindingPending(true);
-    try {
-      const updated = await updateSession(sessionId, {
-        current_node_id: nodeId,
-      });
-      cacheSession(updated);
-      if (node) {
-        publishLearningNodeContext({
-          graphId: binding.graphId,
-          nodeId: node.id,
-          nodeLabel: node.label,
-          sessionId,
-        });
-        toast.success(`当前会话已切换到节点「${node.label}」`);
-      } else {
-        clearNodeContext();
-        toast.success("已取消当前会话的节点绑定");
-      }
-    } catch (error) {
-      setNodeOverride(previousNodeId);
-      toast.error(error instanceof Error ? error.message : "节点绑定失败");
-    } finally {
-      setBindingPending(false);
-    }
+    void bindSessionGraph(graph);
   };
 
   return (
@@ -4288,87 +3929,10 @@ function ChatGraphRail({
           )}
         </Button>
       </div>
-      {view === "learning" ? (
-        <section
-          aria-label="当前会话图谱绑定"
-          className="session-graph-binding"
-        >
-          <div className="session-graph-binding__summary">
-            <span>当前会话</span>
-            <strong>{binding?.graphTitle ?? "未绑定图谱"}</strong>
-            <small>
-              {binding
-                ? boundNode?.label
-                  ? `绑定节点 · ${boundNode.label}`
-                  : "未绑定具体节点"
-                : project?.graphId
-                  ? `文件夹默认 · ${project.graphTitle || project.title}`
-                  : "可从图谱书架选择"}
-            </small>
-          </div>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                aria-label={binding ? "更换当前会话图谱" : "绑定当前会话图谱"}
-                className="session-graph-binding__graph-button"
-                disabled={bindingPending || !session}
-                size="xs"
-                variant="outline"
-              >
-                {bindingPending ? (
-                  <LoaderCircle className="size-3 animate-spin" />
-                ) : (
-                  <Network className="size-3" />
-                )}
-                {binding ? "更换" : "绑定"}
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-60">
-              <DropdownMenuLabel>绑定到当前会话</DropdownMenuLabel>
-              {(graphs.data ?? []).map((graph) => {
-                const compatible =
-                  graph.status === "published" &&
-                  (!session?.goal_id || session.goal_id === graph.goal_id);
-                return (
-                  <DropdownMenuItem
-                    disabled={!compatible || graph.id === binding?.graphId}
-                    key={graph.id}
-                    onSelect={() => void bindGraph(graph)}
-                  >
-                    <Network className="size-3.5" />
-                    <span className="min-w-0 flex-1 truncate">
-                      {graph.title}
-                    </span>
-                    {graph.id === binding?.graphId ? (
-                      <BadgeCheck className="size-3.5" />
-                    ) : !compatible ? (
-                      <small>不可用</small>
-                    ) : null}
-                  </DropdownMenuItem>
-                );
-              })}
-              {binding ? (
-                <>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    onSelect={() => void clearGraph()}
-                    variant="destructive"
-                  >
-                    <X className="size-3.5" />
-                    取消图谱与节点绑定
-                  </DropdownMenuItem>
-                </>
-              ) : null}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </section>
-      ) : null}
       {view === "conversation" ? (
-        <SideConversationRail
-          currentSessionId={sessionId}
-          focusSessionId={sideConversationFocusId}
-          workspaceId={workspaceId}
-        />
+        <SideConversationRail currentSessionId={sessionId} focusSessionId={sideConversationFocusId}
+          selectionDetail={selectionExplanation} creationParentSessionId={creationParentSessionId ?? sessionId}
+          onCloseSelection={onCloseExplanation} workspaceId={workspaceId} />
       ) : view === "files" ? (
         <SessionFilePreviewRail
           sessionId={sessionId}
@@ -4379,9 +3943,8 @@ function ChatGraphRail({
       ) : view === "learning" ? (
         binding ? (
           <BoundGraphRail
-            bindingPending={bindingPending}
             graphId={binding.graphId}
-            onBindNode={(nodeId) => void bindNode(nodeId)}
+            onBindNode={session ? bindNode : undefined}
             selectedNodeId={boundNodeId ?? undefined}
             sessionId={sessionId}
             title={binding.graphTitle}
@@ -4389,6 +3952,7 @@ function ChatGraphRail({
           />
         ) : (
           <ProjectBookshelf
+            bindingPending={bindingPending}
             onBind={bindGraph}
             project={project}
             workspaceId={workspaceId}
@@ -4402,11 +3966,13 @@ function ChatGraphRail({
 }
 
 function ProjectBookshelf({
+  bindingPending,
   project,
   onBind,
   workspaceId,
 }: {
   project?: SidebarProject;
+  bindingPending?: boolean;
   onBind: (graph: GraphSummary) => void;
   workspaceId: string;
 }) {
@@ -4434,7 +4000,7 @@ function ProjectBookshelf({
       </div>
       <div className="project-bookshelf__list">
         {books.map((graph) => (
-          <button key={graph.id} onClick={() => onBind(graph)} type="button">
+          <button disabled={bindingPending} key={graph.id} onClick={() => onBind(graph)} type="button">
             <span className="project-bookshelf__spine">
               <Network className="size-3.5" />
             </span>
@@ -4518,7 +4084,6 @@ function toRailKnowledgeGraph(
 }
 
 function BoundGraphRail({
-  bindingPending,
   graphId,
   onBindNode,
   selectedNodeId: requestedNodeId,
@@ -4526,9 +4091,8 @@ function BoundGraphRail({
   title,
   workspaceId,
 }: {
-  bindingPending?: boolean;
   graphId: string;
-  onBindNode?: (nodeId: string | null) => void;
+  onBindNode?: (nodeId: string | null) => Promise<boolean>;
   selectedNodeId?: string;
   sessionId?: string;
   title: string;
@@ -4772,13 +4336,13 @@ function BoundGraphRail({
       })()
     : undefined;
 
-  function activateNode(
+  async function activateNode(
     node: Pick<GraphNode, "id" | "label">,
     options: { learningPackage?: boolean } = {},
   ) {
+    if (onBindNode && !(await onBindNode(node.id))) return false;
     setSelectedNodeId(node.id);
     rememberLastLearnedNode(graphId, node.id);
-    onBindNode?.(node.id);
     publishLearningNodeContext({
       graphId,
       nodeId: node.id,
@@ -4786,19 +4350,20 @@ function BoundGraphRail({
       sessionId,
       learningPackage: options.learningPackage,
     });
+    return true;
   }
 
-  function askNode(question: string) {
+  async function askNode(question: string) {
     if (!selectedNode) return;
-    activateNode(selectedNode);
+    if (!(await activateNode(selectedNode))) return;
     window.dispatchEvent(
       new CustomEvent("learngraph:compose", { detail: { content: question } }),
     );
   }
 
-  function studyNode() {
+  async function studyNode() {
     if (!selectedNode) return;
-    activateNode(selectedNode, { learningPackage: true });
+    if (!(await activateNode(selectedNode, { learningPackage: true }))) return;
     // 学习内容和追问必须留在同一个对话画布中。由 shell 创建/复用会话，
     // ChatCanvasPage 会在收到 learningNode 后挂载阶段式学习包预览。
     window.dispatchEvent(
@@ -4815,7 +4380,7 @@ function BoundGraphRail({
     );
   }
 
-  function studyNextNode() {
+  async function studyNextNode() {
     if (!selectedNode || !graph) return;
     const next =
       childNodes[0] ??
@@ -4829,7 +4394,7 @@ function BoundGraphRail({
       toast.message("当前没有更合适的下一个节点。");
       return;
     }
-    activateNode(next, { learningPackage: true });
+    if (!(await activateNode(next, { learningPackage: true }))) return;
     window.dispatchEvent(
       new CustomEvent("learngraph:open-learning-project", {
         detail: {
@@ -4854,9 +4419,9 @@ function BoundGraphRail({
     );
   }
 
-  function splitNode() {
+  async function splitNode() {
     if (!selectedNode) return;
-    activateNode(selectedNode);
+    if (!(await activateNode(selectedNode))) return;
     const childHint = childNodes.length
       ? `已有下级：${childNodes
           .slice(0, 8)
@@ -4901,14 +4466,15 @@ function BoundGraphRail({
         minimumZoom={0.15}
         nodes={railGraph.nodes}
         onOpenExplore={(node) => openExploreHistory(node.id)}
-        onStudy={(node) => {
-          activateNode(node, { learningPackage: true });
+        onStudy={async (node) => {
+          if (!(await activateNode(node, { learningPackage: true }))) return;
           window.dispatchEvent(new CustomEvent("learngraph:open-learning-project", {detail: {
             graphId, title: graph.title || node.label, nodeId: node.id, nodeLabel: node.label, learningPackage: true,
           }}));
         }}
         onSelect={(node) => {
-          activateNode(node);
+          // Selecting a card previews it; binding is explicit in page tools.
+          setSelectedNodeId(node.id);
           setEditing(false);
           setExplorePanelOpen(false);
           setValidation(undefined);
@@ -5053,44 +4619,10 @@ function BoundGraphRail({
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="w-40">
-                    <DropdownMenuItem onSelect={splitNode}>
+                    <DropdownMenuItem onSelect={() => void splitNode()}>
                       <Split className="size-3.5" />
                       拆分节点
                     </DropdownMenuItem>
-                    {onBindNode ? (
-                      <DropdownMenuSub>
-                        <DropdownMenuSubTrigger>
-                          <Network className="size-3.5" />
-                          换绑节点
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent className="max-h-[min(60vh,24rem)] w-56 overflow-y-auto">
-                          <DropdownMenuRadioGroup
-                            onValueChange={(value) =>
-                              onBindNode(value === "__none__" ? null : value)
-                            }
-                            value={requestedNodeId ?? "__none__"}
-                          >
-                            <DropdownMenuRadioItem
-                              disabled={Boolean(!graph || bindingPending)}
-                              value="__none__"
-                            >
-                              不绑定具体节点
-                            </DropdownMenuRadioItem>
-                            {(graph?.nodes ?? []).map((node) => (
-                              <DropdownMenuRadioItem
-                                disabled={bindingPending}
-                                key={node.id}
-                                value={node.id}
-                              >
-                                <span className="min-w-0 truncate">
-                                  {node.label}
-                                </span>
-                              </DropdownMenuRadioItem>
-                            ))}
-                          </DropdownMenuRadioGroup>
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
-                    ) : null}
                     <DropdownMenuItem
                       onSelect={() => focus.mutate(selectedNode.id)}
                     >
@@ -5572,7 +5104,7 @@ function SettingsOutletFallback() {
 const SettingsOutlet = memo(function SettingsOutlet() {
   return (
     <Suspense fallback={<SettingsOutletFallback />}>
-      <ShellOutlet />
+      <Outlet />
     </Suspense>
   );
 });

@@ -1,4 +1,5 @@
-import { useState, type FormEvent } from "react";
+import { useSettingsDirty } from '@/lib/settings-dirty';
+import { useId, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Pencil, Plus, X } from "lucide-react";
 import { toast } from "sonner";
@@ -45,6 +46,8 @@ export function DomainAllowlistEditor({
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
+  const dirtyId = useId();
+  useSettingsDirty(`domain-${dirtyId}`, Boolean(draft.trim()) || Boolean(editing && editDraft !== editing));
   const update = useMutation({
     mutationFn: updatePolicy,
     onSuccess: (next) => {
@@ -162,12 +165,12 @@ export function DomainAllowlistEditor({
   );
 }
 
-/** 搜索与 Deep Research 来源白名单（research.policy，应用层）。 */
+/** 搜索来源白名单（research.policy，应用层）。 */
 export function ResearchDomainAllowlistEditor() {
   return (
     <DomainAllowlistEditor
-      description="搜索与 Deep Research 只能使用这里列出的精确公共 DNS 域名。空列表表示不设置工作区默认来源限制，仍受 Provider 与网络安全策略约束。此白名单只约束查询来源（应用层），不授予沙箱出站权限；沙箱联网需在「Egress 审批」中获批。"
-      emptyLabel="尚未设置搜索与 Deep Research 来源白名单。"
+      description="搜索只能使用这里列出的精确公共 DNS 域名。空列表表示不设置工作区默认来源限制，仍受 Provider 与网络安全策略约束。此白名单只约束查询来源（应用层），不授予沙箱出站权限；沙箱联网需在「Egress 审批」中获批。"
+      emptyLabel="尚未设置搜索来源白名单。"
       getPolicy={getResearchPolicy}
       placeholder="例如：arxiv.org"
       queryKey={researchPolicyQueryKey}
@@ -191,7 +194,7 @@ export function FetchDomainAllowlistEditor() {
 }
 
 /**
- * 统一白名单（access.allowlist）：搜索 / Deep Research、网页抓取与沙箱
+ * 统一白名单（access.allowlist）：搜索、网页抓取与沙箱
  * 出站共用一层。白名单内域名一律不拦截；「全放行」开关则不拦截全部公网域名。
  */
 export function UnifiedAllowlistEditor() {
@@ -324,6 +327,8 @@ function DomainListEditor({
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
+  const dirtyId = useId();
+  useSettingsDirty(`domain-${dirtyId}`, Boolean(draft.trim()) || Boolean(editing && editDraft !== editing));
   const add = (event: FormEvent) => {
     event.preventDefault();
     const value = draft.trim();

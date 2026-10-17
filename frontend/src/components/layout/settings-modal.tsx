@@ -1,6 +1,18 @@
-import { startTransition, useEffect, useState, type ReactNode } from "react";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { Check, ChevronDown, Settings, X } from "lucide-react";
+import { startTransition, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useBlocker, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Check, ChevronDown, FilePenLine, Info, Settings, X } from "lucide-react";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogMedia,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 import {
   Dialog,
@@ -17,6 +29,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
+import { SettingsDirtyContext } from "@/lib/settings-dirty";
+import "@/features/settings/settings-center.css";
 import {
   isSettingsNavActive,
   settingsNav,
@@ -49,6 +63,19 @@ export function SettingsModal({
   // Radix fires onOpenChange(false) on Esc/overlay click. Guard against a
   // second dismiss while navigation away from /settings/* is already in flight.
   const [dismissed, setDismissed] = useState(false);
+  const dirtyForms = useRef(new Set<string>());
+  const registerDirty = useCallback((id: string, dirty: boolean) => {
+    if (dirty) dirtyForms.current.add(id);
+    else dirtyForms.current.delete(id);
+  }, []);
+  const blocker = useBlocker(({ currentLocation, nextLocation }) =>
+    currentLocation.pathname !== nextLocation.pathname && dirtyForms.current.size > 0,
+  );
+  const keepEditing = () => {
+    if (blocker.state !== "blocked") return;
+    setDismissed(false);
+    blocker.reset();
+  };
 
   useEffect(() => {
     if (!open) setDismissed(false);
@@ -56,7 +83,7 @@ export function SettingsModal({
 
   const handleOpenChange = (next: boolean) => {
     if (next) return;
-    if (dismissed) return;
+    if (dismissed || blocker.state === "blocked") return;
     setDismissed(true);
     onClose();
   };
@@ -93,6 +120,7 @@ export function SettingsModal({
   }
 
   return (
+    <SettingsDirtyContext.Provider value={registerDirty}>
     <Dialog onOpenChange={handleOpenChange} open={open}>
       <DialogContent
         aria-describedby={undefined}
@@ -105,10 +133,10 @@ export function SettingsModal({
           // ≥sm: ChatGPT-style centered secondary window.
           "sm:inset-auto sm:top-1/2 sm:left-1/2 sm:right-auto sm:bottom-auto",
           "sm:h-[min(860px,86vh)] sm:max-h-[86vh]",
-          "sm:w-full sm:max-w-[min(980px,94vw)]",
+          "sm:w-full sm:max-w-[min(1260px,94vw)]",
           "sm:-translate-x-1/2 sm:-translate-y-1/2",
-          "sm:grid-cols-[220px_minmax(0,1fr)] sm:rounded-[18px]",
-          "sm:border sm:shadow-2xl sm:ring-1 sm:ring-black/10",
+          "sm:grid-cols-[256px_minmax(0,1fr)] sm:rounded-[16px]",
+          "sm:border sm:shadow-lg sm:ring-1 sm:ring-black/5",
         )}
         showCloseButton={false}
       >
@@ -124,10 +152,10 @@ export function SettingsModal({
           </div>
           <ScrollArea className="min-h-0 flex-1">
             <ul className="flex flex-col gap-0.5 px-2 pb-3">
-              {sections.map((section, sectionIndex) => (
-                <li key={section.title ?? sectionIndex}>
+              {sections.filter(section => section.title).map((section, sectionIndex) => (
+                <li key={section.title ?? sectionIndex} className={!section.title ? "mt-6 border-t pt-2" : undefined}>
                   {section.title ? (
-                    <p className="px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/60 first:pt-2">
+                    <p className="px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-muted-foreground first:pt-2">
                       {section.title}
                     </p>
                   ) : (
@@ -141,6 +169,7 @@ export function SettingsModal({
                         <li key={item.path}>
                           <button
                             type="button"
+                            aria-current={active ? "page" : undefined}
                             onClick={() => navigateToSetting(item.path)}
                             className={cn(
                               "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors",
@@ -160,6 +189,7 @@ export function SettingsModal({
               ))}
             </ul>
           </ScrollArea>
+          <div className="shrink-0 border-t p-2"><button type="button" onClick={() => navigateToSetting('settings/about')} aria-current={pathname.endsWith('/settings/about') ? 'page' : undefined} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-muted-foreground hover:bg-background hover:text-foreground"><Info className="size-4"/>关于</button></div>
         </nav>
 
         <section className="flex min-h-0 min-w-0 flex-col">
@@ -263,7 +293,36 @@ export function SettingsModal({
             {children}
           </div>
         </section>
+        <AlertDialog
+          open={blocker.state === "blocked"}
+          onOpenChange={(next) => { if (!next) keepEditing(); }}
+        >
+          <AlertDialogContent className="w-[calc(100%-2rem)] gap-5 rounded-2xl p-6 shadow-xl sm:max-w-[420px] motion-reduce:animate-none">
+            <AlertDialogHeader className="flex flex-col items-start gap-3 text-left">
+              <AlertDialogMedia className="mb-1 size-11 rounded-xl bg-primary/8 text-primary">
+                <FilePenLine className="size-5" aria-hidden="true" />
+              </AlertDialogMedia>
+              <AlertDialogTitle className="text-lg font-semibold">
+                放弃未保存的修改？
+              </AlertDialogTitle>
+              <AlertDialogDescription className="leading-relaxed">
+                当前页面有尚未保存的修改。离开后，这些修改将丢失。
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter className="m-0 rounded-none border-0 bg-transparent p-0 pt-1">
+              <AlertDialogCancel className="h-10 px-4">继续编辑</AlertDialogCancel>
+              <AlertDialogAction
+                variant="destructive"
+                className="h-10 px-4"
+                onClick={() => { if (blocker.state === "blocked") blocker.proceed(); }}
+              >
+                放弃修改并离开
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </DialogContent>
     </Dialog>
+    </SettingsDirtyContext.Provider>
   );
 }

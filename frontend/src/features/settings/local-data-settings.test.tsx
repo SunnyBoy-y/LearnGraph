@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { findByRole } from '@testing-library/react'
+import { findByRole, fireEvent } from '@testing-library/react'
 
 import { listSettings, updateSetting } from '@/api'
 import { authStore } from '@/api/auth-store'
@@ -47,7 +47,7 @@ const record: SelectionExplanationRecord = {
   createdAt: '2026-08-03T00:00:00.000Z',
 }
 
-describe('PersonalizationPage R-017 clear-traces button', () => {
+describe('LocalDataSettings R-017 clear-traces button', () => {
   beforeEach(() => {
     authStore.setSession({
       accessToken: 'token-a',
@@ -66,15 +66,17 @@ describe('PersonalizationPage R-017 clear-traces button', () => {
   it('clears the current (user, workspace) selection namespace when clicked', async () => {
     // Load the page AFTER the barrel mock is registered so the page's own
     // static import cannot capture the real module first.
-    const { PersonalizationPage } = await import('./personalization-page')
+    const { LocalDataSettings } = await import('./local-data-settings')
 
     // Seed the current partition with a private excerpt.
     upsertSelectionExplanation(record)
     expect(listSelectionExplanations(record.parentSessionId)).toEqual([record])
 
-    const { container } = renderWithProviders(<PersonalizationPage />)
+    const { container } = renderWithProviders(<LocalDataSettings />)
     const clearButton = await findByRole(container, 'button', { name: '清除记录' })
-    clearButton.click()
+    fireEvent.click(clearButton)
+    // Local data cleanup now asks for an explicit second confirmation.
+    fireEvent.click(await findByRole(container, 'button', { name: '确认清除记录' }))
 
     // R-017: the clear action removes the current partition (and the legacy
     // key), so no excerpt survives in the active user+workspace namespace.
@@ -82,7 +84,7 @@ describe('PersonalizationPage R-017 clear-traces button', () => {
   })
 
   it('does not clear another workspace partition', async () => {
-    const { PersonalizationPage } = await import('./personalization-page')
+    const { LocalDataSettings } = await import('./local-data-settings')
 
     upsertSelectionExplanation(record)
     // A second workspace partition holds its own record.
@@ -100,9 +102,11 @@ describe('PersonalizationPage R-017 clear-traces button', () => {
       workspaceId: 'workspace-a',
     })
 
-    const { container } = renderWithProviders(<PersonalizationPage />)
+    const { container } = renderWithProviders(<LocalDataSettings />)
     const clearButton = await findByRole(container, 'button', { name: '清除记录' })
-    clearButton.click()
+    fireEvent.click(clearButton)
+    // Local data cleanup now asks for an explicit second confirmation.
+    fireEvent.click(await findByRole(container, 'button', { name: '确认清除记录' }))
 
     expect(listSelectionExplanations(record.parentSessionId)).toEqual([])
     authStore.setSession({

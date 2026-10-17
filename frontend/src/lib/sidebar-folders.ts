@@ -31,7 +31,7 @@ export type SidebarProjectFolders = Record<string, boolean>;
  */
 export type SidebarFolderState = Record<string, boolean>;
 
-export type SidebarFolderKind = "project" | "session";
+export type SidebarFolderKind = "project" | "session" | "section";
 
 export type SidebarFolderRef = {
   kind: SidebarFolderKind;

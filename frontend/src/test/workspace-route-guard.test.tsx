@@ -17,6 +17,8 @@ function authValue(setWorkspaceId: AuthContextValue['setWorkspaceId']): AuthCont
   return {
     authenticated: true,
     username: 'Alice',
+    avatarUrl: null,
+    updateProfile: () => undefined,
     workspaceId: ACTIVE_WORKSPACE,
     workspaceName: '我的工作区',
     mustChangePassword: false,

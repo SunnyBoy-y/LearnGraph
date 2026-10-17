@@ -4,6 +4,11 @@
   min-width: 0;
 }
 
+.provider-settings-table > thead { display: none; }
+.provider-settings-table > tbody > tr > td { min-width: 0; }
+.provider-settings-table summary p { display: inline; }
+.provider-settings-table details .justify-end { justify-content: flex-start; }
+
 @container provider-settings (max-width: 900px) {
   .provider-settings-table,
   .provider-settings-table > tbody {

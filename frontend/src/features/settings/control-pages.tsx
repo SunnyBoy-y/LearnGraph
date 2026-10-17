@@ -113,37 +113,37 @@ function QueryFailure({ message }: { message: string }) {
   );
 }
 
-export function AccessManagementPage() {
+export function AccessManagementPage({ section = "collaboration" }: { section?: "collaboration" | "security" }) {
   const queryClient = useQueryClient();
   const [organizationChoice, setOrganizationChoice] = useState("");
   const currentUser = useQuery({ queryKey: ["auth-me"], queryFn: getCurrentUser });
-  const authSessions = useQuery({ queryKey: ["auth-sessions"], queryFn: listAuthSessions });
+  const authSessions = useQuery({ queryKey: ["auth-sessions"], queryFn: listAuthSessions, enabled: section === "security" });
   const organizations = useQuery({
     queryKey: ["organizations"],
     queryFn: listOrganizations,
-    enabled: Boolean(currentUser.data),
+    enabled: section === "collaboration" && Boolean(currentUser.data),
   });
   const permissions = useQuery({
     queryKey: ["permissions"],
     queryFn: listPermissions,
-    enabled: Boolean(currentUser.data?.is_system_admin),
+    enabled: section === "collaboration" && Boolean(currentUser.data?.is_system_admin),
   });
   const users = useQuery({
     queryKey: ["managed-users"],
     queryFn: listManagedUsers,
-    enabled: Boolean(currentUser.data?.is_system_admin),
+    enabled: section === "collaboration" && Boolean(currentUser.data?.is_system_admin),
   });
   const selectedOrganizationId =
     organizationChoice || organizations.data?.[0]?.id || "";
   const roles = useQuery({
     queryKey: ["organization-roles", selectedOrganizationId],
     queryFn: () => listRoles(selectedOrganizationId),
-    enabled: Boolean(selectedOrganizationId),
+    enabled: section === "collaboration" && Boolean(selectedOrganizationId),
   });
   const memberships = useQuery({
     queryKey: ["organization-memberships", selectedOrganizationId],
     queryFn: () => listMemberships(selectedOrganizationId),
-    enabled: Boolean(selectedOrganizationId),
+    enabled: section === "collaboration" && Boolean(selectedOrganizationId),
   });
   const revokeSession = useMutation({
     mutationFn: revokeAuthSession,
@@ -216,22 +216,23 @@ export function AccessManagementPage() {
     },
     onError: (error) => toast.error(error.message),
   });
-  if (currentUser.isPending || authSessions.isPending) {
+  if (currentUser.isPending || (section === "security" && authSessions.isPending)) {
     return <PageFrame><LoadingState /></PageFrame>;
   }
-  if (currentUser.isError || authSessions.isError) {
+  if (currentUser.isError || (section === "security" && authSessions.isError)) {
     return <PageFrame><ErrorState message={(currentUser.error ?? authSessions.error)?.message ?? "身份信息读取失败"} /></PageFrame>;
   }
   const isSystemAdmin = currentUser.data.is_system_admin;
-  const activeSessions = authSessions.data.filter((session) => !session.revoked_at);
+  const activeSessions = (authSessions.data ?? []).filter((session) => !session.revoked_at);
   return (
-    <PageFrame>
-      <PageIntro
+    <PageFrame className={section === "security" ? "!p-0 !gap-0" : undefined}>
+      {section === "collaboration" ? <PageIntro
         eyebrow="Identity and access"
-        title="账户、组织与访问控制"
-        description="身份、会话、组织角色和工作区权限始终由服务端重新校验；工作区 Header 只用于定位范围，不能替代授权。"
-      />
+        title="成员与访问"
+        description="管理组织成员与角色，权限由服务端校验。"
+      /> : null}
 
+      {section === "collaboration" ? <>
       <Surface className="p-5">
         <SectionHeading
           action={isSystemAdmin ? (
@@ -436,7 +437,8 @@ export function AccessManagementPage() {
         <QueryFailure message="当前身份不是系统管理员。会话管理仍可使用；组织、用户与全局权限管理会按后端授权策略显示可访问内容或明确拒绝。" />
       ) : null}
 
-      <div className="grid gap-5">
+      </> : null}
+      {section === "security" ? <div className="grid gap-5">
         <Surface className="p-5">
           <SectionHeading
             description="可单独下线其他登录设备；当前会话通过退出登录处理。已下线的会话不再显示。"
@@ -458,7 +460,7 @@ export function AccessManagementPage() {
             ) : null}
           </div>
         </Surface>
-      </div>
+      </div> : null}
 
     </PageFrame>
   );

@@ -1,6 +1,7 @@
+import { legacySettingsRoutes } from '@/components/shared/settings-nav-data'
 import { lazy, Suspense } from 'react'
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
-import { BrowserRouter, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
+import { createBrowserRouter, RouterProvider, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { Network } from 'lucide-react'
 import { Toaster } from 'sonner'
 
@@ -34,23 +35,19 @@ const PracticeCenterPage = lazy(() => import('@/features/practice/practice-cente
 const PracticeSessionPage = lazy(() => import('@/features/practice/practice-session-page').then((module) => ({ default: module.PracticeSessionPage })))
 const PracticeReportPage = lazy(() => import('@/features/practice/practice-report-page').then((module) => ({ default: module.PracticeReportPage })))
 const RoadmapPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.RoadmapPage })))
-const ResearchPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.ResearchPage })))
-const ResearchNewTaskPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.ResearchNewTaskPage })))
 const SourcesPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SourcesPage })))
 const DocumentLearningPage = lazy(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
 const MemoryPage = lazy(() => import('@/features/memory/memory-page').then((module) => ({ default: module.MemoryPage })))
-const ProvidersPage = lazy(() => import('@/features/settings/provider-pages').then((module) => ({ default: module.ProvidersPage })))
-const VoiceRelayPage = lazy(() => import('@/features/settings/voice-relay-page').then((module) => ({ default: module.VoiceRelayPage })))
-const UsagePage = lazy(() => import('@/features/settings/usage-pages').then((module) => ({ default: module.UsagePage })))
-const ExtensionsPage = lazy(() => import('@/features/settings/extension-pages').then((module) => ({ default: module.ExtensionsPage })))
-const SearchFetchPage = lazy(() => import('@/features/settings/search-fetch-page').then((module) => ({ default: module.SearchFetchPage })))
-const AuditPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.AuditPage })))
-const MigrationPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.MigrationPage })))
-const WorkspaceSettingsPage = lazy(() => import('@/features/settings/governance-pages').then((module) => ({ default: module.WorkspaceSettingsPage })))
 const PersonalizationPage = lazy(() => import('@/features/settings/personalization-page').then((module) => ({ default: module.PersonalizationPage })))
-const AccessManagementPage = lazy(() => import('@/features/settings/control-pages').then((module) => ({ default: module.AccessManagementPage })))
-const AboutPage = lazy(() => import('@/features/settings/about-page').then((module) => ({ default: module.AboutPage })))
-const SessionSharingPage = lazy(() => import('@/features/settings/session-sharing-page').then((module) => ({ default: module.SessionSharingPage })))
+const ModelSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.ModelSettingsPage })))
+const VoiceSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.VoiceSettingsPage })))
+const ToolsSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.ToolsSettingsPage })))
+const WorkspaceSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.WorkspaceSettingsPage })))
+const DataSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.DataSettingsPage })))
+const MemorySettingsPage = lazy(() => import('@/features/settings/memory-settings-page').then(m => ({ default: m.MemorySettingsPage })))
+const ConversationSettingsPage = lazy(() => import('@/features/settings/conversation-settings-page').then(m => ({ default: m.ConversationSettingsPage })))
+const AccountSettingsPage = lazy(() => import('@/features/settings/account-settings-page').then(m => ({ default: m.AccountSettingsPage })))
+const AboutPage = lazy(() => import('@/features/settings/settings-center-pages').then((module) => ({ default: module.AboutSettingsPage })))
 const ArtifactsPage = lazy(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
 const SessionShareViewPage = lazy(() => import('@/features/chat/session-share-view').then((module) => ({ default: module.SessionShareViewPage })))
 
@@ -133,6 +130,16 @@ function LegacyRoadmapRoute() {
   return <RoadmapPage />
 }
 
+function LegacySettingsRedirect({ target }: { target: string }) {
+  const { workspaceId = '' } = useParams()
+  const location = useLocation()
+  const [path, query = ''] = target.split('?')
+  const search = new URLSearchParams(location.search)
+  if (path === 'tools' && search.has('tab')) { search.set('extensionTab', search.get('tab')!); search.delete('tab') }
+  for (const [key, value] of new URLSearchParams(query)) search.set(key, value)
+  return <Navigate replace to={`/w/${workspaceId}/settings/${path}?${search}${location.hash}`} />
+}
+
 function AppRoutes() {
   return (
     <RouteErrorBoundary><Suspense fallback={<RouteLoading />}><Routes>
@@ -164,31 +171,24 @@ function AppRoutes() {
           element={<SearchFetchRemovedRedirect />}
           path="research/search"
         />
-        <Route element={<ResearchNewTaskPage />} path="research/tasks/new" />
-        <Route element={<ResearchPage />} path="research/tasks/:taskId" />
         <Route element={<EvidenceReviewPage />} path="evidence/review" />
         <Route element={<PracticeCenterPage />} path="practice" />
         <Route element={<PracticeSessionPage />} path="practice/session/:practiceSessionId" />
         <Route element={<PracticeReportPage />} path="practice/report/:practiceSessionId" />
         <Route element={<ExerciseAnswerPage />} path="practice/:setId/:questionId" />
         <Route element={<MemoryPage />} path="memory" />
-        <Route element={<Navigate replace to="../settings/workspace" />} path="memory/settings" />
-        <Route element={<ProvidersPage />} path="settings/providers" />
-        <Route element={<VoiceRelayPage />} path="settings/voice-relay" />
-        <Route element={<UsagePage />} path="settings/usage" />
-        <Route element={<ExtensionsPage />} path="settings/extensions" />
-        <Route element={<SearchFetchPage />} path="settings/search-fetch" />
-        <Route element={<Navigate replace to="../search-fetch" />} path="settings/research" />
-        <Route element={<Navigate replace to="../search-fetch" />} path="settings/egress" />
-        <Route element={<Navigate replace to="../search-fetch" />} path="settings/access-approvals" />
-        <Route element={<MigrationPage />} path="settings/storage/migrations" />
-        <Route element={<AuditPage />} path="settings/audit" />
+        <Route element={<Navigate replace to="../settings/memory" />} path="memory/settings" />
+        <Route element={<Navigate replace to="general" />} path="settings" />
+        <Route element={<PersonalizationPage />} path="settings/general" />
+        <Route element={<ConversationSettingsPage />} path="settings/conversation" />
+        <Route element={<MemorySettingsPage />} path="settings/memory" />
+        <Route element={<VoiceSettingsPage />} path="settings/voice" />
+        <Route element={<ModelSettingsPage />} path="settings/models" />
+        <Route element={<ToolsSettingsPage />} path="settings/tools" />
         <Route element={<WorkspaceSettingsPage />} path="settings/workspace" />
-        <Route element={<PersonalizationPage />} path="settings/personalization" />
-        <Route element={<AccessManagementPage />} path="settings/access" />
-        <Route element={<SessionSharingPage />} path="settings/session-sharing" />
-        <Route element={<Navigate replace to="../session-sharing" />} path="settings/sharing" />
-        <Route element={<Navigate replace to="../session-sharing" />} path="settings/session-shares" />
+        <Route element={<AccountSettingsPage />} path="settings/account" />
+        <Route element={<DataSettingsPage />} path="settings/data" />
+        {Object.entries(legacySettingsRoutes).map(([oldPath, target]) => <Route key={oldPath} path={`settings/${oldPath}`} element={<LegacySettingsRedirect target={target}/>} />)}
         <Route element={<AboutPage />} path="settings/about" />
         <Route element={<ArtifactsPage />} path="artifacts" />
         <Route element={<Navigate replace to="../artifacts" />} path="settings/artifacts" />
@@ -199,13 +199,15 @@ function AppRoutes() {
   )
 }
 
+const router = createBrowserRouter([{ path: '*', element: <AppRoutes /> }])
+
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delayDuration={220}>
         <AuthProvider>
           <VoiceSessionProvider>
-            <BrowserRouter><AppRoutes /></BrowserRouter>
+            <RouterProvider router={router} />
           </VoiceSessionProvider>
           <Toaster closeButton position="top-right" richColors />
         </AuthProvider>

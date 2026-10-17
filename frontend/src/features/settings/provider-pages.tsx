@@ -1,5 +1,7 @@
 import "./provider-settings-layout.css";
-import { currentWorkspaceQueryKey } from "@/lib/query-keys";
+import { useAuth } from "@/features/auth/auth-context-value";
+import { useSettingsDirty } from "@/lib/settings-dirty";
+import { currentWorkspaceQueryKey, workspaceQueryKey } from "@/lib/query-keys";
 import {
   Children,
   isValidElement,
@@ -28,6 +30,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { AnimatePresence, motion } from "motion/react";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
 
 import deepseekMark from "@/assets/deepseek.svg";
 import deepseekBrandMark from "@/assets/brands/si-deepseek.svg";
@@ -149,7 +152,7 @@ import {
   BalanceQueryConfigDialog,
   CustomBalanceDialog,
 } from "./balance-query";
-import { ImportProviderDialog } from "./import-provider-dialog";
+import { ImportProviderPopover } from "./provider-import-popover";
 import { ProviderBalanceStatus } from "./provider-balance-status";
 import { parseModelIds } from "./provider-model-input";
 import type {
@@ -187,7 +190,6 @@ function providerDefaultModelId(provider: Provider): string {
     "default_transcription_model_id",
     "default_vision_model_id",
     "default_embedding_model_id",
-    "deep_research_model",
     "default_model",
   ]) {
     const value = capabilities[key];
@@ -490,7 +492,13 @@ function HostBridgeHint({ status }: { status?: HostBridgeStatus }) {
 }
 
 export function ProvidersPage() {
+  const { workspaceId } = useAuth();
+  return <ProvidersPageForm key={workspaceId}/>;
+}
+function ProvidersPageForm() {
+  const reducedMotion = useReducedMotionPreference();
   const queryClient = useQueryClient();
+  const providerWorkspaceId = String(currentWorkspaceQueryKey()[1]);
   const [roleFilter, setRoleFilter] = useState<ProviderRole>("model");
   const [providerSearch, setProviderSearch] = useState("");
   // 文搜图/图搜图 tab 内的能力筛选：all | text(文搜图) | image(图搜图) | both(都支持)
@@ -498,7 +506,7 @@ export function ProvidersPage() {
     "all" | "text" | "image" | "both"
   >("all");
   const providers = useQuery({
-    queryKey: ["providers"],
+    queryKey: workspaceQueryKey(providerWorkspaceId, "providers"),
     queryFn: listProviders,
   });
   const providerCatalog = useQuery({
@@ -554,7 +562,7 @@ export function ProvidersPage() {
     mutationFn: probeProvider,
     onSuccess: () => {
       toast.success("Provider 健康探测通过");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -569,7 +577,7 @@ export function ProvidersPage() {
       const outcome = await runCustomBalanceQuery(provider.id, config);
       try {
         await persistCustomBalanceResult(outcome);
-        void queryClient.invalidateQueries({ queryKey: ["providers"] });
+        void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
       } catch {
         // 缓存写入失败不影响本次查询结果展示。
       }
@@ -603,9 +611,6 @@ export function ProvidersPage() {
             : configuredProviderRole === "vision"
               ? configuredProvider?.capabilities.default_vision_model_id
                 ?? configuredProvider?.capabilities.default_model
-              : configuredProviderRole === "deep_research"
-                ? configuredProvider?.capabilities.deep_research_model
-                  ?? configuredProvider?.capabilities.default_model
                 : configuredProviderRole === "embedding"
                   ? configuredProvider?.capabilities.default_embedding_model_id
                     ?? configuredProvider?.capabilities.default_model
@@ -646,7 +651,7 @@ export function ProvidersPage() {
     onError: (error) => toast.error(error.message),
   });
   const create = useMutation({
-    mutationFn: createProvider,
+    mutationFn: (payload: Parameters<typeof createProvider>[0]) => createProvider(payload, { headers: { 'X-Workspace-ID': providerWorkspaceId } }),
     onSuccess: (provider) => {
       if (provider.enabled && provider.status === "healthy") {
         toast.success("Provider 探测健康，已自动启用");
@@ -655,7 +660,7 @@ export function ProvidersPage() {
       } else {
         toast.success("Provider 元数据已创建");
       }
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -691,7 +696,7 @@ export function ProvidersPage() {
     onSuccess: (provider, variables) => {
       const modelChanged = Object.entries(variables).some(([key, value]) => key.startsWith("default_") && value !== undefined);
       toast.success(modelChanged ? "默认模型已保存" : variables.provider_priority !== undefined ? "优先级已保存" : provider.enabled ? "供应商已启用" : "供应商已停用");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error, variables) => {
       setDefaultModels((current) => { const next = { ...current }; delete next[variables.id]; return next; });
@@ -713,7 +718,7 @@ export function ProvidersPage() {
     }) => updateProvider(id, { enabled, tested_modes, untested_modes }),
     onSuccess: () => {
       toast.success("转写通道测试标注已更新");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -723,7 +728,7 @@ export function ProvidersPage() {
     onSuccess: () => {
       setEndpointTarget(null);
       toast.success("Provider Base URL 已更新");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -739,7 +744,7 @@ export function ProvidersPage() {
       setHeadersTarget(null);
       setHeadersValue("");
       toast.success("自定义请求头已更新");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -750,7 +755,7 @@ export function ProvidersPage() {
       setSecretTarget(null);
       setSecretValue("");
       toast.success("Provider Secret 已轮换");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -759,7 +764,7 @@ export function ProvidersPage() {
     onSuccess: () => {
       setDeleteTarget(null);
       toast.success("Provider 实例已删除");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -793,7 +798,6 @@ export function ProvidersPage() {
     "search",
     "image_search",
     "fetch",
-    "deep_research",
     "transcription",
     "tts",
     "embedding",
@@ -842,7 +846,7 @@ export function ProvidersPage() {
               onCreate={async (payload) => {
                 const provider = await create.mutateAsync(payload);
                 const role = catalogByType.get(provider.provider_type)?.role;
-                if (role && ["model", "vision", "embedding", "deep_research"].includes(role)) {
+                if (role && ["model", "vision", "embedding"].includes(role)) {
                   setCapabilityTarget({ provider, modelId: providerDefaultModelId(provider) });
                 }
                 return provider;
@@ -851,15 +855,12 @@ export function ProvidersPage() {
                 !secretStore.isPending && Boolean(secretStore.data?.available)
               }
             />
-            <ImportProviderDialog
-              providers={providers.data ?? []}
-              catalog={providerCatalog.data ?? []}
-            />
+            <ImportProviderPopover />
           </div>
         }
         description="配置模型、搜索、抓取与记忆服务。"
         eyebrow="Provider gateway"
-        title="模型与服务"
+        title="服务连接"
       />
       <HostBridgeHint status={hostBridge.data} />
       {roleFilter === "transcription" ? (
@@ -948,8 +949,6 @@ export function ProvidersPage() {
                 const isVisionProvider = providerSpec?.role === "vision";
                 const isTranscriptionProvider =
                   providerSpec?.role === "transcription";
-                const isDeepResearchProvider =
-                  providerSpec?.role === "deep_research";
                 const isEmbeddingProvider = providerSpec?.role === "embedding";
                 const isImageSearchProvider =
                   providerSpec?.role === "image_search";
@@ -959,7 +958,6 @@ export function ProvidersPage() {
                   isImageGenerationProvider ||
                   isTranscriptionProvider ||
                   isVisionProvider ||
-                  isDeepResearchProvider ||
                   isEmbeddingProvider ||
                   (isImageSearchProvider &&
                     providerSpec?.supports_model_discovery === true);
@@ -990,9 +988,6 @@ export function ProvidersPage() {
                       : isEmbeddingProvider
                         ? provider.capabilities.default_embedding_model_id
                           ?? provider.capabilities.default_model
-                        : isDeepResearchProvider
-                          ? provider.capabilities.deep_research_model
-                            ?? provider.capabilities.default_model
                           : provider.capabilities.default_model;
                 const configuredModel =
                   typeof configuredModelValue === "string"
@@ -1036,14 +1031,12 @@ export function ProvidersPage() {
                 return (
                   <motion.tr
                     animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    initial={{ opacity: 0, y: 4 }}
+                    exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -4 }}
+                    initial={reducedMotion ? false : { opacity: 0, y: 4 }}
                     key={provider.id}
-                    layout
-                    transition={{ duration: 0.16 }}
-                  >
-                    <td className="px-5 py-4">
-                      <div className="flex items-center gap-2">
+                    layout={!reducedMotion}
+                    transition={{ duration: reducedMotion ? 0 : 0.16 }}
+                  ><td colSpan={6} className="px-5 py-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><div className="flex items-center gap-2">
                         <span className="grid size-8 place-items-center rounded-lg bg-white p-1 shadow-sm ring-1 ring-black/5">
                           {providerQuickBrand(provider) ? (
                             <img
@@ -1115,26 +1108,7 @@ export function ProvidersPage() {
                             ) : null}
                           </div>
                         </div>
-                      </div>
-                    </td>
-                    <td className="px-5 py-4 text-xs">
-                      <p>
-                        {isOfficialOpenAi
-                          ? providerSpec?.label ?? provider.provider_type
-                          : isDeepSeek
-                          ? "OpenAI-compatible Chat"
-                          : isAnthropic
-                            ? "Anthropic Messages"
-                          : providerSpec?.label ?? provider.provider_type}
-                      </p>
-                      {customHeaderCount > 0 ? (
-                        <p className="mt-1 text-[10px] text-muted-foreground">
-                          {customHeaderCount} 个自定义请求头
-                        </p>
-                      ) : null}
-                    </td>
-                    <td className="px-5 py-4">
-                      <div className="flex flex-col items-start gap-1">
+                      </div></div><div className="shrink-0"><div className="flex flex-col items-start gap-1">
                         <StatePill
                           label={providerStatusLabel(
                             provider.status,
@@ -1169,13 +1143,58 @@ export function ProvidersPage() {
                             {relativeTimeLabel(customBalanceLast.queried_at)}
                           </p>
                         ) : null}
-                      </div>
-                    </td>
-                    <td className="px-5 py-4 font-mono text-xs text-muted-foreground">
-                      <p>{provider.api_key_masked ?? "未保存"}</p>
-                    </td>
-                    <td className="px-5 py-4">
-                      {isTranscriptionProvider ? (
+                      </div></div><Button
+                          disabled={
+                            update.isPending ||
+                            (hasConfigurableDefaultModel &&
+                              !provider.enabled &&
+                              !(isTranscriptionProvider
+                                ? modelValue.trim() || realtimeModelValue.trim()
+                                : modelValue.trim()))
+                          }
+                          onClick={() =>
+                            update.mutate({
+                              id: provider.id,
+                              enabled: !provider.enabled,
+                              default_model:
+                                isModelProvider ||
+                                isEmbeddingProvider
+                                  ? modelValue.trim() || undefined
+                                  : undefined,
+                              default_image_generation_model_id:
+                                isImageGenerationProvider
+                                  ? modelValue.trim() || undefined
+                                  : undefined,
+                              default_transcription_model_id:
+                                isTranscriptionProvider && modelValue.trim()
+                                  ? modelValue.trim()
+                                  : undefined,
+                              default_realtime_transcription_model_id:
+                                isTranscriptionProvider && realtimeModelValue.trim()
+                                  ? realtimeModelValue.trim()
+                                  : undefined,
+                              default_vision_model_id: isVisionProvider
+                                ? modelValue.trim() || undefined
+                                : undefined,
+                            })
+                          }
+                          size="xs"
+                          variant={provider.enabled ? "ghost" : "default"}
+                        >
+                          {provider.enabled ? "停用" : "启用"}
+                        </Button></div><details className="mt-3"><summary className="flex cursor-pointer items-center justify-between gap-3 text-xs text-muted-foreground"><span><p>
+                        {isOfficialOpenAi
+                          ? providerSpec?.label ?? provider.provider_type
+                          : isDeepSeek
+                          ? "OpenAI-compatible Chat"
+                          : isAnthropic
+                            ? "Anthropic Messages"
+                          : providerSpec?.label ?? provider.provider_type}
+                      </p>{customHeaderCount > 0 ? (
+                        <p className="mt-1 text-[10px] text-muted-foreground">
+                          {customHeaderCount} 个自定义请求头
+                        </p>
+                      ) : null}</span><span className="shrink-0">连接详情与高级操作</span></summary><div className="mt-4 space-y-4 border-t pt-4"><div><p className="mb-1 text-xs text-muted-foreground">API Key</p><p>{provider.api_key_masked ?? "未保存"}</p></div><div>{isTranscriptionProvider ? (
                         <>
                           <div className="grid min-w-64 gap-3">
                           <div className="grid gap-1">
@@ -1320,7 +1339,6 @@ export function ProvidersPage() {
                               enabled: provider.enabled,
                               default_model:
                                 isModelProvider ||
-                                isDeepResearchProvider ||
                                 isEmbeddingProvider
                                   ? value
                                   : undefined,
@@ -1357,7 +1375,7 @@ export function ProvidersPage() {
                             placeholder="手动输入模型 ID" value={modelValue} />
                           <Button type="button" size="xs" variant="outline" disabled={update.isPending || !modelValue.trim()}
                             onClick={() => update.mutate({ id: provider.id,
-                              default_model: isModelProvider || isDeepResearchProvider || isEmbeddingProvider ? modelValue.trim() : undefined,
+                              default_model: isModelProvider || isEmbeddingProvider ? modelValue.trim() : undefined,
                               default_image_generation_model_id: isImageGenerationProvider ? modelValue.trim() : undefined,
                               default_transcription_model_id: isTranscriptionProvider ? modelValue.trim() : undefined,
                               default_vision_model_id: isVisionProvider ? modelValue.trim() : undefined,
@@ -1369,10 +1387,7 @@ export function ProvidersPage() {
                             ? `${providerRoleLabel(providerSpec.role)}服务不设置默认模型`
                             : "不适用"}
                         </p>
-                      )}
-                    </td>
-                    <td className="px-5 py-4">
-                      <div className="flex flex-wrap justify-end gap-2">
+                      )}</div><div><div className="flex flex-wrap justify-end gap-2">
                         <div className="flex items-center gap-1.5 rounded-lg border px-2 py-1">
                           <span className="text-[10px] text-muted-foreground">优先级</span>
                           <Input
@@ -1513,47 +1528,7 @@ export function ProvidersPage() {
                             Headers
                           </Button>
                         ) : null}
-                        <Button
-                          disabled={
-                            update.isPending ||
-                            (hasConfigurableDefaultModel &&
-                              !provider.enabled &&
-                              !(isTranscriptionProvider
-                                ? modelValue.trim() || realtimeModelValue.trim()
-                                : modelValue.trim()))
-                          }
-                          onClick={() =>
-                            update.mutate({
-                              id: provider.id,
-                              enabled: !provider.enabled,
-                              default_model:
-                                isModelProvider ||
-                                isDeepResearchProvider ||
-                                isEmbeddingProvider
-                                  ? modelValue.trim() || undefined
-                                  : undefined,
-                              default_image_generation_model_id:
-                                isImageGenerationProvider
-                                  ? modelValue.trim() || undefined
-                                  : undefined,
-                              default_transcription_model_id:
-                                isTranscriptionProvider && modelValue.trim()
-                                  ? modelValue.trim()
-                                  : undefined,
-                              default_realtime_transcription_model_id:
-                                isTranscriptionProvider && realtimeModelValue.trim()
-                                  ? realtimeModelValue.trim()
-                                  : undefined,
-                              default_vision_model_id: isVisionProvider
-                                ? modelValue.trim() || undefined
-                                : undefined,
-                            })
-                          }
-                          size="xs"
-                          variant={provider.enabled ? "ghost" : "default"}
-                        >
-                          {provider.enabled ? "停用" : "启用"}
-                        </Button>
+
                         {!isModelProvider && provider.provider_type !== "local_mock" ? (
                           <Button
                             disabled={rotateSecret.isPending}
@@ -1576,9 +1551,7 @@ export function ProvidersPage() {
                           <Trash2 className="size-3" />
                           删除
                         </Button>
-                      </div>
-                    </td>
-                  </motion.tr>
+                      </div></div></div></details></td></motion.tr>
                 );
               })}
               {filteredProviders.length === 0 ? (
@@ -2018,7 +1991,7 @@ export function ProvidersPage() {
                 },
               };
             });
-            void queryClient.invalidateQueries({ queryKey: ["providers"] });
+            void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
           }}
           onStatesSaved={(result) => {
             // The discovery cache must never shadow the just-persisted toggle
@@ -2050,7 +2023,7 @@ export function ProvidersPage() {
               }
               return current;
             });
-            void queryClient.invalidateQueries({ queryKey: ["providers"] });
+            void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
           }}
                     onSetDefault={(nextModelId) => {
             const provider = capabilityTarget.provider;
@@ -2059,7 +2032,7 @@ export function ProvidersPage() {
               id: provider.id,
               enabled: provider.enabled,
               default_model:
-                spec?.role === "model" || spec?.role === "deep_research" || spec?.role === "embedding"
+                spec?.role === "model" || spec?.role === "embedding"
                   ? nextModelId
                   : undefined,
               default_image_generation_model_id:
@@ -2138,8 +2111,6 @@ function providerRoleLabel(role: ProviderRole) {
       return "文搜图 / 图搜图";
     case "fetch":
       return "网页抓取";
-    case "deep_research":
-      return "Deep Research";
     case "memory":
       return "共同记忆";
     case "transcription":
@@ -2459,7 +2430,6 @@ function roleQuickProviders(
   const compatibleTranscription = findType("openai_compatible_transcription");
   const compatibleEmbedding = findType("openai_compatible_embedding");
   const ollamaEmbedding = findType("ollama_embedding");
-  const qwenDeepResearch = findType("qwen_deep_research");
 
   if (role === "model") {
     return QUICK_PROVIDERS.flatMap((preset) => {
@@ -2568,33 +2538,6 @@ function roleQuickProviders(
           ]
         : []),
     ];
-  }
-
-  // Deep Research: promote 通义千问 to the front of the quick list.
-  if (role === "deep_research") {
-    const items = catalog
-      .filter((item) => item.create_allowed && item.role === role)
-      .map((item) => ({
-        id: item.provider_type,
-        name: item.label,
-        description: item.description,
-        baseUrl: item.default_base_url ?? "",
-        brandId: item.brand_id ?? undefined,
-        iconUrl:
-          item.brand_id === "openai" || item.brand_id === "openai_compatible"
-            ? openAiMark
-            : (brandIcon(item.brand_id) ?? item.brand_icon_url ?? undefined),
-        keyUrl: item.key_management_url ?? undefined,
-        providerType: item.provider_type,
-      }));
-    if (qwenDeepResearch) {
-      items.sort((a, b) => {
-        if (a.providerType === "qwen_deep_research") return -1;
-        if (b.providerType === "qwen_deep_research") return 1;
-        return 0;
-      });
-    }
-    return items;
   }
 
   return catalog
@@ -3020,7 +2963,6 @@ function ProviderDialog({
     "search",
     "image_search",
     "fetch",
-    "deep_research",
     "transcription",
     "tts",
     "embedding",
@@ -3294,10 +3236,6 @@ function ProviderDialog({
     if (role === "embedding" && activeQuickProvider?.brandId === "ollama") {
       capabilities.default_model = "nomic-embed-text";
       capabilities.default_embedding_model_id = "nomic-embed-text";
-    }
-    if (selected.provider_type === "qwen_deep_research") {
-      capabilities.default_model = "qwen-deep-research";
-      capabilities.deep_research_model = "qwen-deep-research";
     }
     void completeCreate({
       display_name: name.trim(),
@@ -3878,6 +3816,7 @@ function ModelCapabilitiesDialog({
   provider: Provider;
 }) {
   const queryClient = useQueryClient();
+  const providerWorkspaceId = String(currentWorkspaceQueryKey()[1]);
   const protocolCatalog = useQuery({
     queryKey: ["provider-catalog"],
     queryFn: listProviderCatalog,
@@ -3910,7 +3849,7 @@ function ModelCapabilitiesDialog({
 
   const latestModels = useQuery({
     gcTime: 0,
-    queryKey: ["provider-models", "capability-dialog", provider.id],
+    queryKey: workspaceQueryKey(providerWorkspaceId, "provider-models", "capability-dialog", provider.id),
     queryFn: () => discoverProviderModels(provider.id),
     enabled: false,
     retry: false,
@@ -3957,7 +3896,7 @@ function ModelCapabilitiesDialog({
       setModelStates((current) => ({ ...current, ...Object.fromEntries(result.models.map((model) => [model.model_id, true])) }));
       setManualModelId("");
       for (const snapshot of result.models) onSaved(snapshot);
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
       toast.success(`已添加 ${result.models.length} 个模型，可按需编辑参数`);
     },
     onError: (error) => toast.error(error.message),
@@ -3976,10 +3915,10 @@ function ModelCapabilitiesDialog({
       });
       setDefaultModelId(result.default_model ?? "");
       queryClient.setQueryData<ProviderModelsResponse>(
-        ["provider-models", "capability-dialog", provider.id],
+        workspaceQueryKey(providerWorkspaceId, "provider-models", "capability-dialog", provider.id),
         (current) => current ? { ...current, models: current.models.filter((model) => model.id !== result.model_id) } : current,
       );
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
       toast.success(`已删除模型 ${result.model_id}`);
     },
     onError: (error) => toast.error(error.message),
@@ -3991,17 +3930,17 @@ function ModelCapabilitiesDialog({
           protocolType === provider.provider_type ? undefined : protocolType,
         base_url: baseUrl.trim() || null,
         extra_headers: parseExtraHeadersInput(headers),
-      }).then((updatedProvider) => ({ updatedProvider, close })),
+      }, { headers: { 'X-Workspace-ID': providerWorkspaceId } }).then((updatedProvider) => ({ updatedProvider, close })),
     onSuccess: ({ updatedProvider, close }) => {
-      queryClient.setQueryData<Provider[]>(["providers"], (current) =>
+      queryClient.setQueryData<Provider[]>(workspaceQueryKey(providerWorkspaceId, "providers"), (current) =>
         current?.map((item) =>
           item.id === updatedProvider.id ? updatedProvider : item,
         ),
       );
-      void queryClient.invalidateQueries({ queryKey: currentWorkspaceQueryKey("provider-balance-status", provider.id) });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(providerWorkspaceId, "provider-balance-status", provider.id) });
       toast.success("连接配置已保存");
       if (close) onClose();
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -4013,11 +3952,11 @@ function ModelCapabilitiesDialog({
       })),
     onSuccess: ({ result, connectionDirty }) => {
       queryClient.setQueryData<ProviderModelsResponse>(
-        ["provider-models", "capability-dialog", provider.id],
+        workspaceQueryKey(providerWorkspaceId, "provider-models", "capability-dialog", provider.id),
         (current) => current ? { ...current, models: current.models.map((model) => ({ ...model, enabled: result.states[model.id] ?? model.enabled })) } : current,
       );
       onStatesSaved(result);
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
       if (connectionDirty) {
         updateConnection.mutate({ close: true });
       } else {
@@ -4031,12 +3970,16 @@ function ModelCapabilitiesDialog({
     mutationFn: () => rotateProviderSecret(provider.id, secret),
     onSuccess: () => {
       setSecret("");
-      void queryClient.invalidateQueries({ queryKey: currentWorkspaceQueryKey("provider-balance-status", provider.id) });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(providerWorkspaceId, "provider-balance-status", provider.id) });
       toast.success("Secret 已更新");
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
+
+  const connectionDirty = (baseUrl.trim() || null) !== (provider.base_url ?? null) || protocolType !== provider.provider_type || headers !== stringifyExtraHeaders(providerExtraHeaders(provider));
+  const draftDirty = connectionDirty || Boolean(secret || manualModelId.trim()) || modelsList.models.some(model => modelStates[model.id] !== (model.enabled !== false));
+  useSettingsDirty(`provider-configuration-${provider.id}`, draftDirty);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -4048,10 +3991,6 @@ function ModelCapabilitiesDialog({
     // 连接配置（URL/请求头/协议）在「连接配置」区有独立的「保存连接」按钮；
     // 但用户在 URL 输入框按 Enter 或直接点底部「保存」时也会走到这里，
     // 若连接已被改动不能静默丢弃——先提交模型开关，再一并保存连接。
-    const connectionDirty =
-      (baseUrl.trim() || null) !== (provider.base_url ?? null) ||
-      protocolType !== provider.provider_type ||
-      headers !== stringifyExtraHeaders(providerExtraHeaders(provider));
     saveModelStates.mutate({ states: modelStates, connectionDirty });
   }
 
@@ -4091,7 +4030,7 @@ function ModelCapabilitiesDialog({
     ? providerBalanceQueryLastResult(provider)
     : null;
   return (
-    <Dialog onOpenChange={(open) => !open && !saveModelStates.isPending && onClose()} open>
+    <Dialog onOpenChange={(open) => { if (!open && !saveModelStates.isPending && !updateConnection.isPending && (!draftDirty || window.confirm("供应商配置尚未保存，确定放弃修改？"))) onClose(); }} open>
       <DialogContent className="h-[min(88dvh,860px)] overflow-hidden p-0 sm:max-w-3xl">
         {/* min-w-0：DialogContent 是 grid 容器，子项默认 min-width:auto，会被内容的
             min-content 撑到超过弹窗宽度；窄屏下即表现为「配置溢出窗口」——右侧内容
@@ -4861,7 +4800,7 @@ function CapabilityFormFields({
   );
 }
 
-function ModelOverrideDialog({
+export function ModelOverrideDialog({
   globalOverrideOn,
   modelId,
   onClose,
@@ -4874,9 +4813,12 @@ function ModelOverrideDialog({
   onSaved: (snapshot: ProviderModelCapabilityView) => void;
   provider: Provider;
 }) {
+  const [edited, setEdited] = useState(false);
+  useSettingsDirty(`model-parameters-${provider.id}-${modelId}`, edited);
   const queryClient = useQueryClient();
+  const providerWorkspaceId = String(currentWorkspaceQueryKey()[1]);
   const capabilitiesQuery = useQuery({
-    queryKey: ["provider-model-capabilities", provider.id, modelId],
+    queryKey: workspaceQueryKey(providerWorkspaceId, "provider-model-capabilities", provider.id, modelId),
     queryFn: () => getProviderModelCapabilities(provider.id, modelId),
     retry: false,
   });
@@ -4887,6 +4829,7 @@ function ModelOverrideDialog({
     useState<ProviderModelCapabilities>(emptyModelCapabilities);
 
   useEffect(() => {
+    if (edited) return;
     if (capabilitiesQuery.data) {
       const next = capabilitiesQuery.data.capabilities;
       setCapabilities(
@@ -4899,11 +4842,12 @@ function ModelOverrideDialog({
     } else if (snapshotMissing) {
       setCapabilities(emptyModelCapabilities());
     }
-  }, [capabilitiesQuery.data, snapshotMissing]);
+  }, [capabilitiesQuery.data, snapshotMissing, edited]);
 
   const loadCatalogDefaults = useMutation({
     mutationFn: () => getProviderModelDefaults(modelId, provider.provider_type),
     onSuccess: (view) => {
+      setEdited(true);
       const merged = {
         ...emptyModelCapabilities(),
         ...view.capabilities,
@@ -4928,11 +4872,12 @@ function ModelOverrideDialog({
         capabilitiesForSave(capabilities),
       ),
     onSuccess: (snapshot) => {
+      setEdited(false);
       queryClient.setQueryData(
-        ["provider-model-capabilities", provider.id, modelId],
+        workspaceQueryKey(providerWorkspaceId, "provider-model-capabilities", provider.id, modelId),
         snapshot,
       );
-      void queryClient.invalidateQueries({ queryKey: ["providers"] });
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
       onSaved(snapshot);
       toast.success("模型配置已保存");
       onClose();
@@ -4967,10 +4912,10 @@ function ModelOverrideDialog({
   }
 
   return (
-    <Dialog onOpenChange={(open) => !open && !save.isPending && onClose()} open>
+    <Dialog onOpenChange={(open) => { if (!open && !save.isPending && (!edited || window.confirm("模型参数尚未保存，确定放弃修改？"))) onClose(); }} open>
       <DialogContent className="h-[min(84dvh,780px)] overflow-hidden p-0 sm:max-w-2xl">
         {/* 与「供应商配置」同因：两层 min-w-0 防止窄屏下内容被撑出弹窗后裁掉。 */}
-        <form className="flex min-h-0 min-w-0 flex-1 flex-col" onSubmit={submit}>
+        <form inert={save.isPending} className="flex min-h-0 min-w-0 flex-1 flex-col" onSubmit={submit}>
           <DialogHeader className="shrink-0 border-b px-5 py-5 pr-14">
             <DialogTitle className="min-w-0 break-all font-mono text-base">{modelId}</DialogTitle>
             <DialogDescription>
@@ -5002,7 +4947,7 @@ function ModelOverrideDialog({
                   capabilities={capabilities}
                   idPrefix={`model-${provider.id}-${modelId}`}
                   providerType={provider.provider_type}
-                  setCapabilities={setCapabilities}
+                  setCapabilities={(next) => { setEdited(true); setCapabilities(next); }}
                 />
                 {save.isError ? (
                   <p className="text-sm text-destructive" role="alert">

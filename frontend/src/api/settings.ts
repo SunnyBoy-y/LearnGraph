@@ -6,20 +6,22 @@ import type {
   WorkspaceSetting,
 } from "@/types/settings";
 
-import { apiClient } from "./client";
+import { apiClient, type ApiRequestOptions } from "./client";
 
-export function listSettings(): Promise<WorkspaceSetting[]> {
-  return apiClient.get<WorkspaceSetting[]>("/settings");
+export function listSettings(options?: ApiRequestOptions): Promise<WorkspaceSetting[]> {
+  return apiClient.get<WorkspaceSetting[]>("/settings", options);
 }
 
 export function updateSetting(
   key: string,
   value: unknown,
+  options?: ApiRequestOptions,
 ): Promise<WorkspaceSetting> {
   const payload: SettingUpdateRequest = { value };
   return apiClient.put<WorkspaceSetting, SettingUpdateRequest>(
     `/settings/${encodeURIComponent(key)}`,
     payload,
+    options,
   );
 }
 

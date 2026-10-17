@@ -1,3 +1,4 @@
+import { currentWorkspaceQueryKey } from '@/lib/query-keys'
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Search } from 'lucide-react'
@@ -105,7 +106,7 @@ export function useFeatureModelChoices(): {
   providers: Provider[]
 } {
   const providersQuery = useQuery({
-    queryKey: ['providers'],
+    queryKey: currentWorkspaceQueryKey('providers'),
     queryFn: listProviders,
     staleTime: 30_000,
   })

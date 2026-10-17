@@ -1,0 +1,62 @@
+.settings-modal__body > div { max-width: 960px; padding: 28px 32px 40px; margin-inline: auto; }
+.settings-modal__body [data-page-eyebrow] { display: none; }
+.settings-modal__body h1 { font-size: 23px; line-height: 1.4; }
+.settings-modal__body .surface { box-shadow: none; border-radius: 12px; min-width: 0; }
+.settings-section { border-bottom: 1px solid var(--border); padding-bottom: 24px; min-width: 0; }
+.settings-section--danger { border: 1px solid color-mix(in srgb, var(--destructive) 30%, var(--border)); border-radius: 12px; padding: 20px; }
+.settings-section--danger h2 { color: var(--destructive); }
+.settings-rows { display: flex; flex-direction: column; gap: 4px; }
+.settings-rows > .rounded-xl { border: 0; border-radius: 0; padding: 12px 0; }
+.settings-rows > .flex, .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 12px; }
+.settings-rows > .flex > div:first-child { flex: 1; }
+.settings-rows > .flex > div:first-child > svg { display: none; }
+.settings-row__control { flex-shrink: 0; max-width: 100%; }
+.settings-rows > div > .mt-3.grid { padding-left: 0; }
+.settings-advanced { border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+.settings-subpage > div { padding: 0; max-width: none; animation: none; }
+.settings-subpage > div > header [data-page-title] { font-size: 17px; }
+.settings-subpage > div > header { border-bottom: 0; padding-bottom: 0; }
+.settings-subpage > div > header > div > p { font-size: 12px; }
+.settings-modal__body .settings-section .grid { align-items: start; }
+.settings-modal__body [role="tablist"] { max-width: 100%; overflow-x: auto; overflow-y: hidden; justify-content: flex-start; }
+.settings-row__control { display: flex; align-items: center; gap: 8px; }
+.settings-row__control > [role="combobox"] { width: 260px; }
+.settings-row__control > button[aria-haspopup] { width: 260px; max-width: 100%; }
+.settings-modal__body :is(input, textarea, [role="combobox"]) { max-width: 100%; }
+.settings-modal__body button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.settings-modal__body .settings-section > .settings-rows > .grid { grid-template-columns: minmax(0, 1fr); }
+/* Dialog -> group -> field. Keep the title bar on the dialog's surface. */
+.dark .settings-modal,
+.dark .settings-modal__topbar,
+.dark .settings-modal__body { background: var(--bg-dialog); }
+.dark .settings-modal > nav { background: var(--bg-sidebar); }
+.dark .settings-modal nav button { color: var(--text-secondary); }
+.dark .settings-modal nav button:hover { background: var(--bg-hover); color: var(--text-primary); }
+.dark .settings-modal nav button[aria-current='page'] {
+  background: var(--bg-selected);
+  color: var(--text-primary);
+  box-shadow: none;
+  --tw-ring-shadow: 0 0 #0000;
+}
+.dark .settings-modal__body :is(.surface, .settings-section) {
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 20px;
+  background: var(--bg-surface);
+}
+.dark .settings-modal__body .settings-section--danger {
+  border-color: color-mix(in srgb, var(--destructive) 30%, var(--border-subtle));
+}
+.dark .settings-modal__body :is([data-slot='input'], [data-slot='textarea'], [data-slot='select-trigger']):not(:disabled):not([aria-invalid='true']) {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+.dark .settings-modal__body [data-slot='select-trigger']:is(:hover, [data-state='open']):not(:disabled) { background: var(--bg-selected); }
+.dark .settings-modal__body :is([data-slot='input'], [data-slot='textarea'], [data-slot='select-trigger']):focus-visible:not([aria-invalid='true']) { border-color: var(--focus-ring); }
+@media (max-width: 639px) {
+  .settings-modal__body > div { padding: 20px 16px calc(32px + env(safe-area-inset-bottom, 0px)); }
+  .settings-rows > .flex, .settings-row { flex-wrap: wrap; }
+  .settings-rows > .flex > div:first-child, .settings-row > div:first-child { min-width: min(100%, 180px); }
+  .settings-row__control { width: 100%; }
+  .settings-row__control:has(> [role="switch"]) { width: auto; }
+}
