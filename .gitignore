@@ -199,6 +199,7 @@ Desktop.ini
 # 文档规则：开发文档放 doc/ 目录且不入库；docs/ 下仅提交 html 文档，
 # 新增 markdown 文档一律不入库（历史已跟踪文件不受影响）
 /docs/*.md
+!/docs/stream-ui-protocol.md
 /ROADMAP.md
 
 # Audit records and one-off verification/smoke/debug scripts are retained locally, not published
@@ -243,3 +244,10 @@ backend/sandbox/.spec-test.json
 
 # Docker 自托管备份产物（含主密钥，等同敏感数据）— 由 scripts/docker-update.sh 生成
 /backups/
+
+# Host updater journal, credentials, backups and durable managed image selection.
+/data/updater/
+/docker-compose.update.json
+
+# Reproducible browser runtimes generated from locked npm dependencies.
+/frontend/public/code-trainer/

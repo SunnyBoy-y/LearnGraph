@@ -34,7 +34,7 @@ from app.api.routers import (
     practice,
     providers,
     provider_imports,
-    research,
+    search,
     sources,
     subapps,
     sandbox_net,
@@ -44,6 +44,8 @@ from app.api.routers import (
     voice_relay,
     sandbox,
     session_sharing,
+    updates,
+    workspace_search,
 )
 
 
@@ -52,6 +54,8 @@ api_router = APIRouter(prefix="/api/v1")
 for router in (
     health.router,
     deployment.router,
+    updates.router,
+    workspace_search.router,
     artifact_gateway.router,
     auth.router,
     dashboard.router,
@@ -63,7 +67,7 @@ for router in (
     document_learning.router,
     fetch_authorizations.router,
     egress_approvals.router,
-    research.router,
+    search.router,
     sources.router,
     subapps.router,
     sandbox_net.router,

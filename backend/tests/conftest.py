@@ -54,7 +54,8 @@ os.environ["NLTK_DATA"] = str(Path(__file__).resolve().parents[2] / "docker" / "
 def pytest_configure(config: pytest.Config) -> None:
     """Keep pytest's tmp_path fixtures inside the writable project tree."""
 
-    config.option.basetemp = Path(__file__).parent / ".pytest-tmp"
+    if not config.option.basetemp:
+        config.option.basetemp = Path(__file__).parent / ".pytest-tmp" / f"run-{os.getpid()}"
 
 
 def _assert_engine_is_not_real_database() -> None:

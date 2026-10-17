@@ -30,7 +30,6 @@ from app.core.scheduler import (
 )
 from app.services.durable_queue import (
     durable_queue_worker,
-    reconcile_research_polling,
 )
 from app.services.memory_outbox_runtime import memory_outbox_scheduler
 from app.services.document_learning import mark_interrupted_document_jobs
@@ -87,9 +86,6 @@ async def lifespan(app: FastAPI):
     durable_queue_stop: asyncio.Event | None = None
     durable_queue_task: asyncio.Task[None] | None = None
     if settings.durable_queue_enabled:
-        # Re-arm durable research poll jobs for tasks left in-flight by a prior
-        # process before the worker starts claiming work.
-        reconcile_research_polling()
         # Reschedule interrupted chat streams that reached a checkpoint so the
         # worker can perform an audited resume attempt (provider continuation
         # gated by adapter capability; otherwise parked with retry path intact).
@@ -254,7 +250,7 @@ class SecurityHeadersMiddleware:
 settings = get_settings()
 app = FastAPI(
     title="LearnGraph API",
-    version="0.1.0",
+    version=settings.app_version,
     description=(
         "# LearnGraph 后端 API\n\n"
         "LearnGraph 是一个按工作区隔离的目标驱动学习图谱服务。API 负责目标澄清、" 
@@ -278,7 +274,7 @@ app = FastAPI(
         {"name": "graphs", "description": "目标图谱查询、节点编辑、合并审核、修订和学习关联。"},
         {"name": "chat", "description": "学习会话、消息、消息分支和 SSE 流式对话。"},
         {"name": "files", "description": "文件上传、解析、文本块、引用和删除影响预检。"},
-        {"name": "search-research", "description": "搜索、研究任务和可追溯网页来源。"},
+        {"name": "search", "description": "搜索和可追溯网页来源。"},
         {"name": "evidence-mastery", "description": "证据审核、掌握度计算和复习调度。"},
         {"name": "mcp-skills", "description": "MCP Server 与 Skill 的能力发现、授权、调用和撤销。"},
         {"name": "providers", "description": "Provider 配置、能力探测、模型发现和启用状态。"},

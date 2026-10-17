@@ -8,6 +8,7 @@ from typing import Annotated, Any
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from app.core.version import application_version
 
 DEPLOYMENT_PROFILES = frozenset({"personal_desktop", "self_hosted_team", "cloud_saas"})
 
@@ -75,7 +76,7 @@ def default_sandboxd_url() -> str:
 # never need to edit their .env to follow a newer runner build. Setting the env
 # var still pins an explicit reference (admin lock).
 DEFAULT_SANDBOX_PREBUILT_IMAGE = (
-    "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.6"
+    "crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.7"
 )
 
 
@@ -92,6 +93,18 @@ class Settings(BaseSettings):
     # self_hosted_team relaxes the listen address; cloud_saas expects a
     # managed TLS termination / reverse proxy in front.
     deployment_profile: str = "personal_desktop"
+    app_version: str = Field(default_factory=application_version)
+    # Independent host process owns Docker; the app only proxies admin requests.
+    update_agent_url: str | None = None
+    update_agent_token_file: Path | None = None
+
+    @field_validator("app_version")
+    @classmethod
+    def version_matches_release(cls, value: str) -> str:
+        packaged = application_version()
+        if packaged != "dev" and value != packaged:
+            raise ValueError("LEARNGRAPH_APP_VERSION must match the packaged VERSION release tag")
+        return value
 
     # Host-service access strategy for whole-app Docker (see HostAccessMode).
     # auto = compose default (bridge); direct = trusted desktop direct host
@@ -277,11 +290,10 @@ class Settings(BaseSettings):
     # goals/graphs/sessions; demo_seed_enabled() gates it to non-production
     # envs. Set LEARNGRAPH_ENABLE_DEMO_SEED=false to disable explicitly.
     enable_demo_seed: bool = True
-    # Demo login is on by default for the local product experience; the fixed
-    # demo credential is never reachable in production-like envs because
-    # demo_login_enabled() additionally gates on LEARNGRAPH_ENV. Set
-    # LEARNGRAPH_ENABLE_DEMO_LOGIN=false to disable explicitly.
-    enable_demo_login: bool = True
+    # Demo is opt-in through the operator's .env (the host root .env for Docker).
+    # Development mode alone must never enable a shared account.
+    # demo_login_enabled() also rejects production-like environments.
+    enable_demo_login: bool = False
     auth_session_hours: int = 12
     auth_max_failed_logins: int = 5
     auth_lockout_minutes: int = 15
@@ -339,8 +351,6 @@ class Settings(BaseSettings):
     external_github_file_max_bytes: int = 10 * 1024 * 1024
     external_github_total_max_bytes: int = 100 * 1024 * 1024
     external_github_max_files: int = 2_000
-    research_poll_seconds: float = 0.25
-    research_max_polls: int = 20
     durable_queue_enabled: bool = True
     durable_queue_poll_seconds: float = 0.25
     durable_queue_lease_seconds: int = 300
@@ -449,6 +459,9 @@ class Settings(BaseSettings):
     # command/MCP call). A hanging upstream must not stall the whole generation
     # chain; the tool returns a timeout failure and the chain can continue.
     agent_tool_timeout_seconds: int = 120
+    # An optional extra model request before the actual Agent turn. Keep it
+    # opt-in: message.accepted already acknowledges the request immediately.
+    agent_fast_preface_enabled: bool = False
     # ── Parallel Agent tool execution ─────────────────────────────────
     # Default ON. When enabled, a provider round whose tools are ALL in the
     # audited parallel-safe allowlist (get_current_time / search_web /
@@ -688,12 +701,11 @@ class Settings(BaseSettings):
     # (also honours the raw LEARNGRAPH_SKILL_LOCAL_PROBE env var); explicit
     # values: "on"/"local" force-allow, "off"/"remote" force-deny.
     skill_local_probe_mode: str = ""
-    # Whether /skills/market may refresh its cache from GitHub raw content.
+    # Legacy GitHub seed-cache refresh (the market itself now uses ClawHub).
     skill_market_refresh_enabled: bool = True
     # Optional GitHub token used for market fetches (raises rate limits).
     skill_market_github_token: str | None = None
-    # External skill catalogs (search-only aggregation; installs still resolve
-    # to GitHub or manual import so content stays pinned and reviewable).
+    # ClawHub market: public browse/search and version-pinned package imports.
     clawhub_enabled: bool = True
     clawhub_api_url: str = "https://clawhub.ai/api/v1"
     # skills.sh has a documented API but authenticated via Vercel OIDC; keep
@@ -703,6 +715,8 @@ class Settings(BaseSettings):
     # Official MCP Registry (frozen v0.1 API; anonymous reads).
     mcp_registry_enabled: bool = True
     mcp_registry_url: str = "https://registry.modelcontextprotocol.io"
+    mcp_smithery_enabled: bool = True
+    mcp_smithery_url: str = "https://api.smithery.ai"
     # Explicit allowlist for OAuth dynamic client registration. Empty by
     # default: registration endpoints exist but stay closed until a deployment
     # opts in with the exact issuer URLs it trusts.

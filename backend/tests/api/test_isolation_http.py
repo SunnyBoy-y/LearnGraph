@@ -51,19 +51,6 @@ def test_cross_user_resource_404(client, register_user, auth_headers):
     assert r.status_code in (403, 404), f"越权访问应 403/404，实际 {r.status_code}"
 
 
-def test_research_created_by_isolation(client, register_user, auth_headers):
-    """S1-2 回归锚点：研究任务创建后，另一用户（同工作区场景外）不得读取。
-    当前实现若返回 200 即暴露越权 —— 用 xfail(strict) 记录缺口。"""
-    import pytest
-
-    token_a, ws_a, _, _ = register_user("userA")
-    token_b, _, _, _ = register_user("userB")
-    # 研究创建需要 search/deep-research provider；不可达时可能 503。
-    # 本测试聚焦：B 对 A 工作区的研究列表访问被拒绝（隔离层面）。
-    r = client.get("/api/v1/research", headers=auth_headers(token_b, ws_a))
-    assert r.status_code in (403, 404), (
-        f"S1-2 相关：B 读取 A 工作区研究列表应被拒，实际 {r.status_code}（若 200 为越权）"
-    )
 
 
 def test_egress_approvals_isolation(client, register_user, auth_headers):

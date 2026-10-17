@@ -28,11 +28,26 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react(), tailwindcss()],
+    // RNNoise's synchronous loader uses import.meta.url inside AudioWorklet.
+    // IIFE worker output rewrites it to self.location.href, but AudioWorklet
+    // has no location. ES output also makes Vite's ?worker constructors use
+    // module workers (including Monaco's workers).
+    worker: { format: 'es' },
     server: {
       host: configured('LEARNGRAPH_LISTEN_HOST') || '127.0.0.1',
       ...(allowedHosts.size > 0 ? { allowedHosts: [...allowedHosts] } : {}),
       ...(publicOrigin ? { origin: publicOrigin } : {}),
       proxy: {
+        ...(configured('LEARNGRAPH_SKILL_TRANSLATION_PREVIEW_ORIGIN') ? {
+          '/api/v1/mcp/registry/translate': {
+            target: configured('LEARNGRAPH_SKILL_TRANSLATION_PREVIEW_ORIGIN'),
+            changeOrigin: true,
+          },
+          '/api/v1/skills/market/translate': {
+            target: configured('LEARNGRAPH_SKILL_TRANSLATION_PREVIEW_ORIGIN'),
+            changeOrigin: true,
+          },
+        } : {}),
         '/api': {
           target: backendOrigin,
           changeOrigin: true,
@@ -53,6 +68,34 @@ export default defineConfig(({ mode }) => {
         output: {
           codeSplitting: {
             groups: [
+              {
+                name: 'monaco',
+                test: /node_modules[\\/]monaco-editor[\\/]/,
+                priority: 40,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
+              {
+                // ZIP codec/worker registration is shared at module startup.
+                // Keep it together so production EPUB loading preserves order.
+                name: 'epub-zip',
+                test: /node_modules[\\/]@zip\.js[\\/]zip\.js[\\/]/,
+                priority: 35,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
+              {
+                // CSV/TSV preview only needs the small DSV parser, not the
+                // mermaid group that otherwise captures every d3-* package.
+                name: 'delimited-text',
+                test: /node_modules[\\/]d3-dsv[\\/]/,
+                priority: 40,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
               {
                 name: 'vendor',
                 test: /node_modules[\\/]/,
@@ -145,10 +188,10 @@ export default defineConfig(({ mode }) => {
                 // used to break it into cyclic chunks. Keep mermaid and its
                 // dedicated deps in ONE chunk so diagram rendering cannot
                 // crash at module-init. Deliberately exclude widely shared
-                // deps (dayjs/uuid/dompurify/marked/stylis) so non-diagram
+                // deps (dayjs/uuid/dompurify/marked/stylis/katex) so non-diagram
                 // pages never pull this chunk in.
                 name: 'mermaid',
-                test: /node_modules[\\/](mermaid|@mermaid-js|@braintree|@iconify|@upsetjs|cytoscape(-[a-z0-9-]+)?|d3(-[a-z0-9-]+)?|dagre-d3-es|es-toolkit|katex|khroma|non-layered-tidy-tree-layout|roughjs|ts-dedent)[\\/]/,
+                test: /node_modules[\\/](mermaid|@mermaid-js|@braintree|@iconify|@upsetjs|cytoscape(-[a-z0-9-]+)?|d3(-[a-z0-9-]+)?|dagre-d3-es|es-toolkit|khroma|non-layered-tidy-tree-layout|roughjs|ts-dedent)[\\/]/,
                 priority: 30,
                 entriesAware: false,
                 minSize: 0,
