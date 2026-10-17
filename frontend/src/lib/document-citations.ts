@@ -1,3 +1,7 @@
+import { unified } from "unified";
+import remarkParse from "remark-parse";
+import type { RootContent } from "mdast";
+
 /**
  * Parse and rewrite inline document citation markers emitted by the model.
  *
@@ -47,7 +51,44 @@ const WEB_CITE_PREFIX = "/__lgwebcite__/";
 
 /** Backend-injected or model-emitted web citation markers. */
 const WEB_CITATION_PATTERN =
-  /（\s*网页引用[:：]?\s*(\d{1,3})\s*）|\[ref_(\d{1,3})\]|\[(\d{1,3})\](?!\()/giu;
+  /(?<!\\)(?:（\s*网页引用[:：]?\s*(\d{1,3})\s*）|\[ref_(\d{1,3})\]|\[(\d{1,3})\](?!\())/giu;
+
+const citationParser = unified().use(remarkParse);
+
+/** Rewrite prose only: code, real links, images and reference definitions keep
+ * their original Markdown bytes. Slice by source offsets rather than serialize. */
+function rewriteCitationProse(text: string, rewrite: (prose: string) => string): string {
+  const ranges: Array<[number, number]> = [];
+  const visit = (node: RootContent) => {
+    if (node.type === "text") {
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      if (start !== undefined && end !== undefined) ranges.push([start, end]);
+    } else if ("children" in node && node.type !== "link" && node.type !== "linkReference") {
+      node.children.forEach((child) => visit(child as RootContent));
+    }
+  };
+  citationParser.parse(text).children.forEach(visit);
+  let cursor = 0;
+  let result = "";
+  for (const [start, end] of ranges) {
+    result += text.slice(cursor, start) + rewrite(text.slice(start, end));
+    cursor = end;
+  }
+  return result + text.slice(cursor);
+}
+
+/** Only consecutive markers in one prose run form a group. Punctuation,
+ * sentence text and newlines always retain separate evidence associations. */
+function groupWebCitations(text: string): string {
+  return text.replace(
+    /\[\d+\]\(\/__lgwebcite__\/\d+\)(?:[ \t]*\[\d+\]\(\/__lgwebcite__\/\d+\))+/g,
+    (group) => {
+      const indexes = [...new Set([...group.matchAll(/\/__lgwebcite__\/(\d+)/g)].map((match) => match[1]))];
+      return `[${indexes.join(",")}](${WEB_CITE_PREFIX}${indexes[0]}?refs=${indexes.join(",")})`;
+    },
+  );
+}
 
 export function isDocumentCitationHref(href: string | null | undefined): boolean {
   return typeof href === "string" && href.startsWith(CITE_PREFIX);
@@ -80,6 +121,7 @@ export function parseDocumentCitationHref(href: string): {
 
 export function parseWebCitationHref(href: string): {
   index: number;
+  indexes: number[];
   missing?: boolean;
 } | null {
   if (!isWebCitationHref(href)) return null;
@@ -87,7 +129,9 @@ export function parseWebCitationHref(href: string): {
     const url = new URL(href, "https://learngraph.local");
     const index = Number(url.pathname.slice(WEB_CITE_PREFIX.length) || "0") || 0;
     if (index < 1) return null;
-    return { index, missing: url.searchParams.get("missing") === "1" };
+    const indexes = [...new Set((url.searchParams.get("refs") ?? String(index))
+      .split(",").map(Number).filter((value) => Number.isInteger(value) && value > 0))];
+    return { index, indexes: indexes.length ? indexes : [index], missing: url.searchParams.get("missing") === "1" };
   } catch {
     return null;
   }
@@ -101,11 +145,11 @@ export function rewriteDocumentCitations(text: string): {
   markdown: string;
   citations: DocumentCitation[];
 } {
-  if (!text) return { markdown: text, citations: [] };
+  if (!text || text.search(CITATION_PATTERN) < 0) return { markdown: text, citations: [] };
   const citations: DocumentCitation[] = [];
   const indexByKey = new Map<string, number>();
 
-  const markdown = text.replace(CITATION_PATTERN, (...args) => {
+  const markdown = rewriteCitationProse(text, (prose) => prose.replace(CITATION_PATTERN, (...args) => {
     const match = args[0] as string;
     // rebuild groups from replace callback args
     const groups = args.slice(1, -2) as string[];
@@ -121,7 +165,7 @@ export function rewriteDocumentCitations(text: string): {
     }
     const href = `${CITE_PREFIX}${fileId}?loc=${encodeURIComponent(locators)}&i=${index}`;
     return `[${index}](${href})`;
-  });
+  }));
 
   return { markdown, citations };
 }
@@ -138,7 +182,7 @@ export function rewriteWebCitations(
   markdown: string;
   citations: WebCitation[];
 } {
-  if (!text) return { markdown: text, citations: [] };
+  if (!text || text.search(WEB_CITATION_PATTERN) < 0) return { markdown: text, citations: [] };
   const allowed =
     knownIndexes instanceof Set
       ? knownIndexes
@@ -147,7 +191,7 @@ export function rewriteWebCitations(
         : null;
   const citations: WebCitation[] = [];
   const seen = new Set<number>();
-  const markdown = text.replace(WEB_CITATION_PATTERN, (match, g1, g2, g3) => {
+  const markdown = rewriteCitationProse(text, (prose) => groupWebCitations(prose.replace(WEB_CITATION_PATTERN, (match, g1, g2, g3) => {
     const index = Number(g1 || g2 || g3 || "0") || 0;
     if (index < 1) return match;
     const isBareNumeric = match.startsWith("[");
@@ -165,7 +209,7 @@ export function rewriteWebCitations(
       citations.push({ index, raw: match, known: isKnown });
     }
     return `[${index}](${WEB_CITE_PREFIX}${index}${isKnown ? "" : "?missing=1"})`;
-  });
+  })));
   return { markdown, citations };
 }
 

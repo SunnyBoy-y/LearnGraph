@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.domain.schemas.common import ORMModel
+from app.domain.schemas.stream_ui import UIAction
 
 
 MessagePartType = Literal[
@@ -23,6 +24,7 @@ MessagePartType = Literal[
     "graph_context",
     "quiz",
     "chart",
+    "ui",
     "sandbox",
     "sandbox_artifact",
     "subapp_artifact",
@@ -418,6 +420,7 @@ class MessageSelectionContext(BaseModel):
 
 class MessageCreateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
+    ui_action: UIAction | None = None
     generation_mode: Literal["text", "image"] = "text"
     image_size: Literal[
         "auto",
@@ -448,6 +451,8 @@ class MessageCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_graph_action_target(self):
+        if self.ui_action is not None and self.generation_mode != "text":
+            raise ValueError("UI actions require text generation mode")
         if self.generation_mode != "image" and (
             self.image_size != "auto" or self.source_file_ids
         ):

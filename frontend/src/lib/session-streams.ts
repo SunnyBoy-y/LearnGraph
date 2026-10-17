@@ -9,6 +9,16 @@ export type SessionStreamHandle = {
 };
 
 const streams = new Map<string, SessionStreamHandle>();
+const listeners = new Set<() => void>();
+
+export function subscribeSessionStreams(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+function emit() {
+  for (const listener of listeners) listener();
+}
 
 export function getSessionStream(
   sessionId: string | null | undefined,
@@ -43,6 +53,7 @@ export function registerSessionStream(
     previous.controller.abort();
   }
   streams.set(sessionId, { controller, messageId });
+  emit();
 }
 
 export function setSessionStreamMessageId(
@@ -52,6 +63,7 @@ export function setSessionStreamMessageId(
   const current = streams.get(sessionId);
   if (!current) return;
   streams.set(sessionId, { ...current, messageId });
+  emit();
 }
 
 /**
@@ -66,6 +78,7 @@ export function clearSessionStream(
   if (!current) return;
   if (controller && current.controller !== controller) return;
   streams.delete(sessionId);
+  emit();
 }
 
 /** Stop generation for one session (toolbar Stop). Other sessions keep running. */
@@ -75,4 +88,5 @@ export function abortSessionStream(sessionId: string | null | undefined): void {
   if (!current) return;
   current.controller.abort();
   streams.delete(sessionId);
+  emit();
 }

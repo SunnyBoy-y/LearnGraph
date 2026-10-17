@@ -27,6 +27,7 @@ CHANNEL_A_TYPES = frozenset(
         "goal_draft_editor",
         "question_batch",
         "stepper",
+        "code_trainer",
     }
 )
 MAX_MAGIC_CARD_PREVIEW_CHARS = 100_000
@@ -289,7 +290,9 @@ def build_trusted_component_part(
         spec["data_schema"],
         normalized_props,
         label=f"{component_type}.props",
-        trusted_main_dom=True,
+        # Trainer strings are inert data, rendered only in textareas/text nodes.
+        # Execution happens in a separate opaque-origin iframe, never the main DOM.
+        trusted_main_dom=component_type != "code_trainer",
     )
 
     events = allowed_events

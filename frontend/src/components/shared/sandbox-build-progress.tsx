@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { LoaderCircle } from "lucide-react";
+import { TaskStatusIcon } from "./task-status-icon";
 
 import type { SandboxBootstrapJob } from "@/types/control";
 import { cn } from "@/lib/utils";
@@ -124,19 +124,11 @@ export function SandboxBuildProgress({
   return (
     <div className={cn("w-full space-y-2", className)}>
       <div className="flex items-center gap-2">
-        {running ? (
-          <LoaderCircle
-            aria-hidden="true"
-            className="size-3.5 shrink-0 animate-spin"
-          />
-        ) : (
-          <span
-            className={cn(
-              "size-1.5 shrink-0 rounded-full",
-              job.status === "succeeded" ? "bg-emerald-500" : "bg-red-500",
-            )}
-          />
-        )}
+        <TaskStatusIcon
+          taskKey={job.job_id}
+          status={running ? "running" : job.status === "succeeded" ? "succeeded" : "failed"}
+          className={cn("size-3.5", job.status === "succeeded" && "text-emerald-600 dark:text-emerald-400")}
+        />
         <p
           className="min-w-0 flex-1 truncate text-sm font-medium"
           title={detail}

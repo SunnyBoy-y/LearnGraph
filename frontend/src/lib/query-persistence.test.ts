@@ -60,6 +60,21 @@ describe("query persistence", () => {
     ).toBeUndefined();
   });
 
+  it("persists durable history without reviving live stream overlays", () => {
+    const source = new QueryClient();
+    const stop = startPersistedQueryCache(source);
+    const liveKey = ["workspace", "workspace-cache", "live-chat-messages"];
+    const durableKey = ["workspace", "workspace-cache", "messages", "s1"];
+    source.setQueryData(liveKey, [{ id: "temp-assistant", content: "partial" }]);
+    source.setQueryData(durableKey, [{ id: "m1", content: "saved" }]);
+    vi.advanceTimersByTime(700);
+    stop();
+    const restored = new QueryClient();
+    hydratePersistedQueryCache(restored);
+    expect(restored.getQueryData(liveKey)).toBeUndefined();
+    expect(restored.getQueryData(durableKey)).toEqual([{ id: "m1", content: "saved" }]);
+  });
+
   it("clears the workspace snapshot without touching unrelated localStorage", () => {
     const source = new QueryClient();
     const stop = startPersistedQueryCache(source);

@@ -469,6 +469,19 @@ class IncrementalRenderer {
       ? `${this.generation}:${block.key}`
       : String(block.key);
     if (isCodeBlock(node)) {
+      // Once a diagram fence closes, use the same plugin/controls as settled
+      // Markdown. Incomplete fences retain the cheap incremental source view.
+      const opening = /^ {0,3}(`{3,}|~{3,})mermaid[^\n]*\n/u.exec(src);
+      if (node.lang === "mermaid" && opening && new RegExp(
+        `\\n {0,3}${opening[1][0]}{${opening[1].length},}[ \\t]*$`, "u",
+      ).test(src)) {
+        return createElement(LazyStreamdown, {
+          codeHighlight: this.codeHighlight,
+          components: this.components,
+          key: renderKey,
+          children: src,
+        });
+      }
       const streamNode = node as unknown as StreamTailNode;
       return createElement(CodeBlockPlain, {
         appendChunk: streamNode.streamAppend,
@@ -488,7 +501,12 @@ class IncrementalRenderer {
         key: renderKey,
       });
     }
-    if (depth < MAX_CONTAINER_DEPTH && isContainerBlock(node)) {
+    // Bounded lists need their complete HAST node for custom list renderers
+    // (e.g. resource cards). Large lists retain item-level freezing so a
+    // growing stream never re-parses an unbounded container on each chunk.
+    const customList = node.type === "list" && src.length <= MAX_ACTIVE_PARSE_CHARS &&
+      this.components?.[node.ordered ? "ol" : "ul"];
+    if (!customList && depth < MAX_CONTAINER_DEPTH && isContainerBlock(node)) {
       return this.renderContainer(text, block, node, depth, appendOnly);
     }
     // Leaf block: render its source slice through the exact streamdown

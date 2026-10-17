@@ -14,12 +14,14 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { downloadFile } from "@/api/files";
+import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
 import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { MessagePartRenderer } from "@/components/chat/message-part-renderer";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import { downloadViaNative } from "@/lib/native-download";
 import type { MessagePart } from "@/types/sessions";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
+import { isFailedArtifactPart } from "@/features/chat/chat-message-parts";
 
 function safeImageSource(value: unknown) {
   if (typeof value !== "string") return "";
@@ -51,14 +53,12 @@ function positiveNumber(value: unknown) {
  */
 function ImageParticleField({ active }: { active: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const reducedMotion = useReducedMotionPreference();
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !active) return;
 
-    const reducedMotion = window.matchMedia(
-      "(prefers-reduced-motion: reduce)",
-    ).matches;
     const context = canvas.getContext("2d");
     if (!context) return;
 
@@ -235,7 +235,7 @@ function ImageParticleField({ active }: { active: boolean }) {
       observer.disconnect();
       if (raf) window.cancelAnimationFrame(raf);
     };
-  }, [active]);
+  }, [active, reducedMotion]);
 
   return (
     <canvas
@@ -255,48 +255,8 @@ function ChatImagePart({ part }: { part: MessagePart }) {
   const revision = String(
     data?.preview_revision ?? data?.revision ?? data?.updated_at ?? "initial",
   );
-  const [downloadedSource, setDownloadedSource] = useState("");
-  const [loadingRevision, setLoadingRevision] = useState(Boolean(fileId));
-  const [downloadFailed, setDownloadFailed] = useState(false);
+  const { source: downloadedSource, loading: loadingRevision, failed: downloadFailed } = useFileStreamUrl(fileId, revision);
   const [lightboxOpen, setLightboxOpen] = useState(false);
-
-  useEffect(() => {
-    if (!fileId) {
-      setDownloadedSource("");
-      setLoadingRevision(false);
-      setDownloadFailed(false);
-      return;
-    }
-    let cancelled = false;
-    setLoadingRevision(true);
-    setDownloadFailed(false);
-    void downloadFile(fileId)
-      .then((blob) => {
-        if (cancelled) return;
-        const nextObjectUrl = URL.createObjectURL(blob);
-        setDownloadedSource(nextObjectUrl);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setDownloadedSource("");
-          setDownloadFailed(true);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingRevision(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [fileId, revision]);
-
-  useEffect(
-    () => () => {
-      if (downloadedSource.startsWith("blob:"))
-        URL.revokeObjectURL(downloadedSource);
-    },
-    [downloadedSource],
-  );
 
   const width = positiveNumber(data?.width);
   const height = positiveNumber(data?.height);
@@ -376,7 +336,7 @@ function ChatImagePart({ part }: { part: MessagePart }) {
     try {
       let href = source;
       let revoke = false;
-      if (!source.startsWith("blob:") && !source.startsWith("data:")) {
+      if (!fileId && !source.startsWith("blob:") && !source.startsWith("data:")) {
         const response = await fetch(source);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         href = URL.createObjectURL(await response.blob());
@@ -392,7 +352,7 @@ function ChatImagePart({ part }: { part: MessagePart }) {
     } catch {
       toast.error("图片下载失败");
     }
-  }, [downloadName, source]);
+  }, [downloadName, fileId, source]);
 
   const interactive = done && !failed;
   // Failed states, or partial-preview polishing, keep a compact status chip.
@@ -513,7 +473,9 @@ export function ChatStreamPartRenderer({
   siblingParts?: MessagePart[];
   streaming?: boolean;
 }) {
-  if (part.type === "image") return <ChatImagePart part={part} />;
+  if (part.type === "image" && !isFailedArtifactPart(part)) {
+    return <ChatImagePart part={part} />;
+  }
   return (
     <MessagePartRenderer
       interactive={interactive}

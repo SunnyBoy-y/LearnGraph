@@ -19,13 +19,13 @@ describe("text/reasoning stream presentation", () => {
       .toEqual(["session1", "think1", "tool1"]);
   });
 
-  it("keeps unclassified narration in place as reasoning and tools arrive", () => {
+  it("shows unclassified text while streaming and folds it only after explicit process classification", () => {
     const stream = [part("session1", "text", 1), part("think1", "reasoning_content", 2), part("tool1", "tool_call", 3)];
-    for (let end = 1; end <= stream.length; end++) {
-      expect(visible(stream.slice(0, end))).toEqual(stream.slice(0, end).map((p) => p.id));
-    }
+    expect(groupPartsForDisplay(stream, { live: true }).map(s => [s.kind, s.parts.map(p => p.id)]))
+      .toEqual([["chain", ["think1", "tool1"]], ["parts", ["session1"]]]);
     const promoted = [{ ...stream[0], id: "plan1", data: { kind: "plan_narration" } }, ...stream.slice(1)];
-    expect(visible(promoted)).toEqual(visible(stream));
+    expect(groupPartsForDisplay(promoted, { live: true }).map(s => [s.kind, s.parts.map(p => p.id)]))
+      .toEqual([["chain", ["plan1", "think1", "tool1"]]]);
   });
 
   it("preserves the requested five-block order through final boundary and reload", () => {

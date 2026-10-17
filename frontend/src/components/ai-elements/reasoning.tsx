@@ -22,7 +22,6 @@ import {
   useState,
 } from "react";
 
-import { Shimmer } from "./shimmer";
 
 interface ReasoningContextValue {
   isStreaming: boolean;
@@ -154,7 +153,7 @@ export type ReasoningTriggerProps = ComponentProps<
 
 const defaultGetThinkingMessage = (isStreaming: boolean, duration?: number) => {
   if (isStreaming || duration === 0) {
-    return <Shimmer duration={1}>正在思考…</Shimmer>;
+    return <p>正在思考…</p>;
   }
   if (duration === undefined) {
     return <p>思考过程</p>;

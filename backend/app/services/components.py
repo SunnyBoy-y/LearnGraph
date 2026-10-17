@@ -44,6 +44,7 @@ from app.services.component_renderer_protocol import (
     issue_renderer_capability_token,
 )
 from app.services.component_trust import resolve_active_issuer, verify_component_signature
+from app.services.code_trainer import CODE_TRAINER_SPEC
 from app.repositories.domain import PluginRepository
 
 
@@ -60,6 +61,7 @@ BUILTIN_COMPONENT_IDS = frozenset(
         "goal_draft_editor",
         "question_batch",
         "stepper",
+        "code_trainer",
     }
 )
 MAX_SCHEMA_BYTES = 64 * 1024
@@ -123,7 +125,7 @@ def _flatten_permissions(permissions: dict[str, Any]) -> list[str]:
     return flattened
 
 
-def _schema_guard(schema: dict[str, Any], *, label: str) -> None:
+def _schema_guard(schema: dict[str, Any], *, label: str, trusted_builtin: bool = False) -> None:
     encoded = _canonical_json(schema)
     if len(encoded) > MAX_SCHEMA_BYTES:
         raise AppError(
@@ -169,7 +171,7 @@ def _schema_guard(schema: dict[str, Any], *, label: str) -> None:
                     f"{label} cannot declare HTML or JavaScript content",
                 )
             pattern = value.get("pattern")
-            if isinstance(pattern, str):
+            if isinstance(pattern, str) and not trusted_builtin:
                 raise AppError(
                     422,
                     "component_schema_pattern_forbidden",
@@ -611,6 +613,7 @@ def _builtin_specs() -> dict[str, dict[str, Any]]:
         },
     }
     return {
+        "code_trainer": CODE_TRAINER_SPEC,
         "stepper": {
             "display_name": "Stepper 教学步进视图",
             "data_schema": {
@@ -1952,8 +1955,11 @@ def ensure_builtin_components(db: Session, workspace_id: str) -> None:
             "skill_triggers": [],
             "example_data": spec["example_data"],
         }
-        _schema_guard(spec["data_schema"], label=f"{component_id}.data_schema")
-        _schema_guard(event_schema, label=f"{component_id}.event_schema")
+        # These schemas come exclusively from the checked-in registry, never
+        # caller manifests. Keep the regex prohibition for imported components
+        # while allowing audited built-ins such as code_trainer to bootstrap.
+        _schema_guard(spec["data_schema"], label=f"{component_id}.data_schema", trusted_builtin=True)
+        _schema_guard(event_schema, label=f"{component_id}.event_schema", trusted_builtin=True)
         _validate_instance(
             spec["data_schema"],
             spec["example_data"],

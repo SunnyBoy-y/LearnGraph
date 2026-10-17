@@ -13,6 +13,8 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { createUuid } from "@/lib/uuid";
+import { useLatestCallback } from "@/hooks/use-latest-callback";
+import { useLiveChatMessages } from "./use-live-chat-messages";
 import {
   useMutation,
   useQueries,
@@ -29,13 +31,14 @@ import {
   ChevronRight,
   Copy,
   FilePlus2,
-  FileSearch,
   FileText,
   GitBranch,
   GitCompareArrows,
   LayoutDashboard,
   ImageIcon,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   Camera,
   MessageSquareQuote,
   Mic,
@@ -57,6 +60,7 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { SandboxAuthDialog, type SandboxAuthRequest } from "@/components/chat/sandbox-auth-dialog";
 import { SandboxBuildProgress } from "@/components/shared/sandbox-build-progress";
 import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
+import { RetryAnswerMenu, RetryMenuSettings } from "@/components/chat/retry-answer-menu";
 import {
   beginStreamStats,
   deltaTextOf,
@@ -91,6 +95,7 @@ import {
   listSessionMessageEvents,
   listProviders,
   listGraphs,
+  listProjects,
   listMemories,
   listSessionMessages,
   listSessionMessagesPage,
@@ -104,6 +109,7 @@ import {
   retrySessionMessage,
   startSandboxBootstrap,
   streamSessionMessage,
+  submitUIAction,
   undoGraphChangeSet,
   updateSession,
   updateSetting,
@@ -113,17 +119,21 @@ import {
   transcribeDictationSegment,
 } from "@/api";
 import { VoiceCallControl, VoiceComposerActions, VoiceOrb } from "@/features/voice/voice-orb";
+import { VoiceActivityIndicator } from "@/features/voice/voice-activity-indicator";
 import { voiceModelPinText, voiceStatusText } from "@/features/voice/voice-status";
 import { applyVoiceCanvasUpdate } from "@/features/voice/voice-canvas";
 import { VoiceTaskCanvas } from "@/features/voice/voice-task-canvas";
+import { ManagedChildSessionControls } from "@/features/voice/managed-agent-controls";
+import { ManagedSessionTasks } from "@/features/voice/managed-session-tasks";
 import { voiceSessionController } from "@/features/voice/voice-session-controller";
 import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controller";
 import { hashFileSha256 } from "@/lib/file-hash";
 import { PREFILL_COMPOSER_EVENT } from "@/features/mobile/PendingShareConsumer";
 import { ThinkingSlider, THINKING_STOPS, thinkingStopIndex } from "@/components/chat/thinking-slider";
-import { providerDictationSupported } from "@/lib/provider-dictation";
+import { DictationBar } from "@/components/chat/dictation-bar";
 import {
   startDictationOrchestrator,
+  dictationOrchestratorSupported,
   type DictationOrchestratorHandle,
 } from "@/lib/dictation-orchestrator";
 import {
@@ -194,12 +204,7 @@ import {
   celebration,
   chime as nativeChime,
 } from "@/lib/native-bridge";
-import { DeepResearchApprovalFromPart } from "@/components/chat/message-part-renderer";
-import {
-  groupAnswerParts,
-  QuestionSetPager,
-} from "@/components/chat/question-set-pager";
-import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
+import { AnswerParts } from "@/components/chat/answer-parts";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import {
   readVoiceCaptionParts,
@@ -234,6 +239,7 @@ import {
   listStreamingSessionIds,
   registerSessionStream,
   setSessionStreamMessageId,
+  subscribeSessionStreams,
 } from "@/lib/session-streams";
 import {
   PageFrame,
@@ -245,7 +251,6 @@ import {
 import { ExpandableContent } from "@/components/shared/expandable-content";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -289,7 +294,6 @@ import {
   fallbackSessionTitle,
   getDraftSessionCreationKey,
   getDraftSessionId,
-  getDraftSessionProjectId,
   getOrCreateDraftSession,
   isDefaultDraftTitle,
   isQuestionFallbackTitle,
@@ -301,7 +305,6 @@ import {
   getSessionComposerPrefs,
   hasSessionComposerPrefs,
   inheritSessionComposerPrefs,
-  isDefaultComposerPrefs,
   prefsFromModelSnapshot,
   setSessionComposerPrefs,
   type GenerationMode,
@@ -355,7 +358,6 @@ import {
 } from "@/lib/query-keys";
 import {
   groupPartsForDisplay,
-  isDeepResearchApprovalPart,
   isReasoningTextPart,
   orderedMessageParts,
   thinkingDurationSeconds,
@@ -862,7 +864,6 @@ type ComposerCommandId =
   | "search"
   | "agentic"
   | "graph"
-  | "research"
   | "roadmap"
   | "schedule"
   | "progress"
@@ -1525,7 +1526,7 @@ function readTextSelection(): TextSelectionMenu | null {
   if (!selection || selection.rangeCount === 0 || selection.isCollapsed)
     return null;
   const selectedText = selection.toString().trim().slice(0, 500);
-  if (selectedText.length < 3) return null;
+  if (!selectedText) return null;
   const range = selection.getRangeAt(0);
   const startElement =
     range.startContainer instanceof HTMLElement
@@ -1914,6 +1915,10 @@ function AssistantMessageInner({
   sessionId,
   workspaceId,
   onRetry,
+  onRetryClose,
+  retryMenuContent,
+  retryMenuOpen = false,
+  retryPending = false,
   onBranch,
   onComponentAction,
   selectionMarks = [],
@@ -1929,6 +1934,10 @@ function AssistantMessageInner({
   sessionId: string;
   workspaceId: string;
   onRetry: () => void;
+  onRetryClose: () => void;
+  retryMenuContent?: ((shown: Message) => ReactNode) | null;
+  retryMenuOpen?: boolean;
+  retryPending?: boolean;
   onBranch: () => void;
   onComponentAction: (action: TrustedComponentAction) => void | Promise<void>;
   selectionMarks?: SelectionExplanationRecord[];
@@ -1993,7 +2002,6 @@ function AssistantMessageInner({
     live: shown.status === "streaming",
   });
   // Budget approval needs a clickable card outside the collapsed thinking fold.
-  const deepResearchApprovalParts = orderedParts.filter(isDeepResearchApprovalPart);
   const fullText = shown.parts
     .filter((part) => part.type === "text" || part.type === "acknowledgement")
     .map((part) => part.content ?? "")
@@ -2026,56 +2034,7 @@ function AssistantMessageInner({
     }
     return rendered;
   };
-  const renderAnswerParts = (parts: MessagePart[]) =>
-    groupAnswerParts(parts).map((group) => {
-      if (group.kind === "question_set") {
-        return (
-          <QuestionSetPager
-            key={`question-set-${group.parts.map((part) => part.id).join("-")}`}
-            onSubmit={(submission) =>
-              void onComponentAction?.({
-                componentId: group.questions[0]?.componentId ?? group.parts[0].id,
-                componentType:
-                  group.questions.length > 1
-                    ? "question_set"
-                    : group.questions[0]?.componentType ?? "question_set",
-                event: "submit",
-                payload: {
-                  answer: submission.summaryText,
-                  summaryText: submission.summaryText,
-                  results: submission.results,
-                  labels: submission.results.flatMap((item) => item.labels),
-                  graded_count: submission.gradedCount,
-                  correct_count: submission.correctCount,
-                },
-              })
-            }
-            questions={group.questions}
-          />
-        );
-      }
-      if (group.kind === "image_strip") {
-        return (
-          <SandboxImageStrip
-            key={`image-strip-${group.parts[0]?.id ?? "empty"}`}
-            parts={group.parts}
-          />
-        );
-      }
-      if (group.kind === "side_pair") {
-        // Model-authored |layout=side: text left, artifact right (flex row).
-        return (
-          <div
-            className="grid gap-3 sm:grid-cols-2 sm:items-start"
-            key={`side-pair-${group.artifact.id}`}
-          >
-            <div>{renderPart(group.text)}</div>
-            <div>{renderPart(group.artifact)}</div>
-          </div>
-        );
-      }
-      return renderPart(group.part);
-    });
+  const renderAnswerParts = (parts: MessagePart[]) => <AnswerParts parts={parts} siblingParts={orderedParts} onAction={onComponentAction} renderPart={renderPart} />;
 
   useEffect(() => {
     if (selectedVersionId || !messageContentRef.current) return;
@@ -2207,16 +2166,6 @@ function AssistantMessageInner({
                   ),
                 )}
               </ThinkingChain>
-              {index === 0 && deepResearchApprovalParts.length ? (
-                <div className="message-deep-research-approvals space-y-3">
-                  {deepResearchApprovalParts.map((part) => (
-                    <DeepResearchApprovalFromPart
-                      key={`approval-${part.id}`}
-                      part={part}
-                    />
-                  ))}
-                </div>
-              ) : null}
             </div>
           ) : (
             <div
@@ -2233,14 +2182,6 @@ function AssistantMessageInner({
             </div>
           ),
         )}
-        {!displaySegments.some((segment) => segment.kind === "chain") &&
-        deepResearchApprovalParts.length ? (
-          <div className="message-deep-research-approvals space-y-3 pt-1">
-            {deepResearchApprovalParts.map((part) => (
-              <DeepResearchApprovalFromPart key={`approval-${part.id}`} part={part} />
-            ))}
-          </div>
-        ) : null}
         </div>
       </MessageContent>
       {
@@ -2269,14 +2210,17 @@ function AssistantMessageInner({
           >
           <Copy className="size-3.5" />
         </MessageAction>
-        <MessageAction
-          disabled={retryDisabled}
-          label="重试并保留版本"
-          onClick={onRetry}
-          tooltip={retryDisabledReason ?? "重试并保留版本"}
-        >
-          <RefreshCcw className="size-3.5" />
-        </MessageAction>
+        {retryMenuContent === undefined ? (
+          <MessageAction disabled={retryDisabled} label="重试并保留版本" onClick={onRetry} tooltip={retryDisabledReason ?? "重试并保留版本"}>
+            <RefreshCcw className="size-3.5" />
+          </MessageAction>
+        ) : (
+          <RetryAnswerMenu open={retryMenuOpen} onOpenChange={(open) => open ? onRetry() : onRetryClose()} content={retryMenuContent?.(shown)}>
+            <MessageAction disabled={retryDisabled} label={retryPending ? "正在生成新版本" : "重试并保留版本"} title={retryDisabledReason ?? "重新生成回答"} className="data-[state=open]:bg-muted data-[state=open]:text-foreground">
+              {retryPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCcw className="size-3.5" />}
+            </MessageAction>
+          </RetryAnswerMenu>
+        )}
         {/* 低频动作（创建分支 / 复制消息 ID）收进「更多」二级菜单，操作行只留高频按钮。 */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -2352,6 +2296,9 @@ const areEqualAssistantMessage = (
   prev.sessionId === next.sessionId &&
   prev.workspaceId === next.workspaceId &&
   prev.retryDisabled === next.retryDisabled &&
+  prev.retryMenuOpen === next.retryMenuOpen &&
+  prev.retryMenuContent === next.retryMenuContent &&
+  prev.retryPending === next.retryPending &&
   prev.branchDisabled === next.branchDisabled &&
   prev.retryDisabledReason === next.retryDisabledReason &&
   prev.branchDisabledReason === next.branchDisabledReason &&
@@ -2538,7 +2485,6 @@ type WorkbenchCapability = {
 
 function ConversationQuickActions({
   attachDisabled,
-  deepResearchDisabled,
   goalActive,
   goalDisabled,
   graphActive,
@@ -2546,7 +2492,6 @@ function ConversationQuickActions({
   imageActive,
   imageDisabled,
   onAttach,
-  onDeepResearch,
   onGoal,
   onGraph,
   onImage,
@@ -2558,7 +2503,6 @@ function ConversationQuickActions({
   onPhoto,
 }: {
   attachDisabled: boolean;
-  deepResearchDisabled: boolean;
   goalActive: boolean;
   goalDisabled: boolean;
   graphActive: boolean;
@@ -2566,7 +2510,6 @@ function ConversationQuickActions({
   imageActive: boolean;
   imageDisabled: boolean;
   onAttach: () => void;
-  onDeepResearch: () => void;
   onGoal: () => void;
   onGraph: () => void;
   onImage: () => void;
@@ -2579,9 +2522,8 @@ function ConversationQuickActions({
   onPhoto?: () => void;
 }) {
   const dragScroll = useHorizontalDragScroll<HTMLElement>();
-  // 窄屏一次只横向展示高频入口，图谱/绘图/练习等低频能力收进「更多」，
-  // 避免 7 个入口把输入条上方挤成一整行。桌面维持全部平铺。
-  const isCompactToolbar = usePhoneLayout();
+  // Keep the reading surface quiet on every screen. Active modes stay visible
+  // so their state is never hidden in the overflow menu.
   const capabilities: WorkbenchCapability[] = [
     {
       key: "attach",
@@ -2590,7 +2532,6 @@ function ConversationQuickActions({
       title: "添加文件或图片，发送时按文件权限和解析状态处理",
       onClick: onAttach,
       disabled: attachDisabled,
-      primary: true,
     },
     ...(isNativeApp() && onPhoto
       ? [
@@ -2631,17 +2572,6 @@ function ConversationQuickActions({
       primary: true,
     },
     {
-      key: "deep-research",
-      label: "深度研究",
-      icon: <FileSearch aria-hidden="true" />,
-      title: deepResearchDisabled
-        ? "请先启用 Deep Research Provider，并使用支持工具调用的模型"
-        : "快捷启动深度研究：启用智能体并预填 start_deep_research 任务",
-      onClick: onDeepResearch,
-      disabled: deepResearchDisabled,
-      primary: true,
-    },
-    {
       key: "graph",
       label: graphActive ? "图谱变更" : "图谱",
       icon: <Network aria-hidden="true" />,
@@ -2670,12 +2600,9 @@ function ConversationQuickActions({
       disabled: practiceDisabled,
     },
   ];
-  const toolbarCapabilities = isCompactToolbar
-    ? capabilities.filter((capability) => capability.primary)
-    : capabilities;
-  const overflowCapabilities = isCompactToolbar
-    ? capabilities.filter((capability) => !capability.primary)
-    : [];
+  const toolbarCapabilities = capabilities.filter(
+    (capability) => capability.primary || capability.pressed,
+  );
   return (
     <section
       aria-label="对话工作台功能"
@@ -2698,71 +2625,8 @@ function ConversationQuickActions({
             {capability.label}
           </button>
         ))}
-        {overflowCapabilities.length ? (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                aria-label="更多工作台能力"
-                className="chat-workbench-toolbar__action"
-                title="图谱、绘图与生成练习等低频能力"
-                type="button"
-              >
-                <MoreHorizontal aria-hidden="true" />
-                更多
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="w-52">
-              {overflowCapabilities.map((capability) => (
-                <DropdownMenuItem
-                  disabled={capability.disabled}
-                  key={capability.key}
-                  onSelect={capability.onClick}
-                  title={capability.title}
-                >
-                  {capability.icon}
-                  {capability.label}
-                  {capability.pressed ? (
-                    <Check aria-hidden="true" className="ml-auto size-4" />
-                  ) : null}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        ) : null}
       </div>
     </section>
-  );
-}
-
-function VoiceBar({ level, canceling }: { level: number; canceling?: boolean }) {
-  const bars = 24;
-  return (
-    <div
-      className={canceling ? "chat-voice-bar is-canceling" : "chat-voice-bar"}
-      role="status"
-      aria-label="正在聆听"
-    >
-      <div className="chat-voice-bar__bars">
-        {Array.from({ length: bars }).map((_, index) => {
-          const variation = 0.5 + 0.5 * Math.sin(index * 1.7);
-          const height = Math.min(
-            1,
-            Math.max(0.12, level * variation + (level > 0.02 ? 0.08 : 0)),
-          );
-          return (
-            <span
-              key={index}
-              className="chat-voice-bar__bar"
-              style={{ height: `${Math.round(height * 100)}%` }}
-            />
-          );
-        })}
-      </div>
-      <div className="chat-voice-bar__hint">
-        <span>松开发送</span>
-        <span className="chat-voice-bar__cancel">上滑取消</span>
-      </div>
-    </div>
   );
 }
 
@@ -2805,9 +2669,13 @@ export function ChatCanvasPage() {
     scrollMessageIntoView,
   } = conversationScroll;
   const goalMode = new URLSearchParams(location.search).get("mode") === "goal";
-  /** True when this session should restore goal mode after a session switch. */
-  const sessionGoalModeStored = hasSessionGoalMode(workspaceId, sessionId);
-  const conversationResetKey = `${workspaceId}:${sessionId}`;
+  const draftProjectId = sessionId === "new"
+    ? new URLSearchParams(location.search).get("project")
+    : null;
+  const conversationResetKey = `${workspaceId}:${sessionId}${sessionId === "new" ? `:${draftProjectId ?? "root"}` : ""}`;
+  // Giving the visible draft its durable id is not a conversation switch.
+  // Keep its composer and the first turn's scroll anchor through that handoff.
+  const promotingDraftSessionIdRef = useRef<string | null>(null);
   const mentionMenuId = useId();
   const isPhoneLayout = usePhoneLayout();
   // On phones the model picker renders inside the top bar (slot owned by the
@@ -2818,7 +2686,7 @@ export function ChatCanvasPage() {
   useEffect(() => {
     setTopbarModelSlot(document.getElementById("topbar-model-slot"));
   }, []);
-  const [localMessages, setLocalMessages] = useState<Message[]>([]);
+  const [localMessages, setLocalMessages] = useLiveChatMessages(workspaceId);
   const [status, setStatus] = useState<ChatStatus>("ready");
   const [streamConnectionNotice, setStreamConnectionNotice] =
     useState<StreamConnectionNotice | null>(null);
@@ -2907,16 +2775,16 @@ export function ChatCanvasPage() {
   );
   const [imageSize, setImageSize] = useState<ImageSize>("auto");
   useEffect(() => {
+    if (promotingDraftSessionIdRef.current === sessionId) return;
     setStreamConnectionNotice(null);
     // 会话切换时释放上一段会话留下的尾部预留：否则新会话末尾会凭空多出一段空白。
     resetTailSpace();
-  }, [conversationResetKey, resetTailSpace]);
+  }, [conversationResetKey, resetTailSpace, sessionId]);
   const [modelSearch, setModelSearch] = useState("");
   // Collapsed = icon + chevron, open = current mode word + chevron, matching
   // the ChatGPT composer trigger. Drives the chip content and Ctrl+Shift+M.
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [composerInstanceKey, setComposerInstanceKey] =
-    useState(conversationResetKey);
+  const [composerInstanceKey, setComposerInstanceKey] = useState(0);
   const resumeInFlightRef = useRef<string | null>(null);
   const resumeRetryCountsRef = useRef(new Map<string, number>());
   const [rejectProposalId, setRejectProposalId] = useState<string | null>(null);
@@ -3008,7 +2876,7 @@ export function ChatCanvasPage() {
   // 必须等 `useVoiceSession().open(...)` 把快照写成本会话之后再拨：connect() 在
   // `snapshot.sessionId` 为空时会直接返回，而那时链路仍然是 idle。
   const voiceReadyToDial =
-    voiceModeOpen && voiceSnapshotForGating.sessionId === sessionId;
+    voiceModeOpen && sessionId !== "new" && voiceSnapshotForGating.sessionId === sessionId;
   useEffect(() => {
     if (!voiceModeOpen) {
       voiceAutoDialedForRef.current = null;
@@ -3118,7 +2986,7 @@ export function ChatCanvasPage() {
     return () => {
       window.removeEventListener("learngraph:voice-render", onVoiceRender);
     };
-  }, [armVoiceTitleRefetch, notifyActivityUpdated, sessionId, voiceModeOpen, workspaceId]);
+  }, [armVoiceTitleRefetch, notifyActivityUpdated, sessionId, setLocalMessages, voiceModeOpen, workspaceId]);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageContent, setEditingMessageContent] = useState("");
   const [dismissedMention, setDismissedMention] = useState("");
@@ -3159,6 +3027,30 @@ export function ChatCanvasPage() {
   /** Always the session currently on screen — background streams must not mutate UI. */
   const viewingSessionIdRef = useRef(sessionId);
   viewingSessionIdRef.current = sessionId;
+  useEffect(() => {
+    viewingSessionIdRef.current = sessionId;
+    return () => {
+      if (viewingSessionIdRef.current === sessionId) viewingSessionIdRef.current = "";
+    };
+  }, [sessionId]);
+  const sessionStream = useSyncExternalStore(
+    subscribeSessionStreams,
+    () => getSessionStream(sessionId),
+    () => undefined,
+  );
+  useEffect(() => {
+    if (sessionStream) {
+      abortRef.current = sessionStream.controller;
+      activeStreamSessionId.current = sessionId;
+      activeMessageId.current = sessionStream.messageId;
+      setStatus("streaming");
+    } else if (activeStreamSessionId.current === sessionId) {
+      abortRef.current = null;
+      activeStreamSessionId.current = null;
+      activeMessageId.current = null;
+      setStatus(current => current === "streaming" || current === "submitted" ? "ready" : current);
+    }
+  }, [sessionId, sessionStream]);
   const latestOperationId = useRef(0);
   const optimisticSessionId = useRef<string | null>(null);
   const retryExpectedVersionRef = useRef(0);
@@ -3184,11 +3076,16 @@ export function ChatCanvasPage() {
     [attachmentRowDrag.ref],
   );
   const [composerExpanded, setComposerExpanded] = useState(false);
+  // Keep automatic multi-line sizing separate from the user's enlarged editor.
+  const [composerEnlarged, setComposerEnlarged] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
+  useEffect(() => {
+    setComposerEnlarged(false);
+  }, [conversationResetKey]);
   const openFileDialogRef = useRef<() => void>(() => undefined);
   const pendingHandled = useRef(false);
   const draftSessionCreationRef = useRef<{
-    locationKey: string;
+    scope: string;
     promise: Promise<Session>;
   } | null>(null);
   const preserveDraftForSessionRef = useRef<string | null>(null);
@@ -3200,16 +3097,21 @@ export function ChatCanvasPage() {
   // 长按语音条（push-to-talk）：空输入框长按启动 ASR，松开发送 / 上滑取消
   const [voiceBarActive, setVoiceBarActive] = useState(false);
   const [voiceLevel, setVoiceLevel] = useState(0);
+  const [holdFinalizing, setHoldFinalizing] = useState(false);
+  const dictationSendRequestedRef = useRef(false);
   const [holdCanceling, setHoldCanceling] = useState(false);
   const holdRef = useRef<{
     active: boolean;
+    canceled: boolean;
+    starting: Promise<DictationOrchestratorHandle> | null;
+    finishSpeech: (() => void) | null;
     timer: number | null;
     startY: number;
     handle: DictationOrchestratorHandle | null;
     speech: BrowserSpeechRecognition | null;
     final: string;
     interim: string;
-  }>({ active: false, timer: null, startY: 0, handle: null, speech: null, final: "", interim: "" });
+  }>({ active: false, canceled: false, starting: null, finishSpeech: null, timer: null, startY: 0, handle: null, speech: null, final: "", interim: "" });
   const dictationStopRequestedRef = useRef(false);
   const dictationCleanupSessionRef = useRef<DictationCleanupSession | null>(
     null,
@@ -3233,6 +3135,13 @@ export function ChatCanvasPage() {
     if (!el) return;
 
     el.style.width = "100%";
+
+    if (composerEnlarged && composerText) {
+      el.style.height = "100%";
+      el.style.overflowY = "auto";
+      return;
+    }
+    if (!composerText) setComposerEnlarged(false);
 
     const syncHeight = () => {
       // 高度预算来自 CSS token，窄屏由堆叠式布局收紧，避免这里写死像素。
@@ -3263,7 +3172,7 @@ export function ChatCanvasPage() {
       window.removeEventListener("resize", syncHeight);
       observer?.disconnect();
     };
-  }, [composerText, composerInstanceKey]);
+  }, [composerText, composerInstanceKey, composerEnlarged]);
 
   // 底部 Composer 高度变化时写入 --composer-height：正文动态安全区、底部
   // 淡出区域与「回到底部」按钮统一依赖该变量，而不是各自的固定像素值。
@@ -3462,6 +3371,7 @@ export function ChatCanvasPage() {
       toast.error(
         error instanceof Error ? error.message : "加载更早消息失败",
       );
+      return false;
     } finally {
       loadingOlderRef.current = false;
       setLoadingOlderMessages(false);
@@ -3531,15 +3441,17 @@ export function ChatCanvasPage() {
       },
     });
     // Keep only optimistic/streaming rows for active + background streams.
+    const promotingVisibleDraft = promotingDraftSessionIdRef.current === sessionId;
     setLocalMessages((current) => {
       const next = current.filter((message) => {
         const owner = message.session_id;
         if (!owner || owner === sessionId) return true;
+        if (owner === "new" && promotingVisibleDraft) return true;
         return isSessionStreaming(owner);
       });
       return next.length === current.length ? current : next;
     });
-  }, [queryClient, sessionId, workspaceId]);
+  }, [queryClient, sessionId, setLocalMessages, workspaceId]);
 
   const settings = useQuery({ queryKey: workspaceQueryKey(workspaceId, "settings"), queryFn: listSettings });
   const workspaceDefaultResponseMode = useMemo(
@@ -3564,9 +3476,12 @@ export function ChatCanvasPage() {
 
   // Restore per-session composer prefs whenever the active session changes.
   useEffect(() => {
+    // Session-list/title refreshes are not a session switch. Reapplying a
+    // snapshot here can overwrite a choice the user just made for the next turn.
+    if (composerPrefsReadySessionId === (sessionId || "new")) return;
     // Workspace default only matters when this session has no local prefs yet.
-    // Existing sessions can restore immediately; drafts wait for settings so we
-    // do not seed/persist the product fallback before the admin default arrives.
+    // Saved choices do not depend on settings; drafts wait so we do not
+    // seed/persist the product fallback before the admin default arrives.
     const hasStoredPrefs =
       Boolean(sessionId) &&
       sessionId !== "new" &&
@@ -3584,6 +3499,9 @@ export function ChatCanvasPage() {
       setComposerPrefsReadySessionId(sessionId || "new");
       return;
     }
+    // Do not persist defaults before the first durable snapshot has arrived;
+    // that would make a first visit look like an explicit local selection.
+    if (sessions.isPending) return;
     const stored = hasStoredPrefs
       ? getSessionComposerPrefs(sessionId)
       : defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode);
@@ -3600,16 +3518,9 @@ export function ChatCanvasPage() {
       ...(!stored.modelId && fromSnapshot.modelId
         ? { modelId: fromSnapshot.modelId }
         : {}),
-      // If prefs are still workspace/product defaults and snapshot has a
-      // different mode, adopt the durable snapshot (e.g. first open after refresh).
-      ...(isDefaultComposerPrefs(stored, workspaceDefaultResponseMode) &&
-      fromSnapshot.responseMode &&
-      fromSnapshot.responseMode !== stored.responseMode
-        ? {
-            responseMode: fromSnapshot.responseMode,
-            thinkingMode: fromSnapshot.thinkingMode ?? stored.thinkingMode,
-          }
-        : {}),
+      // A saved choice remains explicit even when it equals the defaults.
+      // Snapshots initialize a first visit only; local preferences win thereafter.
+      ...(!hasStoredPrefs ? fromSnapshot : {}),
     };
     setResponseMode(merged.responseMode);
     setThinkingMode(merged.thinkingMode);
@@ -3621,8 +3532,10 @@ export function ChatCanvasPage() {
     setSelectedImageModelId(merged.imageModelId ?? "");
     setComposerPrefsReadySessionId(sessionId);
   }, [
+    composerPrefsReadySessionId,
     sessionId,
     sessions.data,
+    sessions.isPending,
     settings.isPending,
     workspaceDefaultResponseMode,
   ]);
@@ -3908,7 +3821,7 @@ export function ChatCanvasPage() {
   });
   const retryModelOptions = useMemo(
     () =>
-      providerModelOptions(retryProvider, retryDiscoveredModels.data?.models),
+      providerModelOptions(retryProvider, retryDiscoveredModels.data?.models).filter(isTextChatModel),
     [retryDiscoveredModels.data?.models, retryProvider],
   );
   const retrySelectedModel = retryModelOptions.find(
@@ -3918,6 +3831,7 @@ export function ChatCanvasPage() {
     retryProvider &&
       isModelProviderType(retryProvider.provider_type) &&
       retryProvider.capabilities.supports_agent_tools !== false &&
+      retrySelectedModel?.capabilities?.supports_agent_tools !== false &&
       retrySelectedModel?.remote,
   );
   const activeProviderSupportsStructuredAgent = Boolean(
@@ -3946,16 +3860,6 @@ export function ChatCanvasPage() {
             Array.isArray(provider.capabilities.companion_capabilities) &&
             provider.capabilities.companion_capabilities.includes("web_search"))),
     ),
-  );
-  const hasDeepResearchProvider = Boolean(
-    providers.data?.some((provider) => {
-      if (!provider.enabled || !provider.remote_capability) return false;
-      const role = providerCapabilityString(provider, "provider_role");
-      return (
-        role === "deep_research" ||
-        provider.provider_type.includes("deep_research")
-      );
-    }),
   );
   const hasQwenCompanionSearchProvider = Boolean(
     providers.data?.some(
@@ -4122,20 +4026,20 @@ export function ChatCanvasPage() {
     );
   }, [retryDiscoveredModels.isPending, retryModelOptions]);
   useEffect(() => {
-    if (retryTarget && retryDiscoveredModels.isPending) return;
-    if (!retryThinkingModes.length) {
-      setRetryResponseMode("fast");
+    if (!retryTarget || retryDiscoveredModels.isPending) return;
+    if (!retrySupportsAgentMode) setRetryResponseMode("fast");
+    if (retryResponseMode === "fast" || !retrySupportsAgentMode || !retryThinkingModes.length) {
       setRetryThinkingMode("off");
       return;
     }
     setRetryThinkingMode((current) =>
-      retryThinkingModes.includes(current)
+      retryThinkingModes.includes(current) || (current === "off" && !retrySelectedModel?.capabilities?.thinking_required)
         ? current
         : retryThinkingModes.includes("medium")
           ? "medium"
           : retryThinkingModes[0],
     );
-  }, [retryDiscoveredModels.isPending, retryTarget, retryThinkingModes]);
+  }, [retryDiscoveredModels.isPending, retryTarget, retryThinkingModes, retryResponseMode, retrySupportsAgentMode, retrySelectedModel?.capabilities?.thinking_required]);
   const supportsThinkingMode = thinkingModes.length > 0;
   const thinkingRequired =
     selectedModel?.capabilities?.thinking_required === true;
@@ -4221,13 +4125,13 @@ export function ChatCanvasPage() {
       const resolved = byId ?? findPersistedUserTwin(item, persisted);
       if (resolved) tempUserToPersisted.set(item.id, resolved.id);
     }
-    // Concurrent streams may still push into localMessages; only show the
-    // active session so session B's tokens never paint on session C.
+    // Draft promotion may briefly leave this turn owned by "new". Only that
+    // draft can cross the handoff; background sessions remain isolated even
+    // while optimisticSessionId points at the session currently on screen.
     localMessages.forEach((message) => {
       if (
-        message.session_id &&
         message.session_id !== sessionId &&
-        optimisticSessionId.current !== sessionId
+        !(message.session_id === "new" && optimisticSessionId.current === sessionId)
       ) {
         return;
       }
@@ -4428,7 +4332,7 @@ export function ChatCanvasPage() {
   // hydrate may see neither the just-submitted user turn nor its assistant row.
   // Recheck a few times after mount so the normal in-flight replay effect below
   // can attach as soon as the durable message becomes visible. This is bounded
-  // (not a permanent poll) and stops early once a stream is found.
+  // (not a permanent poll) and stops once any durable turn is available.
   useEffect(() => {
     if (!sessionId || sessionId === "new") return;
     const queryKey = workspaceQueryKey(workspaceId, "messages", sessionId);
@@ -4436,14 +4340,10 @@ export function ChatCanvasPage() {
       window.setTimeout(() => {
         if (isSessionStreaming(sessionId)) return;
         const cached = queryClient.getQueryData<Message[]>(queryKey) ?? [];
-        const hasInFlight = cached.some(
-          (message) =>
-            message.role === "assistant" &&
-            IN_FLIGHT_MESSAGE_STATUSES.includes(
-              message.status as (typeof IN_FLIGHT_MESSAGE_STATUSES)[number],
-            ),
-        );
-        if (hasInFlight) return;
+        // These retries only repair an initially empty hydrate. Re-reading
+        // an already settled turn can race reconciliation and briefly replace
+        // the new answer with an older timeline snapshot.
+        if (cached.length) return;
         void queryClient.invalidateQueries({ exact: true, queryKey });
       }, delay),
     );
@@ -4749,7 +4649,7 @@ export function ChatCanvasPage() {
     // Intentionally no abort on unmount/session switch — concurrent sessions
     // keep replaying until the user stops this session or it finishes.
     return undefined;
-  }, [history.data, history.isSuccess, queryClient, sessionId, status, workspaceId]);
+  }, [history.data, history.isSuccess, queryClient, sessionId, setLocalMessages, status, workspaceId]);
 
 
   useEffect(() => {
@@ -4836,7 +4736,7 @@ export function ChatCanvasPage() {
         optimisticSessionId.current = null;
       return next.length === current.length ? current : next;
     });
-  }, [history.data, sessionId]);
+  }, [history.data, sessionId, setLocalMessages]);
   const currentSession = sessions.data?.find(
     (session) => session.id === sessionId,
   );
@@ -5409,9 +5309,7 @@ export function ChatCanvasPage() {
       // 智能体 + a real provider/model, and seeding workspace defaults here
       // would wipe that selection once the chat route hydrates — forcing the
       // mode back to 思考 and leaving selectedModel empty for the next send
-      // (e.g. submitting the goal-clarification answer card). For page-load
-      // draft creation the live selection IS the workspace default, so that
-      // flow keeps its "no previous-session leak" guarantee unchanged.
+      // (e.g. submitting the goal-clarification answer card).
       if (!hasSessionComposerPrefs(session.id)) {
         setSessionComposerPrefs(session.id, {
           responseMode,
@@ -5445,136 +5343,65 @@ export function ChatCanvasPage() {
       workspaceId,
     ],
   );
-  useEffect(() => {
-    // A session switching back into goal mode (the restore effect re-applies
-    // ?mode=goal in the same commit) must stay on /chat/new instead of being
-    // promoted to a real draft session.
-    if (sessionId !== "new" || goalMode || sessionGoalModeStored) {
-      return;
-    }
-    let cancelled = false;
-    const draftScope = draftSessionScope(workspaceId, null);
-
-    // Prefer reusing the single unused empty draft so /chat/new never multiplies.
-    const existingDraftId = getDraftSessionId();
-    const existingDraftProjectId = getDraftSessionProjectId();
-    if (existingDraftId && existingDraftProjectId === null) {
-      const cached = (
-        queryClient.getQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions")) ?? []
-      ).find((session) => session.id === existingDraftId);
-      if (cached) {
-        // Blank drafts re-opened via /chat/new adopt the current workspace
-        // default, clearing any mode stamped by a previous session switch race.
-        setSessionComposerPrefs(
-          existingDraftId,
-          defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
-        );
-        preserveDraftForSessionRef.current = existingDraftId;
-        navigate(`/w/${workspaceId}/chat/${existingDraftId}`, {
-          replace: true,
-        });
-        return;
+  // Opening a blank canvas never creates a server record. Commit only when
+  // sending content or explicitly starting a voice interaction.
+  const ensureDraftSession = useCallback((): Promise<Session> => {
+    const scope = `${draftSessionScope(workspaceId, draftProjectId)}:${goalMode ? "goal" : "chat"}`;
+    const existing = draftSessionCreationRef.current;
+    if (existing?.scope === scope) return existing.promise;
+    const promise = getOrCreateDraftSession(scope, async () => {
+      const projects = draftProjectId
+        ? await queryClient.fetchQuery({
+            queryKey: workspaceQueryKey(workspaceId, "projects"),
+            queryFn: () => listProjects(true),
+            staleTime: 30_000,
+          })
+        : [];
+      const project = projects.find((item) => item.id === draftProjectId);
+      if (draftProjectId && (!project || project.status === "archived")) {
+        throw new Error("文件夹不存在或已归档，请重新选择文件夹。");
       }
-      const reusePromise = listSessions()
-        .then((sessions) => {
-          queryClient.setQueryData(workspaceQueryKey(workspaceId, "sessions"), sessions);
-          return sessions.find((session) => session.id === existingDraftId);
-        })
-        .then((session) => {
-          if (cancelled) return;
-          if (session) {
-            setSessionComposerPrefs(
-              session.id,
-              defaultComposerPrefsForResponseMode(workspaceDefaultResponseMode),
-            );
-            preserveDraftForSessionRef.current = session.id;
-            navigate(`/w/${workspaceId}/chat/${session.id}`, {
-              replace: true,
-            });
-            return;
-          }
-          clearDraftSessionId(existingDraftId);
-          return getOrCreateDraftSession(draftScope, () =>
-            createSession(
-              { memory_enabled: true, title: "新会话" },
-              {
-                headers: {
-                  "Idempotency-Key": getDraftSessionCreationKey(draftScope),
-                },
-              },
-            ),
-          ).then((created) => {
-            if (cancelled) return;
-            rememberCreatedSession(created);
-            setDraftSessionId(created.id, created.project_id ?? null);
-            preserveDraftForSessionRef.current = created.id;
-            navigate(`/w/${workspaceId}/chat/${created.id}`, {
-              replace: true,
-            });
-          });
-        });
-      void reusePromise.catch((error: unknown) => {
-        if (!cancelled) {
-          toast.error(
-            error instanceof Error ? error.message : "无法创建新会话",
-          );
-        }
-      });
-      return () => {
-        cancelled = true;
-      };
-    }
+      const initialNode = learningNodeRef.current;
+      const session = await createSession(
+        {
+          memory_enabled: true,
+          title: goalMode ? "目标调研" : "新会话",
+          project_id: project?.id ?? null,
+          goal_id: project?.primary_goal_id ?? null,
+          graph_id: initialNode?.graphId ?? project?.primary_graph_id ?? null,
+          current_node_id: initialNode?.nodeId ?? null,
+        },
+        { headers: { "Idempotency-Key": getDraftSessionCreationKey(scope) } },
+      );
+      setDraftSessionId(session.id, session.project_id ?? null);
+      return session;
+    });
+    const attempt = { scope, promise };
+    draftSessionCreationRef.current = attempt;
+    void promise.catch(() => {
+      if (draftSessionCreationRef.current === attempt) {
+        draftSessionCreationRef.current = null;
+      }
+    });
+    return promise;
+  }, [draftProjectId, goalMode, queryClient, workspaceId]);
 
-    let attempt = draftSessionCreationRef.current;
-    if (!attempt || attempt.locationKey !== location.key) {
-      attempt = {
-        locationKey: location.key,
-        promise: getOrCreateDraftSession(draftScope, () =>
-          createSession(
-            { memory_enabled: true, title: "新会话" },
-            {
-              headers: {
-                "Idempotency-Key": getDraftSessionCreationKey(draftScope),
-              },
-            },
-          ),
-        ),
-      };
-      draftSessionCreationRef.current = attempt;
-    }
-    const currentAttempt = attempt;
-    void currentAttempt.promise
-      .then((session) => {
-        if (cancelled) return;
-        rememberCreatedSession(session);
-        setDraftSessionId(session.id, session.project_id ?? null);
-        preserveDraftForSessionRef.current = session.id;
-        navigate(`/w/${workspaceId}/chat/${session.id}`, { replace: true });
-      })
-      .catch((error: unknown) => {
-        if (draftSessionCreationRef.current === currentAttempt) {
-          draftSessionCreationRef.current = null;
-        }
-        if (!cancelled) {
-          toast.error(
-            error instanceof Error ? error.message : "无法创建新会话",
-          );
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    goalMode,
-    sessionGoalModeStored,
-    location.key,
-    navigate,
-    queryClient,
-    rememberCreatedSession,
-    sessionId,
-    workspaceDefaultResponseMode,
-    workspaceId,
-  ]);
+  useEffect(() => {
+    if (sessionId !== "new" || !voiceModeOpen) return;
+    let cancelled = false;
+    void ensureDraftSession().then((session) => {
+      if (cancelled) return;
+      rememberCreatedSession(session);
+      preserveDraftForSessionRef.current = session.id;
+      navigate(`/w/${workspaceId}/chat/${session.id}`, { replace: true });
+    }).catch((error: unknown) => {
+      if (cancelled) return;
+      setVoiceModeOpen(false);
+      toast.error(error instanceof Error ? error.message : "无法开始语音会话");
+    });
+    return () => { cancelled = true; };
+  }, [ensureDraftSession, navigate, rememberCreatedSession, sessionId, voiceModeOpen, workspaceId]);
+
   const completeGoalSetup = useCallback(
     async ({ goal, graph }: { goal: Goal; graph: Graph }) => {
       try {
@@ -5631,6 +5458,7 @@ export function ChatCanvasPage() {
       currentSession,
       navigate,
       queryClient,
+      setLocalMessages,
       rememberCreatedSession,
       sessionId,
       workspaceId,
@@ -6001,6 +5829,9 @@ export function ChatCanvasPage() {
         sourceFileIds?: string[];
         sandboxPreflighted?: boolean;
         selectionContext?: MessageSelectionContext | null;
+        uiAction?: MessageCreateRequest["ui_action"];
+        /** Code trainer sends source for model analysis without server tools. */
+        analysisOnly?: boolean;
       } = {},
     ) => {
       const content = contentValue.trim();
@@ -6037,6 +5868,7 @@ export function ChatCanvasPage() {
       if (
         requestedGenerationMode === "text" &&
         responseMode === "agentic" &&
+        !options.analysisOnly &&
         !options.sandboxPreflighted
       ) {
         if (!(await ensureAgentSandboxReady())) return;
@@ -6160,48 +5992,15 @@ export function ChatCanvasPage() {
       let targetSession = currentSession;
       if (sessionId === "new") {
         try {
-          const initialNode = learningNodeRef.current;
-          if (goalMode) {
-            targetSession = await createSession({
-              memory_enabled: true,
-              title: "目标调研",
-            });
-          } else {
-            let draftAttempt = draftSessionCreationRef.current;
-            if (!draftAttempt || draftAttempt.locationKey !== location.key) {
-              const draftScope = draftSessionScope(workspaceId, null);
-              draftAttempt = {
-                locationKey: location.key,
-                promise: getOrCreateDraftSession(draftScope, () =>
-                  createSession(
-                    {
-                      memory_enabled: true,
-                      title: "新会话",
-                      graph_id: initialNode?.graphId ?? null,
-                      current_node_id: initialNode?.nodeId ?? null,
-                    },
-                    {
-                      headers: {
-                        "Idempotency-Key": getDraftSessionCreationKey(draftScope),
-                      },
-                    },
-                  ),
-                ),
-              };
-              draftSessionCreationRef.current = draftAttempt;
-            }
-            targetSession = await draftAttempt.promise;
-          }
+          targetSession = await ensureDraftSession();
           targetSessionId = targetSession.id;
           optimisticSessionId.current = targetSessionId;
-          setLocalMessages((current) =>
-            current.map((message) =>
-              message.id === user.id || message.id === assistant.id
-                ? { ...message, session_id: targetSessionId }
-                : message,
-            ),
-          );
+          promotingDraftSessionIdRef.current = targetSessionId;
           rememberCreatedSession(targetSession);
+          // Let the router commit independently of the SSE state updates.
+          // Keep rows on the visible draft until that commit; promoting them
+          // inside the navigation transition lets urgent tokens keep rebasing
+          // that same state while the canvas is still bound to /chat/new.
           navigate(
             `/w/${workspaceId}/chat/${targetSessionId}${goalMode ? "?mode=goal" : ""}`,
             { replace: true },
@@ -6290,6 +6089,7 @@ export function ChatCanvasPage() {
         : undefined;
       const request: MessageCreateRequest = {
         content,
+        ui_action: options.uiAction,
         generation_mode: requestedGenerationMode,
         image_size:
           requestedGenerationMode === "image"
@@ -6309,16 +6109,17 @@ export function ChatCanvasPage() {
         thinking_mode:
           requestedGenerationMode === "image" ? "off" : effectiveThinkingMode,
         agent_mode:
-          requestedGenerationMode === "text" && responseMode === "agentic",
+          requestedGenerationMode === "text" && responseMode === "agentic" && !options.analysisOnly,
         goal_mode:
           requestedGenerationMode === "text" &&
           responseMode === "agentic" &&
+          !options.analysisOnly &&
           goalMode,
         // Agent mode no longer forces web_search just because a SearchProvider
         // exists. Network search follows the explicit searchRoute (and the
         // composer "联网" toggle), while agent tools still run without search.
         search_route:
-          requestedGenerationMode === "image"
+          requestedGenerationMode === "image" || options.analysisOnly
             ? "disabled"
             : responseMode === "agentic" &&
                 !hasAuthorizedAgentSearchProvider &&
@@ -6333,6 +6134,7 @@ export function ChatCanvasPage() {
                 : searchRoute,
         web_search:
           requestedGenerationMode === "text" &&
+          !options.analysisOnly &&
           searchRoute !== "disabled" &&
           (searchRoute === "model_native" || hasAuthorizedAgentSearchProvider),
         graph_action: requestedGraphAction,
@@ -6772,12 +6574,19 @@ export function ChatCanvasPage() {
           abortRef.current = null;
           activeMessageId.current = null;
           activeStreamSessionId.current = null;
+          // Publish idle only after removing the controller. A synchronous
+          // history refresh can otherwise reattach this completed handle and
+          // leave all native UI actions disabled despite a completed message.
+          if (isViewingStream()) {
+            setStatus(current => current === "streaming" || current === "submitted" ? "ready" : current);
+          }
         }
       }
     },
     [
       queryClient,
       activeModelProvider,
+      setLocalMessages,
       activeImageProvider,
       applyFallbackSessionTitle,
       applyGeneratedSessionTitle,
@@ -6790,7 +6599,6 @@ export function ChatCanvasPage() {
       history.isSuccess,
       imageProviders,
       imageSize,
-      location.key,
       messages,
       selectedModel?.id,
       selectedModel?.remote,
@@ -6798,6 +6606,7 @@ export function ChatCanvasPage() {
       responseMode,
       effectiveThinkingMode,
       ensureAgentSandboxReady,
+      ensureDraftSession,
       searchRoute,
       sessionId,
       navigate,
@@ -7551,6 +7360,20 @@ export function ChatCanvasPage() {
 
   const handleComponentAction = useCallback(
     (action: TrustedComponentAction) => {
+      if (action.componentType === "code_trainer") {
+        if (action.event !== "submit" || typeof action.payload.prompt !== "string" || action.payload.prompt.length > 50000) return;
+        return send(action.payload.prompt, { graphAction: "none", generationMode: "text", analysisOnly: true });
+      }
+      if (action.componentType === "stream_ui") {
+        if (action.event !== "explain" && action.event !== "graph.node.explain") return;
+        const uiAction = {
+          part_id: action.componentId,
+          revision: Number(action.payload.revision),
+          action: action.event,
+          ...(typeof action.payload.node_id === "string" ? { node_id: action.payload.node_id } : {}),
+        } satisfies NonNullable<MessageCreateRequest["ui_action"]>;
+        return submitUIAction(sessionId, uiAction).then(({ prompt }) => send(prompt, { graphAction: "none", generationMode: "text", uiAction }));
+      }
       if (action.componentType === "graph_update_proposal") {
         const proposalId = action.payload.proposal_id;
         if (typeof proposalId !== "string" || !proposalId) {
@@ -7667,10 +7490,23 @@ export function ChatCanvasPage() {
       }
       void send(answer, { graphAction: "none" });
     },
-    [submitGraphReview, send],
+    [submitGraphReview, send, sessionId],
   );
 
+  // Message rows intentionally skip changing inline callbacks in their memo
+  // comparator. Pass a stable bridge so a restored graph never invokes a send
+  // closure captured before its provider/model finished loading.
+  const dispatchComponentAction = useLatestCallback(handleComponentAction);
+
   useEffect(() => {
+    draftSessionCreationRef.current = null;
+    if (promotingDraftSessionIdRef.current === sessionId) {
+      promotingDraftSessionIdRef.current = null;
+      setLocalMessages((current) => current.map((message) =>
+        message.session_id === "new" ? { ...message, session_id: sessionId } : message,
+      ));
+      return;
+    }
     if (preserveDraftForSessionRef.current === sessionId) {
       preserveDraftForSessionRef.current = null;
       setLocalMessages([]);
@@ -7684,7 +7520,9 @@ export function ChatCanvasPage() {
     // streams continue painting; the messages memo only shows this session.
     setEditingMessageId(null);
     setEditingMessageContent("");
-    setComposerInstanceKey(conversationResetKey);
+    // The draft route may reuse the key it had before promotion. A reset
+    // counter still clears PromptInput's internal files on a real switch back.
+    setComposerInstanceKey((current) => current + 1);
     setComposerText("");
     setPendingFiles([]);
     setLongPaste(null);
@@ -7725,7 +7563,7 @@ export function ChatCanvasPage() {
     learningNodeRef.current = undefined;
     setLearningNode(undefined);
     clearLearningNodeContext();
-  }, [conversationResetKey, sessionId, workspaceDefaultResponseMode]);
+  }, [conversationResetKey, sessionId, setLocalMessages, workspaceDefaultResponseMode]);
 
   useEffect(() => {
     const routeState = location.state as {
@@ -7738,24 +7576,35 @@ export function ChatCanvasPage() {
     } | null;
     const targetMessageId = routeState?.targetMessageId;
     if (targetMessageId && history.isSuccess) {
+      // Search can target assistant rows and history hidden by the DOM cap.
+      // The stable mount host exists even before its lazy content is painted.
+      setRevealedHistoryCount(historyTotalCount);
       let attempts = 0;
+      let cancelled = false;
       const timer = window.setInterval(() => {
-        const target = document.getElementById(`conversation-jump-${targetMessageId}`);
+        const target = document.querySelector<HTMLElement>(
+          `[data-message-mount-id="${CSS.escape(targetMessageId)}"]`,
+        );
         if (target) {
           scrollMessageIntoView(targetMessageId, "center");
           target.classList.add("ring-2", "ring-primary", "ring-offset-2");
           window.setTimeout(() => target.classList.remove("ring-2", "ring-primary", "ring-offset-2"), 1800);
           window.clearInterval(timer);
-          navigate(location.pathname, { replace: true });
-        } else if (historyHasMoreBefore && attempts < 30) {
-          void loadOlderMessages();
-          attempts += 1;
+          navigate(`${location.pathname}${location.search}`, { replace: true });
+        } else if (historyHasMoreBefore) {
+          void loadOlderMessages().then((loaded) => {
+            if (!cancelled && loaded === false) {
+              window.clearInterval(timer);
+              navigate(`${location.pathname}${location.search}`, { replace: true });
+            }
+          });
         } else if (++attempts >= 12) {
           window.clearInterval(timer);
-          navigate(location.pathname, { replace: true });
+          toast.error("未能定位到该消息，请重新搜索");
+          navigate(`${location.pathname}${location.search}`, { replace: true });
         }
       }, 120);
-      return () => window.clearInterval(timer);
+      return () => { cancelled = true; window.clearInterval(timer); };
     }
     if (routeState?.learningNode?.graphId) {
       const context = { ...routeState.learningNode, sessionId };
@@ -7768,10 +7617,10 @@ export function ChatCanvasPage() {
       pendingPrompt &&
       activeModelProvider &&
       !pendingHandled.current &&
-      !history.isPending
+      (sessionId === "new" || !history.isPending)
     ) {
       pendingHandled.current = true;
-      navigate(location.pathname, { replace: true });
+      navigate(`${location.pathname}${location.search}`, { replace: true });
       const pendingAttachmentFiles = routeState.pendingAttachmentFiles ?? [];
       const pendingFileIds = Array.from(
         new Set([
@@ -7789,13 +7638,16 @@ export function ChatCanvasPage() {
     activeModelProvider,
     history.isPending,
     location.pathname,
+    location.search,
     location.state,
     navigate,
     send,
     history.isSuccess,
+    historyTotalCount,
     historyHasMoreBefore,
     loadOlderMessages,
     scrollMessageIntoView,
+    sessionId,
   ]);
 
   useEffect(() => {
@@ -7912,12 +7764,30 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       dictationStopRequestedRef.current = true;
       const session = dictationCleanupSessionRef.current;
       if (session) session.degraded = true;
+      dictationCleanupSessionRef.current = null;
+      dictationSendRequestedRef.current = false;
       speechRecognitionRef.current?.abort();
       providerDictationRef.current?.abort();
       providerDictationRef.current = null;
     },
     [],
   );
+
+  useEffect(() => {
+    setVoiceBarActive(false);
+    setHoldFinalizing(false);
+    setHoldCanceling(false);
+    return () => {
+      const hold = holdRef.current;
+      hold.canceled = true;
+      hold.active = false;
+      if (hold.timer != null) window.clearTimeout(hold.timer);
+      hold.timer = null;
+      hold.handle?.abort();
+      hold.speech?.abort();
+      hold.finishSpeech?.();
+    };
+  }, [conversationResetKey]);
 
   const dictationEngine = useMemo(() => {
     const apply = (session: DictationCleanupSession) => {
@@ -8009,6 +7879,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   // 采用原始转写并收起标签。
   const finishDictationSession = useCallback(
     (session: DictationCleanupSession) => {
+      if (dictationCleanupSessionRef.current !== session) return;
       session.recognitionEnded = true;
       // 实时听写可能残留未定稿的 partial 文本,并入待整理内容以免丢失。
       if (session.interim) {
@@ -8048,14 +7919,18 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         });
         return;
       }
-      speechRecognitionRef.current?.stop();
+      if (speechRecognitionRef.current) speechRecognitionRef.current.stop();
+      else {
+        setIsListening(false);
+        setDictationFinalizing("transcribing");
+      }
       return;
     }
 
     // 已配置云端 ASR 时优先使用:麦克风持续采集(长会话,不因识别轮次
     // 中断),保留 ASR 服务原生的标点推断。realtime 模型走 WebSocket
     // 实时长连接(partial 逐字上屏);非 realtime 模型在自然停顿处切段上传。
-    if (asrAvailable && providerDictationSupported()) {
+    if (asrAvailable && dictationOrchestratorSupported()) {
       const session: DictationCleanupSession = {
         prefix: composerText.trimEnd(),
         cleaned: "",
@@ -8088,6 +7963,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         session.pending += joiner + clean;
       };
       const handleFatal = (message: string) => {
+        if (dictationCleanupSessionRef.current !== session) return;
+        dictationSendRequestedRef.current = false;
         toast.error(message);
         providerDictationRef.current = null;
         setIsListening(false);
@@ -8116,6 +7993,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           })
         ).text;
       };
+      setIsListening(true);
       startDictationOrchestrator({
         realtime:
           asrRealtimeConfigured && asrVadMode !== "local_only"
@@ -8127,6 +8005,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               }
             : undefined,
         adaptiveVad: asrVadAdaptive,
+        onLevel: setVoiceLevel,
         transcribeSegment,
         onPartial: (text) => {
           if (dictationCleanupSessionRef.current !== session) return;
@@ -8150,10 +8029,19 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         onFatal: (message) => handleFatal(message),
       })
         .then((handle) => {
+          if (dictationCleanupSessionRef.current !== session || session.recognitionEnded) {
+            handle.abort();
+            return;
+          }
           providerDictationRef.current = handle;
-          setIsListening(true);
+          if (dictationStopRequestedRef.current) {
+            void handle.stop().then(() => finishDictationSession(session));
+          }
         })
         .catch((error: unknown) => {
+          setIsListening(false);
+          setDictationFinalizing(null);
+          dictationSendRequestedRef.current = false;
           if (dictationCleanupSessionRef.current === session)
             dictationCleanupSessionRef.current = null;
           toast.error(
@@ -8303,167 +8191,139 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   // 长按语音条（push-to-talk）
   // ------------------------------------------------------------------ //
   const beginHoldDictation = () => {
-    const hold = holdRef.current;
-    if (hold.active || isListening) return;
+    if (holdRef.current.active || isListening || holdFinalizing || dictationFinalizing || voiceBlocksComposer || sessionIsClosed || goalFlow.busy) return;
     if (composerText.trim().length > 0) return;
-    hold.active = true;
-    hold.final = "";
-    hold.interim = "";
+    // Each gesture owns its callbacks, including the results returned by stop().
+    const hold = { ...holdRef.current, active: true, canceled: false, starting: null as Promise<DictationOrchestratorHandle> | null, finishSpeech: null as (() => void) | null, final: "", interim: "", handle: null as DictationOrchestratorHandle | null, speech: null as BrowserSpeechRecognition | null };
+    holdRef.current = hold;
     lastDictationFinal = { text: "", at: 0 };
-    hold.handle = null;
-    hold.speech = null;
     setVoiceBarActive(true);
     setVoiceLevel(0);
-
-    const applyLevel = (level: number) => setVoiceLevel(level);
-
-    if (asrAvailable && providerDictationSupported()) {
-      const asrLanguageValue =
-        asrLanguage && asrLanguage !== "auto" ? asrLanguage : undefined;
-      const transcribeSegment = async (segment: Blob) => {
-        if (!storedAudioTranscriptionProvider)
-          throw new Error("尚未配置文件/分段转写模型");
-        return (
-          await transcribeDictationSegment(segment, {
+    const acceptsResults = () => holdRef.current === hold && !hold.canceled;
+    const fail = (message: string) => {
+      if (!acceptsResults()) return;
+      hold.canceled = true;
+      hold.active = false;
+      hold.handle?.abort();
+      setVoiceBarActive(false);
+      setHoldFinalizing(false);
+      toast.error(message);
+    };
+    if (asrAvailable && dictationOrchestratorSupported()) {
+      const language = asrLanguage !== "auto" ? asrLanguage : undefined;
+      hold.starting = startDictationOrchestrator({
+        realtime: asrRealtimeConfigured && asrVadMode !== "local_only" ? {
+          providerId: realtimeAudioTranscriptionProvider!.id,
+          modelId: realtimeAudioTranscriptionModel,
+          language,
+          hotwords: asrHotwords.map((item) => item.text),
+        } : undefined,
+        adaptiveVad: asrVadAdaptive,
+        transcribeSegment: async (segment) => {
+          if (!storedAudioTranscriptionProvider) throw new Error("尚未配置文件/分段转写模型");
+          return (await transcribeDictationSegment(segment, {
             provider_id: storedAudioTranscriptionProvider.id,
             model_id: providerAsrModelId(storedAudioTranscriptionProvider, "stored"),
-            language: asrLanguageValue,
-          })
-        ).text;
-      };
-      startDictationOrchestrator({
-        realtime:
-          asrRealtimeConfigured && asrVadMode !== "local_only"
-            ? {
-                providerId: realtimeAudioTranscriptionProvider!.id,
-                modelId: realtimeAudioTranscriptionModel,
-                language: asrLanguageValue,
-                hotwords: asrHotwords.map((item) => item.text),
-              }
-            : undefined,
-        adaptiveVad: asrVadAdaptive,
-        transcribeSegment,
-        onLevel: applyLevel,
-        onPartial: (text) => {
-          if (!holdRef.current.active) return;
-          holdRef.current.interim = text;
+            language,
+          })).text;
         },
+        onLevel: (level) => { if (acceptsResults()) setVoiceLevel(level); },
+        onPartial: (text) => { if (acceptsResults()) hold.interim = text; },
         onFinal: (text) => {
-          if (!holdRef.current.active) return;
+          if (!acceptsResults()) return;
           const clean = dedupeDictationFinal(text);
-          if (clean) holdRef.current.final += clean;
-          holdRef.current.interim = "";
+          if (clean) hold.final += clean;
+          hold.interim = "";
         },
-        onDegrade: () => {},
-        onFatal: (message) => {
-          holdRef.current.active = false;
-          setVoiceBarActive(false);
-          toast.error(message);
-        },
-      })
-        .then((handle) => {
-          if (holdRef.current.active) holdRef.current.handle = handle;
-        })
-        .catch((error: unknown) => {
-          holdRef.current.active = false;
-          setVoiceBarActive(false);
-          toast.error(
-            error instanceof Error && error.message
-              ? error.message
-              : "无法启动语音转写",
-          );
-        });
+        onDegrade: (message) => { if (acceptsResults()) toast.message(message); },
+        onFatal: fail,
+      });
+      void hold.starting.then((handle) => {
+        if (!acceptsResults()) handle.abort();
+        else hold.handle = handle;
+      }).catch((error: unknown) => fail(error instanceof Error ? error.message : "无法启动语音转写"));
       return;
     }
-
     const speechWindow = window as Window & {
       SpeechRecognition?: BrowserSpeechRecognitionConstructor;
       webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
     };
-    const SpeechRecognition =
-      speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      holdRef.current.active = false;
-      setVoiceBarActive(false);
-      toast.message("当前浏览器不支持语音转写");
-      return;
-    }
+    const SpeechRecognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!SpeechRecognition) { fail("当前浏览器不支持语音转写，请先配置 ASR 模型"); return; }
     const recognition = new SpeechRecognition();
-    recognition.lang = navigator.language.startsWith("zh")
-      ? "zh-CN"
-      : navigator.language || "zh-CN";
+    hold.speech = recognition;
+    recognition.lang = asrLanguage !== "auto" ? asrLanguage : navigator.language || "zh-CN";
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.onresult = (event) => {
-      if (!holdRef.current.active) return;
-      let finalText = "";
-      let interimText = "";
+      if (!acceptsResults()) return;
+      let interim = "";
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const result = event.results[index];
-        const text = result[0]?.transcript ?? "";
-        if (result.isFinal) finalText += text;
-        else interimText += text;
+        if (result.isFinal) hold.final += result[0]?.transcript ?? "";
+        else interim += result[0]?.transcript ?? "";
       }
-      holdRef.current.final += finalText;
-      holdRef.current.interim = interimText;
-      // 浏览器引擎无音量回调，给波形一个恒定的“在听”基线
-      applyLevel(0.35);
+      hold.interim = interim;
     };
-    recognition.onerror = () => {};
+    recognition.onerror = (event) => {
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") fail("未获得麦克风权限");
+    };
     recognition.onend = () => {
-      if (!holdRef.current.active) return;
-      try {
-        recognition.start();
-      } catch {
-        // 忽略自动重启失败
-      }
+      if (!hold.active) { hold.finishSpeech?.(); return; }
+      if (!acceptsResults()) return;
+      try { recognition.start(); } catch { fail("语音转写已停止，请稍后再试"); }
     };
-    holdRef.current.speech = recognition;
-    try {
-      recognition.start();
-    } catch {
-      holdRef.current.active = false;
-      setVoiceBarActive(false);
-      toast.error("无法启动语音转写");
-    }
+    try { recognition.start(); } catch { fail("无法启动语音转写"); }
   };
 
-  const endHoldDictation = (send: boolean) => {
+  const endHoldDictation = async (send: boolean) => {
     const hold = holdRef.current;
-    if (!hold.active) return;
-    hold.active = false;
-    setVoiceBarActive(false);
-    setVoiceLevel(0);
-    setHoldCanceling(false);
-    const handle = hold.handle;
-    const speech = hold.speech;
-    hold.handle = null;
-    hold.speech = null;
-
     if (!send) {
-      hold.final = "";
-      hold.interim = "";
-      handle?.abort();
-      speech?.abort();
+      hold.canceled = true;
+      hold.active = false;
+      hold.handle?.abort();
+      hold.speech?.abort();
+      hold.finishSpeech?.();
+      setVoiceBarActive(false);
+      setHoldFinalizing(false);
+      setHoldCanceling(false);
       return;
     }
-
-    const finish = () => {
+    if (!hold.active) return;
+    hold.active = false;
+    setHoldFinalizing(true);
+    setHoldCanceling(false);
+    try {
+      // Release may happen during getUserMedia / WebSocket setup.
+      const handle = hold.handle ?? await hold.starting;
+      if (hold.canceled || holdRef.current !== hold) { handle?.abort(); return; }
+      if (handle) await handle.stop();
+      else if (hold.speech) await new Promise<void>((resolve) => {
+        const timer = window.setTimeout(resolve, 2000);
+        hold.finishSpeech = () => { window.clearTimeout(timer); resolve(); };
+        hold.speech!.stop();
+      });
+      if (hold.canceled || holdRef.current !== hold) return;
       const text = `${hold.final}${hold.interim}`.trim();
-      hold.final = "";
-      hold.interim = "";
+      hold.canceled = true;
       if (text) void submitPrompt({ text, files: [] });
-    };
-    if (handle) {
-      void handle.stop().then(finish);
-    } else if (speech) {
-      speech.stop();
-      window.setTimeout(finish, 300);
+      else toast.message("未识别到语音，请重试");
+    } catch (error) {
+      if (!hold.canceled) toast.error(error instanceof Error ? error.message : "语音转写失败");
+      hold.handle?.abort();
+    } finally {
+      hold.canceled = true;
+      if (holdRef.current === hold) {
+        setVoiceBarActive(false);
+        setHoldFinalizing(false);
+        setVoiceLevel(0);
+      }
     }
   };
 
   const handleComposerPointerDown = (event: ReactPointerEvent<HTMLTextAreaElement>) => {
-    if (composerHasText) return;
+    if (composerHasText || voiceBarActive || isListening || holdFinalizing || dictationFinalizing || voiceBlocksComposer || sessionIsClosed || goalFlow.busy) return;
+    if (holdRef.current.timer != null) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
     const hold = holdRef.current;
     hold.startY = event.clientY;
@@ -8497,9 +8357,21 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   };
   const handleComposerPointerMove = (event: ReactPointerEvent<HTMLTextAreaElement>) => {
     const hold = holdRef.current;
-    if (!hold.active) return;
+    if (!hold.active) {
+      if (hold.timer != null && Math.abs(hold.startY - event.clientY) > 12) {
+        window.clearTimeout(hold.timer);
+        hold.timer = null;
+      }
+      return;
+    }
     setHoldCanceling(hold.startY - event.clientY > 80);
   };
+
+  useEffect(() => {
+    if (!dictationSendRequestedRef.current || isListening || dictationFinalizing) return;
+    dictationSendRequestedRef.current = false;
+    if (composerText.trim()) void submitPrompt({ text: composerText, files: [] });
+  }, [isListening, dictationFinalizing, composerText, submitPrompt]);
 
   const skipDictationFinalizing = useCallback(() => {
     // 跳过收尾:转写阶段丢弃未完成的语音段,润色阶段废弃在途整理结果,
@@ -9011,14 +8883,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       { agent: true },
     );
   }, [currentSession?.graph_id, graphCommandAvailable, prepareTaskPrompt, voiceModeOpen, voiceBlocksComposer]);
-  const startDeepResearch = useCallback(() => {
-    if (voiceBlocksComposer) return;
-    if (!supportsAgentMode || !hasDeepResearchProvider) return;
-    prepareTaskPrompt(
-      "请使用 start_deep_research 工具启动深度研究。研究问题请根据当前对话上下文提炼；若用户已给出预算则使用该预算，否则先询问预算金额和供应商原币（currency=USD 或 CNY，budget_amount 为十进制字符串，不进行汇率换算）。提交后若返回 user_approval_required=true，请停止并等待用户在界面上确认预算，不要重复调用 get_deep_research。",
-      { agent: true },
-    );
-  }, [hasDeepResearchProvider, prepareTaskPrompt, supportsAgentMode, voiceModeOpen, voiceBlocksComposer]);
   const toggleNetworkSearch = useCallback(() => {
     if (voiceBlocksComposer) return;
     setGenerationMode("text");
@@ -9121,17 +8985,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       keywords: "图谱 节点 变更 graph",
       disabled: sessionIsClosed || !graphCommandAvailable,
       Icon: Network,
-    },
-    {
-      id: "research" as const,
-      label: "深度研究",
-      description: hasDeepResearchProvider
-        ? "预填 start_deep_research 任务，确认预算后启动"
-        : "请先在 Provider 管理中启用 Deep Research Provider",
-      keywords: "研究 调研 深度研究 deep research",
-      disabled:
-        sessionIsClosed || !supportsAgentMode || !hasDeepResearchProvider,
-      Icon: FileSearch,
     },
     {
       id: "roadmap" as const,
@@ -9292,10 +9145,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         setGraphProposal();
         return;
       }
-      if (action === "research") {
-        startDeepResearch();
-        return;
-      }
       if (action === "roadmap") {
         prepareTaskPrompt(
           "请读取当前学习目标的路线，说明下一步行动、前置阻塞和可执行建议；如需调整，只创建待审核的路线草稿。",
@@ -9335,17 +9184,16 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       hasAuthorizedAgentSearchProvider,
       prepareTaskPrompt,
       setGraphProposal,
-      startDeepResearch,
       voiceModeOpen,
       voiceBlocksComposer,
     ],
   );
-  const clearSelectedLearningNode = useCallback(() => {
+  const clearSelectedLearningNode = useCallback((persisted = false) => {
     const previousLabel = learningNodeRef.current?.nodeLabel;
     learningNodeRef.current = undefined;
     setLearningNode(undefined);
     clearLearningNodeContext();
-    if (currentSession?.current_node_id) {
+    if (!persisted && currentSession?.current_node_id) {
       void updateSession(currentSession.id, { current_node_id: null })
         .then((updated) => {
           queryClient.setQueryData<Session[]>(
@@ -9366,15 +9214,13 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     );
     focusComposer();
   }, [currentSession, focusComposer, queryClient, workspaceId]);
-  // The merged topbar status+context menu dispatches this event to unbind the
-  // active learning node (the conversation context chip lives in the shell).
+  // The binding menu persists first, then clears the local learning context.
+  // Other callers can still request both persistence and local cleanup.
   useEffect(() => {
     const clearNode = (event: Event) => {
-      const targetSessionId = (
-        event as CustomEvent<{ sessionId?: string }>
-      ).detail?.sessionId;
-      if (targetSessionId && targetSessionId !== sessionId) return;
-      clearSelectedLearningNode();
+      const detail = (event as CustomEvent<{ sessionId?: string; persisted?: boolean }>).detail;
+      if (detail?.sessionId && detail.sessionId !== sessionId) return;
+      clearSelectedLearningNode(detail?.persisted);
     };
     window.addEventListener("learngraph:learning-node-clear", clearNode);
     return () =>
@@ -9422,7 +9268,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
 
   // 离线草稿（断网 reload / 刷新后恢复当前会话未发送输入）
   useEffect(() => {
-    if (!sessionId || !workspaceId) return;
+    if (!sessionId || sessionId === "new" || !workspaceId) return;
     try {
       const saved = window.localStorage.getItem(
         `lg:composer-draft:${workspaceId}:${sessionId}`,
@@ -9434,7 +9280,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, workspaceId]);
   useEffect(() => {
-    if (!sessionId || !workspaceId) return;
+    if (!sessionId || sessionId === "new" || !workspaceId) return;
     const timer = window.setTimeout(() => {
       try {
         const key = `lg:composer-draft:${workspaceId}:${sessionId}`;
@@ -9478,17 +9324,21 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     ],
   );
 
+  // Message rows are memoized while composer preferences change; read the
+  // latest saved settings when opening a retry menu rather than an old closure.
+  const retryDefaultsRef = useRef({ providerId: "", modelId: "", responseMode, thinkingMode: effectiveThinkingMode, webSearch: false });
+  retryDefaultsRef.current = {
+    providerId: activeModelProvider?.id ?? modelProviders[0]?.id ?? "",
+    modelId: selectedModelId,
+    responseMode,
+    thinkingMode: effectiveThinkingMode,
+    webSearch: searchRoute !== "disabled",
+  };
   const submitRetry = () => {
-    if (!retryTarget || !retryProvider || !retrySelectedModel?.remote) return;
+    if (retry.isPending || !retryTarget || !retryProvider || !retrySelectedModel?.remote ||
+        (retryResponseMode === "agentic" && !retrySupportsAgentMode)) return;
     const useWebSearch = retryWebSearch && retryCanUseNetworkSearch;
-    const allowedDomains = [
-      ...new Set(
-        retryAllowedDomains
-          .split(/[\s,，]+/u)
-          .map((domain) => domain.trim())
-          .filter(Boolean),
-      ),
-    ];
+    const allowedDomains = [...new Set(retryAllowedDomains.split(/[\s,，]+/u).map((domain) => domain.trim()).filter(Boolean))];
     const variables = {
       messageId: retryTarget.messageId,
       sourceSessionId: retryTarget.sourceSessionId,
@@ -9532,7 +9382,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   };
 
   return (
-    <div className="chat-canvas-page relative flex h-full min-h-0 flex-col bg-background">
+    <div className="chat-canvas-page relative flex h-full min-h-0 flex-col bg-background" data-session-id={sessionId}>
+      {currentSession?.session_kind === "agent" && currentSession.parent_session_id ? <ManagedChildSessionControls sessionId={sessionId} parentId={currentSession.parent_session_id} /> : null}
       <ConversationJumpNav
         branches={conversationBranchLinks}
         items={conversationJumpItems}
@@ -9595,7 +9446,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           {isEmptySession && !learningNode?.nodeId && !goalMode && !voiceModeOpen ? (
             <EmptySessionPrompts
               disabled={
-                history.isPending || status !== "ready" || sessionIsClosed
+                (sessionId !== "new" && history.isPending) || status !== "ready" || sessionIsClosed
               }
               isPending={
                 (showSuggestedPromptState && suggestedPromptsPending) ||
@@ -9777,13 +9628,44 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                         status !== "submitted"
                       }
                       message={message}
-                      onComponentAction={handleComponentAction}
+                      onComponentAction={dispatchComponentAction}
                       onBranch={() => {
                         if (persisted && message.session_id === sessionId)
                           branch.mutate(message.id);
                       }}
                       onOpenSelectionExplanation={handleOpenSelectionExplanation}
                       selectionMarks={selectionExplanationMarks}
+                      onRetryClose={() => setRetryTarget(null)}
+                      retryMenuOpen={retryTarget?.messageId === message.id && retryTarget.sourceSessionId === message.session_id}
+                      retryPending={retry.isPending && retry.variables?.messageId === message.id && retry.variables.sourceSessionId === message.session_id}
+                      retryMenuContent={imageAnswer ? undefined : retryTarget?.messageId === message.id && retryTarget.sourceSessionId === message.session_id ? (shown) => (
+                        <RetryMenuSettings
+                          previousAnswerTrace={shown.provider_trace}
+                          groups={modelProviders.map((provider, index) => ({
+                            id: provider.id,
+                            label: provider.display_name,
+                            models: providerModelOptions(provider, providerModelQueries[index]?.data?.models).filter(isTextChatModel),
+                            loading: providerModelQueries[index]?.isPending,
+                            failed: providerModelQueries[index]?.isError,
+                          }))}
+                          providerId={retryProviderId} modelId={retryModelId}
+                          responseMode={retryResponseMode} thinkingMode={retryThinkingMode}
+                          thinkingModes={!retryThinkingModes.length ? [] : retrySelectedModel?.capabilities?.thinking_required ? retryThinkingModes.filter((mode) => mode !== "off") : [...new Set<ThinkingMode>(["off", ...retryThinkingModes])]}
+                          supportsAgent={retrySupportsAgentMode}
+                          webSearch={retryWebSearch} canSearch={retryCanUseNetworkSearch}
+                          canRetry={!retry.isPending && Boolean(retryProvider && retrySelectedModel?.remote) && (retryResponseMode !== "agentic" || retrySupportsAgentMode)}
+                          modelError={retryDiscoveredModels.isError}
+                          onModelChange={(providerId, modelId) => { setRetryProviderId(providerId); setRetryModelId(modelId); }}
+                          onModeChange={(mode) => {
+                            setRetryResponseMode(mode);
+                            setRetryThinkingMode(mode === "fast" ? "off" : retryThinkingMode !== "off" ? retryThinkingMode : retryThinkingModes.includes("medium") ? "medium" : retryThinkingModes[0] ?? "off");
+                          }}
+                          onThinkingChange={setRetryThinkingMode} onSearchChange={setRetryWebSearch}
+                          allowedDomains={retryAllowedDomains} onDomainsChange={setRetryAllowedDomains}
+                          onRetry={submitRetry} onRefreshModels={() => void retryDiscoveredModels.refetch()}
+                          onConfigure={() => { setRetryTarget(null); navigate(`/w/${workspaceId}/settings/providers`); }}
+                        />
+                      ) : null}
                       onRetry={() => {
                         if (!persisted) return;
                         if (imageAnswer) {
@@ -9813,13 +9695,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                           });
                           return;
                         }
-                        setRetryProviderId(
-                          activeModelProvider?.id ?? modelProviders[0]?.id ?? "",
-                        );
-                        setRetryModelId(selectedModelId);
-                        setRetryResponseMode(responseMode);
-                        setRetryThinkingMode(effectiveThinkingMode);
-                        setRetryWebSearch(searchRoute !== "disabled");
+                        const defaults = retryDefaultsRef.current;
+                        setRetryProviderId(defaults.providerId);
+                        setRetryModelId(defaults.modelId);
+                        setRetryResponseMode(defaults.responseMode);
+                        setRetryThinkingMode(defaults.thinkingMode);
+                        setRetryWebSearch(defaults.webSearch);
                         setRetryAllowedDomains("");
                         setRetryTarget({
                           messageId: message.id,
@@ -9885,9 +9766,14 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 onReject={(taskId) => void voiceSessionController.approveTask(taskId, false)}
                 onRetryApproval={(taskId) => void voiceSessionController.retryApproval(taskId)}
                 onRetryPlayback={(taskId) => void voiceSessionController.retryPlayback(taskId)}
+                onRender={voiceSessionController.acknowledgeScene}
+                onExplain={(taskId, anchor) => void voiceSessionController.explainTask(taskId, anchor)}
+                onSetAutoDelivery={(taskId, enabled) => void voiceSessionController.setTaskAutoDelivery(taskId, enabled)}
+                onControlExecution={(taskId, operation) => void voiceSessionController.controlTaskExecution(taskId, operation)}
                 busyTaskIds={new Set(voiceSnapshotForGating.busyTaskIds)}
                 tasks={voiceSnapshotForGating.tasks}
               />
+              {sessionId !== "new" && !voiceSnapshotForGating.tasks.length && currentSession?.session_kind !== "agent" ? <ManagedSessionTasks key={sessionId} sessionId={sessionId} /> : null}
             </>
           )}
         </ConversationContent>
@@ -9901,9 +9787,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           role="toolbar"
           style={{ left: selectionMenu.left, top: selectionMenu.top }}
         >
-          <span title={selectionMenu.selected_text}>
-            “{selectionMenu.selected_text}”
-          </span>
           <Button
             aria-label="复制划词文本"
             onClick={() => void copySelectionText(selectionMenu.selected_text)}
@@ -9999,8 +9882,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         </div>
       ) : null}
 
-      <div className={cn("chat-composer-dock", voiceBarActive && "is-recording")} ref={composerDockRef}>
-        {voiceBarActive ? <VoiceBar level={voiceLevel} canceling={holdCanceling} /> : null}
+      <div
+        className={cn("chat-composer-dock", composerEnlarged && "is-enlarged")}
+        ref={composerDockRef}
+      >
         {responseMode === "agentic" ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
         ) : null}
@@ -10186,24 +10071,16 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             </em>
           </button>
         ) : null}
-        {dictationFinalizing ? (
+        {dictationFinalizing === "polishing" ? (
           <button
-            aria-label={
-              dictationFinalizing === "transcribing"
-                ? "正在转写剩余语音，点击跳过并保留已有文本"
-                : "正在润色语音转写，点击跳过并保留原始转写"
-            }
+            aria-label="正在润色语音转写，点击跳过并保留原始转写"
             className="chat-dictation-polish"
             onClick={skipDictationFinalizing}
             title="点击跳过收尾，立即保留已有文本"
             type="button"
           >
             <LoaderCircle className="size-3.5 animate-spin" />
-            <span>
-              {dictationFinalizing === "transcribing"
-                ? "正在转写剩余语音…"
-                : "正在润色语音转写…"}
-            </span>
+            <span>正在润色语音转写…</span>
             <em>点击跳过</em>
           </button>
         ) : null}
@@ -10301,6 +10178,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                   时才有内容，缺失的模型名也绝不用占位符冒充——一个叫「新模型」的
                   模型并不存在，那是把上下文快照事件误当模型声明时的产物。 */}
               {voiceModelPinText(voiceSnapshotForGating.modelPin)}
+              {voiceSnapshotForGating.transport === "connected" ? <VoiceActivityIndicator activity={voiceSnapshotForGating.foregroundActivity} /> : null}
             </p>
             {voiceSnapshotForGating.playbackBlocked || voiceSnapshotForGating.transport === "error" ? (
               // 通话需要用户做一件事：浏览器按自动播放策略拦了导师的声音，或者连接失败
@@ -10368,13 +10246,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         <ConversationQuickActions
           attachDisabled={sessionIsClosed || goalFlow.busy || voiceBlocksComposer}
           onPhoto={handleNativePhoto}
-          deepResearchDisabled={
-            sessionIsClosed || voiceBlocksComposer ||
-            goalMode ||
-            goalFlow.busy ||
-            !supportsAgentMode ||
-            !hasDeepResearchProvider
-          }
           goalActive={goalMode}
           goalDisabled={voiceBlocksComposer || goalFlow.busy || (!goalMode && sessionIsClosed)}
           graphActive={graphAction !== "none"}
@@ -10393,7 +10264,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             !selectedImageModel
           }
           onAttach={openAttachmentPicker}
-          onDeepResearch={startDeepResearch}
           onGoal={toggleGoalMode}
           onGraph={setGraphProposal}
           onImage={toggleImageMode}
@@ -10417,7 +10287,32 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           request={sandboxAuthRequest}
         />
 
-        <div className="chat-composer-anchor">
+        <div className={cn("chat-composer-anchor", (voiceBarActive || isListening || dictationFinalizing === "transcribing") && "is-dictating")}>
+        {voiceBarActive || isListening || dictationFinalizing === "transcribing" ? <DictationBar
+          holdToTalk={voiceBarActive}
+          level={voiceLevel}
+          canceling={holdCanceling}
+          finalizing={holdFinalizing || dictationFinalizing === "transcribing"}
+          onCancel={() => {
+            dictationSendRequestedRef.current = false;
+            if (voiceBarActive) { void endHoldDictation(false); return; }
+            const prefix = dictationCleanupSessionRef.current?.prefix ?? "";
+            dictationStopRequestedRef.current = true;
+            dictationCleanupSessionRef.current = null;
+            speechRecognitionRef.current?.abort();
+            providerDictationRef.current?.abort();
+            providerDictationRef.current = null;
+            setIsListening(false);
+            setDictationFinalizing(null);
+            setComposerText(prefix);
+          }}
+          onStop={() => { if (voiceBarActive) void endHoldDictation(true); else toggleDictation(); }}
+          onSend={() => {
+            if (voiceBarActive) { void endHoldDictation(true); return; }
+            dictationSendRequestedRef.current = true;
+            toggleDictation();
+          }}
+        /> : null}
         {showMentionMenu ? (
           <div
             aria-label="@ 命令与资料文件"
@@ -10485,14 +10380,17 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         ) : null}
         <PromptInput
           key={composerInstanceKey}
+          aria-hidden={voiceBarActive || isListening || dictationFinalizing === "transcribing" || undefined}
           accept={composerFileAccept}
           maxFiles={generationMode === "image" ? 4 : undefined}
           maxFileSize={
             generationMode === "image" ? 50 * 1024 * 1024 : undefined
           }
-          className={
-            composerExpanded ? "chat-composer is-expanded" : "chat-composer"
-          }
+          className={cn(
+            "chat-composer",
+            (composerExpanded || composerEnlarged) && "is-expanded",
+            composerEnlarged && "is-enlarged",
+          )}
           multiple
           onError={(error) => {
             if (error.code === "accept") {
@@ -10511,6 +10409,23 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           onSubmit={submitPrompt}
         >
           <PromptInputAttachments portalTarget={attachmentRowHost} />
+          {composerExpanded || composerEnlarged ? (
+            <button
+              aria-controls={`${mentionMenuId}-input`}
+              aria-expanded={composerEnlarged}
+              aria-label={composerEnlarged ? "收起输入框" : "展开输入框"}
+              className="chat-composer__resize"
+              onClick={() => {
+                setComposerEnlarged((current) => !current);
+                composerTextareaRef.current?.focus({ preventScroll: true });
+              }}
+              onMouseDown={(event) => event.preventDefault()}
+              title={composerEnlarged ? "收起输入框 (Esc)" : "展开输入框"}
+              type="button"
+            >
+              {composerEnlarged ? <Minimize2 aria-hidden="true" /> : <Maximize2 aria-hidden="true" />}
+            </button>
+          ) : null}
           <InputGroupAddon
             align="inline-start"
             className="chat-composer__start"
@@ -10574,7 +10489,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 })}
                 <DropdownMenuSeparator />
                 <DropdownMenuLabel>学习工作流</DropdownMenuLabel>
-                {(["research", "roadmap", "schedule", "progress", "practice", "usage"] as const).map(
+                {(["roadmap", "schedule", "progress", "practice", "usage"] as const).map(
                   (id) => {
                     const command = composerCommands.find(
                       (item) => item.id === id,
@@ -10593,17 +10508,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                     );
                   },
                 )}
-                <DropdownMenuSeparator />
-                <PromptInputActionMenuItem
-                  onSelect={() =>
-                    navigate(`/w/${workspaceId}/research/tasks/new`, {
-                      state: { pendingPrompt: composerText },
-                    })
-                  }
-                >
-                  <Sparkles className="size-4" />
-                  打开深度研究任务
-                </PromptInputActionMenuItem>
               </PromptInputActionMenuContent>
             </PromptInputActionMenu>
           </InputGroupAddon>
@@ -10627,6 +10531,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               aria-expanded={showMentionMenu}
               aria-label="输入消息"
               className="chat-composer__textarea"
+              id={`${mentionMenuId}-input`}
               disabled={
                 (goalMode
                   ? !activeModelProvider
@@ -10677,6 +10582,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 } else if (showMentionMenu && event.key === "Escape") {
                   event.preventDefault();
                   setDismissedMention(composerText);
+                } else if (composerEnlarged && event.key === "Escape" && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  setComposerEnlarged(false);
                 }
               }}
               onPaste={(event) => {
@@ -10708,6 +10616,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               onPointerDown={handleComposerPointerDown}
               onPointerMove={handleComposerPointerMove}
               onPointerUp={handleComposerPointerUp}
+              style={{ touchAction: composerHasText ? undefined : "none" }}
               role="combobox"
               value={composerText}
             />
@@ -11059,237 +10968,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
          </PromptInput>
         </div>
       </div>
-      <Dialog
-        onOpenChange={(open) => {
-          if (!open && !retry.isPending) setRetryTarget(null);
-        }}
-        open={Boolean(retryTarget)}
-      >
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>重试回答并保留版本</DialogTitle>
-            <DialogDescription>
-              为这次重试显式选择真实 Provider、模型和调用模式。新回答会保存为可追溯版本，原回答与 Provider Trace 不会被覆盖。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <div className="grid gap-2">
-              <Label htmlFor="retry-provider">模型 Provider</Label>
-              <Select
-                disabled={retry.isPending || !modelProviders.length}
-                onValueChange={(value) => {
-                  setRetryProviderId(value);
-                  setRetryModelId("");
-                }}
-                value={retryProviderId}
-              >
-                <SelectTrigger className="w-full" id="retry-provider">
-                  <SelectValue placeholder="选择真实模型 Provider" />
-                </SelectTrigger>
-                <SelectContent>
-                  {modelProviders.map((provider) => (
-                    <SelectItem key={provider.id} value={provider.id}>
-                      {provider.display_name} · {provider.provider_type}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {!modelProviders.length && !providers.isPending ? (
-                <div className="flex items-center justify-between gap-3 text-xs text-amber-700 dark:text-amber-300">
-                  <span>当前工作区没有已启用的真实模型 Provider。</span>
-                  <Button
-                    onClick={() =>
-                      navigate(`/w/${workspaceId}/settings/providers`)
-                    }
-                    size="xs"
-                    variant="outline"
-                  >
-                    前往设置
-                  </Button>
-                </div>
-              ) : null}
-            </div>
-
-            <div className="grid gap-2">
-              <Label htmlFor="retry-model">模型</Label>
-              <Select
-                disabled={
-                  retry.isPending ||
-                  !retryProvider ||
-                  retryDiscoveredModels.isPending ||
-                  !retryModelOptions.some((model) => model.remote)
-                }
-                onValueChange={setRetryModelId}
-                value={retryModelId}
-              >
-                <SelectTrigger className="w-full" id="retry-model">
-                  <SelectValue
-                    placeholder={
-                      retryDiscoveredModels.isPending
-                        ? "正在载入模型…"
-                        : "选择远程模型"
-                    }
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  {retryModelOptions.map((model) => (
-                    <SelectItem
-                      disabled={!model.remote}
-                      key={model.id}
-                      value={model.id}
-                    >
-                      {model.id}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {retryDiscoveredModels.isError ? (
-                <div className="flex items-center justify-between gap-3 text-xs text-destructive">
-                  <span>模型发现失败，尚未发起重试。</span>
-                  <Button
-                    disabled={retryDiscoveredModels.isFetching}
-                    onClick={() => void retryDiscoveredModels.refetch()}
-                    size="xs"
-                    variant="ghost"
-                  >
-                    <RefreshCcw className="size-3" />
-                    重试发现
-                  </Button>
-                </div>
-              ) : null}
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="grid gap-2">
-                <Label htmlFor="retry-response-mode">响应模式</Label>
-                <Select
-                  disabled={retry.isPending}
-                  onValueChange={(value) => {
-                    const mode = value as ResponseMode;
-                    setRetryResponseMode(mode);
-                    if (mode === "fast") setRetryThinkingMode("off");
-                    else if (retryThinkingMode === "off")
-                      setRetryThinkingMode(
-                        retryThinkingModes.includes("medium")
-                          ? "medium"
-                          : (retryThinkingModes[0] ?? "off"),
-                      );
-                  }}
-                  value={retryResponseMode}
-                >
-                  <SelectTrigger className="w-full" id="retry-response-mode">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="fast">极速</SelectItem>
-                    <SelectItem
-                      disabled={!retrySupportsAgentMode}
-                      value="agentic"
-                    >
-                      智能体
-                      {retrySupportsAgentMode
-                        ? ""
-                        : "（所选模型未声明结构化工具能力）"}
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="grid gap-2">
-                <Label htmlFor="retry-thinking-mode">思考力度</Label>
-                <Select
-                  disabled={
-                    retry.isPending ||
-                    retryResponseMode === "fast" ||
-                    !retryThinkingModes.length
-                  }
-                  onValueChange={(value) =>
-                    setRetryThinkingMode(value as ThinkingMode)
-                  }
-                  value={retryThinkingMode}
-                >
-                  <SelectTrigger className="w-full" id="retry-thinking-mode">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {retryThinkingModes.map((mode) => (
-                      <SelectItem key={mode} value={mode}>
-                        {thinkingLabels[mode]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-
-            <div className="grid gap-3 rounded-lg border p-3">
-              <div className="flex items-start gap-3">
-                <Checkbox
-                  checked={retryWebSearch}
-                  disabled={retry.isPending || !retryCanUseNetworkSearch}
-                  id="retry-web-search"
-                  onCheckedChange={(checked) =>
-                    setRetryWebSearch(checked === true)
-                  }
-                />
-                <Label
-                  className="grid cursor-pointer gap-1 font-normal"
-                  htmlFor="retry-web-search"
-                >
-                  <span className="font-medium">启用联网搜索</span>
-                  <span className="text-xs text-muted-foreground">
-                    {retryCanUseNetworkSearch
-                      ? "由后端按模型能力与已授权 Search Provider 选择真实搜索路由。"
-                      : "当前模型与工作区没有可用的真实搜索能力。"}
-                  </span>
-                </Label>
-              </div>
-              {retryWebSearch && retryCanUseNetworkSearch ? (
-                <div className="grid gap-2">
-                  <Label htmlFor="retry-allowed-domains">限定来源域名（可选）</Label>
-                  <Input
-                    disabled={retry.isPending}
-                    id="retry-allowed-domains"
-                    onChange={(event) =>
-                      setRetryAllowedDomains(event.currentTarget.value)
-                    }
-                    placeholder="例如：docs.python.org, react.dev"
-                    value={retryAllowedDomains}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    使用逗号或空格分隔；只允许这些域名及其子域的结果。
-                  </p>
-                </div>
-              ) : null}
-            </div>
-          </div>
-          <DialogFooter>
-            <Button
-              disabled={retry.isPending}
-              onClick={() => setRetryTarget(null)}
-              variant="outline"
-            >
-              取消
-            </Button>
-            <Button
-              disabled={
-                retry.isPending ||
-                !retryTarget ||
-                !retryProvider ||
-                !retrySelectedModel?.remote ||
-                (retryResponseMode === "agentic" && !retrySupportsAgentMode)
-              }
-              onClick={submitRetry}
-            >
-              {retry.isPending ? (
-                <LoaderCircle className="size-4 animate-spin" />
-              ) : (
-                <RefreshCcw className="size-4" />
-              )}
-              {retry.isPending ? "正在生成新版本…" : "开始重试"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
       <Dialog
         onOpenChange={(open) => {
           if (!open) setImageRetryTarget(null);

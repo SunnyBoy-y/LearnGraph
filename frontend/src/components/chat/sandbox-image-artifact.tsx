@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { CircleAlert, Download, LoaderCircle } from "lucide-react";
 
-import { downloadFile } from "@/api/files";
+import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
 import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import type { MessagePart } from "@/types/sessions";
@@ -83,40 +83,9 @@ export function SandboxImageArtifact({
     typeof data.title === "string" && data.title.trim() ? data.title : "图片产物";
   const path = typeof data.path === "string" ? data.path : "";
   const size = formatSize(data.size_bytes);
-  const [source, setSource] = useState("");
-  const [loading, setLoading] = useState(Boolean(fileId));
-  const [failed, setFailed] = useState(false);
+  const { source, loading, failed: streamFailed } = useFileStreamUrl(fileId, part.id);
+  const failed = !fileId || streamFailed;
   const [lightboxOpen, setLightboxOpen] = useState(false);
-
-  useEffect(() => {
-    if (!fileId) {
-      setSource("");
-      setLoading(false);
-      setFailed(true);
-      return;
-    }
-    let cancelled = false;
-    let objectUrl = "";
-    setSource("");
-    setLoading(true);
-    setFailed(false);
-    void downloadFile(fileId)
-      .then((blob) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setSource(objectUrl);
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [fileId, part.id]);
 
   const download = () => {
     if (!source) return;

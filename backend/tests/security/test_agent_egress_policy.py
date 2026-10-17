@@ -174,3 +174,28 @@ def test_ensure_policy_no_approvals_fails_closed(db: Session, settings, policy_d
     service = EgressApprovalService(db, WORKSPACE, settings)
     assert service.ensure_agent_egress_policy() is None
     assert not (policy_dir / f"{WORKSPACE}.json").exists()
+
+
+def test_unchanged_permissions_keep_warm_runtime_digest(db: Session, settings, policy_dir: Path):
+    from datetime import datetime, timezone
+    _grant(db, "always.example.com")
+    service = EgressApprovalService(db, WORKSPACE, settings)
+    now = datetime.now(timezone.utc)
+    first = service.ensure_agent_egress_policy(now=now)
+    before = (policy_dir / f"{WORKSPACE}.json").read_bytes()
+    second = service.ensure_agent_egress_policy(now=now + timedelta(seconds=20))
+    assert second.digest == first.digest
+    assert (policy_dir / f"{WORKSPACE}.json").read_bytes() == before
+
+
+def test_shorter_authorization_window_rotates_digest(db: Session, settings, policy_dir: Path):
+    from datetime import datetime, timezone
+    _grant(db, "always.example.com")
+    service = EgressApprovalService(db, WORKSPACE, settings)
+    now = datetime.now(timezone.utc)
+    first = service.ensure_agent_egress_policy(now=now)
+    tighter = SimpleNamespace(**vars(settings), sandbox_container_absolute_ttl_seconds=60,
+        sandbox_workspace_absolute_ttl_seconds=60)
+    second = EgressApprovalService(db, WORKSPACE, tighter).ensure_agent_egress_policy(now=now + timedelta(seconds=1))
+    assert second.expires_at < first.expires_at
+    assert second.digest != first.digest

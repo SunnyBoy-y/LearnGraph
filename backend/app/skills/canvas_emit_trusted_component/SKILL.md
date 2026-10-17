@@ -18,6 +18,7 @@ description: Teach the Agent how to call canvas_emit_trusted_component with vali
 1. **先选组件类型**（`component_type` 必须是下列之一）：
    - 交互：`option_group` | `single_choice` | `multiple_choice` | `fill_blank` | `short_answer_table`
    - 展示：`weather_card` | `metric_card` | `image_frame`
+   - 编程实验：`code_trainer`（见下方契约）
 2. **不要传 `null`**。可选字段要么省略，要么给真实字符串/数组/布尔值。
 3. **选项类必须带非空 `options`**（至少 1 项；每项 `id` + `label`）。
 4. **填空类**至少要有可读 `title`/`prompt`；后端会补 `blank_ids`，但你最好显式传。
@@ -151,6 +152,19 @@ description: Teach the Agent how to call canvas_emit_trusted_component with vali
   **Agent:** `fill_blank`，带 `title`/`prompt` 与 `blank_ids`。
 
 ## Notes
+
+### `code_trainer` 编程判题训练器
+
+调用 `canvas_emit_trusted_component`，`component_type="code_trainer"`，`allowed_events=["submit"]`。
+`props` 包含 `title`、`description`（题目）、`language`、`starter_code`、`stdin`、
+`tests:[{name,stdin,expected_stdout}]`（最多12个公开样例）、`time_limit_ms`（100–5000，默认2000）。
+仅 Python、JavaScript、TypeScript 在浏览器执行；其他语言仅将代码作为 prompt 发给当前模型分析。
+JS/TS 使用 `stdin` 字符串、`readline()`、`print()`、`console.log()`，不支持 Node.js 模块和网络。
+Python 支持内置标准库，不自动安装第三方包。生成单文件、同步、标准输入输出算法题。
+代码中的 `<script` 等文字是待编辑的数据，不是宿主脚本。不要把题目包装成 HTML。
+样例必须与题面一致；模型生成的期望输出需要核对，不能声称已执行验证。
+AI 辅导只做代码推演与解释，不调用终端、代码执行或沙箱工具，不声称其他语言真实运行或正式判题通过。
+公开样例通过仅代表本地练习结果；没有隐藏用例、受信任成绩或服务端 Runner。
 
 - 通道 A 是**声明式可信渲染**；非法数据会在前端显示「组件已安全降级」，并露出 JSON，不会执行脚本。
 - 通道 B（`canvas_emit_magic_card`）在隔离沙箱 iframe 里执行内联 HTML/CSS/JS，必须一次提交全部源码且不能依赖任何网络资源；**不要**拿它替代表单。

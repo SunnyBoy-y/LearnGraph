@@ -1,0 +1,17 @@
+[
+  {"name":"plain shapes and Chinese labels","valid":true,"svg":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 400\"><rect x=\"10\" y=\"10\" width=\"620\" height=\"380\" fill=\"#fafafa\"/><g transform=\"translate(20 30)\"><path d=\"M10 20L40 60Z\" fill=\"none\" stroke=\"#222\" stroke-width=\"2\"/><text x=\"100\" y=\"200\" font-size=\"24\" font-family=\"sans-serif\">叶片<tspan dx=\"10\">边缘</tspan>特征</text></g></svg>"},
+  {"name":"scripts","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><script>alert(1)</script><circle r=\"10\"/></svg>"},
+  {"name":"event handler","valid":false,"svg":"<svg viewBox=\"0 0 100 100\" onload=\"alert(1)\"><circle r=\"10\"/></svg>"},
+  {"name":"external image","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><image href=\"https://evil.example/track\"/></svg>"},
+  {"name":"foreign HTML","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><foreignObject><div>bad</div></foreignObject></svg>"},
+  {"name":"CSS","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><circle r=\"10\" style=\"fill:url(https://evil.example)\"/></svg>"},
+  {"name":"reference paint","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><circle r=\"10\" fill=\"url(#host)\"/></svg>"},
+  {"name":"use reference","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><use href=\"#host\"/></svg>"},
+  {"name":"entity","valid":false,"svg":"<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///private'>]><svg viewBox=\"0 0 100 100\"><circle r=\"10\"/><text>&x;</text></svg>"},
+  {"name":"huge viewBox","valid":false,"svg":"<svg viewBox=\"0 0 100000 100\"><circle r=\"10\"/></svg>"},
+  {"name":"overflow path","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><path d=\"M1e999 0L10 20\"/></svg>"},
+  {"name":"animation","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><circle r=\"10\"><animate attributeName=\"r\"/></circle></svg>"},
+  {"name":"unexpected tail","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><circle r=\"10\"/>bad text</svg>"},
+  {"name":"text without diagram","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><text>unhelpful placeholder</text></svg>"},
+  {"name":"malformed XML","valid":false,"svg":"<svg viewBox=\"0 0 100 100\"><circle></svg>"}
+]

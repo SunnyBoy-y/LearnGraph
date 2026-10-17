@@ -158,7 +158,7 @@ function streamEvents(textId: string, reasoningId?: string) {
 }
 
 describe('极速/思考模式 answer.started 边界解析（payload 修复）', () => {
-  it('修复前：从顶层 data.* 读取 → 边界无效 → 流式文本落入思考链（复现 bug）', () => {
+  it('旧事件缺失边界字段时，未分类的流式正文仍然可见', () => {
     const textId = 'text-record-id-bug';
     const assistant = message({
       id: 'temp-assistant-bug',
@@ -179,9 +179,9 @@ describe('极速/思考模式 answer.started 边界解析（payload 修复）', 
     });
     const chain = segments.find((s) => s.kind === 'chain');
     const answer = segments.find((s) => s.kind === 'parts');
-    // 流式文本被错误地折叠进思考链，answer body 里没有正文
-    expect(chain?.kind === 'chain' ? chain.parts.some((p) => p.type === 'text' && p.content === '你好，世界') : false).toBe(true);
-    expect(answer?.kind === 'parts' ? answer.parts.some((p) => p.type === 'text' && p.content === '你好，世界') : false).toBe(false);
+    // 正文显示不再依赖最终边界必须先于 token 到达。
+    expect(chain?.kind === 'chain' ? chain.parts.some((p) => p.type === 'text' && p.content === '你好，世界') : false).toBe(false);
+    expect(answer?.kind === 'parts' ? answer.parts.some((p) => p.type === 'text' && p.content === '你好，世界') : false).toBe(true);
   })
 
   it('修复后：从 payload 读取 → 边界有效 → 极速模式文本流式显示在 answer body', () => {

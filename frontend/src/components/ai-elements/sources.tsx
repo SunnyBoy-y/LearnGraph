@@ -6,7 +6,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-import { BookIcon, ChevronDownIcon } from "lucide-react";
+import { BookIcon, ChevronRightIcon, Globe2 } from "lucide-react";
 import type { ComponentProps } from "react";
 
 export type SourcesProps = ComponentProps<typeof Collapsible>;
@@ -29,14 +29,16 @@ export const SourcesTrigger = ({
   ...props
 }: SourcesTriggerProps) => (
   <CollapsibleTrigger
+    type="button"
     className={cn(
-      "group inline-flex items-center gap-2 whitespace-nowrap",
+      "group inline-flex h-7 w-fit cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-[6px] border-0 bg-transparent px-1.5 py-0 text-[13px] font-normal text-muted-foreground shadow-none transition-colors duration-150 hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
       className
     )}
     {...props}
   >
-    {children ?? <span className="font-medium">Used {count} sources</span>}
-    <ChevronDownIcon className="size-3 inline transition-transform duration-200 group-data-[state=closed]:-rotate-90" />
+    <Globe2 aria-hidden="true" className="size-3.5 shrink-0" />
+    {children ?? <span>Used {count} sources</span>}
+    <ChevronRightIcon aria-hidden="true" className="size-3 shrink-0 transition-transform duration-150 group-hover:translate-x-0.5 group-data-[state=open]:rotate-90 motion-reduce:transition-none motion-reduce:group-hover:translate-x-0" />
   </CollapsibleTrigger>
 );
 

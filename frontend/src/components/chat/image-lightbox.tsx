@@ -201,9 +201,10 @@ export function ImageLightbox({
       const stage = stageRef.current;
       if (clientPoint && stage) {
         const rect = stage.getBoundingClientRect();
+        // 包围盒已包含平移；换回未平移的中心，连续缩放才不会漂移。
         anchor = {
-          x: clientPoint.x - (rect.left + rect.width / 2),
-          y: clientPoint.y - (rect.top + rect.height / 2),
+          x: clientPoint.x - (rect.left + rect.width / 2) + offsetRef.current.x,
+          y: clientPoint.y - (rect.top + rect.height / 2) + offsetRef.current.y,
         };
       }
       const from = offsetRef.current;
@@ -299,9 +300,10 @@ export function ImageLightbox({
       const stage = stageRef.current;
       if (!stage) return;
       const rect = stage.getBoundingClientRect();
+      // 与滚轮相同，两个中点都使用未平移中心作为坐标原点。
       const toLocal = (point: Point): Point => ({
-        x: point.x - (rect.left + rect.width / 2),
-        y: point.y - (rect.top + rect.height / 2),
+        x: point.x - (rect.left + rect.width / 2) + offsetRef.current.x,
+        y: point.y - (rect.top + rect.height / 2) + offsetRef.current.y,
       });
       // 双指中点下的像素保持跟随：起始中点 m0 与当前中点 m1 共同决定平移量。
       const m0 = toLocal(pinch.midpoint);

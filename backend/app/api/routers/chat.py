@@ -64,6 +64,7 @@ from app.domain.schemas.chat import (
     SuggestedPromptGenerateRequest,
 )
 from app.domain.schemas.common import ActionResponse
+from app.domain.schemas.stream_ui import UIAction
 from app.domain.schemas.graphs import GraphChangeSetView, RejectGraphChangeSetRequest
 from app.providers.factory import (
     fetch_provider_for_workspace,
@@ -445,6 +446,14 @@ def require_session_access(
         permission,
     ):
         raise AppError(404, "not_found", "Resource not found in this workspace")
+
+
+@router.post("/{session_id}/ui/actions")
+def stream_ui_action(session_id: str, payload: UIAction, db: DB, context: CurrentWorkspace) -> dict[str, str]:
+    """Validate the selection; the client sends the returned prompt through normal chat admission."""
+    from app.services.stream_ui import action_prompt
+    require_session_access(session_id, "write", db, context)
+    return {"prompt": action_prompt(db, context.workspace_id, session_id, payload, display_only=True)}
 
 
 def service(

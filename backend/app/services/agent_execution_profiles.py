@@ -63,6 +63,7 @@ _TOOL_NETWORK_REQUIREMENTS: Mapping[str, NetworkCapability] = {
 _OFFLINE_SAFE_TOOL_NAMES = frozenset(
     {
         "get_current_time",
+        "ui_stream",
         "list_session_files",
         "read_session_file",
         "sandbox_env_info",

@@ -7,6 +7,7 @@ from __future__ import annotations
 import uuid
 
 import json
+import pytest
 
 
 def _create_session(client, headers, title="test-session"):
@@ -15,6 +16,46 @@ def _create_session(client, headers, title="test-session"):
     )
     assert r.status_code in (200, 201), r.text
     return r.json()["id"]
+
+
+@pytest.mark.parametrize("web_search", [False, True])
+def test_answer_and_retry_preserve_search_setting(
+    client, register_user, auth_headers, stub_chat_service, monkeypatch, web_search
+):
+    from app.services.chat import ChatService
+
+    # No external search/model calls: exercise persisted metadata even when a
+    # search is enabled but yields no sources (the route alone is insufficient).
+    monkeypatch.setattr(ChatService, "_ensure_web_search_available", lambda *args: None)
+    monkeypatch.setattr(ChatService, "_run_web_search", lambda *args, **kwargs: ([], ""))
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    sid = _create_session(client, headers)
+    response = client.post(
+        f"/api/v1/sessions/{sid}/messages/stream", headers=headers,
+        json={"content": "记录回答配置", "web_search": web_search},
+    )
+    assert response.status_code == 200, response.text
+    rows = client.get(f"/api/v1/sessions/{sid}/messages", headers=headers).json()["items"]
+    answer = next(row for row in rows if row["role"] == "assistant")
+    assert answer["provider_trace"]["model_id"] == "stub-model"
+    assert answer["provider_trace"]["web_search"] is web_search
+
+    response = client.post(
+        f"/api/v1/sessions/{sid}/messages/{answer['id']}/retry", headers=headers,
+        json={"web_search": not web_search},
+    )
+    assert response.status_code == 200, response.text
+    rows = client.get(f"/api/v1/sessions/{sid}/messages", headers=headers).json()["items"]
+    retried = next(row for row in rows if row["id"] == answer["id"])
+    assert retried["provider_trace"]["web_search"] is (not web_search)
+    versions = client.get(
+        f"/api/v1/sessions/{sid}/messages/{answer['id']}/versions", headers=headers,
+    ).json()
+    assert len(versions) == 2
+    assert {row["version"]: row["provider_trace"]["web_search"] for row in versions} == {
+        1: web_search, 2: not web_search,
+    }
 
 
 def test_create_session_and_list(client, register_user, auth_headers):

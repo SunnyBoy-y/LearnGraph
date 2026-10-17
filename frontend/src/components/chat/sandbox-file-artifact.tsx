@@ -9,10 +9,8 @@ import {
   ShieldCheck,
 } from "lucide-react";
 
-import { downloadFile } from "@/api/files";
-import {
-  FilePreviewCanvas,
-} from "@/components/resources/file-preview";
+import { fileStreamUrl } from "@/api/files";
+import { FilePreviewContent } from "@/components/resources/file-preview-content";
 import { resolveFilePreviewKind } from "@/lib/file-preview";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { Badge } from "@/components/ui/badge";
@@ -37,9 +35,6 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
   const [downloading, setDownloading] = useState(false);
   const [viewerOpen, setViewerOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [loadingPreview, setLoadingPreview] = useState(false);
-  const [previewError, setPreviewError] = useState("");
-  const [previewBlob, setPreviewBlob] = useState<Blob>();
 
   const title =
     typeof data.title === "string"
@@ -61,31 +56,6 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
   const isHtmlArtifact = previewKind === "html";
   const canPreview = Boolean(fileId) && previewKind !== "unsupported";
 
-  useEffect(() => {
-    if (!viewerOpen || !fileId || !canPreview || previewBlob) return;
-    let cancelled = false;
-    setLoadingPreview(true);
-    setPreviewError("");
-    void downloadFile(fileId)
-      .then((blob) => {
-        if (!cancelled) setPreviewBlob(blob);
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) {
-          setPreviewError(
-            reason instanceof Error
-              ? reason.message
-              : "无法加载文件内容，请稍后重试或直接下载。",
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingPreview(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [canPreview, fileId, previewBlob, viewerOpen]);
 
   useEffect(() => {
     if (!viewerOpen) setIsFullscreen(false);
@@ -116,13 +86,11 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
       ) {
         return;
       }
-      const blob = await downloadFile(fileId);
-      const url = URL.createObjectURL(blob);
+      const url = await fileStreamUrl(fileId);
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download = title;
       anchor.click();
-      URL.revokeObjectURL(url);
     } finally {
       setDownloading(false);
     }
@@ -198,25 +166,15 @@ export function SandboxFileArtifact({ data }: { data: Record<string, unknown> })
               isFullscreen ? "flex flex-col overflow-hidden" : "overflow-auto",
             )}
           >
-            {loadingPreview ? (
-              <div className="flex min-h-[32rem] items-center justify-center gap-2 text-sm text-muted-foreground" role="status">
-                <LoaderCircle className="size-4 animate-spin" />
-                正在加载预览…
-              </div>
-            ) : previewError ? (
-              <div className="grid min-h-[24rem] place-items-center p-8 text-sm text-destructive" role="alert">{previewError}</div>
-            ) : previewBlob ? (
-              <FilePreviewCanvas
-                blob={previewBlob}
-                className={
-                  isFullscreen
-                    ? "flex h-full min-h-0 flex-1 flex-col"
-                    : "min-h-[32rem]"
-                }
-                filename={path || title}
-                mimeType={mime || previewBlob.type}
-              />
-            ) : null}
+            <FilePreviewContent
+              enabled={viewerOpen && canPreview}
+              fileId={fileId}
+              fileSize={typeof data.size_bytes === "number" ? data.size_bytes : undefined}
+              filename={path || title}
+              mimeType={mime}
+              imageZoom
+              className={isFullscreen ? "flex h-full min-h-0 flex-1 flex-col" : "min-h-[32rem]"}
+            />
           </div>
           <div className="flex shrink-0 flex-col-reverse gap-2 border-t bg-background px-5 py-3 sm:flex-row sm:justify-end">
             <Button disabled={!fileId || downloading} onClick={() => void onDownload()} size="sm" variant="outline">

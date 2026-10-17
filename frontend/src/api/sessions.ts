@@ -23,6 +23,7 @@ import type {
   SuggestedPromptBatch,
   SuggestedPromptRequest,
 } from '@/types/sessions'
+import type { UIActionRequest } from '@/lib/stream-ui'
 
 import { apiClient } from './client'
 import type { ApiRequestOptions, ApiStreamOptions } from './client'
@@ -362,6 +363,12 @@ export function listSessionMessageEvents(
 export function cancelSessionMessage(sessionId: string, messageId: string): Promise<void> {
   return apiClient.post<void>(
     `/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/cancel`,
+  )
+}
+
+export function submitUIAction(sessionId: string, payload: UIActionRequest): Promise<{ prompt: string }> {
+  return apiClient.post<{ prompt: string }, UIActionRequest>(
+    `/sessions/${encodeURIComponent(sessionId)}/ui/actions`, payload,
   )
 }
 

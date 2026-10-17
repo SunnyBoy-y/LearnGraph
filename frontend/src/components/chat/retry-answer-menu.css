@@ -1,0 +1,11 @@
+.retry-answer-menu[data-slot="dropdown-menu-content"],
+.retry-answer-menu[data-slot="dropdown-menu-sub-content"] {
+  border-radius: 12px !important;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .09) !important;
+}
+
+.retry-answer-menu [data-highlighted],
+.retry-answer-menu [data-slot="dropdown-menu-sub-trigger"][data-state="open"] {
+  background: var(--muted);
+  color: var(--popover-foreground);
+}

@@ -24,10 +24,10 @@ export const REASONING_TEXT_PART_TYPES = new Set<MessagePart["type"]>([
 ]);
 
 /**
- * Agent-produced artifacts (images, html files, magic cards, charts…) that must
+ * Successful or in-progress artifacts (images, html files, magic cards, charts…)
  * render in the answer body where the final answer references them — never
  * hidden inside the collapsed thinking chain. They keep their stream position
- * ahead of the final-answer text.
+ * ahead of the final-answer text. Failed attempts belong in the thinking chain.
  */
 export const ARTIFACT_PART_TYPES = new Set<MessagePart["type"]>([
   "image",
@@ -37,6 +37,7 @@ export const ARTIFACT_PART_TYPES = new Set<MessagePart["type"]>([
   "magic_card",
   "component",
   "chart",
+  "ui",
 ]);
 
 /** Layout hint carried on an artifact part by the model's [[artifact:...|layout=]] reference. */
@@ -63,6 +64,11 @@ export function isArtifactPart(part: MessagePart): boolean {
   return ARTIFACT_PART_TYPES.has(part.type);
 }
 
+/** Failed generation/publication attempts are process details, not deliverables. */
+export function isFailedArtifactPart(part: MessagePart): boolean {
+  return isArtifactPart(part) && part.status === "failed";
+}
+
 /**
  * Stable presentation order.
  *
@@ -84,21 +90,8 @@ function partSequence(part: MessagePart, index: number) {
 
 export function isChainPart(part: MessagePart): boolean {
   // Reasoning + tools + agent steps fold into the outer "正在思考" chain.
-  // Model answer text / cards stay in the main stream below the fold.
-  return CHAIN_PART_TYPES.has(part.type);
-}
-
-/**
- * Agent tool result that needs an explicit budget confirmation card.
- * The tool row itself still belongs in the thinking chain; the approval UI is
- * hoisted outside so the user can act without expanding the fold.
- */
-export function isDeepResearchApprovalPart(part: MessagePart): boolean {
-  if (part.type !== "tool_call") return false;
-  if (part.data?.tool_name !== "start_deep_research") return false;
-  const output = part.data?.output;
-  if (!output || typeof output !== "object" || Array.isArray(output)) return false;
-  return (output as { user_approval_required?: unknown }).user_approval_required === true;
+  // Usable cards stay in the answer; failed attempts remain inspectable here.
+  return CHAIN_PART_TYPES.has(part.type) || isFailedArtifactPart(part);
 }
 
 /** Graph review card that is deferred to the end of the answer body. */
@@ -293,10 +286,36 @@ export type DisplaySegment =
 export interface DisplayGroupOptions {
   /** Live final-answer boundary from the `answer.started` SSE event. */
   boundary?: FinalAnswerBoundaryInfo;
-  /** True while the message is still streaming: without a boundary every
-   *  process part (including unclassified text that may later become
-   *  plan_narration) renders inside the chain in raw stream order. */
+  /** True while streaming: text without a process kind remains visible even
+   * when the server cannot establish the final boundary until the turn ends. */
   live?: boolean;
+}
+
+/** Expand live placement references before grouping, using durable UI Part IDs.
+ * Final server splicing removes these markers; history then needs no projection.
+ * Frozen segment ids depend on source offsets, never on arriving token count.
+ */
+export function placeRichResponseParts(parts: MessagePart[]): MessagePart[] {
+  const byBlock = new Map(parts.filter(part => part.type === "ui").map(part => [part.data?.block_id, part]));
+  if (!byBlock.size) return parts;
+  const moved = new Set<string>();
+  const expanded = parts.flatMap(part => {
+    if (part.type !== "text" || !part.content?.includes("[[artifact:block_id:")) return [{ part, placed: false }];
+    const result: { part: MessagePart; placed: boolean }[] = [];
+    let offset = 0;
+    for (const match of part.content.matchAll(/\[\[artifact:block_id:([a-zA-Z0-9_-]+)\]\]/g)) {
+      const block = byBlock.get(match[1]);
+      if (!block || moved.has(block.id)) continue;
+      const start = match.index!;
+      if (start > offset) result.push({ part: { ...part, id: offset ? `${part.id}:rich:${offset}` : part.id, content: part.content.slice(offset, start), content_delta: undefined }, placed: false });
+      result.push({ part: block, placed: true }); moved.add(block.id); offset = start + match[0].length;
+    }
+    if (!offset) return [{ part, placed: false }];
+    if (offset < part.content.length) result.push({ part: { ...part, id: `${part.id}:rich:${offset}`, content: part.content.slice(offset), content_delta: undefined }, placed: false });
+    return result;
+  });
+  // Only the inserted occurrences survive, regardless of original ordinals.
+  return expanded.filter(entry => entry.placed || !moved.has(entry.part.id)).map(entry => entry.part);
 }
 
 /**
@@ -342,7 +361,9 @@ export function isArtifactAnchoringText(
   if (ordered[index]?.type !== "text") return false;
   // Messages without any artifact have nothing to anchor; keep every
   // pre-answer narration in the chain (status quo for plain Q&A).
-  if (!ordered.some(isArtifactPart)) return false;
+  if (!ordered.some((part) => isArtifactPart(part) && !isFailedArtifactPart(part))) {
+    return false;
+  }
   for (let offset = index - 1; offset >= 0; offset -= 1) {
     const neighbor = ordered[offset];
     if (isInvisiblePart(neighbor)) continue;
@@ -379,11 +400,10 @@ export function groupPartsForDisplay(
   parts: MessagePart[],
   options?: DisplayGroupOptions,
 ): DisplaySegment[] {
-  const ordered = orderedMessageParts(parts);
+  const ordered = placeRichResponseParts(orderedMessageParts(parts));
   const boundaryIndex = findFinalAnswerBoundaryIndex(ordered, options?.boundary);
   // New-protocol messages carry a live boundary, durable `kind` marks on
-  // text parts, or the streaming flag (unclassified stream text waits inside
-  // the chain until the boundary/kind arrives). Old history has none of these
+  // text parts, or the streaming flag. Old history has none of these
   // and keeps the legacy type-based partition.
   const hasProtocolMarks =
     options?.boundary !== undefined ||
@@ -398,6 +418,10 @@ export function groupPartsForDisplay(
   for (let index = 0; index < ordered.length; index += 1) {
     const part = ordered[index];
     if (isPlaceholderAcknowledgement(part) || isHostAgentBoilerplate(part)) {
+      continue;
+    }
+    if (isFailedArtifactPart(part)) {
+      processParts.push(part);
       continue;
     }
     // Graph review cards stay at the end of the answer body so mid-turn tool
@@ -434,6 +458,13 @@ export function groupPartsForDisplay(
         isFinalAnswerPart(part) ||
         (boundaryIndex >= 0 && index >= boundaryIndex);
       if (isFinalAnswer) {
+        answerParts.push(part);
+        continue;
+      }
+      // Agent streams can emit answer.started only after all text deltas.
+      // Hiding unclassified text until then turns a real token stream into
+      // an all-at-once answer. Explicit process kinds still fold normally.
+      if (options?.live && !part.data?.kind) {
         answerParts.push(part);
         continue;
       }

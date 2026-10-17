@@ -90,6 +90,9 @@ function isPersistableQuery(
     return false;
   }
   const namespace = query.queryKey[0];
+  // Live stream overlays belong only to this runtime. Durable history already
+  // has its own cache; replaying temporary ids after a reload duplicates turns.
+  if (query.queryKey[2] === "live-chat-messages") return false;
   if (namespace !== "workspace" && namespace !== "identity") return false;
   if (namespace === "workspace" && query.queryKey[1] !== scope.workspaceId) {
     return false;
@@ -185,6 +188,7 @@ function readEnvelope(
           return false;
         }
         const namespace = query.queryKey[0];
+        if (query.queryKey[2] === "live-chat-messages") return false;
         if (
           query.queryKey.some(
             (part) =>

@@ -207,6 +207,17 @@ class EgressApprovalService:
                 max_concurrency=max(1, int(getattr(self.settings, "sandbox_agent_egress_max_concurrency", 8) or 8)),
                 now=current,
             )
+            # issued_at/expires_at are document identity too. Rewriting them
+            # on every command rotates an otherwise identical warm runtime.
+            # Reuse only a still-valid derived policy whose authorization
+            # window is no longer than the newly derived one. Host removal,
+            # reduced limits or earlier lease expiry still rotate immediately.
+            def permissions(value):
+                return {key: item for key, item in value.raw.items() if key not in {"issued_at", "expires_at"}}
+            if (baseline is not None and baseline.issuer == AGENT_EGRESS_POLICY_ISSUER
+                    and baseline.expires_at <= policy.expires_at
+                    and permissions(baseline) == permissions(policy)):
+                return baseline
             store_workspace_policy_file(policy_dir, policy)
         except EgressPolicyInvalid as exc:
             logger.warning(

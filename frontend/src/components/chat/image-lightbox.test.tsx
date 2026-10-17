@@ -117,7 +117,15 @@ function setupLightbox(open = true) {
   );
   const view = render(tree(open));
   const stageNode = stage();
-  stageNode.getBoundingClientRect = () => rect(STAGE_BOX);
+  stageNode.getBoundingClientRect = () => {
+    const current = transform();
+    return rect({
+      left: STAGE_CENTER.x + current.x - FIT_WIDTH * current.scale / 2,
+      top: STAGE_CENTER.y + current.y - FIT_HEIGHT * current.scale / 2,
+      width: FIT_WIDTH * current.scale,
+      height: FIT_HEIGHT * current.scale,
+    });
+  };
   Object.defineProperty(stageNode, "offsetWidth", {
     configurable: true,
     get: () => parseFloat(image().style.width || "0"),
@@ -298,6 +306,21 @@ describe("ImageLightbox 适配与缩放", () => {
     expect(transform().scale).toBeCloseTo(zoomed.scale, 6);
     expect(transform().x).toBeCloseTo(maxX, 4);
     expect(transform().y).toBeCloseTo(maxY, 4);
+  });
+
+  it("连续滚轮缩放时，已平移的图片仍以光标为锚点", () => {
+    setupLightbox();
+    // 尺寸桩跟随真实 transform，验证已有位移时的连续缩放。
+    const clientX = STAGE_CENTER.x + 100;
+    wheel(surface(), -100, clientX, STAGE_CENTER.y);
+    wheel(surface(), -100, clientX, STAGE_CENTER.y);
+    const current = transform();
+    expect(current.x + 100 * current.scale).toBeCloseTo(100, 4);
+
+    wheel(surface(), 100, clientX, STAGE_CENTER.y);
+    wheel(surface(), 100, clientX, STAGE_CENTER.y);
+    expect(transform().x).toBeCloseTo(0, 4);
+    expect(transform().scale).toBeCloseTo(1, 6);
   });
 
   it("双指张开放大，并把双指中点当作锚点", () => {

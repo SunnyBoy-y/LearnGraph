@@ -576,11 +576,17 @@ class OllamaChatProvider(OpenAICompatibleChatProvider):
                             for fallback_index, raw_tool_call in enumerate(raw_tool_calls):
                                 if isinstance(raw_tool_call, dict):
                                     saw_model_output = True
-                                    self._merge_chat_tool_delta(
+                                    index = self._merge_chat_tool_delta(
                                         tool_aggregates,
                                         raw_tool_call,
                                         fallback_index,
                                     )
+                                    aggregate = tool_aggregates[index]
+                                    yield ProviderStreamEvent("tool_call_delta", tool_calls=[{
+                                        "id": aggregate.get("id", ""), "index": index,
+                                        "function": {"name": aggregate["function"]["name"],
+                                            "arguments": (raw_tool_call.get("function") or {}).get("arguments", "")},
+                                    }])
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError("Ollama chat stream timed out") from exc
         except httpx.HTTPError as exc:

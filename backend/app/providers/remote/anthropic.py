@@ -367,6 +367,9 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                     }
                 )
         if converted:
+            for tool in converted:
+                if tool["name"] in {"sandbox_write_file", "ui_stream"}:
+                    tool["eager_input_streaming"] = True
             # Cache-breakpoint the trailing tool so the whole tool-definition
             # block is eligible for Anthropic prompt caching (system already
             # carries one breakpoint; this adds a second, independent one).
@@ -459,6 +462,10 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
                                 )
                                 if isinstance(partial, str):
                                     aggregate["function"]["arguments"] += partial
+                                    yield ProviderStreamEvent("tool_call_delta", tool_calls=[{
+                                        "id": aggregate.get("id", ""), "index": index,
+                                        "function": {"name": aggregate["function"]["name"], "arguments": partial},
+                                    }])
                         elif event_type == "content_block_start":
                             block = event.get("content_block")
                             if not isinstance(block, dict):

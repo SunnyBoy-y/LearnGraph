@@ -1,14 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 
-// Lazy-load the streamdown/hast/parse5 subtree. @streamdown/mermaid is
-// removed on purpose: it statically imports mermaid, which imports the d3 v7
-// hub (src/index.js re-exports ~30 mutually-importing submodules). Rolldown
-// flattens that circular ESM graph into shared vendor chunks that are
-// modulepreloaded as soon as the first streamdown message renders, crashing
-// module evaluation (TypeError: Cannot read properties of undefined (reading
-// 'axis')). Upgrading mermaid cannot help (11.x pins d3 ^7.9.0); without the
-// plugin, ```mermaid blocks degrade to plain code blocks handled by the code
-// plugin.
+// Keep the Markdown renderer lazy. Mermaid loads separately, only for diagram
+// fences; vite.config.ts keeps its cyclic dependency graph in a single chunk.
 type StreamdownLike = (props: Record<string, unknown>) => ReactNode;
 type StreamdownModule = {
   Streamdown: StreamdownLike;
@@ -62,6 +55,7 @@ function loadStreamdown(mode: CodeHighlightMode): Promise<StreamdownModule> {
 
 let shikiCached: Promise<StreamdownModule> | undefined;
 let plainCached: Promise<StreamdownModule> | undefined;
+let mermaidCached: Promise<typeof import("@streamdown/mermaid")> | undefined;
 
 export function LazyStreamdown({
   children,
@@ -73,6 +67,22 @@ export function LazyStreamdown({
   [key: string]: unknown;
 }) {
   const [module, setModule] = useState<StreamdownModule | null>(null);
+  const [diagramPlugin, setDiagramPlugin] = useState<unknown>(null);
+  const hasMermaid = typeof children === "string" &&
+    /(?:^|\n)[ \t]*(?:>[ \t]*)*(?:`{3,}|~{3,})mermaid(?:[ \t\r\n]|$)/u.test(children);
+
+  useEffect(() => {
+    if (!hasMermaid) return;
+    let cancelled = false;
+    const promise = mermaidCached ??= import("@streamdown/mermaid");
+    promise.then((loaded) => {
+      if (!cancelled) setDiagramPlugin(loaded.mermaid);
+    }).catch(() => {
+      // Keep source readable on a failed import and allow a later retry.
+      mermaidCached = undefined;
+    });
+    return () => { cancelled = true; };
+  }, [hasMermaid]);
 
   useEffect(() => {
     let cancelled = false;
@@ -103,7 +113,7 @@ export function LazyStreamdown({
 
   const { Streamdown, plugins } = module;
   return (
-    <Streamdown {...props} plugins={plugins}>
+    <Streamdown {...props} plugins={diagramPlugin ? { ...plugins, mermaid: diagramPlugin } : plugins}>
       {children}
     </Streamdown>
   );

@@ -1,8 +1,9 @@
 import { nativeMoney } from "@/lib/money";
-import { useQuery } from "@tanstack/react-query";
-import { workspaceQueryKey } from "@/lib/query-keys";
 import type { BillingCurrency } from "@/types/usage";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import {
+  createContext, lazy, Suspense, useContext, useEffect, useMemo, useRef, useState,
+  type ComponentProps,
+} from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Check,
@@ -20,6 +21,11 @@ import {
   Sparkles,
 } from "lucide-react";
 
+import { Citation, type CitationSource } from "@/components/chat/citation";
+import { MessageLink } from "@/components/chat/message-link";
+import { MarkdownOrderedList, MarkdownUnorderedList } from "@/components/chat/markdown-search-results";
+import { MarkdownTaskCheckbox, MarkdownTaskListItem } from "@/components/chat/interactive-control-list";
+import { citationHttpUrl } from "@/lib/citation-url";
 import { MessageResponse } from "@/components/ai-elements/message";
 import type { CodeHighlightMode } from "@/components/ai-elements/lazy-streamdown";
 import { IncrementalMarkdown } from "@/components/ai-elements/incremental-markdown";
@@ -44,6 +50,8 @@ import {
 } from "@/components/ai-elements/tool";
 import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { MagicCardHost } from "@/components/chat/magic-card-host";
+import { StreamUI } from "@/components/chat/stream-ui";
+import { visibleStreamUIText } from "@/lib/stream-ui";
 import {
   PreviewableMarkdownPre,
   type MarkdownPreProps,
@@ -55,8 +63,9 @@ import {
 } from "@/components/chat/sandbox-image-artifact";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
-import { FilePreviewCanvas } from "@/components/resources/file-preview";
-import { downloadFile } from "@/api/files";
+import { FilePreviewDialog } from "@/components/resources/file-preview-dialog";
+import { fileStreamUrl } from "@/api/files";
+import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
 import { apiClient } from "@/api/client";
 import {
   cancelAgentTask,
@@ -65,7 +74,6 @@ import {
   type AgentTask,
 } from "@/api/agent-tasks";
 import { confirmSkillDeletion } from "@/api/extensions";
-import { approveResearch, getResearchJob } from "@/api/research";
 import { decideFetchAuthorization, resumeFetchAuthorization } from "@/api/fetch-authorizations";
 import { decideEgressApproval, resumeEgressApproval } from "@/api/egress";
 import {
@@ -77,20 +85,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { isFailedArtifactPart } from "@/features/chat/chat-message-parts";
 import { toast } from "sonner";
 import {
   documentHref,
@@ -130,6 +126,9 @@ type SourceItem = {
   index?: number;
   /** Optional provider thumbnail (http(s) only). Display reference, not proxied. */
   imageUrl?: string;
+  siteName?: string;
+  faviconUrl?: string;
+  publishedAt?: string;
 };
 
 function graphLabels(value: unknown): string[] {
@@ -652,7 +651,9 @@ function collectSourceItems(data: PartData, workspaceId: string): SourceItem[] {
           locator: locator || undefined,
         })
       : "";
-    const href = documentPath || safeHref(record.url ?? record.href);
+    const href = documentPath || citationHttpUrl(
+      typeof (record.url ?? record.href) === "string" ? String(record.url ?? record.href) : undefined,
+    );
     if (!title || !href) return [];
     const index =
       typeof record.index === "number" && Number.isFinite(record.index)
@@ -674,6 +675,13 @@ function collectSourceItems(data: PartData, workspaceId: string): SourceItem[] {
         isDocument: Boolean(fileId),
         index,
         ...(imageUrl ? { imageUrl } : {}),
+        siteName: [record.site_name, record.siteName, record.source_name, record.publisher]
+          .find((value): value is string => typeof value === "string" && Boolean(value.trim())),
+        faviconUrl: [record.favicon_url, record.favicon, record.icon]
+          .map((value) => typeof value === "string" ? citationHttpUrl(value) : undefined)
+          .find(Boolean),
+        publishedAt: [record.published_at, record.published_date, record.publishedDate, record.date]
+          .find((value): value is string => typeof value === "string" && Boolean(value.trim())),
       },
     ];
   });
@@ -711,9 +719,7 @@ function SourceListPart({ data }: { data: PartData }) {
   return (
     <Sources className="message-sources" defaultOpen={false}>
       <SourcesTrigger count={items.length}>
-        <>
-          <span className="font-medium">引用了 {items.length} 个来源</span>
-        </>
+        <span>参考了 {items.length} 个来源</span>
       </SourcesTrigger>
       <SourcesContent>
         {items.map((item) =>
@@ -782,6 +788,10 @@ type CitationLookup = {
   webIndexes: Set<number>;
 };
 
+// Streamdown memoizes unchanged Markdown blocks. Context lets late source
+// metadata reach their citations without remounting text or an open card.
+const CitationLookupContext = createContext<CitationLookup | null>(null);
+
 function buildCitationLookup(
   parts: MessagePart[] | undefined,
   workspaceId: string,
@@ -842,166 +852,47 @@ function useCitationLookup(
   return cache.current!.lookup;
 }
 
-function CitationBadge({
+function DocumentCitation({
   fileId,
   locators,
-  index,
-  lookup,
 }: {
   fileId: string;
   locators: string;
-  index: number;
-  lookup: CitationLookup;
 }) {
+  const lookup = useContext(CitationLookupContext)!;
   const { workspaceId } = useAuth();
-  const navigate = useNavigate();
   const sources = lookup.byFileId.get(fileId) ?? [];
-  const preferred =
-    sources.find(
-      (item) =>
-        item.locator &&
-        locators &&
-        (locators.includes(item.locator) || item.locator.includes(locators.split(/[、,，]/)[0] ?? "")),
-    ) ?? sources[0];
+  const preferred = sources.find((item) =>
+    item.locator && locators &&
+    (locators.includes(item.locator) || item.locator.includes(locators.split(/[、,，]/)[0] ?? "")),
+  ) ?? sources[0];
   const filename = preferred?.filename || preferred?.title || "引用文档";
-  const quote = preferred?.quote || "";
-  const href =
-    preferred?.fileId && workspaceId
-      ? documentHref(workspaceId, preferred.fileId, {
-          chunkId: preferred.chunkId || undefined,
-          locator: preferred.locator || locators || undefined,
-        })
-      : workspaceId
-        ? documentHref(workspaceId, fileId, { locator: locators || undefined })
-        : "";
-
+  const href = documentHref(workspaceId, fileId, {
+    chunkId: preferred?.chunkId || undefined,
+    locator: preferred?.locator || locators || undefined,
+  });
   return (
-    <TooltipProvider delayDuration={120}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            aria-label={`打开引用文件 ${filename}`}
-            className="message-citation-badge"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              if (href) navigate(href);
-            }}
-            type="button"
-          >
-            {index}
-          </button>
-        </TooltipTrigger>
-        <TooltipContent
-          className="message-citation-tooltip max-w-72"
-          side="top"
-          sideOffset={6}
-        >
-          <div className="grid gap-1.5">
-            <div className="flex items-start gap-2">
-              <FileText className="mt-0.5 size-3.5 flex-none opacity-80" />
-              <div className="min-w-0">
-                <strong className="block truncate text-[12px] font-semibold">
-                  {filename}
-                </strong>
-                {locators ? (
-                  <span className="block font-mono text-[10px] opacity-80">
-                    {locators}
-                  </span>
-                ) : null}
-              </div>
-            </div>
-            {quote ? (
-              <p className="line-clamp-4 text-[11px] leading-4 opacity-90">
-                {quote}
-              </p>
-            ) : (
-              <p className="text-[11px] opacity-80">点击打开该引用文件</p>
-            )}
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+    <Citation sources={[{
+      id: fileId, url: href, title: filename, siteName: filename,
+      kind: "document", locator: locators || preferred?.locator,
+    }]} />
   );
 }
 
-function WebCitationBadge({
-  index,
-  lookup,
-  missing = false,
-}: {
-  index: number;
-  lookup: CitationLookup;
-  missing?: boolean;
-}) {
-  const source = missing ? undefined : lookup.byWebIndex.get(index);
-  const title = source?.title || source?.filename || `来源 ${index}`;
-  const href = source?.href ? safeHref(source.href) : "";
-  const quote = source?.quote || "";
-
-  return (
-    <TooltipProvider delayDuration={120}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          {href ? (
-            <a
-              aria-label={`打开网页来源 ${index}: ${title}`}
-              className="message-citation-badge"
-              href={href}
-              onClick={(event) => event.stopPropagation()}
-              rel="noreferrer"
-              target="_blank"
-            >
-              {index}
-            </a>
-          ) : (
-            <button
-              aria-label={missing ? `网页来源 ${index} 不可用` : `网页来源 ${index}`}
-              className={cn(
-                "message-citation-badge",
-                missing && "message-citation-badge--missing",
-              )}
-              type="button"
-            >
-              {index}
-            </button>
-          )}
-        </TooltipTrigger>
-        <TooltipContent
-          className="message-citation-tooltip max-w-72"
-          side="top"
-          sideOffset={6}
-        >
-          <div className="grid gap-1.5">
-            <div className="flex items-start gap-2">
-              <ExternalLink className="mt-0.5 size-3.5 flex-none opacity-80" />
-              <div className="min-w-0">
-                <strong className="block truncate text-[12px] font-semibold">
-                  {missing ? `来源 ${index} 不可用` : title}
-                </strong>
-                {href ? (
-                  <span className="block truncate font-mono text-[10px] opacity-80">
-                    {decodeUrlForDisplay(href)}
-                  </span>
-                ) : null}
-              </div>
-            </div>
-            {missing ? (
-              <p className="text-[11px] opacity-80">该引用未对应到本次提供的来源列表</p>
-            ) : quote ? (
-              <p className="line-clamp-4 text-[11px] leading-4 opacity-90">
-                {quote}
-              </p>
-            ) : href ? (
-              <p className="text-[11px] opacity-80">点击跳转到该网页</p>
-            ) : (
-              <p className="text-[11px] opacity-80">来源详情不可用</p>
-            )}
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
+function WebCitation({ indexes }: { indexes: number[] }) {
+  const lookup = useContext(CitationLookupContext)!;
+  const sources: CitationSource[] = indexes.map((index) => {
+    const item = lookup.byWebIndex.get(index);
+    return {
+      id: String(index),
+      url: item?.href ?? "",
+      title: item?.title || `来源 ${index} 不可用`,
+      siteName: item?.siteName,
+      faviconUrl: item?.faviconUrl,
+      publishedAt: item?.publishedAt,
+    };
+  });
+  return <Citation sources={sources} />;
 }
 
 /**
@@ -1011,13 +902,14 @@ function WebCitationBadge({
  */
 const INCREMENTAL_RENDER_MIN_CHARS = 8_192;
 
-function TextWithCitations({
+export function TextWithCitations({
   content,
   siblingParts,
   className,
   codeHighlight = "shiki",
   streaming = false,
   streamEpoch,
+  safeDocument = false,
 }: {
   content: string;
   siblingParts?: MessagePart[];
@@ -1025,6 +917,7 @@ function TextWithCitations({
   codeHighlight?: CodeHighlightMode;
   streaming?: boolean;
   streamEpoch?: object;
+  safeDocument?: boolean;
 }) {
   const { workspaceId } = useAuth();
   const lookup = useCitationLookup(siblingParts, workspaceId);
@@ -1040,11 +933,9 @@ function TextWithCitations({
           const parsed = parseDocumentCitationHref(href ?? "");
           if (parsed) {
             return (
-              <CitationBadge
+              <DocumentCitation
                 fileId={parsed.fileId}
-                index={parsed.index}
                 locators={parsed.locators}
-                lookup={lookup}
               />
             );
           }
@@ -1052,51 +943,17 @@ function TextWithCitations({
         if (isWebCitationHref(href)) {
           const parsed = parseWebCitationHref(href ?? "");
           if (parsed) {
-            return (
-              <WebCitationBadge
-                index={parsed.index}
-                lookup={lookup}
-                missing={parsed.missing}
-              />
-            );
+            return <WebCitation indexes={parsed.indexes} />;
           }
         }
-        const safe =
-          typeof href === "string" &&
-          (href.startsWith("http://") ||
-            href.startsWith("https://") ||
-            href.startsWith("/"))
-            ? href
-            : undefined;
-        // Decode percent-encoded link text (e.g. %E7%9F%A5… → 知识…) when the
-        // visible children are just the raw URL or still encoded.
-        const childText =
-          typeof children === "string"
-            ? children
-            : Array.isArray(children)
-              ? children.map((child) => (typeof child === "string" ? child : "")).join("")
-              : "";
-        const looksEncoded =
-          /%[0-9A-Fa-f]{2}/.test(childText) ||
-          (safe && childText === href) ||
-          (safe && childText === safe);
-        const label =
-          looksEncoded && childText
-            ? decodeUrlForDisplay(childText)
-            : children;
-        return (
-          <a
-            href={safe}
-            rel="noreferrer"
-            target={safe?.startsWith("http") ? "_blank" : undefined}
-            title={safe ? decodeUrlForDisplay(safe) : undefined}
-            {...props}
-          >
-            {label}
-          </a>
-        );
+        return <MessageLink {...props} href={href}>{children}</MessageLink>;
       },
+      ol: MarkdownOrderedList,
+      ul: MarkdownUnorderedList,
+      li: MarkdownTaskListItem,
+      input: MarkdownTaskCheckbox,
       img: ({ src, alt, ...props }) => {
+        if (safeDocument) return <span>{alt}</span>;
         if (
           typeof src === "string" &&
           src.toLowerCase().startsWith("sandbox:")
@@ -1115,38 +972,41 @@ function TextWithCitations({
         }
         return <img alt={alt} src={src} {...props} />;
       },
-      pre: (props: MarkdownPreProps) => <PreviewableMarkdownPre {...props} />,
+      pre: (props: MarkdownPreProps) => safeDocument ? <pre className={props.className}>{props.children}</pre> : <PreviewableMarkdownPre {...props} />,
     }),
-    [lookup],
+    [safeDocument],
   );
 
   // Large streaming texts render through the incremental frozen-prefix
   // renderer: only the trailing blocks re-parse per chunk, the frozen prefix
   // keeps cached element identity (dsh IncrementalMarkdownParser port). Small
   // or settled texts keep the single full-document render for exactness.
-  const useIncremental = streaming && markdown.length > INCREMENTAL_RENDER_MIN_CHARS;
+  const useIncremental = !safeDocument && streaming && markdown.length > INCREMENTAL_RENDER_MIN_CHARS;
 
   return (
-    <div className={cn("message-text-block", className)}>
-      <div data-message-selectable-text>
-        {useIncremental ? (
-          <IncrementalMarkdown
-            codeHighlight={codeHighlight}
-            components={components}
-            epoch={streamEpoch}
-            text={markdown}
-          />
-        ) : (
-          <MessageResponse
-            className={cn("min-w-0", className)}
-            codeHighlight={codeHighlight}
-            components={components}
-          >
-            {markdown}
-          </MessageResponse>
-        )}
+    <CitationLookupContext.Provider value={lookup}>
+      <div className={cn("message-text-block", className)}>
+        <div data-message-selectable-text>
+          {useIncremental ? (
+            <IncrementalMarkdown
+              codeHighlight={codeHighlight}
+              components={components}
+              epoch={streamEpoch}
+              text={markdown}
+            />
+          ) : (
+            <MessageResponse
+              className={cn("min-w-0", className)}
+              skipHtml={safeDocument || undefined}
+              codeHighlight={codeHighlight}
+              components={components}
+            >
+              {markdown}
+            </MessageResponse>
+          )}
+        </div>
       </div>
-    </div>
+    </CitationLookupContext.Provider>
   );
 }
 
@@ -1242,24 +1102,8 @@ function UserConfirmationPart({ data }: { data: PartData }) {
 function ImagePart({ data, status }: { data: PartData; status: string }) {
   const directSrc = safeHref(data?.src ?? data?.url);
   const fileId = typeof data?.file_id === "string" ? data.file_id : "";
-  const [fileSrc, setFileSrc] = useState("");
+  const { source: fileSrc } = useFileStreamUrl(directSrc ? undefined : fileId);
   const [lightboxOpen, setLightboxOpen] = useState(false);
-  useEffect(() => {
-    if (!fileId || directSrc) return;
-    let objectUrl = "";
-    let cancelled = false;
-    void downloadFile(fileId)
-      .then((blob) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setFileSrc(objectUrl);
-      })
-      .catch(() => setFileSrc(""));
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [directSrc, fileId]);
   const title = typeof data?.title === "string" ? data.title : "图片任务";
   const alt = typeof data?.alt === "string" ? data.alt : title;
   const src = directSrc || fileSrc;
@@ -1307,12 +1151,7 @@ function ImagePart({ data, status }: { data: PartData; status: string }) {
  * （pdf/word/ppt/xlsx/音频/视频/html/文本 均有浏览器内查看器）。
  */
 function AttachmentPreviewDialog({
-  fileId,
-  filename,
-  kindLabel,
-  mimeType,
-  onOpenChange,
-  open,
+  fileId, filename, kindLabel, mimeType, onOpenChange, open,
 }: {
   fileId: string;
   filename: string;
@@ -1321,76 +1160,7 @@ function AttachmentPreviewDialog({
   onOpenChange: (open: boolean) => void;
   open: boolean;
 }) {
-  const [blob, setBlob] = useState<Blob | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    if (!open || !fileId || blob) return;
-    let cancelled = false;
-    setLoading(true);
-    setFailed(false);
-    void downloadFile(fileId)
-      .then((next) => {
-        if (!cancelled) setBlob(next);
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [blob, fileId, open]);
-
-  return (
-    <Dialog
-      onOpenChange={(next) => {
-        if (!next) setBlob(null);
-        onOpenChange(next);
-      }}
-      open={open}
-    >
-      <DialogContent
-        className="flex max-h-[min(92svh,58rem)] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl"
-        showCloseButton
-      >
-        <DialogHeader className="shrink-0 border-b px-5 py-4 pr-12">
-          <DialogTitle className="truncate">{filename}</DialogTitle>
-          <DialogDescription className="truncate">
-            {kindLabel} · 内置预览
-          </DialogDescription>
-        </DialogHeader>
-        <div className="min-h-0 flex-1 overflow-auto bg-muted/15">
-          {loading ? (
-            <div
-              className="grid min-h-[24rem] place-items-center gap-2 text-sm text-muted-foreground"
-              role="status"
-            >
-              <LoaderCircle className="size-4 animate-spin" />
-              正在加载预览…
-            </div>
-          ) : failed ? (
-            <div
-              className="grid min-h-[24rem] place-items-center p-8 text-sm text-destructive"
-              role="alert"
-            >
-              预览加载失败，请下载后使用本地应用查看。
-            </div>
-          ) : blob ? (
-            <FilePreviewCanvas
-              blob={blob}
-              className="min-h-[32rem]"
-              filename={filename}
-              mimeType={mimeType}
-            />
-          ) : null}
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
+  return <FilePreviewDialog fileId={fileId} filename={filename} mimeType={mimeType} open={open} onOpenChange={onOpenChange} description={`${kindLabel} · 内置预览`} />;
 }
 
 function AttachmentPart({ data, status }: { data: PartData; status: string }) {
@@ -1427,23 +1197,7 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
     !isImage && previewKind !== "unsupported" && Boolean(fileId);
 
   // 图片附件缩略图：优先直接地址，否则按 file_id 拉取内容。
-  const [imageSrc, setImageSrc] = useState("");
-  useEffect(() => {
-    if (!isImage || !fileId || href) return;
-    let objectUrl = "";
-    let cancelled = false;
-    void downloadFile(fileId)
-      .then((blob) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setImageSrc(objectUrl);
-      })
-      .catch(() => setImageSrc(""));
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [href, fileId, isImage]);
+  const { source: imageSrc } = useFileStreamUrl(isImage && !href ? fileId : undefined);
   const imageHref = href || imageSrc;
 
   async function download() {
@@ -1451,7 +1205,7 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
     setDownloading(true);
     try {
       // 移动端 WebView：真实 URL 交给原生下载器（OkHttp 自动附 Bearer，
-      // 走原生进度/管理页）。桌面浏览器回退原 blob 下载。
+      // 走原生进度/管理页）。桌面浏览器通过文件票据流式下载。
       if (
         fileId &&
         downloadViaNative(
@@ -1461,14 +1215,12 @@ function AttachmentPart({ data, status }: { data: PartData; status: string }) {
       ) {
         return;
       }
-      const blob = fileId ? await downloadFile(fileId) : undefined;
-      const url = blob ? URL.createObjectURL(blob) : href;
+      const url = fileId ? await fileStreamUrl(fileId) : href;
       if (!url) return;
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download = filename;
       anchor.click();
-      if (blob) URL.revokeObjectURL(url);
     } finally {
       setDownloading(false);
     }
@@ -1687,12 +1439,6 @@ function toolDisplayTitle(
   if (toolName === "sandbox_exec" || toolName === "sandbox_run") {
     return "沙箱执行";
   }
-  if (toolName === "start_deep_research") {
-    return "启动深度研究";
-  }
-  if (toolName === "get_deep_research") {
-    return "查询深度研究";
-  }
   return toolName ?? "工具调用";
 }
 
@@ -1785,6 +1531,7 @@ function ToolCallPart({
       open={open}
     >
       <ToolHeader
+        taskKey={part.id}
         className="chat-tool-call__header"
         state={toolState}
         title={title}
@@ -1826,126 +1573,6 @@ function ToolCallPart({
         ) : null}
       </ToolContent>
     </Tool>
-  );
-}
-
-type DeepResearchApprovalData = {
-  user_approval_required?: boolean;
-  research_job_id?: string;
-  currency?: BillingCurrency;
-  estimated_cost_amount?: string | null;
-  budget_amount?: string | null;
-  workspace_id?: string;
-  quote_id?: string;
-  question?: string;
-};
-
-/**
- * Budget-approval card for an agent-initiated Deep Research job.
- * Rendered outside the thinking chain so the user can approve without expanding
- * the fold; approval auto-re-drives the agent.
- */
-export function DeepResearchApprovalFromPart({ part }: { part: MessagePart }) {
-  const output = part.data?.output as DeepResearchApprovalData | undefined;
-  if (
-    part.data?.tool_name !== "start_deep_research" ||
-    output?.user_approval_required !== true
-  ) {
-    return null;
-  }
-  return <DeepResearchApprovalCard data={output} />;
-}
-
-function DeepResearchApprovalCard({ data }: { data: DeepResearchApprovalData }) {
-  const jobId = typeof data.research_job_id === "string" ? data.research_job_id : "";
-  const { workspaceId, userId, effectivePermissions } = useAuth();
-  const current = useQuery({ queryKey: workspaceQueryKey(workspaceId, "research", "approval", userId, jobId),
-    queryFn: ({ signal }) => getResearchJob(jobId, workspaceId, signal),
-    enabled: Boolean(jobId) && (!data.workspace_id || data.workspace_id === workspaceId), retry: false });
-  const fresh = current.data;
-  const displayCost = nativeMoney(fresh?.estimated_cost_amount, fresh?.currency);
-  const displayBudget = nativeMoney(fresh?.budget_amount, fresh?.currency);
-  const quoteId = fresh?.billing_snapshot?.schema_version === 2 ? String(fresh.billing_snapshot.quote_id ?? "") : "";
-  const [status, setStatus] = useState<"pending" | "submitting" | "approved">(
-    "pending",
-  );
-  const [error, setError] = useState("");
-
-  if (!jobId) {
-    return (
-      <section className="mt-3 rounded-xl border border-amber-300 p-4">
-        <p className="text-sm text-muted-foreground">
-          研究任务等待预算确认，但缺少任务标识。
-        </p>
-      </section>
-    );
-  }
-  if (status === "approved" || (fresh?.approval_status === "approved" && fresh.status !== "awaiting_approval")) {
-    return (
-      <section className="mt-3 rounded-xl border border-emerald-300 bg-emerald-50 p-4 dark:bg-emerald-950/30">
-        <strong className="text-emerald-700 dark:text-emerald-400">
-          预算已确认并启动，等待智能体续跑取回研究结果。
-        </strong>
-      </section>
-    );
-  }
-  return (
-    <section
-      aria-label="研究任务预算确认"
-      className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20"
-    >
-      <div>
-        <strong className="text-amber-700 dark:text-amber-400">
-          需要确认研究预算
-        </strong>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {"预计费用 " + displayCost + "；批准预算 " + displayBudget + "。批准后才会调用远程研究 Provider。"}
-        </p>
-        {typeof data.question === "string" && data.question.trim() ? (
-          <p className="mt-2 text-sm text-foreground/80">
-            研究问题：{data.question.trim()}
-          </p>
-        ) : null}
-      </div>
-      {error ? (
-        <p className="text-sm text-destructive" role="alert">
-          {error}
-        </p>
-      ) : null}
-      <Button
-        disabled={status === "submitting" || !quoteId || !effectivePermissions.includes("workspace.write") || fresh?.status !== "awaiting_approval"}
-        size="sm"
-        onClick={async () => {
-          setStatus("submitting");
-          setError("");
-          try {
-            await approveResearch(jobId, quoteId, workspaceId);
-            setStatus("approved");
-            toast.success("预算已确认，研究任务已启动");
-            // Re-drive the agent to fetch the approved job's results via the
-            // existing composer auto-send path in chat-pages.
-            window.dispatchEvent(
-              new CustomEvent("learngraph:compose", {
-                detail: {
-                  content: `已批准研究任务 ${jobId}，请使用 get_deep_research 工具查询结果。`,
-                  autoSend: true,
-                },
-              }),
-            );
-          } catch (fetchError) {
-            setStatus("pending");
-            const message =
-              fetchError instanceof Error ? fetchError.message : "预算确认失败";
-            setError(message);
-            toast.error(message);
-          }
-        }}
-      >
-        {status === "submitting" ? "确认中…" : "确认预算并启动"}
-      </Button>
-      {current.isError ? <p className="text-sm text-destructive">{current.error.message}</p> : null}
-      {fresh && !quoteId ? <p className="text-sm">旧报价已过期，请用原币预算重新生成研究计划。</p> : null}
-    </section>
   );
 }
 
@@ -2203,11 +1830,29 @@ export function MessagePartRenderer({
   interactive?: boolean;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
   part: MessagePart;
-  /** Sibling parts of the same assistant message (used to resolve citation tooltips). */
+  /** Sibling parts of the same assistant message (used to resolve inline source groups). */
   siblingParts?: MessagePart[];
   streaming?: boolean;
 }) {
-  const content = part.content ?? part.content_delta ?? "";
+  const rawContent = part.content ?? part.content_delta ?? "";
+  // Also clean historical answers and streams whose artifact has not arrived yet.
+  const content = part.type === "text"
+    ? visibleStreamUIText(rawContent, streaming)
+    : rawContent;
+  if (isFailedArtifactPart(part)) {
+    const label = part.type === "image" ? "图片生成失败" : "产物生成失败";
+    const title = typeof part.data?.title === "string" ? part.data.title : content;
+    const error = typeof part.data?.error_message === "string" ? part.data.error_message : "";
+    return (
+      <div className="flex items-start gap-2 py-1 text-xs text-muted-foreground" role="status">
+        <ShieldAlert aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
+        <div className="min-w-0 break-words">
+          <p>{label}{title && title !== label ? ` · ${title}` : ""}</p>
+          {error && error !== title && error !== label ? <p className="mt-1 whitespace-pre-wrap">{error}</p> : null}
+        </div>
+      </div>
+    );
+  }
   switch (part.type) {
     case "acknowledgement":
       return (
@@ -2292,6 +1937,8 @@ export function MessagePartRenderer({
           <ChartPart data={part.data} />
         </Suspense>
       );
+    case "ui":
+      return <StreamUI data={part.data} partId={part.id} siblingParts={siblingParts} interactive={interactive && !streaming} settled={!streaming} failed={part.status === "failed"} onAction={onAction} />;
     case "user_confirmation":
       return <UserConfirmationPart data={part.data} />;
     case "component":

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -31,6 +31,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { DateScheduleCalendar } from "@/components/chat/date-schedule-calendar";
 import { StepperCard, type StepperProps } from "@/components/chat/stepper-renderer";
+import { CodeTrainer } from "@/components/chat/code-trainer";
+import { trainerComponentSchema } from "@/lib/code-trainer";
+import { StreamUIStateScope } from "@/lib/stream-ui-local-state";
 
 const optionSchema = z.object({
   id: z.string().min(1).max(160),
@@ -275,6 +278,7 @@ const trustedComponentSchema = z.union([
   goalDraftEditorSchema,
   questionBatchSchema,
   stepperComponentSchema,
+  trainerComponentSchema,
 ]);
 
 export type TrustedComponentAction = {
@@ -373,6 +377,12 @@ export function TrustedComponentRenderer({
 
   const component = parsed.data;
   const componentId = component.component_id ?? fallbackId;
+
+  if (component.component_type === "code_trainer") {
+    return <StreamUIStateScope.Provider key={fallbackId} value={`code-trainer:${fallbackId}`}>
+      <CodeTrainer props={component.props} interactive={interactive} onAsk={onAction && component.allowed_events.includes("submit") ? prompt => onAction({ componentId, componentType: "code_trainer", event: "submit", payload: { prompt } }) : undefined} />
+    </StreamUIStateScope.Provider>;
+  }
 
   function emit(event: string, payload: Record<string, unknown>) {
     void onAction?.({
@@ -553,7 +563,6 @@ export function TrustedComponentRenderer({
         className="message-component metric-card"
       >
         <div className="message-component__heading">
-          <ShieldCheck className="size-4" />
           <div>
             <strong>{component.props.title}</strong>
             {component.props.description ? (
@@ -561,10 +570,13 @@ export function TrustedComponentRenderer({
             ) : null}
           </div>
         </div>
-        <ul className="metric-card__grid">
+        <ul
+          className="metric-card__grid"
+          style={{ "--metric-columns": Math.min(component.props.metrics.length, 3) } as CSSProperties}
+        >
           {component.props.metrics.map((metric, index) => (
             <li
-              className={`metric-card__item metric-card__item--${index % 4}`}
+              className="metric-card__item"
               key={metric.id ?? `${metric.label}-${index}`}
             >
               <span className="metric-card__label">{metric.label}</span>

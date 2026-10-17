@@ -114,7 +114,7 @@ class ProviderStreamEvent:
     output items for a later stateless continuation.
     """
 
-    type: Literal["reasoning_delta", "text_delta", "tool_calls", "completed"]
+    type: Literal["reasoning_delta", "text_delta", "tool_call_delta", "tool_calls", "completed"]
     content: str | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str | None = None

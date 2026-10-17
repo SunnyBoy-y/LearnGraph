@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -64,3 +66,31 @@ def test_truncated_stream_does_not_execute_partial_tool_calls():
             events.append(event)
     assert not any(event.type == 'tool_calls' for event in events)
     assert provider._http_client is None
+
+
+def test_large_deepseek_request_uses_bounded_chunks_without_losing_tool_context():
+    from app.services.sandbox import SandboxAgentWorkspaceService
+    received = {}
+    class Transport(httpx.BaseTransport):
+        def handle_request(self, request):
+            chunks = list(request.stream)
+            received.update(headers=dict(request.headers), chunks=chunks, payload=json.loads(b"".join(chunks)))
+            return httpx.Response(200, stream=httpx.ByteStream(
+                b'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+            ))
+    provider = DeepSeekChatProvider(provider_id="p", model_id="deepseek-chat", base_url="https://api.deepseek.com",
+                                    api_key="test", transport=Transport())
+    tools = [tool for tool in SandboxAgentWorkspaceService.agent_tool_definitions() if tool["function"]["name"] == "sandbox_bash"]
+    text = "已完成操作的中文结果" * 1000
+    messages = [ProviderChatMessage(role="user", content=text),
+                ProviderChatMessage(role="assistant", reasoning_content="continuation state", tool_calls=[{
+                    "id":"once", "type":"function", "function":{"name":"sandbox_bash","arguments":"{}"}}]),
+                ProviderChatMessage(role="tool", tool_call_id="once", content="already completed")]
+    events = list(provider.stream_chat(messages, tools=tools))
+    assert events[-1].type == "completed"
+    assert received["headers"]["transfer-encoding"] == "chunked"
+    assert received["headers"]["content-type"] == "application/json"
+    assert len(received["chunks"]) > 1 and max(map(len, received["chunks"])) <= 1024
+    assert received["payload"]["messages"] == [message.as_payload() for message in messages]
+    assert received["payload"]["tools"] == tools
+    provider.reset_transport()

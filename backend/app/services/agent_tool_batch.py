@@ -133,7 +133,6 @@ _DATABASE_READ_TOOLS: frozenset[str] = frozenset(
         "get_memory_policy",
         "list_plugins",
         "get_local_probe_policy",
-        "get_deep_research",
         "read_chart",
         "lg_goal_read",
         "component_list",
@@ -167,6 +166,7 @@ _DATABASE_WRITE_TOOLS: frozenset[str] = frozenset(
     {
         "propose_memory_draft",
         "canvas_emit_trusted_component",
+        "ui_stream",
         "canvas_emit_magic_card",
         "artifact_publish_card",
         "component_register_manifest",
@@ -213,7 +213,6 @@ _DATABASE_WRITE_TOOLS: frozenset[str] = frozenset(
         "update_skill_manifest",
         "transcribe_audio",
         "analyze_image",
-        "start_deep_research",
         "download_external_image",
         "download_github_source",
         "fetch_web_page",

@@ -10,22 +10,15 @@ import {
   LoaderCircle,
   Video,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-import { downloadFile, listSessionFiles } from "@/api/files";
-import { FilePreviewCanvas } from "@/components/resources/file-preview";
+import { fileStreamUrl, listSessionFiles } from "@/api/files";
+import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
+import { FilePreviewDialog } from "@/components/resources/file-preview-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { documentHref } from "@/lib/document-citations";
-import { resolveFilePreviewKind } from "@/lib/file-preview";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import type { SessionFile } from "@/types/files";
 
@@ -77,31 +70,12 @@ function fileKindLabel(file: SessionFile): {
 }
 
 function SessionFileThumb({ file }: { file: SessionFile }) {
-  const [src, setSrc] = useState("");
-  const [failed, setFailed] = useState(false);
   const isImage =
     (file.is_image || (file.mime_type ?? "").toLowerCase().startsWith("image/")) &&
     Boolean(file.file_id);
   const { Icon, label } = fileKindLabel(file);
 
-  useEffect(() => {
-    if (!isImage || !file.file_id) return;
-    let objectUrl = "";
-    let cancelled = false;
-    void downloadFile(file.file_id)
-      .then((blob) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        setSrc(objectUrl);
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      });
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [file.file_id, isImage]);
+  const { source: src, failed } = useFileStreamUrl(isImage ? file.file_id ?? undefined : undefined);
 
   if (isImage && src) {
     return (
@@ -256,13 +230,11 @@ export function SessionFilesList({
                             ) {
                               return;
                             }
-                            void downloadFile(file.file_id!).then((blob) => {
-                              const url = URL.createObjectURL(blob);
+                            void fileStreamUrl(file.file_id!).then((url) => {
                               const anchor = document.createElement("a");
                               anchor.href = url;
                               anchor.download = file.filename;
                               anchor.click();
-                              URL.revokeObjectURL(url);
                             });
                           }}
                           size="icon-xs"
@@ -302,160 +274,15 @@ function SessionFilePreviewDialog({
   file: SessionFile | null;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [blob, setBlob] = useState<Blob | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [failed, setFailed] = useState(false);
-  const open = Boolean(file);
-  const isImage =
-    Boolean(file) &&
-    (file!.is_image || (file!.mime_type ?? "").toLowerCase().startsWith("image/"));
-  const previewKind = file
-    ? resolveFilePreviewKind(file.filename, file.mime_type)
-    : "unsupported";
-  const canPreview = Boolean(file?.file_id && !isImage && previewKind !== "unsupported");
-
-  useEffect(() => {
-    if (!open || !file?.file_id || isImage || !canPreview || blob) return;
-    let cancelled = false;
-    setLoading(true);
-    setFailed(false);
-    void downloadFile(file.file_id)
-      .then((next) => {
-        if (!cancelled) setBlob(next);
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [blob, canPreview, file?.file_id, isImage, open]);
-
-  // 图片预览：单独拉取 blob 显示大图。
-  const [imageSrc, setImageSrc] = useState("");
-  useEffect(() => {
-    if (!open || !file?.file_id || !isImage) return;
-    let objectUrl = "";
-    let cancelled = false;
-    setImageSrc("");
-    setLoading(true);
-    setFailed(false);
-    void downloadFile(file.file_id)
-      .then((next) => {
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(next);
-        setImageSrc(objectUrl);
-      })
-      .catch(() => setFailed(true))
-      .finally(() => setLoading(false));
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [file?.file_id, isImage, open]);
-
-  const filename = file?.filename ?? "";
-  const originLabel = file ? (ORIGIN_LABELS[file.origin] ?? file.origin) : "";
-
   return (
-    <Dialog onOpenChange={onOpenChange} open={open}>
-      <DialogContent
-        className="flex max-h-[min(92svh,58rem)] w-full max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl"
-        showCloseButton
-      >
-        {file ? (
-          <>
-            <DialogHeader className="shrink-0 border-b px-5 py-4 pr-12">
-              <DialogTitle className="truncate">{filename}</DialogTitle>
-              <DialogDescription className="truncate">
-                {originLabel}
-                {file.path ? ` · ${file.path}` : ""} · {formatFileSize(file.size_bytes)}
-              </DialogDescription>
-            </DialogHeader>
-            <div className="min-h-0 flex-1 overflow-auto bg-muted/15">
-              {isImage ? (
-                loading ? (
-                  <div className="grid min-h-[24rem] place-items-center gap-2 text-sm text-muted-foreground" role="status">
-                    <LoaderCircle className="size-4 animate-spin" />
-                    正在加载图片…
-                  </div>
-                ) : imageSrc ? (
-                  <div className="grid min-h-[24rem] place-items-center p-6">
-                    <img
-                      alt={filename}
-                      className="max-h-[72svh] w-auto max-w-full rounded-lg object-contain shadow-lg"
-                      src={imageSrc}
-                    />
-                  </div>
-                ) : (
-                  <div className="grid min-h-[24rem] place-items-center p-8 text-sm text-destructive" role="alert">
-                    图片加载失败，请下载后查看。
-                  </div>
-                )
-              ) : canPreview ? (
-                loading ? (
-                  <div className="grid min-h-[24rem] place-items-center gap-2 text-sm text-muted-foreground" role="status">
-                    <LoaderCircle className="size-4 animate-spin" />
-                    正在加载预览…
-                  </div>
-                ) : failed ? (
-                  <div className="grid min-h-[24rem] place-items-center p-8 text-sm text-destructive" role="alert">
-                    预览加载失败，请下载后使用本地应用查看。
-                  </div>
-                ) : blob ? (
-                  <FilePreviewCanvas
-                    blob={blob}
-                    className="min-h-[32rem]"
-                    filename={filename}
-                    mimeType={file.mime_type}
-                  />
-                ) : null
-              ) : (
-                <div className="grid min-h-[24rem] place-items-center gap-3 p-8 text-center text-sm text-muted-foreground">
-                  <FolderOpen className="size-8 opacity-50" />
-                  <div>
-                    {file.file_id
-                      ? "该类型暂不支持浏览器内预览；请下载后使用本地应用查看。"
-                      : "该文件仅存在于会话工作区（无独立下载文件），无法在浏览器中预览。"}
-                  </div>
-                  {file.file_id ? (
-                    <Button
-                      onClick={() => {
-                        if (
-                          file.file_id &&
-                          downloadViaNative(
-                            toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.file_id)}/content`),
-                            filename,
-                          )
-                        ) {
-                          return;
-                        }
-                        void downloadFile(file.file_id!).then((next) => {
-                          const url = URL.createObjectURL(next);
-                          const anchor = document.createElement("a");
-                          anchor.href = url;
-                          anchor.download = filename;
-                          anchor.click();
-                          URL.revokeObjectURL(url);
-                        });
-                      }}
-                      size="sm"
-                      type="button"
-                      variant="outline"
-                    >
-                      <Download className="size-4" />
-                      下载
-                    </Button>
-                  ) : null}
-                </div>
-              )}
-            </div>
-          </>
-        ) : null}
-      </DialogContent>
-    </Dialog>
+    <FilePreviewDialog
+      fileId={file?.file_id ?? undefined}
+      fileSize={file?.size_bytes}
+      filename={file?.filename ?? "文件预览"}
+      mimeType={file?.mime_type}
+      open={Boolean(file)}
+      onOpenChange={onOpenChange}
+      description={file ? `${ORIGIN_LABELS[file.origin] ?? file.origin} · ${formatFileSize(file.size_bytes)}${file.file_id ? "" : " · 仅存在于会话工作区，暂无可读取内容"}` : undefined}
+    />
   );
 }

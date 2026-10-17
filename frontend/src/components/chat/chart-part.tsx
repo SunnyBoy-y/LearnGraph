@@ -4,6 +4,7 @@
 // 使 recharts 只进入按需加载的独立 chunk。recharts 本体在 ChartPart 内部二次
 // 动态 import——只有真正渲染图表时才求值 recharts 模块。
 import { useEffect, useState } from "react";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
 
 export type PartData = Record<string, unknown> | undefined;
 
@@ -18,6 +19,7 @@ function EmptyPart({ children }: { children: string }) {
 }
 
 export function ChartPart({ data }: { data: PartData }) {
+  const reducedMotion = useReducedMotionPreference();
   const [recharts, setRecharts] = useState<RechartsModule | null>(null);
 
   useEffect(() => {
@@ -141,6 +143,7 @@ export function ChartPart({ data }: { data: PartData }) {
               <PieChart>
                 {common}
                 <Pie
+                  isAnimationActive={!reducedMotion}
                   data={structuredPoints}
                   dataKey={series[0].key}
                   label={data?.show_values === true}
@@ -175,6 +178,7 @@ export function ChartPart({ data }: { data: PartData }) {
                 {common}
                 {series.map((item) => (
                   <Bar
+                    isAnimationActive={!reducedMotion}
                     dataKey={item.key}
                     fill={item.color}
                     key={item.key}
@@ -199,6 +203,7 @@ export function ChartPart({ data }: { data: PartData }) {
                 {common}
                 {series.map((item) => (
                   <Line
+                    isAnimationActive={!reducedMotion}
                     dataKey={item.key}
                     dot
                     key={item.key}
@@ -285,6 +290,7 @@ export function ChartPart({ data }: { data: PartData }) {
               }}
             />
             <Area
+              isAnimationActive={!reducedMotion}
               dataKey={yKey}
               fill="color-mix(in srgb, var(--primary) 18%, transparent)"
               stroke="var(--primary)"

@@ -221,7 +221,7 @@ export function StreamStatsBadge({
 
   if (!segments.length && !cacheBadge) return null;
 
-  return (
+  const metrics = (
     <div
       aria-busy={streaming ? "true" : undefined}
       className="message-stream-stats"
@@ -236,5 +236,14 @@ export function StreamStatsBadge({
       ))}
       {cacheBadge}
     </div>
+  );
+
+  if (streaming) return metrics;
+
+  return (
+    <details className="message-stream-details">
+      <summary>生成详情</summary>
+      {metrics}
+    </details>
   );
 }

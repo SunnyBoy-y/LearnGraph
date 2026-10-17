@@ -53,6 +53,19 @@ const DOC_1 = "## Title\n\nFirst paragraph stays.\n\nSecond paragraph.\n\nThird 
 const DOC_2 = "## Title\n\nFirst paragraph stays.\n\nSecond paragraph.\n\nThird paragraph here";
 
 describe("IncrementalMarkdown streaming", () => {
+  it("renders a closed Mermaid fence while later prose is still streaming", () => {
+    resetStreams();
+    const epoch = {};
+    const source = "```mermaid\ngraph LR\n A --> B";
+    const view = render(createElement(IncrementalMarkdown, { text: source, epoch }));
+    expect(streams.renders).toHaveLength(0);
+    view.rerender(createElement(IncrementalMarkdown, { text: `${source}\n\`\`\`\n\nMore text`, epoch }));
+    expect(streams.renders.some(({ src }) => src === `${source}\n\`\`\``)).toBe(true);
+    const renders = streams.renders.filter(({ src }) => src.startsWith("```mermaid")).length;
+    view.rerender(createElement(IncrementalMarkdown, { text: `${source}\n\`\`\`\n\nMore text arriving`, epoch }));
+    expect(streams.renders.filter(({ src }) => src.startsWith("```mermaid"))).toHaveLength(renders);
+  });
+
   it("keeps block instances when a full part replacement is still an append", () => {
     resetStreams();
     const epoch = {};

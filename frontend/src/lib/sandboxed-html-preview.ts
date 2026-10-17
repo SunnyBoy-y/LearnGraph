@@ -70,9 +70,19 @@ function isAllowedResourceUrl(value: string) {
   return isAllowedEmbeddedUrl(value) || isNetworkUrl(value);
 }
 
+/** Single uploaded HTML files have no directory containing their companion assets. */
+export function relativeHtmlResources(html: string) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return [...new Set([...doc.querySelectorAll("img[src],script[src],link[rel='stylesheet'][href],source[src],video[src],audio[src]")]
+    .map((node) => (node.getAttribute("src") ?? node.getAttribute("href") ?? "").trim())
+    .filter((value) => value && !isAllowedResourceUrl(value) && !/^[a-z][a-z\d+.-]*:/i.test(value)))];
+}
+
 export interface SandboxedHtmlPreviewOptions {
   /** Learning packages are self-contained and must not load remote assets. */
   offline?: boolean
+  /** Disable executable book content and omit host script shims. */
+  scripts?: boolean
   /**
    * Inject the browser-sandbox runtime shim (`window.__lg` + `fetch` relay).
    * The shim talks to the host bridge over postMessage (`lg:1` protocol) so
@@ -149,8 +159,11 @@ export function sandboxedHtmlPreviewDocument(
       .replace(/expression\s*\(/giu, "invalid(");
   });
 
-  const shimTag = options.runtimeShim ? sandboxRuntimeShimInlineTag() : "";
-  const clientTag = options.subappClient ? subappClientInlineTag() : "";
-  const policy = options.offline ? "default-src 'none'; img-src data: blob:; media-src data: blob:; font-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" : SANDBOXED_HTML_PREVIEW_CSP;
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${PREVIEW_CONTROL_SHIM}${shimTag}${clientTag}${doc.head?.innerHTML ?? ""}</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
+  const scripts = options.scripts !== false;
+  if (!scripts) doc.querySelectorAll("script").forEach((node) => node.remove());
+  const shimTag = scripts && options.runtimeShim ? sandboxRuntimeShimInlineTag() : "";
+  const clientTag = scripts && options.subappClient ? subappClientInlineTag() : "";
+  let policy = options.offline ? "default-src 'none'; img-src data: blob:; media-src data: blob:; font-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" : SANDBOXED_HTML_PREVIEW_CSP;
+  if (!scripts) policy = policy.replace(/script-src[^;]*/u, "script-src 'none'");
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${scripts ? PREVIEW_CONTROL_SHIM : ""}${shimTag}${clientTag}${doc.head?.innerHTML ?? ""}</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
 }

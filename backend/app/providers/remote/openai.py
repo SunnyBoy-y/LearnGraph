@@ -1156,6 +1156,14 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                                 function_call_aggregates,
                                 event,
                             )
+                            if event_type == "response.function_call_arguments.delta":
+                                item_id = event.get("item_id") or event.get("call_id")
+                                aggregate = function_call_aggregates.get(item_id, {})
+                                yield ProviderStreamEvent("tool_call_delta", tool_calls=[{
+                                    "id": aggregate.get("id", ""),
+                                    "function": {"name": aggregate.get("function", {}).get("name", ""),
+                                                 "arguments": event.get("delta", "")},
+                                }])
                         elif event_type == "response.completed":
                             completed = True
                             response_payload, response_items = self._complete_response_metadata(
@@ -1346,7 +1354,7 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
         aggregates: dict[int, dict[str, Any]],
         raw: dict[str, Any],
         fallback_index: int,
-    ) -> None:
+    ) -> int:
         if "index" not in raw:
             # Gateways that omit ``index`` on every chunk (one tool call per SSE
             # chunk, always fallback 0) would silently merge distinct calls into
@@ -1395,12 +1403,13 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
             item["type"] = raw["type"]
         function = raw.get("function")
         if not isinstance(function, dict):
-            return
+            return index
         target = item["function"]
         if isinstance(function.get("name"), str) and function["name"]:
             target["name"] += function["name"]
         if isinstance(function.get("arguments"), str):
             target["arguments"] += function["arguments"]
+        return index
 
     @staticmethod
     def _completed_chat_tool_calls(
@@ -1600,11 +1609,17 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
                             for fallback_index, raw_tool_call in enumerate(raw_tool_calls):
                                 if isinstance(raw_tool_call, dict):
                                     saw_model_output = True
-                                    self._merge_chat_tool_delta(
+                                    index = self._merge_chat_tool_delta(
                                         tool_aggregates,
                                         raw_tool_call,
                                         fallback_index,
                                     )
+                                    aggregate = tool_aggregates[index]
+                                    yield ProviderStreamEvent("tool_call_delta", tool_calls=[{
+                                        "id": aggregate.get("id", ""), "index": index,
+                                        "function": {"name": aggregate["function"]["name"],
+                                            "arguments": (raw_tool_call.get("function") or {}).get("arguments", "")},
+                                    }])
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError("Compatible Chat structured stream timed out") from exc
         except httpx.HTTPError as exc:

@@ -4,7 +4,8 @@ import { cn } from "@/lib/utils";
 import type { MotionProps } from "motion/react";
 import { motion } from "motion/react";
 import type { CSSProperties, ElementType, JSX } from "react";
-import { memo, useMemo } from "react";
+import { createElement, memo, useMemo } from "react";
+import { useReducedMotionPreference } from "@/lib/motion-preferences";
 
 type MotionHTMLProps = MotionProps & Record<string, unknown>;
 
@@ -38,6 +39,7 @@ const ShimmerComponent = ({
   duration = 2,
   spread = 2,
 }: TextShimmerProps) => {
+  const reducedMotion = useReducedMotionPreference();
   const MotionComponent = getMotionComponent(
     Component as keyof JSX.IntrinsicElements
   );
@@ -46,6 +48,8 @@ const ShimmerComponent = ({
     () => (children?.length ?? 0) * spread,
     [children, spread]
   );
+
+  if (reducedMotion) return createElement(Component, { className: cn("relative inline-block text-muted-foreground", className) }, children);
 
   return (
     <MotionComponent

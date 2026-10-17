@@ -201,20 +201,12 @@ class _PinnedConnectionPool:
                     pass
 
 
-class ExternalAcquisitionService:
-    def __init__(
-        self,
-        db: Session,
-        workspace_id: str,
-        actor_id: str,
-        settings: Settings,
-    ) -> None:
-        self.db = db
-        self.workspace_id = workspace_id
-        self.actor_id = actor_id
+class PublicImageDownloadClient:
+    """Database-free, pinned HTTPS downloads shared with external acquisition."""
+
+    def __init__(self, settings: Settings, *, deadline: float | None = None) -> None:
         self.settings = settings
-        self.workspace = SessionWorkspaceService(db, workspace_id, actor_id, settings)
-        self.audit = AuditRepository(db, workspace_id)
+        self.deadline = deadline
         self._classified_host_cache = _ClassifiedHostCache(
             ttl_seconds=float(getattr(settings, "external_download_dns_cache_ttl_seconds", 300.0)),
             max_entries=int(getattr(settings, "external_download_dns_cache_max_entries", 128)),
@@ -224,11 +216,9 @@ class ExternalAcquisitionService:
             idle_timeout_seconds=float(getattr(settings, "external_download_idle_connection_timeout_seconds", 60.0)),
         )
 
-    @staticmethod
-    def canonical_spec(kind: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], str]:
-        spec = {"kind": kind, **arguments}
-        encoded = json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return spec, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def close(self) -> None:
+        self._connection_pool.close_all()
 
     @staticmethod
     def initial_hostname(url: str) -> str:
@@ -243,6 +233,253 @@ class ExternalAcquisitionService:
             return normalize_hostname(parsed.hostname)
         except Exception as exc:
             raise AppError(422, "external_download_host_invalid", "Download host must be a public DNS name") from exc
+
+    def _classified_host_addresses(self, host: str) -> tuple[str, ...]:
+        """Return classified-public addresses for ``host``, resolving and
+        classifying only on a cache miss.
+
+        A hit reuses the exact answer the uncached path would have produced, so
+        receipt provenance and connection pinning are unchanged. Denied/empty
+        answers are never cached, so a policy failure is re-evaluated on every
+        miss. Bounded per service instance: the hot multi-file GitHub loop and
+        the parallel image batch share one resolution per host instead of one
+        per file.
+        """
+        cache = getattr(self, "_classified_host_cache", None)
+        if cache is None:
+            # Test doubles built with object.__new__ bypass __init__; build the
+            # cache lazily so they still exercise the exact same path.
+            cache = _ClassifiedHostCache(
+                ttl_seconds=float(
+                    getattr(self.settings, "external_download_dns_cache_ttl_seconds", 300.0)
+                ),
+                max_entries=int(
+                    getattr(self.settings, "external_download_dns_cache_max_entries", 128)
+                ),
+            )
+            self._classified_host_cache = cache
+        cached = cache.get(host)
+        if cached is not None:
+            return cached
+        addresses = system_resolver(host)
+        try:
+            classified = _classify_all(addresses)
+        except EgressPolicyDenied as exc:
+            raise AppError(
+                422,
+                "external_download_host_blocked",
+                "Download host did not resolve exclusively to public addresses",
+            ) from exc
+        public_addresses = tuple(address for address, _ in classified)
+        cache.put(host, public_addresses)
+        return public_addresses
+
+    def _request_hop(
+        self,
+        *,
+        host: str,
+        ip: str,
+        path: str,
+        accept: str,
+        max_bytes: int,
+        timeout: float,
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Perform one pinned HTTP GET hop, reusing a keep-alive connection.
+
+        Returns ``(status, headers, body)``. Redirect and error responses are
+        drained (up to 4096 bytes) and their connection is never returned to the
+        pool; only a fully-read 2xx response on a connection whose server did
+        not ask to close is released back. A pooled connection the server closed
+        while idle is discarded and the hop is retried once on a fresh
+        connection (GET is idempotent).
+        """
+        pool = getattr(self, "_connection_pool", None)
+        if pool is None:
+            # Test doubles built with object.__new__ bypass __init__; build the
+            # pool lazily so they still exercise the exact same path.
+            pool = _PinnedConnectionPool(
+                max_idle_connections=int(
+                    getattr(self.settings, "external_download_max_idle_connections", 4)
+                ),
+                idle_timeout_seconds=float(
+                    getattr(self.settings, "external_download_idle_connection_timeout_seconds", 60.0)
+                ),
+            )
+            self._connection_pool = pool
+        for attempt in (1, 2):
+            deadline = getattr(self, "deadline", None)
+            if deadline is not None:
+                timeout = min(timeout, deadline - time.monotonic())
+                if timeout <= 0:
+                    raise AppError(504, "external_download_timeout", "Image resource deadline exceeded")
+            connection = pool.acquire(host, ip)
+            reused = connection is not None
+            if connection is None:
+                connection = _PinnedHTTPSConnection(host, ip, port=443, timeout=timeout)
+            try:
+                if getattr(connection, "sock", None) is not None:
+                    connection.sock.settimeout(timeout)
+                connection.request(
+                    "GET",
+                    path,
+                    headers={
+                        "Host": host,
+                        "User-Agent": "LearnGraph-ExternalAcquisition/1.0",
+                        "Accept": accept,
+                        "Accept-Encoding": "identity",
+                    },
+                )
+                response = connection.getresponse()
+                status = int(response.status)
+                headers = {name.casefold(): value for name, value in response.getheaders()}
+                if status in REDIRECT_STATUSES or status < 200 or status >= 300:
+                    response.read(4096)
+                    return status, headers, b""
+                declared_length = headers.get("content-length")
+                try:
+                    declared_size = int(declared_length) if declared_length else None
+                except (TypeError, ValueError):
+                    declared_size = None
+                if declared_size is not None and declared_size > max_bytes:
+                    raise AppError(413, "external_download_too_large", "Remote content exceeds the configured limit")
+                if deadline is None:
+                    data = response.read(max_bytes + 1)
+                else:
+                    chunks = []
+                    size = 0
+                    while size <= max_bytes:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AppError(504, "external_download_timeout", "Image resource deadline exceeded")
+                        if getattr(connection, "sock", None) is not None:
+                            connection.sock.settimeout(min(timeout, remaining))
+                        chunk = response.read1(min(65_536, max_bytes + 1 - size))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        size += len(chunk)
+                    data = b"".join(chunks)
+                if len(data) > max_bytes:
+                    raise AppError(413, "external_download_too_large", "Remote content exceeds the configured limit")
+                if not response.will_close:
+                    pool.release(connection, host=host, ip=ip)
+                    connection = None
+                return status, headers, data
+            except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+                if reused and attempt == 1:
+                    # The pooled keep-alive connection may have been closed by
+                    # the server while idle; drop it and retry once fresh.
+                    continue
+                raise AppError(502, "external_download_failed", "Remote download failed") from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+        raise AppError(502, "external_download_failed", "Remote download failed")  # pragma: no cover
+
+    def _download(
+        self,
+        url: str,
+        *,
+        allowed_hosts: set[str],
+        max_bytes: int,
+        accept: str = "*/*",
+    ) -> DownloadedResponse:
+        requested_url = url.strip()
+        current = requested_url
+        redirects: list[dict[str, Any]] = []
+        resolved: dict[str, list[str]] = {}
+        for _ in range(self.settings.external_download_max_redirects + 1):
+            parsed = urlsplit(current)
+            host = self.initial_hostname(current)
+            if host not in allowed_hosts:
+                raise AcquisitionApprovalRequired(host)
+            host_addresses = self._classified_host_addresses(host)
+            resolved[host] = list(host_addresses)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += f"?{parsed.query}"
+            status, headers, data = self._request_hop(
+                host=host,
+                ip=host_addresses[0],
+                path=path,
+                accept=accept,
+                max_bytes=max_bytes,
+                timeout=float(self.settings.external_download_timeout_seconds),
+            )
+            if status in REDIRECT_STATUSES:
+                location = headers.get("location")
+                if not location:
+                    raise AppError(502, "external_download_redirect_invalid", "Remote redirect omitted Location")
+                target = urljoin(current, location)
+                redirects.append({"status": status, "from": current, "to": target})
+                current = target
+                continue
+            if status < 200 or status >= 300:
+                raise AppError(502, "external_download_http_error", f"Remote server returned HTTP {status}",
+                    {"remote_status": status, "retry_after": headers.get("retry-after", "")})
+            return DownloadedResponse(
+                requested_url=requested_url,
+                final_url=current,
+                redirect_chain=redirects,
+                resolved_addresses=resolved,
+                status=status,
+                declared_mime=(headers.get("content-type") or "application/octet-stream").split(";", 1)[0].strip().casefold(),
+                data=data,
+                headers=dict(headers),
+            )
+        raise AppError(422, "external_download_too_many_redirects", "Remote download exceeded the redirect limit")
+
+    def _sanitize_image(self, data: bytes) -> tuple[bytes, str, int, int, str]:
+        try:
+            with Image.open(BytesIO(data)) as probe:
+                image_format = str(probe.format or "").upper()
+                width, height = probe.size
+                frames = int(getattr(probe, "n_frames", 1) or 1)
+                if image_format not in SUPPORTED_IMAGE_FORMATS:
+                    raise AppError(422, "external_image_format_unsupported", "Only PNG, JPEG, and WebP images are supported")
+                if frames != 1:
+                    raise AppError(422, "external_image_animated_unsupported", "Animated images are not supported")
+                if width <= 0 or height <= 0 or width * height > self.settings.external_image_download_max_pixels:
+                    raise AppError(413, "external_image_pixels_exceeded", "Image dimensions exceed the configured pixel limit")
+                probe.load()
+                sanitized = probe.convert("RGB") if image_format == "JPEG" else probe.convert("RGBA")
+                output = BytesIO()
+                if image_format == "JPEG":
+                    sanitized.save(output, format="JPEG", quality=92, optimize=True)
+                    mime = "image/jpeg"
+                elif image_format == "WEBP":
+                    sanitized.save(output, format="WEBP", quality=92, method=4)
+                    mime = "image/webp"
+                else:
+                    sanitized.save(output, format="PNG", optimize=True)
+                    mime = "image/png"
+                return output.getvalue(), mime, width, height, image_format
+        except AppError:
+            raise
+        except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
+            raise AppError(422, "external_image_invalid", "Downloaded content is not a valid supported image") from exc
+
+class ExternalAcquisitionService(PublicImageDownloadClient):
+    def __init__(
+        self,
+        db: Session,
+        workspace_id: str,
+        actor_id: str,
+        settings: Settings,
+    ) -> None:
+        self.db = db
+        self.workspace_id = workspace_id
+        self.actor_id = actor_id
+        self.settings = settings
+        self.workspace = SessionWorkspaceService(db, workspace_id, actor_id, settings)
+        self.audit = AuditRepository(db, workspace_id)
+        super().__init__(settings)
+
+    @staticmethod
+    def canonical_spec(kind: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        spec = {"kind": kind, **arguments}
+        encoded = json.dumps(spec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return spec, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def download_image(
         self,
@@ -826,207 +1063,6 @@ class ExternalAcquisitionService:
             return json.loads(response.data.decode("utf-8")), response
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AppError(502, "external_download_invalid_json", "Remote service returned invalid JSON") from exc
-
-    def _classified_host_addresses(self, host: str) -> tuple[str, ...]:
-        """Return classified-public addresses for ``host``, resolving and
-        classifying only on a cache miss.
-
-        A hit reuses the exact answer the uncached path would have produced, so
-        receipt provenance and connection pinning are unchanged. Denied/empty
-        answers are never cached, so a policy failure is re-evaluated on every
-        miss. Bounded per service instance: the hot multi-file GitHub loop and
-        the parallel image batch share one resolution per host instead of one
-        per file.
-        """
-        cache = getattr(self, "_classified_host_cache", None)
-        if cache is None:
-            # Test doubles built with object.__new__ bypass __init__; build the
-            # cache lazily so they still exercise the exact same path.
-            cache = _ClassifiedHostCache(
-                ttl_seconds=float(
-                    getattr(self.settings, "external_download_dns_cache_ttl_seconds", 300.0)
-                ),
-                max_entries=int(
-                    getattr(self.settings, "external_download_dns_cache_max_entries", 128)
-                ),
-            )
-            self._classified_host_cache = cache
-        cached = cache.get(host)
-        if cached is not None:
-            return cached
-        addresses = system_resolver(host)
-        try:
-            classified = _classify_all(addresses)
-        except EgressPolicyDenied as exc:
-            raise AppError(
-                422,
-                "external_download_host_blocked",
-                "Download host did not resolve exclusively to public addresses",
-            ) from exc
-        public_addresses = tuple(address for address, _ in classified)
-        cache.put(host, public_addresses)
-        return public_addresses
-
-    def _request_hop(
-        self,
-        *,
-        host: str,
-        ip: str,
-        path: str,
-        accept: str,
-        max_bytes: int,
-        timeout: float,
-    ) -> tuple[int, dict[str, str], bytes]:
-        """Perform one pinned HTTP GET hop, reusing a keep-alive connection.
-
-        Returns ``(status, headers, body)``. Redirect and error responses are
-        drained (up to 4096 bytes) and their connection is never returned to the
-        pool; only a fully-read 2xx response on a connection whose server did
-        not ask to close is released back. A pooled connection the server closed
-        while idle is discarded and the hop is retried once on a fresh
-        connection (GET is idempotent).
-        """
-        pool = getattr(self, "_connection_pool", None)
-        if pool is None:
-            # Test doubles built with object.__new__ bypass __init__; build the
-            # pool lazily so they still exercise the exact same path.
-            pool = _PinnedConnectionPool(
-                max_idle_connections=int(
-                    getattr(self.settings, "external_download_max_idle_connections", 4)
-                ),
-                idle_timeout_seconds=float(
-                    getattr(self.settings, "external_download_idle_connection_timeout_seconds", 60.0)
-                ),
-            )
-            self._connection_pool = pool
-        for attempt in (1, 2):
-            connection = pool.acquire(host, ip)
-            reused = connection is not None
-            if connection is None:
-                connection = _PinnedHTTPSConnection(host, ip, port=443, timeout=timeout)
-            try:
-                connection.request(
-                    "GET",
-                    path,
-                    headers={
-                        "Host": host,
-                        "User-Agent": "LearnGraph-ExternalAcquisition/1.0",
-                        "Accept": accept,
-                        "Accept-Encoding": "identity",
-                    },
-                )
-                response = connection.getresponse()
-                status = int(response.status)
-                headers = {name.casefold(): value for name, value in response.getheaders()}
-                if status in REDIRECT_STATUSES or status < 200 or status >= 300:
-                    response.read(4096)
-                    return status, headers, b""
-                declared_length = headers.get("content-length")
-                try:
-                    declared_size = int(declared_length) if declared_length else None
-                except (TypeError, ValueError):
-                    declared_size = None
-                if declared_size is not None and declared_size > max_bytes:
-                    raise AppError(413, "external_download_too_large", "Remote content exceeds the configured limit")
-                data = response.read(max_bytes + 1)
-                if len(data) > max_bytes:
-                    raise AppError(413, "external_download_too_large", "Remote content exceeds the configured limit")
-                if not response.will_close:
-                    pool.release(connection, host=host, ip=ip)
-                    connection = None
-                return status, headers, data
-            except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
-                if reused and attempt == 1:
-                    # The pooled keep-alive connection may have been closed by
-                    # the server while idle; drop it and retry once fresh.
-                    continue
-                raise AppError(502, "external_download_failed", "Remote download failed") from exc
-            finally:
-                if connection is not None:
-                    connection.close()
-        raise AppError(502, "external_download_failed", "Remote download failed")  # pragma: no cover
-
-    def _download(
-        self,
-        url: str,
-        *,
-        allowed_hosts: set[str],
-        max_bytes: int,
-        accept: str = "*/*",
-    ) -> DownloadedResponse:
-        requested_url = url.strip()
-        current = requested_url
-        redirects: list[dict[str, Any]] = []
-        resolved: dict[str, list[str]] = {}
-        for _ in range(self.settings.external_download_max_redirects + 1):
-            parsed = urlsplit(current)
-            host = self.initial_hostname(current)
-            if host not in allowed_hosts:
-                raise AcquisitionApprovalRequired(host)
-            host_addresses = self._classified_host_addresses(host)
-            resolved[host] = list(host_addresses)
-            path = parsed.path or "/"
-            if parsed.query:
-                path += f"?{parsed.query}"
-            status, headers, data = self._request_hop(
-                host=host,
-                ip=host_addresses[0],
-                path=path,
-                accept=accept,
-                max_bytes=max_bytes,
-                timeout=float(self.settings.external_download_timeout_seconds),
-            )
-            if status in REDIRECT_STATUSES:
-                location = headers.get("location")
-                if not location:
-                    raise AppError(502, "external_download_redirect_invalid", "Remote redirect omitted Location")
-                target = urljoin(current, location)
-                redirects.append({"status": status, "from": current, "to": target})
-                current = target
-                continue
-            if status < 200 or status >= 300:
-                raise AppError(502, "external_download_http_error", f"Remote server returned HTTP {status}")
-            return DownloadedResponse(
-                requested_url=requested_url,
-                final_url=current,
-                redirect_chain=redirects,
-                resolved_addresses=resolved,
-                status=status,
-                declared_mime=(headers.get("content-type") or "application/octet-stream").split(";", 1)[0].strip().casefold(),
-                data=data,
-                headers=dict(headers),
-            )
-        raise AppError(422, "external_download_too_many_redirects", "Remote download exceeded the redirect limit")
-
-    def _sanitize_image(self, data: bytes) -> tuple[bytes, str, int, int, str]:
-        try:
-            with Image.open(BytesIO(data)) as probe:
-                image_format = str(probe.format or "").upper()
-                width, height = probe.size
-                frames = int(getattr(probe, "n_frames", 1) or 1)
-                if image_format not in SUPPORTED_IMAGE_FORMATS:
-                    raise AppError(422, "external_image_format_unsupported", "Only PNG, JPEG, and WebP images are supported")
-                if frames != 1:
-                    raise AppError(422, "external_image_animated_unsupported", "Animated images are not supported")
-                if width <= 0 or height <= 0 or width * height > self.settings.external_image_download_max_pixels:
-                    raise AppError(413, "external_image_pixels_exceeded", "Image dimensions exceed the configured pixel limit")
-                probe.load()
-                sanitized = probe.convert("RGB") if image_format == "JPEG" else probe.convert("RGBA")
-                output = BytesIO()
-                if image_format == "JPEG":
-                    sanitized.save(output, format="JPEG", quality=92, optimize=True)
-                    mime = "image/jpeg"
-                elif image_format == "WEBP":
-                    sanitized.save(output, format="WEBP", quality=92, method=4)
-                    mime = "image/webp"
-                else:
-                    sanitized.save(output, format="PNG", optimize=True)
-                    mime = "image/png"
-                return output.getvalue(), mime, width, height, image_format
-        except AppError:
-            raise
-        except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
-            raise AppError(422, "external_image_invalid", "Downloaded content is not a valid supported image") from exc
 
     @staticmethod
     def _github_path(value: str) -> str:

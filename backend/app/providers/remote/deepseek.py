@@ -175,6 +175,12 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
             supports_structured_chat=True,
             **kwargs,
         )
+        # Use the explicit OpenAI-compatible route on the official origin.
+        # In the deployed path the unversioned route disconnected large tool
+        # requests; the same authenticated payload succeeds through /v1.
+        # Custom gateway paths retain their configured routing.
+        if is_official_deepseek_api_base_url(self.base_url):
+            self.base_url = self.base_url.rstrip('/') + '/v1'
 
     def _apply_call_options(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
         payload = super()._apply_call_options(payload, responses=responses)
@@ -217,7 +223,7 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
         aggregates: dict[int, dict[str, Any]],
         raw: dict[str, Any],
         fallback_index: int,
-    ) -> None:
+    ) -> int:
         raw_index = raw.get("index", fallback_index)
         index = raw_index if isinstance(raw_index, int) and raw_index >= 0 else fallback_index
         item = aggregates.setdefault(
@@ -232,12 +238,13 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
             item["type"] = raw["type"]
         function = raw.get("function")
         if not isinstance(function, dict):
-            return
+            return index
         target = item["function"]
         if isinstance(function.get("name"), str) and function["name"]:
             target["name"] += function["name"]
         if isinstance(function.get("arguments"), str):
             target["arguments"] += function["arguments"]
+        return index
 
     @staticmethod
     def _error_event_message(error: object) -> str:
@@ -279,7 +286,11 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
                 with client.stream(
                     "POST",
                     f"{self.base_url}/chat/completions",
-                    json=payload,
+                    # Large one-write JSON requests are disconnected on some
+                    # deployment proxy paths. Preserve the exact JSON document
+                    # while sending bounded request chunks over HTTP.
+                    content=_request_body_chunks(payload),
+                    headers={"Content-Type": "application/json"},
                 ) as response:
                     self._raise_for_status(response)
                     self.last_request_id = (
@@ -349,11 +360,17 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
                             for fallback_index, raw_tool_call in enumerate(raw_tool_calls):
                                 if isinstance(raw_tool_call, dict):
                                     saw_model_output = True
-                                    self._merge_tool_delta(
+                                    index = self._merge_tool_delta(
                                         tool_aggregates,
                                         raw_tool_call,
                                         fallback_index,
                                     )
+                                    aggregate = tool_aggregates[index]
+                                    yield ProviderStreamEvent("tool_call_delta", tool_calls=[{
+                                        "id": aggregate.get("id", ""), "index": index,
+                                        "function": {"name": aggregate["function"]["name"],
+                                            "arguments": (raw_tool_call.get("function") or {}).get("arguments", "")},
+                                    }])
         except httpx.TimeoutException as exc:
             raise ProviderTimeoutError("DeepSeek chat stream timed out") from exc
         except httpx.HTTPError as exc:
@@ -378,3 +395,9 @@ class DeepSeekChatProvider(OpenAICompatibleChatProvider):
         if tool_calls:
             yield ProviderStreamEvent("tool_calls", tool_calls=tool_calls)
         yield ProviderStreamEvent("completed", finish_reason=finish_reason)
+
+
+def _request_body_chunks(payload: dict[str, Any]) -> Iterable[bytes]:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    for offset in range(0, len(body), 512):
+        yield body[offset:offset + 512]

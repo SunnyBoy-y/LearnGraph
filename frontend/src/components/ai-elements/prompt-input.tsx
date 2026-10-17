@@ -34,7 +34,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { FilePreviewDialog } from "@/components/resources/file-preview-dialog";
+import { resolveFilePreviewKind } from "@/lib/file-preview";
+import { ImageLightbox } from "@/components/chat/image-lightbox";
 import {
   Tooltip,
   TooltipContent,
@@ -973,7 +975,10 @@ export const PromptInputAttachments = ({
   ...props
 }: PromptInputAttachmentsProps) => {
   const attachments = usePromptInputAttachments();
-  const [preview, setPreview] = useState<FileUIPart | null>(null);
+  const [preview, setPreview] = useState<(FileUIPart & { localFile?: File }) | null>(null);
+  const imagePreview = preview && resolveFilePreviewKind(preview.filename ?? "", preview.mediaType) === "image" && preview.url
+    ? preview
+    : null;
   if (!attachments.files.length) return null;
   const row = (
     <div
@@ -1016,20 +1021,24 @@ export const PromptInputAttachments = ({
         </div>
         );
       })}
-      <Dialog onOpenChange={(open) => { if (!open) setPreview(null); }} open={Boolean(preview)}>
-        <DialogContent className="max-w-4xl">
-          <DialogTitle className="truncate text-sm">{preview?.filename ?? "附件预览"}</DialogTitle>
-          {preview?.mediaType?.startsWith("image/") && preview.url ? (
-            <img alt={preview.filename ?? "附件预览"} className="max-h-[76svh] w-full object-contain" src={preview.url} />
-          ) : preview?.mediaType === "application/pdf" && preview.url ? (
-            <iframe className="h-[70svh] w-full border" sandbox="" src={preview.url} title={preview.filename ?? "PDF 附件预览"} />
-          ) : preview ? (
-            <div className="grid min-h-56 place-items-center border-y p-8 text-center text-sm text-muted-foreground">
-              <div><FileTextIcon className="mx-auto mb-3 size-7" /><p>{preview.filename}</p><small>该类型不在对话框内执行；发送后可从资料学习页查看。</small></div>
-            </div>
-          ) : null}
-        </DialogContent>
-      </Dialog>
+      {imagePreview ? (
+        <ImageLightbox
+          alt={imagePreview.filename ?? "附件预览"}
+          dialogTitle={`预览附件 ${imagePreview.filename ?? "未命名附件"}`}
+          onOpenChange={(open) => { if (!open) setPreview(null); }}
+          open
+          src={imagePreview.url}
+        />
+      ) : null}
+      <FilePreviewDialog
+        blob={preview?.localFile}
+        url={preview?.url}
+        filename={preview?.filename ?? "附件预览"}
+        mimeType={preview?.mediaType}
+        open={Boolean(preview) && !imagePreview}
+        onOpenChange={(open) => { if (!open) setPreview(null); }}
+        description="待发送附件 · 内置预览"
+      />
     </div>
   );
   return portalTarget ? createPortal(row, portalTarget) : row;

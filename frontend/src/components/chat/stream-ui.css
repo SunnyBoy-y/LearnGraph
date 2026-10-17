@@ -1,0 +1,337 @@
+/* Share the existing message-component shell. Scope layout rules to this
+   renderer; shared Button/Input/Select primitives own their control styles. */
+.message-component.stream-ui.stream-ui--document {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+  font-size: var(--reading-font-size, 16px);
+}
+.message-component.stream-ui {
+  display: block;
+  padding: 0;
+  color: var(--foreground);
+  overflow: hidden;
+  min-width: 0;
+  font-size: 12px;
+}
+.stream-ui .stream-ui__heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 14px 14px 10px;
+}
+.stream-ui__heading-copy {
+  flex: 1;
+  min-width: 0;
+}
+.stream-ui .stream-ui__title {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.stream-ui .stream-ui__heading p {
+  color: var(--muted-foreground);
+  font-size: 11px;
+  margin: 2px 0 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.stream-ui .stream-ui__status {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.stream-ui[aria-busy="true"] .stream-ui__status::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--chart-1);
+  animation: stream-ui-pulse 1.5s infinite;
+}
+.stream-ui__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+}
+.stream-ui__toolbar label,
+.stream-ui__control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+.stream-ui .stream-ui__search {
+  width: min(220px, 100%);
+  height: 28px;
+  font-size: 12px;
+}
+.stream-ui__node:focus-visible rect {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}
+.stream-ui__toolbar input[type="range"] {
+  width: 80px;
+  accent-color: var(--primary);
+}
+.stream-ui__segmented {
+  display: flex;
+  background: var(--muted);
+  border-radius: 8px;
+  padding: 2px;
+}
+.stream-ui__segmented [data-slot="button"][aria-pressed="true"] {
+  background: var(--card);
+  box-shadow: 0 1px 3px #0001;
+}
+.stream-ui__legend {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  padding: 4px 14px;
+}
+.stream-ui__legend [aria-pressed="false"] {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+.stream-ui__legend i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.stream-ui__chart {
+  width: 100%;
+  display: block;
+  padding: 0 8px;
+}
+.stream-ui__chart text,
+.stream-ui__graph-scroll svg text {
+  font-size: 11px;
+  font-family: inherit;
+  fill: var(--muted-foreground);
+}
+.stream-ui__grid {
+  stroke: var(--border);
+  stroke-dasharray: 3 5;
+}
+.stream-ui__tooltip {
+  min-height: 32px;
+  padding: 0 14px 10px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.stream-ui__graph-scroll {
+  overflow: auto;
+  max-height: 500px;
+  background-image: radial-gradient(var(--border) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+.stream-ui__graph-scroll svg {
+  display: block;
+  width: 100%;
+  min-width: 500px;
+}
+.stream-ui__edge line {
+  stroke: var(--muted-foreground);
+  stroke-width: 1.3;
+  opacity: 0.65;
+}
+.stream-ui__edge text {
+  paint-order: stroke;
+  stroke: var(--card);
+  stroke-width: 5px;
+  stroke-linejoin: round;
+}
+.stream-ui__node {
+  cursor: grab;
+  touch-action: none;
+}
+.stream-ui__node rect {
+  fill: var(--card);
+  stroke: var(--border);
+  stroke-width: 1.5;
+}
+.stream-ui__node text {
+  fill: var(--foreground);
+  font-weight: 500;
+  pointer-events: none;
+}
+.stream-ui__node[data-selected="true"] rect {
+  stroke: var(--chart-1);
+  stroke-width: 2;
+  fill: var(--muted);
+}
+.stream-ui__detail {
+  margin: 12px 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--muted);
+}
+.stream-ui__detail p {
+  margin: 6px 0;
+  color: var(--muted-foreground);
+  white-space: pre-wrap;
+}
+.stream-ui__table-scroll {
+  overflow-x: auto;
+  max-height: 420px;
+  margin: 8px 14px 14px;
+}
+.stream-ui table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+.stream-ui th,
+.stream-ui td {
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  padding: 10px 12px;
+  white-space: nowrap;
+}
+.stream-ui th {
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+.stream-ui thead {
+  position: sticky;
+  top: 0;
+  background: var(--card);
+}
+.message-component.stream-ui[data-ui-component="timeline"] {
+  font-size: max(16px, var(--reading-font-size, 16px));
+  line-height: 1.65;
+}
+.stream-ui[data-ui-component="timeline"] .stream-ui__title {
+  font-size: 1em;
+  line-height: 1.6;
+}
+.stream-ui[data-ui-component="timeline"] .stream-ui__heading > svg {
+  width: 20px;
+  height: 20px;
+  margin-top: 3px;
+}
+.stream-ui[data-ui-component="timeline"] .stream-ui__status {
+  font-size: 12px;
+}
+.stream-ui .stream-ui__timeline {
+  list-style: none;
+  margin: 14px 18px 18px;
+  padding: 0;
+}
+.stream-ui .stream-ui__timeline > li {
+  position: relative;
+  margin: 0;
+  padding: 0 0 24px 24px;
+  border-left: 1px solid var(--border);
+}
+.stream-ui .stream-ui__timeline > li:last-child {
+  border-left-color: transparent;
+  padding-bottom: 0;
+}
+.stream-ui .stream-ui__timeline > li::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  left: -5px;
+  width: 9px;
+  height: 9px;
+  background: var(--chart-1);
+  border-radius: 50%;
+}
+.stream-ui .stream-ui__timeline time {
+  display: block;
+  font-size: 0.875em;
+  font-weight: 500;
+  color: color-mix(in srgb, var(--foreground) 75%, var(--background));
+}
+.stream-ui .stream-ui__timeline details {
+  border: 0;
+  padding: 0;
+}
+.stream-ui .stream-ui__timeline summary {
+  cursor: pointer;
+  color: var(--foreground);
+  font-size: 1em;
+  font-weight: 600;
+  line-height: 1.65;
+  margin-top: 4px;
+  padding-block: 3px;
+  overflow-wrap: anywhere;
+}
+.stream-ui .stream-ui__timeline p {
+  color: color-mix(in srgb, var(--foreground) 85%, var(--background));
+  font-size: 0.9375em;
+  line-height: 1.75;
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+}
+.stream-ui .stream-ui__timeline summary:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+.stream-ui .stream-ui__metrics {
+  padding: 0 14px 14px;
+  margin: 0;
+}
+.stream-ui__metrics .metric-card__value small {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  margin-left: 5px;
+  font-weight: 400;
+  letter-spacing: normal;
+  color: var(--muted-foreground);
+}
+.stream-ui__footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding: 10px 14px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.stream-ui__footer > span {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.stream-ui__empty {
+  min-height: 140px;
+  display: grid;
+  place-items: center;
+  color: var(--muted-foreground);
+}
+.stream-ui__invalid,
+.stream-ui [role="alert"] {
+  padding: 12px 14px;
+  color: var(--destructive);
+}
+@keyframes stream-ui-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .stream-ui[aria-busy="true"] .stream-ui__status::before {
+    animation: none;
+  }
+}
+@media (max-width: 420px) {
+  .stream-ui__footer {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .stream-ui__footer [data-slot="button"] {
+    margin-left: auto;
+  }
+}

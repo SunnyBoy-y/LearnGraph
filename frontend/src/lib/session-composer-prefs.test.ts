@@ -157,6 +157,7 @@ describe("session composer preferences", () => {
       providerId: "provider-a",
       modelId: "model-a",
       responseMode: "agentic",
+      thinkingMode: "off",
     });
     expect(prefsFromModelSnapshot({ thinking_mode: "high" })).toEqual({
       responseMode: "agentic",
@@ -168,6 +169,13 @@ describe("session composer preferences", () => {
     });
     expect(prefsFromModelSnapshot({ provider_id: 5, model_id: "" })).toEqual({});
     expect(prefsFromModelSnapshot([])).toEqual({});
+  });
+
+  it.each(["low", "medium", "high", "xhigh"])("restores agentic thinking %s independently of response mode", (thinking) => {
+    expect(prefsFromModelSnapshot({
+      agent_mode: true, thinking_mode: thinking, search_route: "disabled", generation_mode: "image",
+    })).toEqual({ responseMode: "agentic", thinkingMode: thinking, searchRoute: "disabled", generationMode: "image" });
+    expect(prefsFromModelSnapshot({ search_route: "invalid", generation_mode: "video" })).toEqual({});
   });
 
   it("uses fast-mode defaults consistently and ignores model selections when checking defaults", () => {

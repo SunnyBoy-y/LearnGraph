@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest'
 import { groupAnswerParts } from '@/components/chat/question-set-pager'
 import {
   artifactLayout,
+  ARTIFACT_PART_TYPES,
   groupPartsForDisplay,
+  partitionMessageParts,
   isInlineLayoutArtifactPart,
   isSideLayoutArtifactPart,
 } from '@/features/chat/chat-message-parts'
@@ -22,6 +24,46 @@ function firstAnswer(segments: ReturnType<typeof groupPartsForDisplay>) {
 }
 
 describe('groupPartsForDisplay chain/answer split', () => {
+  it.each([...ARTIFACT_PART_TYPES])('folds failed %s artifacts in live and historical messages', (type) => {
+    const failed = part({ id: 'failed', type, status: 'failed', sequence: 1 })
+    const answer = part({ id: 'answer', type: 'text', content: '完成', sequence: 0, data: { kind: 'final_answer' } })
+    for (const options of [undefined, { live: true }, { boundary: { finalPartId: 'answer' } }]) {
+      const segments = groupPartsForDisplay([answer, failed], options)
+      expect(firstChain(segments)?.parts).toEqual([failed])
+      expect(firstAnswer(segments)?.parts).toEqual([answer])
+    }
+    expect(partitionMessageParts([answer, failed])).toEqual({ chainParts: [failed], answerParts: [answer] })
+  })
+
+  it('moves a failed generation into the chain and shows its successful retry in the body', () => {
+    const image = part({ id: 'image', type: 'image', status: 'streaming', sequence: 0 })
+    expect(firstAnswer(groupPartsForDisplay([image], { live: true }))?.parts).toEqual([image])
+    const failed = { ...image, status: 'failed' as const }
+    expect(firstAnswer(groupPartsForDisplay([failed], { live: true }))).toBeUndefined()
+    const retry = { ...image, id: 'retry', status: 'completed' as const, sequence: 1 }
+    const segments = groupPartsForDisplay([failed, retry])
+    expect(firstChain(segments)?.parts).toEqual([failed])
+    expect(firstAnswer(segments)?.parts).toEqual([retry])
+  })
+
+  it('keeps failed probe narration and failed graph proposals inside the chain', () => {
+    const parts = [
+      part({ id: 'probe', type: 'text', content: '先验证发布通路', sequence: 0, data: { kind: 'plan_narration' } }),
+      part({ id: 'file', type: 'sandbox_artifact', status: 'failed', sequence: 1 }),
+      part({ id: 'image', type: 'image', status: 'failed', sequence: 2 }),
+      part({ id: 'graph', type: 'component', status: 'failed', sequence: 3, data: { component_type: 'graph_update_proposal' } }),
+      part({ id: 'answer', type: 'text', content: '最终结果', sequence: 4, data: { kind: 'final_answer' } }),
+    ]
+    const segments = groupPartsForDisplay(parts)
+    expect(firstChain(segments)?.parts.map(p => p.id)).toEqual(['probe', 'file', 'image', 'graph'])
+    expect(firstAnswer(segments)?.parts.map(p => p.id)).toEqual(['answer'])
+  })
+
+  it('keeps turn-level errors visible in the answer', () => {
+    const error = part({ id: 'error', type: 'error', status: 'failed', content: '回复中断' })
+    expect(firstAnswer(groupPartsForDisplay([error]))?.parts).toEqual([error])
+  })
+
   it('hoists reasoning parts emitted after the final-answer boundary into the chain', () => {
     // OpenAI Responses streams the reasoning summary as a trailing output item:
     // reasoning_content → final answer text → reasoning_summary. The summary

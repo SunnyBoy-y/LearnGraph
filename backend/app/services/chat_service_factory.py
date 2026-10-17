@@ -386,6 +386,7 @@ def build_chat_service(
             )
         ),
         agent_tool_runtime=agent_tool_runtime,
+        image_search_provider_loader=lambda: image_search_provider_for_workspace(db, context.workspace_id, settings),
         vision_provider=vision_provider_for_workspace(
             db, context.workspace_id, settings
         ),

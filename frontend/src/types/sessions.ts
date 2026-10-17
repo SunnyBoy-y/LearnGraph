@@ -16,6 +16,7 @@ export type MessagePartType =
   | 'graph_context'
   | 'quiz'
   | 'chart'
+  | 'ui'
   | 'sandbox'
   | 'sandbox_artifact'
   | 'subapp_artifact'
@@ -76,7 +77,7 @@ export interface SessionCreateRequest {
   project_id?: string | null
   /** Nest under a parent conversation (e.g. 划词解释). */
   parent_session_id?: string | null
-  session_kind?: 'main' | 'concept_branch' | 'side' | 'standalone'
+  session_kind?: 'main' | 'concept_branch' | 'side' | 'standalone' | 'agent'
   memory_enabled?: boolean
 }
 
@@ -132,7 +133,7 @@ export interface Session {
   status: string
   closed_at: IsoDateTime | null
   archived_at: IsoDateTime | null
-  session_kind: 'main' | 'concept_branch' | 'side' | 'standalone'
+  session_kind: 'main' | 'concept_branch' | 'side' | 'standalone' | 'agent'
   writeback_policy: 'normal' | 'manual_only'
   context_capsule: UnknownRecord
   /**
@@ -214,6 +215,7 @@ export interface DocumentSelectionContext {
 
 export interface MessageCreateRequest {
   content: string
+  ui_action?: import('@/lib/stream-ui').UIActionRequest
   /** Defaults to text for older callers; chat always sends this explicitly. */
   generation_mode?: 'text' | 'image'
   /** OpenAI Images output dimensions; auto lets the image model choose. */

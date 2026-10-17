@@ -190,6 +190,15 @@ export function prefsFromModelSnapshot(
   if (typeof snapshot.model_id === "string" && snapshot.model_id) {
     result.modelId = snapshot.model_id;
   }
+  if (isThinkingMode(thinking)) {
+    result.thinkingMode = thinking;
+  }
+  if (isSearchRoute(snapshot.search_route)) {
+    result.searchRoute = snapshot.search_route;
+  }
+  if (isGenerationMode(snapshot.generation_mode)) {
+    result.generationMode = snapshot.generation_mode;
+  }
   if (agentMode === true) {
     result.responseMode = "agentic";
   } else if (isThinkingMode(thinking) && thinking !== "off") {

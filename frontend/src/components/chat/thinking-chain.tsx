@@ -20,7 +20,6 @@ import {
 import { cn } from "@/lib/utils";
 import type { MessagePart } from "@/types/sessions";
 
-import { Shimmer } from "@/components/ai-elements/shimmer";
 
 /**
  * Outer ChatGPT-style thinking collapsible — one fold for the WHOLE process
@@ -166,9 +165,9 @@ export function ThinkingChain({
 
   const headerLabel =
     phase === "thinking" ? (
-      <Shimmer duration={1} className="text-[13px] font-medium">
+      <span className="text-[13px] font-medium text-muted-foreground">
         {`正在思考${open ? ` ${formatThinkingDuration(durationSec ?? 0)}` : ""}`}
-      </Shimmer>
+      </span>
     ) : isFailed ? (
       <span className="text-[13px] font-medium text-muted-foreground">
         {messageStatus === "cancelled"

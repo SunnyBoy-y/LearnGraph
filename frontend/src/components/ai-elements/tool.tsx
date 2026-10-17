@@ -21,6 +21,7 @@ import { isValidElement } from "react";
 
 import { CodeBlock } from "./code-block";
 import { ExpandableContent } from "@/components/shared/expandable-content";
+import { TaskStatusIcon } from "@/components/shared/task-status-icon";
 
 export type ToolProps = ComponentProps<typeof Collapsible>;
 
@@ -34,6 +35,7 @@ export const Tool = ({ className, ...props }: ToolProps) => (
 export type ToolPart = ToolUIPart | DynamicToolUIPart;
 
 export type ToolHeaderProps = {
+  taskKey?: string;
   title?: string;
   className?: string;
 } & (
@@ -58,16 +60,18 @@ const statusLabels: Record<ToolPart["state"], string> = {
 const statusIcons: Record<ToolPart["state"], ReactNode> = {
   "approval-requested": <ClockIcon className="size-3.5 text-yellow-600" />,
   "approval-responded": <CheckCircleIcon className="size-3.5 text-blue-600" />,
-  "input-available": <ClockIcon className="size-3.5 animate-pulse" />,
+  "input-available": <ClockIcon className="size-3.5" />,
   "input-streaming": <CircleIcon className="size-3.5" />,
   "output-available": <CheckCircleIcon className="size-3.5 text-green-600" />,
   "output-denied": <XCircleIcon className="size-3.5 text-orange-600" />,
   "output-error": <XCircleIcon className="size-3.5 text-red-600" />,
 };
 
-const getStatusBadge = (status: ToolPart["state"]) => (
+const getStatusBadge = (status: ToolPart["state"], taskKey: string) => (
   <Badge className="gap-1 rounded-full px-1.5 py-0 text-[10px]" variant="secondary">
-    {statusIcons[status]}
+    {status === 'input-available' || status === 'output-available'
+      ? <TaskStatusIcon taskKey={taskKey} status={status === 'output-available' ? 'succeeded' : 'running'} className="size-3.5" />
+      : statusIcons[status]}
     {statusLabels[status]}
   </Badge>
 );
@@ -78,6 +82,7 @@ export const ToolHeader = ({
   type,
   state,
   toolName,
+  taskKey,
   ...props
 }: ToolHeaderProps) => {
   const derivedName =
@@ -96,7 +101,7 @@ export const ToolHeader = ({
         <span className="truncate font-medium text-sm text-muted-foreground">
           {title ?? derivedName}
         </span>
-        {getStatusBadge(state)}
+        {getStatusBadge(state, taskKey ?? derivedName)}
       </div>
       <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=closed]:rotate-[-90deg]" />
     </CollapsibleTrigger>

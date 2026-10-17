@@ -139,6 +139,66 @@ class AgentToolRuntime:
         self.fetch_provider = fetch_provider
         self.audit = AuditRepository(extensions.db, workspace_id)
 
+    def discard_streamed_writes(self):
+        pending = getattr(self, "_streamed_writes", {})
+        for state in pending.values():
+            state.close()
+        pending.clear()
+
+    def stream_chat(self, provider, messages, *, chat_session_id, sandbox_session_id=None, **kwargs):
+        """Preserve parameter deltas through the tool loop; stage only disclosed writes."""
+        from app.services.streamed_file_write import StreamedFileWrite
+        import weakref
+
+        self.discard_streamed_writes()
+        self._streamed_writes = {}
+        pending = self._streamed_writes
+        # Normal dispatch closes every consumed stream. This also reclaims a
+        # completed provider turn abandoned before dispatch (e.g. cancellation).
+        weakref.finalize(self, lambda states: [state.close() for state in states.values()], pending)
+        allowed = {d.get("function", {}).get("name") for d in (kwargs.get("tools") or [])}
+        enabled = self.sandbox is not None and self.sandbox_authorized and "sandbox_write_file" in allowed
+        states = {}
+        disabled = set()
+        completed = False
+        try:
+            for event in provider.stream_chat(messages, **kwargs):
+                if enabled and event.type == "tool_call_delta":
+                    for call in event.tool_calls:
+                        function = call.get("function", {})
+                        if function.get("name") != "sandbox_write_file":
+                            continue
+                        key = call.get("id") or f"index:{call.get('index', 0)}"
+                        if key in disabled:
+                            continue
+                        state = states.get(key)
+                        if state is None:
+                            state = states[key] = StreamedFileWrite(self.sandbox, chat_session_id, sandbox_session_id)
+                        try:
+                            state.feed(function.get("arguments", ""))
+                        except Exception:
+                            # Streaming is an optimization. A partial/odd gateway
+                            # delta must not break otherwise valid completed args.
+                            state.close()
+                            states.pop(key, None)
+                            disabled.add(key)
+                elif enabled and event.type == "tool_calls":
+                    for position, call in enumerate(event.tool_calls):
+                        if call.get("function", {}).get("name") == "sandbox_write_file":
+                            state = states.get(call.get("id")) or states.get(f"index:{position}")
+                            if state is not None:
+                                pending[call["id"]] = state
+                elif event.type == "completed":
+                    completed = True
+                yield event
+        finally:
+            retained = set(map(id, pending.values())) if completed else set()
+            for state in states.values():
+                if id(state) not in retained:
+                    state.close()
+            if not completed:
+                pending.clear()
+
     def definitions(
         self,
         *,
@@ -154,12 +214,17 @@ class AgentToolRuntime:
         # Clock is a host-local, side-effect-free fact. Always expose it in Agent
         # mode so the model does not guess "today" from training data.
         definitions = list(self._clock_tool_definitions())
+        # Result recovery also applies to large non-sandbox tool results and
+        # requires no code-execution permission.
+        definitions.extend(d for d in SandboxAgentWorkspaceService.agent_tool_definitions()
+                           if d["function"]["name"] == "sandbox_read_result")
         definitions.extend(self._canvas_tool_definitions())
-        definitions.extend(self._component_admin_tool_definitions())
-        definitions.extend(self._provider_tool_definitions())
-        definitions.extend(self._management_tool_definitions())
+        management = [*self._component_admin_tool_definitions(), *self._provider_tool_definitions(), *self._management_tool_definitions()]
+        definitions.extend(management)
         definitions.extend(self._model_invocation_tool_definitions())
         definitions.extend(self._chart_tool_definitions())
+        from app.services.stream_ui import tool_definitions as stream_ui_tools
+        definitions.extend(stream_ui_tools())
         definitions.extend(self._learning_orchestration_tool_definitions())
         definitions.extend(self._voice_practice_tool_definitions())
         # Read-only observation of interactive sub-application events (T1.4).
@@ -227,6 +292,25 @@ class AgentToolRuntime:
             definitions.extend(self._session_retrieval_tool_definitions())
         if self.memory_tools is not None and memory_enabled:
             definitions.extend(self._memory_tool_definitions())
+        from app.services.runtime_tool_catalog import compact_definitions
+
+        definitions = list({d["function"]["name"]: d for d in definitions}.values())
+        definitions, catalog = compact_definitions(
+            definitions, management_names={d["function"]["name"] for d in management},
+            active_ids=effective_activated or set(), active_families=effective_families or set(),
+            progressive=progressive_enabled and (capability_families is not None or activated_capabilities is not None),
+        )
+        self.extensions.runtime_tool_descriptors = catalog
+        # Session identity/runtime selection are host responsibilities. Keep
+        # accepting old arguments at dispatch for stored calls and old Skills.
+        if progressive_enabled and (capability_families is not None or activated_capabilities is not None):
+            import copy
+            definitions = copy.deepcopy(definitions)
+            for definition in definitions:
+                if definition["function"]["name"].startswith("sandbox_"):
+                    props = definition["function"]["parameters"].get("properties", {})
+                    props.pop("sandbox_session_id", None)
+                    props.pop("runtime", None)
         return definitions
 
     def definitions_for_tools(
@@ -1222,7 +1306,7 @@ class AgentToolRuntime:
                         "Publish a channel-A declarative trusted component into the "
                         "assistant message stream (weather_card, metric_card, "
                         "option_group, single_choice, multiple_choice, fill_blank, "
-                        "short_answer_table, image_frame). Prefer this over free-form "
+                        "short_answer_table, image_frame, code_trainer). Prefer this over free-form "
                         "HTML/React for forms, metrics, and weather. "
                         "CRITICAL: never pass JSON null for optional fields — omit them. "
                         "Option cards need non-empty options[{id,label}]; "
@@ -1233,7 +1317,14 @@ class AgentToolRuntime:
                         "and optional explanation so the UI can grade after the learner confirms. "
                         "When emitting multiple practice questions in one turn, emit them "
                         "as consecutive trusted components so the client stacks them into "
-                        "one paged exercise control."
+                        "one paged exercise control. "
+                        "For programming practice use code_trainer: props={title,description,language,"
+                        "starter_code,stdin,tests:[{name,stdin,expected_stdout}],time_limit_ms}. "
+                        "Python/javascript/typescript run only in the browser; all other languages "
+                        "send code as a prompt for AI reasoning, never execute them with server tools. "
+                        "Use single-file stdin/stdout algorithms. JS/TS provide stdin:string, readline(), "
+                        "print()/console.log(); no Node.js modules. Tests are public practice examples, "
+                        "not hidden tests or trusted grades. allowed_events=['submit']."
                     ),
                     "parameters": {
                         "type": "object",
@@ -1251,6 +1342,7 @@ class AgentToolRuntime:
                                     "image_frame",
                                     "goal_draft_editor",
                                     "question_batch",
+                                    "code_trainer",
                                 ],
                             },
                             "props": {
@@ -1674,7 +1766,7 @@ class AgentToolRuntime:
                                 "type": "string",
                                 "description": (
                                     "Optional filter: model | image_generation | vision | "
-                                    "search | image_search | fetch | deep_research | memory | "
+                                    "search | image_search | fetch | memory | "
                                     "transcription"
                                 ),
                             }
@@ -1710,7 +1802,7 @@ class AgentToolRuntime:
                         "(reasoning efforts, search route, image input, etc.). "
                         "Works on every discovery-capable Provider role: chat "
                         "model, image generation, vision, transcription, "
-                        "embedding, and deep research."
+                        "embedding."
                     ),
                     "parameters": {
                         "type": "object",
@@ -1746,7 +1838,7 @@ class AgentToolRuntime:
                         "Run a non-destructive connectivity check for one Provider. "
                         "For chat / image / vision Providers this lists models via "
                         "the official GET /models endpoint (zero-cost; it never "
-                        "generates content). For search / fetch / deep-research / "
+                        "generates content). For search / fetch / "
                         "memory Providers it runs their role-specific health probe. "
                         "It never enables a Provider, changes its status, or "
                         "disables same-role peers."
@@ -2110,7 +2202,7 @@ class AgentToolRuntime:
             ),
             self._function_definition(
                 "get_functional_model_defaults",
-                "Read default Provider/model routing for chat, vision, ASR, image generation, search, fetch, and deep research.",
+                "Read default Provider/model routing for chat, vision, ASR, image generation, search, fetch.",
                 {},
             ),
             self._function_definition(
@@ -2264,7 +2356,6 @@ class AgentToolRuntime:
                                 "image_generation",
                                 "search",
                                 "fetch",
-                                "deep_research",
                             ],
                         },
                         "provider_id": {"type": ["string", "null"]},
@@ -2274,7 +2365,7 @@ class AgentToolRuntime:
                 ),
                 self._function_definition(
                     "set_models_enabled",
-                    "Enable or disable many models of one Provider at once. Works on every discovery-capable role (chat, image generation, vision, transcription, embedding, deep research). Requires workspace.manage.",
+                    "Enable or disable many models of one Provider at once. Works on every discovery-capable role (chat, image generation, vision, transcription, embedding). Requires workspace.manage.",
                     {
                         "provider_id": {"type": "string"},
                         "states": {
@@ -2423,33 +2514,6 @@ class AgentToolRuntime:
                     "model_id": {"type": "string", "maxLength": 160},
                 },
                 required=["file_id", "prompt"],
-            ),
-            self._function_definition(
-                "start_deep_research",
-                "Create a Deep Research job. Cost-bearing remote jobs remain awaiting explicit user approval. When the result contains user_approval_required=true, STOP and do not call get_deep_research again until the user approves the budget in chat; the host injects a confirmation card the user must click.",
-                {
-                    "question": {"type": "string", "minLength": 3, "maxLength": 4000},
-                    "budget_amount": {"type": "string", "description": "Native decimal amount; never convert currencies"},
-                    "currency": {"type": "string", "enum": ["USD", "CNY"]},
-                    "allowed_domains": {
-                        "type": "array",
-                        "maxItems": 50,
-                        "items": {"type": "string", "maxLength": 255},
-                    },
-                },
-                required=["question"],
-            ),
-            self._function_definition(
-                "get_deep_research",
-                "Read the status and evidence pack of a previously created Deep Research job.",
-                {
-                    "research_job_id": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 36,
-                    }
-                },
-                required=["research_job_id"],
             ),
         ]
 
@@ -3099,6 +3163,7 @@ class AgentToolRuntime:
         model_supports_image_input: bool = False,
         disclosed_tool_names: set[str] | None = None,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        self._result_session_id = chat_session_id
         # P1: never carry a write transaction across the tool-call boundary.
         # A prior tool (or an inline coordinator call) that wrote without
         # committing would hold the single SQLite write gate through this
@@ -3126,7 +3191,24 @@ class AgentToolRuntime:
                 "search and activate the capability before calling it",
             )
         try:
-            arguments = self._parse_arguments(function.get("arguments"))
+            arguments = self._parse_arguments(function.get("arguments"), tool_name=name)
+            default_budget = 4000 if name in {"sandbox_exec", "sandbox_bash", "sandbox_get_job"} else AGENT_TOOL_RESULT_MAX_BYTES // 4
+            self._result_max_bytes = min(AGENT_TOOL_RESULT_MAX_BYTES, max(4096, int(arguments.get("max_output_tokens", default_budget)) * 4))
+            if name == "ui_stream":
+                from app.services.stream_ui import prepare_command
+                if not assistant_message_id or not assistant_version_id:
+                    raise AppError(422, "ui_message_required", "UI streaming requires an assistant message")
+                update = prepare_command(
+                    self.extensions.db, self.workspace_id, chat_session_id,
+                    assistant_message_id, assistant_version_id, arguments,
+                )
+                snapshot = update["snapshot"]
+                return self._success(
+                    {"block_id": snapshot["block_id"], "revision": snapshot["revision"],
+                     "state": snapshot["state"],
+                     "reference": f"[[artifact:block_id:{snapshot['block_id']}]]"},
+                    {"tool": name, "ui_stream": update}, [],
+                )
             if name == "search_session_fragments":
                 if self.session_retrieval is None:
                     return self._failure(
@@ -3291,8 +3373,6 @@ class AgentToolRuntime:
             if name in {
                 "transcribe_audio",
                 "analyze_image",
-                "start_deep_research",
-                "get_deep_research",
             }:
                 return self._execute_model_invocation_tool(
                     name,
@@ -3396,16 +3476,60 @@ class AgentToolRuntime:
                 result, sources = self._parallel_web_research(arguments, allowed_domains)
                 return self._success(result, {"child_runs": result["child_runs"]}, sources)
             if name.startswith("sandbox_"):
+                if name == "sandbox_read_result":
+                    from app.services.tool_results import ToolResultStore
+
+                    store = ToolResultStore(self.settings.storage_root, self.workspace_id, self.actor_id, chat_session_id)
+                    result = store.read(
+                        str(arguments.get("result_ref") or ""),
+                        field=arguments.get("field"), cursor=arguments.get("cursor"),
+                        max_chars=min(16000, max(1, int(arguments.get("max_chars", 16000)))),
+                        pattern=arguments.get("pattern"),
+                    )
+                    return self._success(result, {}, [])
                 if self.sandbox is None:
                     return self._failure("sandbox_agent_unavailable", "Sandbox Agent tools are unavailable")
-                result = self.sandbox.execute_agent_tool(
-                    name,
-                    arguments,
-                    chat_session_id=chat_session_id,
-                    agent_authorized=self.sandbox_authorized,
-                )
+                versions = getattr(self, "_observed_file_versions", {})
+                self._observed_file_versions = versions
+                if name == "sandbox_edit_file" and not arguments.get("expected_sha256"):
+                    observed = versions.get((chat_session_id, arguments.get("path")))
+                    if not observed:
+                        raise AppError(409, "sandbox_edit_read_required", "Read this file in the current run before editing it")
+                    arguments = {**arguments, "expected_sha256": observed}
+                stream = getattr(self, "_streamed_writes", {}).pop(tool_call.get("id"), None)
+                if stream is not None:
+                    import hashlib
+                    content = arguments.get("content")
+                    if name != "sandbox_write_file" or not isinstance(content, str) or hashlib.sha256(content.encode()).hexdigest() != stream.digest.hexdigest():
+                        stream.close()
+                        stream = None
+                try:
+                    options = {"streamed_file": stream} if stream is not None else {}
+                    if assistant_version_id and name in {"sandbox_exec", "sandbox_get_job", "sandbox_bash"} and getattr(self.sandbox, "db", None) is not None:
+                        def wait_cancelled():
+                            from app.domain.models import MessageControl, MessageVersion
+                            db = self.sandbox.db
+                            db.commit()
+                            control = db.get(MessageControl, assistant_version_id, populate_existing=True)
+                            version = db.get(MessageVersion, assistant_version_id, populate_existing=True)
+                            return bool((control and control.cancel_requested) or version is None
+                                or version.status in {"cancelled", "failed"})
+                        options["cancel_check"] = wait_cancelled
+                    result = self.sandbox.execute_agent_tool(
+                        name, arguments, chat_session_id=chat_session_id,
+                        agent_authorized=self.sandbox_authorized, **options,
+                    )
+                finally:
+                    if stream is not None:
+                        stream.close()
+                if name == "sandbox_read_file":
+                    for entry in result.get("files", [result]):
+                        if entry.get("path") and entry.get("sha256"):
+                            versions[(chat_session_id, entry["path"])] = entry["sha256"]
+                elif result.get("path") and result.get("sha256"):
+                    versions[(chat_session_id, result["path"])] = result["sha256"]
                 status = str(result.get("status") or "completed")
-                if status in {"failed", "sandbox_timeout", "sandbox_command_failed"} and name == "sandbox_exec":
+                if status.lower() in {"failed", "sandbox_timeout", "sandbox_command_failed", "timed_out", "cancelled", "expired"}:
                     return self._failure(
                         str(result.get("error_class") or "sandbox_execution_failed"),
                         str(result.get("stderr") or result.get("error_class") or "Sandbox command failed"),
@@ -3473,6 +3597,10 @@ class AgentToolRuntime:
             )
             self.extensions.db.commit()
             return self._failure("agent_tool_failed", "The authorized tool failed")
+        finally:
+            unused_stream = getattr(self, "_streamed_writes", {}).pop(tool_call.get("id"), None)
+            if unused_stream is not None:
+                unused_stream.close()
 
     def _execute_voice_practice_create(
         self,
@@ -6254,15 +6382,11 @@ class AgentToolRuntime:
         *,
         chat_session_id: str,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-        from app.domain.schemas.research import ResearchJobView, ResearchRequest
         from app.providers.factory import (
-            deep_research_provider_for_workspace,
-            search_provider_for_workspace,
             transcription_provider_for_workspace,
             vision_provider_for_workspace,
         )
         from app.providers.ports.model import ProviderChatMessage
-        from app.services.research import ResearchService
 
         db = self.extensions.db
         settings = self.settings or get_settings()
@@ -6449,67 +6573,6 @@ class AgentToolRuntime:
                 [],
             )
 
-        search_provider = search_provider_for_workspace(
-            db,
-            self.workspace_id,
-            settings,
-            route="auto",
-        )
-        if search_provider is None:
-            raise AppError(
-                503,
-                "search_provider_unavailable",
-                "No SearchProvider is configured for research",
-            )
-        research = ResearchService(
-            db,
-            self.workspace_id,
-            self.actor_id,
-            search_provider,
-            deep_research_provider_for_workspace(
-                db,
-                self.workspace_id,
-                settings,
-            ),
-            settings,
-        )
-        if name == "start_deep_research":
-            job = research.create_research(
-                ResearchRequest(
-                    question=str(arguments.get("question") or "").strip(),
-                    budget_amount=arguments.get("budget_amount") or "0",
-                    currency=str(arguments.get("currency") or "USD"),
-                    allowed_domains=[
-                        str(item)
-                        for item in (arguments.get("allowed_domains") or [])
-                        if isinstance(item, str)
-                    ],
-                )
-            )
-            payload = ResearchJobView.model_validate(job).model_dump(mode="json")
-            payload["user_approval_required"] = job.status == "awaiting_approval"
-            payload["quote_id"] = (job.billing_snapshot or {}).get("quote_id")
-            return self._success(
-                payload,
-                {
-                    "tool": name,
-                    "research_job_id": job.id,
-                    "status": job.status,
-                    "user_approval_required": payload["user_approval_required"],
-                    "currency": payload.get("currency"),
-                    "budget_amount": payload.get("budget_amount"),
-                    "estimated_cost_amount": payload.get("estimated_cost_amount"),
-                },
-                [],
-            )
-        if name == "get_deep_research":
-            job_id = str(arguments.get("research_job_id") or "").strip()
-            job = research.get_research(job_id)
-            return self._success(
-                ResearchJobView.model_validate(job).model_dump(mode="json"),
-                {"tool": name, "research_job_id": job.id, "status": job.status},
-                [],
-            )
         raise AppError(
             404,
             "unknown_model_invocation_tool",
@@ -7070,19 +7133,32 @@ class AgentToolRuntime:
         return self._failure("unknown_memory_tool", f"Unknown memory tool {name}")
 
     @staticmethod
-    def _parse_arguments(raw_arguments: Any) -> dict[str, Any]:
+    def _parse_arguments(raw_arguments: Any, *, tool_name: str | None = None) -> dict[str, Any]:
         if not isinstance(raw_arguments, str):
             raise AppError(422, "invalid_tool_arguments", "Tool arguments must be a JSON object")
         try:
             value = json.loads(raw_arguments)
         except json.JSONDecodeError as exc:
+            message = (
+                f"Tool arguments are not valid JSON: {exc.msg} "
+                f"at line {exc.lineno}, column {exc.colno}."
+            )
+            if tool_name == "ui_stream":
+                message += (
+                    " Resubmit strict JSON, using smaller independent ui_stream patches if needed. "
+                    "Parsing failed before any UI operation was applied; use the revision from "
+                    "the last successful result."
+                )
+            elif tool_name == "sandbox_publish_web_app":
+                message += (
+                    " Do not inline a large interaction_contract: write it to learngraph.subapp.json, "
+                    "run sandbox_validate_interaction_contract, and pass contract_path instead."
+                )
             raise AppError(
                 422,
                 "invalid_tool_arguments",
-                "Tool arguments are not valid JSON. For sandbox_publish_web_app, "
-                "do not inline a large interaction_contract — write it to "
-                "learngraph.subapp.json, run sandbox_validate_interaction_contract, "
-                "and pass contract_path instead",
+                message,
+                {"line": exc.lineno, "column": exc.colno},
             ) from exc
         if not isinstance(value, dict):
             raise AppError(422, "invalid_tool_arguments", "Tool arguments must be a JSON object")
@@ -8499,8 +8575,19 @@ class AgentToolRuntime:
             }
         return content, meta, []
 
-    @staticmethod
-    def _bounded_content(value: dict[str, Any]) -> tuple[str, bool]:
+    def _bounded_content(self, value: dict[str, Any]) -> tuple[str, bool]:
         from app.services.harness_contracts import bounded_json
+        from app.services.tool_results import ToolResultStore, result_preview
 
-        return bounded_json(value, AGENT_TOOL_RESULT_MAX_BYTES)
+        budget = getattr(self, "_result_max_bytes", AGENT_TOOL_RESULT_MAX_BYTES)
+        content, truncated = bounded_json(value, budget)
+        settings = getattr(self, "settings", None)
+        session_id = getattr(self, "_result_session_id", None)
+        if truncated and settings is not None and session_id:
+            store = ToolResultStore(settings.storage_root, self.workspace_id, self.actor_id, session_id)
+            ref = store.save(value)
+            # _failure wraps the command under details. Preserve its status and
+            # streams in the preview while keeping the complete original result.
+            preview = {**value.get("details", {}), **value} if isinstance(value.get("details"), dict) else value
+            content = result_preview(preview, ref, budget)
+        return content, truncated

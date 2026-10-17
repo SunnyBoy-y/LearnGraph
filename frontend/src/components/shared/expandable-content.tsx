@@ -90,32 +90,54 @@ export function ExpandableContent({
     const style = window.getComputedStyle(node);
     const fontSize = Number.parseFloat(style.fontSize) || 14;
     const parsedLineHeight = Number.parseFloat(style.lineHeight);
-    const lineHeight = Number.isFinite(parsedLineHeight)
-      ? parsedLineHeight
-      : fontSize * 1.5;
+    const lineHeight =
+      Number.isFinite(parsedLineHeight) && parsedLineHeight > 0
+        ? parsedLineHeight
+        : fontSize * 1.5;
     const limitHeight = Math.max(1, lineHeight * lineLimit);
     const fullHeight = node.scrollHeight;
     const hasOverflow = fullHeight > limitHeight + 1;
     setOverflowing(hasOverflow);
-    setEstimatedLines(Math.max(lineLimit + 1, Math.ceil(fullHeight / lineHeight)));
+    setEstimatedLines(
+      Math.max(lineLimit + 1, Math.ceil(fullHeight / lineHeight)),
+    );
   }, [lineLimit]);
 
   useLayoutEffect(() => {
-    measure();
+    // Streaming children and scroll/layout effects can update each other in
+    // the same commit. Measuring synchronously here caused a real chat to hit
+    // React's maximum update depth. Read geometry once the frame settles.
+    const frame = window.requestAnimationFrame(measure);
+    return () => window.cancelAnimationFrame(frame);
   }, [children, measure]);
 
   useEffect(() => {
     const node = contentRef.current;
     if (!node || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
+    let frame: number | null = null;
+    const observer = new ResizeObserver(() => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        measure();
+      });
+    });
     observer.observe(node);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (frame !== null) window.cancelAnimationFrame(frame);
+    };
   }, [measure]);
 
   // Do not hide the live tail while the model is writing. Once the stream
   // settles, a long block folds automatically unless the user opened it.
   useEffect(() => {
-    if (wasStreamingRef.current && !streaming && overflowing && storedOpen.current !== true) {
+    if (
+      wasStreamingRef.current &&
+      !streaming &&
+      overflowing &&
+      storedOpen.current !== true
+    ) {
       setOpen(false);
     }
     wasStreamingRef.current = streaming;
@@ -135,7 +157,11 @@ export function ExpandableContent({
 
   return (
     <div
-      className={cn("expandable-content", effectiveOpen && "is-expanded", className)}
+      className={cn(
+        "expandable-content",
+        effectiveOpen && "is-expanded",
+        className,
+      )}
       data-expandable-content=""
       data-expanded={effectiveOpen ? "true" : "false"}
       data-overflowing={overflowing ? "true" : "false"}
@@ -157,7 +183,11 @@ export function ExpandableContent({
             type="button"
             variant="ghost"
           >
-            {effectiveOpen ? <ChevronUp aria-hidden="true" /> : <ChevronDown aria-hidden="true" />}
+            {effectiveOpen ? (
+              <ChevronUp aria-hidden="true" />
+            ) : (
+              <ChevronDown aria-hidden="true" />
+            )}
             {effectiveOpen
               ? `收起${label}`
               : `展开${label}（约 ${estimatedLines} 行）`}

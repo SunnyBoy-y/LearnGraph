@@ -105,7 +105,8 @@ function findAnswerAnchor(turnId: string) {
 }
 
 function findMessageAnchor(messageId: string) {
-  return document.getElementById(`conversation-jump-${messageId}`);
+  return document.getElementById(`conversation-jump-${messageId}`) ??
+    document.querySelector<HTMLElement>(`[data-message-mount-id="${CSS.escape(messageId)}"]`);
 }
 
 function findVisibleReadingAnchor(element: HTMLElement) {

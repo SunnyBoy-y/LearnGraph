@@ -588,3 +588,28 @@ export function decorateSelectionExplanationMarks(
     }
   };
 }
+
+export function ensureSelectionExplanationRecord(
+  detail: SelectionExplanationOpenDetail,
+  parentSessionId: string,
+): SelectionExplanationRecord {
+  if (detail.recordId) {
+    const existing = getSelectionExplanation(parentSessionId, detail.recordId);
+    if (existing) return existing;
+  }
+  const action =
+    detail.action ?? inferSelectionAction(detail.selectedText);
+  const record: SelectionExplanationRecord = {
+    id: detail.recordId ?? createSelectionExplanationId(),
+    parentSessionId,
+    sourceMessageId: detail.sourceMessageId,
+    selectedText: detail.selectedText.trim(),
+    prefix: detail.prefix ?? "",
+    suffix: detail.suffix ?? "",
+    contentMatched: detail.contentMatched ?? false,
+    action,
+    explanationSessionId: detail.explanationSessionId,
+    createdAt: new Date().toISOString(),
+  };
+  return upsertSelectionExplanation(record);
+}

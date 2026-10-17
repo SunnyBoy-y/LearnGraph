@@ -2,7 +2,6 @@ import {
   Children,
   cloneElement,
   isValidElement,
-  useMemo,
   useState,
   type HTMLAttributes,
   type ReactElement,
@@ -12,7 +11,7 @@ import { EyeOff, Play } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ExpandableContent } from "@/components/shared/expandable-content";
-import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import { SandboxedHtmlFrame } from "@/components/resources/sandboxed-html-frame";
 import { cn } from "@/lib/utils";
 
 /** Languages whose fenced source can be executed as a browser HTML document. */
@@ -91,14 +90,6 @@ export function HtmlCodePreview({
 }: HtmlCodePreviewProps) {
   const [open, setOpen] = useState(false);
   const hasCode = code.trim().length > 0;
-  const previewDocument = useMemo(() => {
-    if (!hasCode) return "";
-    try {
-      return sandboxedHtmlPreviewDocument(code);
-    } catch {
-      return "";
-    }
-  }, [code, hasCode]);
 
   const previewLabel = open ? "关闭预览" : "预览运行";
   const nativeSource = isStreamdownBlockElement(children);
@@ -149,12 +140,10 @@ export function HtmlCodePreview({
           data-html-preview-frame=""
           role="region"
         >
-          {previewDocument ? (
-            <iframe
+          {hasCode ? (
+            <SandboxedHtmlFrame
               className="html-code-preview__iframe"
-              referrerPolicy="no-referrer"
-              sandbox="allow-scripts"
-              srcDoc={previewDocument}
+              html={code}
               title={title}
             />
           ) : (
@@ -221,11 +210,21 @@ export function PreviewableMarkdownPre({
     );
   }
 
+  // A custom `pre` replaces Streamdown's default pre, which promotes the code
+  // child to a block using data-block. Without it, fences render as inline code
+  // and never reach the Mermaid renderer (or the native code toolbar).
+  const source = isValidElement<Record<string, unknown>>(children) && "node" in children.props
+    ? cloneElement(children, {
+      "data-block": "true",
+      className: `${typeof children.props.className === "string" ? children.props.className : ""} markdown-preview-code-block`.trim(),
+    })
+    : <pre className={className} {...props}>{children}</pre>;
+
+  if (language === "mermaid") return source;
+
   return (
     <ExpandableContent className="markdown-code-block" label="代码" lineLimit={24}>
-      <pre className={className} {...props}>
-        {children}
-      </pre>
+      {source}
     </ExpandableContent>
   );
 }

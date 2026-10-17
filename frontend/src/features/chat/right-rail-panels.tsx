@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowUpRight,
-  Bot,
+  ChevronDown,
+  Check,
   Download,
   FileArchive,
   FileSpreadsheet,
@@ -13,9 +14,7 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Send,
-  Square,
-  UserRound,
+  X,
   Video,
 } from "lucide-react";
 import {
@@ -32,7 +31,7 @@ import { toast } from "sonner";
 import {
   cancelSessionMessage,
   createSession,
-  downloadFile,
+  fileStreamUrl,
   listSessionFiles,
   listSessionMessages,
   listSessions,
@@ -43,30 +42,26 @@ import {
   ConversationContent,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
-import {
-  Message as AiMessage,
-  MessageContent,
-} from "@/components/ai-elements/message";
-import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
-import { QuestionSetPager, groupAnswerParts } from "@/components/chat/question-set-pager";
-import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
-import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
-import { ThinkingChain } from "@/components/chat/thinking-chain";
-import { FilePreviewCanvas } from "@/components/resources/file-preview";
+import { RailConversationComposer, RailConversationMessage } from "./rail-conversation";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { FilePreviewContent } from "@/components/resources/file-preview-content";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  groupPartsForDisplay,
-  isReasoningTextPart,
-  thinkingDurationSeconds,
-  toolCallCount,
-} from "@/features/chat/chat-message-parts";
 import {
   getSessionComposerPrefs,
-  prefsFromModelSnapshot,
 } from "@/lib/session-composer-prefs";
+import { useRailConversationModel } from "./use-rail-conversation-model";
+import {
+  bindExplanationSession,
+  buildSelectionExplainPrompt,
+  ensureSelectionExplanationRecord,
+  listSelectionExplanations,
+  upsertSelectionExplanation,
+  type SelectionExplainAction,
+  type SelectionExplanationOpenDetail,
+  type SelectionExplanationRecord,
+} from "./selection-explanation";
 import { createUuid } from "@/lib/uuid";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { resolveFilePreviewKind, type FilePreviewKind } from "@/lib/file-preview";
@@ -101,7 +96,7 @@ function fileKind(filename: string, mimeType?: string): {
   if (kind === "image") return { label: "图片", Icon: ImageIcon, kind };
   if (kind === "video") return { label: "视频", Icon: Video, kind };
   if (kind === "spreadsheet") return { label: "表格", Icon: FileSpreadsheet, kind };
-  if (kind === "pdf" || kind === "word" || kind === "powerpoint" || kind === "text" || kind === "html") {
+  if (kind === "pdf" || kind === "word" || kind === "rtf" || kind === "powerpoint" || kind === "text" || kind === "html") {
     return { label: kind === "powerpoint" ? "演示文稿" : kind === "html" ? "网页" : "文档", Icon: FileText, kind };
   }
   if (kind === "audio") return { label: "音频", Icon: FileText, kind };
@@ -114,20 +109,6 @@ function sessionKindLabel(kind: Session["session_kind"]) {
   if (kind === "concept_branch") return "概念分支";
   if (kind === "standalone") return "独立会话";
   return "主会话";
-}
-
-function railMessageParts(message: Message): MessagePart[] {
-  if (message.parts.length) return message.parts;
-  return message.content
-    ? [
-        {
-          id: `${message.id}-text`,
-          type: "text",
-          status: "completed",
-          content: message.content,
-        },
-      ]
-    : [];
 }
 
 function isRailMessagePart(value: unknown): value is MessagePart {
@@ -197,127 +178,6 @@ function railStreamError(data: Record<string, unknown>): string {
   return message.trim() || "侧边会话生成失败";
 }
 
-function RailMessageContent({
-  message,
-  onAction,
-}: {
-  message: Message;
-  onAction?: (action: TrustedComponentAction) => void | Promise<void>;
-}) {
-  const parts = railMessageParts(message);
-  const displaySegments = groupPartsForDisplay(parts, {
-    boundary: message.finalAnswerStarted,
-    live: message.status === "streaming",
-  });
-  const renderPart = (part: MessagePart) => (
-    <ChatStreamPartRenderer
-      interactive={message.status !== "streaming"}
-      key={part.id}
-      onAction={onAction}
-      part={part}
-      siblingParts={parts}
-      streaming={
-        message.status === "streaming" &&
-        (part.status === "streaming" || part.status === "pending")
-      }
-    />
-  );
-  const renderAnswerParts = (answerParts: MessagePart[]) =>
-    groupAnswerParts(answerParts).map((group) => {
-      if (group.kind === "question_set") {
-        return (
-          <QuestionSetPager
-            key={`question-set-${group.parts.map((part) => part.id).join("-")}`}
-            onSubmit={
-              onAction
-                ? (submission) =>
-                    onAction({
-                      componentId:
-                        group.questions[0]?.componentId ?? group.parts[0].id,
-                      componentType:
-                        group.questions.length > 1
-                          ? "question_set"
-                          : group.questions[0]?.componentType ?? "question_set",
-                      event: "submit",
-                      payload: {
-                        answer: submission.summaryText,
-                        summaryText: submission.summaryText,
-                        results: submission.results,
-                        labels: submission.results.flatMap((item) => item.labels),
-                        graded_count: submission.gradedCount,
-                        correct_count: submission.correctCount,
-                      },
-                    })
-                : undefined
-            }
-            questions={group.questions}
-          />
-        );
-      }
-      if (group.kind === "image_strip") {
-        return (
-          <SandboxImageStrip
-            key={`image-strip-${group.parts[0]?.id ?? "empty"}`}
-            parts={group.parts}
-          />
-        );
-      }
-      if (group.kind === "side_pair") {
-        return (
-          <div
-            className="grid gap-3 sm:grid-cols-2 sm:items-start"
-            key={`side-pair-${group.artifact.id}`}
-          >
-            <div>{renderPart(group.text)}</div>
-            <div>{renderPart(group.artifact)}</div>
-          </div>
-        );
-      }
-      return renderPart(group.part);
-    });
-
-  return (
-    <div className="right-rail-rich-message__content">
-      {displaySegments.map((segment, index) =>
-        segment.kind === "chain" ? (
-          <div className="right-rail-rich-message__chain" key={`chain-${message.id}-${index}`}>
-            <ThinkingChain
-              chainParts={segment.parts}
-              completedDurationSec={thinkingDurationSeconds(message.provider_trace)}
-              defaultOpen={message.status === "streaming"}
-              finalAnswerStarted={Boolean(message.finalAnswerStarted)}
-              messageStatus={message.status}
-              startedAt={
-                typeof message.provider_trace.generation_started_at === "string"
-                  ? message.provider_trace.generation_started_at
-                  : message.created_at
-              }
-              thinkingDurationMs={message.finalAnswerStarted?.thinkingDurationMs}
-              toolCallCount={toolCallCount(parts)}
-            >
-              {segment.parts.map((part) =>
-                isReasoningTextPart(part) ? (
-                  <ReasoningSummaryRow
-                    key={part.id}
-                    part={part}
-                    streaming={message.status === "streaming"}
-                  />
-                ) : (
-                  renderPart(part)
-                ),
-              )}
-            </ThinkingChain>
-          </div>
-        ) : (
-          <div className="right-rail-rich-message__answer" key={`answer-${message.id}-${index}`}>
-            {renderAnswerParts(segment.parts)}
-          </div>
-        ),
-      )}
-    </div>
-  );
-}
-
 type RailStreamHandle = {
   controller: AbortController;
   assistantId: string;
@@ -334,16 +194,43 @@ export function SideConversationRail({
   focusSessionId,
   workspaceId,
   currentSessionId,
+  selectionDetail,
+  creationParentSessionId,
+  onCloseSelection,
 }: {
   workspaceId: string;
   currentSessionId?: string;
   focusSessionId?: string;
+  selectionDetail?: SelectionExplanationOpenDetail | null;
+  creationParentSessionId?: string;
+  onCloseSelection?: () => void;
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const streamHandlesRef = useRef<Map<string, RailStreamHandle>>(new Map());
+  const mountedRef = useRef(true);
   const [draft, setDraft] = useState("");
+  const [selection, setSelection] = useState<SelectionExplanationRecord | null>(() =>
+    selectionDetail ? ensureSelectionExplanationRecord(selectionDetail, currentSessionId ?? selectionDetail.parentSessionId) : null,
+  );
+  const selectionInputRef = useRef({ detail: selectionDetail, parent: currentSessionId });
+  const activeSelectionIdRef = useRef(selection?.id);
+  activeSelectionIdRef.current = selection?.id;
+  const creatingExplanationsRef = useRef(new Map<string, Promise<Session>>());
+  const autoSubmittedRef = useRef(new Set<string>());
+
+  useEffect(() => {
+    const previous = selectionInputRef.current;
+    selectionInputRef.current = { detail: selectionDetail, parent: currentSessionId };
+    if (selectionDetail && (previous.detail !== selectionDetail || previous.parent !== currentSessionId)) {
+      setSelection(ensureSelectionExplanationRecord(selectionDetail, currentSessionId ?? selectionDetail.parentSessionId));
+      setDraft("");
+    } else if (previous.parent !== currentSessionId) {
+      setSelection(null);
+      setDraft("");
+    }
+  }, [selectionDetail, currentSessionId]);
   const [streamingSessionIds, setStreamingSessionIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -353,6 +240,7 @@ export function SideConversationRail({
     staleTime: 15_000,
   });
   const [query, setQuery] = useState("");
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [selectedSessionId, setSelectedSessionId] = useState<string | undefined>(
     currentSessionId && currentSessionId !== "new" ? currentSessionId : undefined,
   );
@@ -385,7 +273,11 @@ export function SideConversationRail({
   }, [currentSessionId, sessions.data]);
 
   useEffect(() => {
-    if (focusSessionId) setSelectedSessionId(focusSessionId);
+    if (focusSessionId) {
+      setSelectedSessionId(focusSessionId);
+      if (!selectionInputRef.current.detail) setSelection(null);
+      setDraft("");
+    }
   }, [focusSessionId]);
 
   const currentSession = sessions.data?.find(
@@ -396,17 +288,20 @@ export function SideConversationRail({
     (currentSessionId && currentSessionId !== "new"
       ? currentSessionId
       : null);
-  const selectedSession = sessions.data?.find(
-    (session) => session.id === selectedSessionId,
-  );
+  const activeSessionId = selection ? selection.explanationSessionId : selectedSessionId;
+  const selectedSession = sessions.data?.find((session) => session.id === activeSessionId);
+  const { canSend, pending: modelsPending, control: modelControl, persistComposerPrefs, requestPreferences } =
+    useRailConversationModel(workspaceId, activeSessionId || currentSessionId || "", activeSessionId, (selectedSession ?? currentSession)?.model_snapshot);
   const messages = useQuery({
     // Keep the same cache key as the main canvas. A message sent from the
     // split pane is therefore immediately available when that session is
     // opened in the full canvas.
-    queryKey: workspaceQueryKey(workspaceId, "messages", selectedSessionId),
-    queryFn: () => listSessionMessages(selectedSessionId!, { compact: false }),
-    enabled: Boolean(selectedSessionId),
+    queryKey: workspaceQueryKey(workspaceId, "messages", activeSessionId),
+    queryFn: () => listSessionMessages(activeSessionId!, { compact: false }),
+    enabled: Boolean(activeSessionId),
     staleTime: 10_000,
+    // Switching the common surface must retain an in-flight conversation.
+    gcTime: 15 * 60_000,
   });
 
   const messageKey = useCallback(
@@ -446,6 +341,8 @@ export function SideConversationRail({
         ],
       );
       queryClient.setQueryData<Message[]>(messageKey(session.id), []);
+      setSelection(null);
+      onCloseSelection?.();
       setSelectedSessionId(session.id);
       setDraft("");
       requestAnimationFrame(() => composerRef.current?.focus());
@@ -454,14 +351,58 @@ export function SideConversationRail({
     onError: (error) => toast.error(error instanceof Error ? error.message : "创建侧边对话失败"),
   });
 
+  const ensureExplanationSession = useCallback(async (record: SelectionExplanationRecord): Promise<Session> => {
+    const existing = sessions.data?.find((session) => session.id === record.explanationSessionId);
+    if (existing) return existing;
+    let pending = creatingExplanationsRef.current.get(record.id);
+    if (!pending) {
+      const titleSeed = record.selectedText.replace(/\s+/gu, " ").slice(0, 24);
+      pending = createSession({
+        title: `划词解释 · ${titleSeed || "选区"}`,
+        memory_enabled: false,
+        session_kind: "side",
+        parent_session_id: creationParentSessionId ?? parentSessionId,
+        project_id: currentSession?.project_id,
+      });
+      creatingExplanationsRef.current.set(record.id, pending);
+    }
+    try {
+      const session = await pending;
+      persistComposerPrefs(session.id);
+      const bound = bindExplanationSession(record.parentSessionId, record.id, session.id);
+      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) => [
+        session, ...(current ?? []).filter((item) => item.id !== session.id),
+      ]);
+      if (queryClient.getQueryData(messageKey(session.id)) === undefined) {
+        queryClient.setQueryData<Message[]>(messageKey(session.id), []);
+      }
+      if (activeSelectionIdRef.current === record.id) {
+        setSelection(bound ?? { ...record, explanationSessionId: session.id });
+        setSelectedSessionId(session.id);
+      }
+      return session;
+    } finally {
+      creatingExplanationsRef.current.delete(record.id);
+    }
+  }, [sessions.data, creationParentSessionId, parentSessionId, currentSession?.project_id, persistComposerPrefs, queryClient, workspaceId, messageKey]);
+
   const send = useCallback(
     async (event?: FormEvent, contentOverride?: string) => {
       event?.preventDefault();
       const content = (contentOverride ?? draft).trim();
-      if (!selectedSession || !content) return;
-      if (streamHandlesRef.current.has(selectedSession.id)) return;
-
-      const sessionId = selectedSession.id;
+      if (!content || !canSend || selectedSession?.status === "closed") return;
+      let targetSession = selectedSession;
+      if (!targetSession && selection && !selection.explanationSessionId) {
+        try {
+          targetSession = await ensureExplanationSession(selection);
+        } catch (error) {
+          toast.error(error instanceof Error ? error.message : "创建解释会话失败");
+          return;
+        }
+      }
+      if (!mountedRef.current || !targetSession || streamHandlesRef.current.has(targetSession.id)) return;
+      const sessionId = targetSession.id;
+      persistComposerPrefs(sessionId);
       const stamp = Date.now();
       const userId = `rail-user-${stamp}-${createUuid()}`;
       const assistantId = `rail-assistant-${stamp}-${createUuid()}`;
@@ -485,6 +426,13 @@ export function SideConversationRail({
         provider_trace: {},
         created_at: new Date().toISOString(),
       };
+      if (selection) {
+        user.parts.push({
+          id: `${userId}-quote`, type: "selection_quote", status: "completed", content: selection.selectedText,
+          data: { source_role: "assistant", source_message_id: selection.sourceMessageId,
+            parent_session_id: selection.parentSessionId, action: selection.action },
+        });
+      }
       const assistant: Message = {
         id: assistantId,
         workspace_id: workspaceId,
@@ -513,19 +461,13 @@ export function SideConversationRail({
       if (contentOverride === undefined) setDraft("");
 
       const prefs = getSessionComposerPrefs(sessionId);
-      const snapshotPrefs = prefsFromModelSnapshot(
-        selectedSession.model_snapshot as Record<string, unknown>,
-      );
+      const searchRoute = selection ? "disabled" : prefs.searchRoute;
       const request: MessageCreateRequest = {
         content,
         generation_mode: "text",
-        provider_id: prefs.providerId ?? snapshotPrefs.providerId,
-        model_id: prefs.modelId ?? snapshotPrefs.modelId,
-        thinking_mode:
-          prefs.responseMode === "fast" ? "off" : prefs.thinkingMode,
-        agent_mode: prefs.responseMode !== "fast",
-        search_route: prefs.searchRoute,
-        web_search: prefs.searchRoute !== "disabled",
+        ...requestPreferences,
+        search_route: searchRoute,
+        web_search: searchRoute !== "disabled",
         graph_action: "none",
       };
       const controller = new AbortController();
@@ -613,10 +555,9 @@ export function SideConversationRail({
                 patchAssistant((message) => ({
                   ...message,
                   parts: appendRailPart(message.parts, part),
-                  content:
-                    part.type === "text"
-                      ? `${message.content}${part.content_delta ?? part.content ?? ""}`
-                      : message.content,
+                  content: appendRailPart(message.parts, part)
+                    .filter((item) => item.type === "text")
+                    .map((item) => item.content ?? "").join("\n"),
                 }));
               }
             }
@@ -663,23 +604,28 @@ export function SideConversationRail({
       patchMessages,
       queryClient,
       selectedSession,
+      selection,
+      canSend,
+      ensureExplanationSession,
+      persistComposerPrefs,
+      requestPreferences,
       setStreaming,
       workspaceId,
     ],
   );
 
   const stop = useCallback(async () => {
-    if (!selectedSessionId) return;
-    const handle = streamHandlesRef.current.get(selectedSessionId);
+    if (!activeSessionId) return;
+    const handle = streamHandlesRef.current.get(activeSessionId);
     if (!handle) return;
     if (handle.messageId) {
       try {
-        await cancelSessionMessage(selectedSessionId, handle.messageId);
+        await cancelSessionMessage(activeSessionId, handle.messageId);
       } catch {
         // Aborting the client stream below still prevents more UI updates.
       }
     }
-    patchMessages(selectedSessionId, (current) =>
+    patchMessages(activeSessionId, (current) =>
       current.map((message) =>
         message.id === handle.assistantId && message.status === "streaming"
           ? {
@@ -695,7 +641,32 @@ export function SideConversationRail({
       ),
     );
     handle.controller.abort();
-  }, [patchMessages, selectedSessionId]);
+  }, [patchMessages, activeSessionId]);
+
+  useEffect(() => {
+    if (!selection || !canSend) return;
+    if (selection.explanationSessionId && (messages.isPending || messages.isError)) return;
+    if (messages.data?.length || (activeSessionId && streamingSessionIds.has(activeSessionId))) return;
+    const key = `${selection.id}:${selection.action}`;
+    if (autoSubmittedRef.current.has(key)) return;
+    autoSubmittedRef.current.add(key);
+    void send(undefined, buildSelectionExplainPrompt(selection.action, selection.selectedText));
+  }, [selection, canSend, messages.isPending, messages.isError, messages.data?.length, activeSessionId, streamingSessionIds, send]);
+
+  function chooseSession(sessionId: string) {
+    const record = listSelectionExplanations(currentSessionId).find((item) => item.explanationSessionId === sessionId);
+    setSelectedSessionId(sessionId);
+    setSelection(record ?? null);
+    setDraft("");
+    setPickerOpen(false);
+    setQuery("");
+    onCloseSelection?.();
+  }
+
+  function setSelectionAction(action: SelectionExplainAction) {
+    if (!selection) return;
+    setSelection(upsertSelectionExplanation({ ...selection, action }));
+  }
 
   const handleRailAction = useCallback(
     (action: TrustedComponentAction) => {
@@ -791,23 +762,21 @@ export function SideConversationRail({
     [send],
   );
 
-  useEffect(
-    () => () => {
-      for (const handle of streamHandlesRef.current.values()) {
-        handle.controller.abort();
-      }
-      streamHandlesRef.current.clear();
-    },
-    [],
-  );
+  useEffect(() => {
+    mountedRef.current = true;
+    const handles = streamHandlesRef.current;
+    return () => {
+      mountedRef.current = false;
+      for (const handle of handles.values()) handle.controller.abort();
+      handles.clear();
+    };
+  }, []);
 
   return (
     <section aria-label="侧边对话" className="right-rail-panel right-rail-conversation">
       <header className="right-rail-panel__header">
         <div className="right-rail-panel__heading">
-          <span className="right-rail-panel__eyebrow"><MessageCircle className="size-3.5" />分屏工作区</span>
           <strong>侧边对话</strong>
-          <small>选择一个会话，在不离开当前页面的情况下查看上下文。</small>
         </div>
         <div className="right-rail-panel__header-actions">
           <Button
@@ -833,82 +802,73 @@ export function SideConversationRail({
         </div>
       </header>
 
-      <div className="right-rail-conversation__picker">
-        <div className="right-rail-conversation__search">
-          <Search className="size-3.5" />
-          <Input
-            aria-label="搜索会话"
-            onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="搜索会话…"
-            value={query}
-          />
-        </div>
-        <label className="right-rail-conversation__select-label" htmlFor="right-rail-session-select">
-          分屏会话
-          <select
-            aria-label="选择分屏会话"
-            className="right-rail-conversation__select"
-            id="right-rail-session-select"
-            onChange={(event) => setSelectedSessionId(event.currentTarget.value || undefined)}
-            value={selectedSessionId ?? ""}
-          >
-            <option disabled value="">选择一个会话</option>
-            {visibleSessions.map((session) => (
-              <option key={session.id} value={session.id}>{session.title || "新会话"}</option>
-            ))}
-          </select>
-        </label>
+      <div className="rail-session-picker">
+        <Popover open={pickerOpen} onOpenChange={(open) => { setPickerOpen(open); if (!open) setQuery(""); }}>
+          <PopoverTrigger asChild>
+            <button aria-label="选择分屏会话" className="rail-session-picker__trigger" type="button">
+              <MessageCircle className="size-4 shrink-0" />
+              <span className="rail-session-picker__copy">
+                <strong>{selectedSession?.title || (selection ? "划词解释" : "选择一个会话")}</strong>
+                <small>{selectedSession ? `${sessionKindLabel(selectedSession.session_kind)} · ${selectedSession.id === currentSessionId ? "当前主区" : "可继续问答"}` : selection ? "侧边对话 · 划词解释" : "查看或继续一段对话"}</small>
+              </span>
+              <ChevronDown className="size-3.5 shrink-0" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="rail-session-picker__popover">
+            <div className="right-rail-conversation__search">
+              <Search className="size-3.5" />
+              <Input aria-label="搜索会话" onChange={(event) => setQuery(event.currentTarget.value)} placeholder="搜索会话…" value={query} />
+            </div>
+            <div aria-label="分屏会话" className="rail-session-picker__list">
+              {visibleSessions.map((session) => (
+                <button aria-pressed={session.id === activeSessionId} key={session.id} type="button"
+                  onClick={() => chooseSession(session.id)}>
+                  <span><strong>{session.title || "新会话"}</strong><small>{sessionKindLabel(session.session_kind)}{session.id === currentSessionId ? " · 当前主区" : ""}</small></span>
+                  {session.id === activeSessionId ? <Check className="size-3.5" /> : null}
+                </button>
+              ))}
+              {!visibleSessions.length ? <p className="p-3 text-xs text-muted-foreground">{sessions.isPending ? "正在读取会话…" : "没有匹配的会话"}</p> : null}
+            </div>
+          </PopoverContent>
+        </Popover>
+        {selectedSession ? <Button aria-label="在主区打开这个会话" disabled={selectedSession.id === currentSessionId}
+          onClick={() => navigate(`/w/${encodeURIComponent(workspaceId)}/chat/${encodeURIComponent(selectedSession.id)}`)}
+          size="icon-xs" title={selectedSession.id === currentSessionId ? "这就是当前主区会话" : "在主区打开这个会话"} variant="ghost">
+          <ArrowUpRight className="size-3.5" />
+        </Button> : null}
       </div>
 
-      {selectedSession ? (
-        <div className="right-rail-conversation__active">
-          <div className="right-rail-conversation__active-meta">
-            <div className="right-rail-conversation__session-mark"><MessageCircle className="size-3.5" /></div>
-            <div className="min-w-0">
-              <strong title={selectedSession.title}>{selectedSession.title || "新会话"}</strong>
-              <span>{sessionKindLabel(selectedSession.session_kind)} · {selectedSession.id === currentSessionId ? "当前主区" : "可继续问答"}</span>
+      {selectedSession || selection ? (
+        <div className="right-rail-conversation__active rail-chat-surface">
+          {selection ? (
+            <div className="rail-selection-context">
+              <div className="flex items-center justify-between gap-2">
+                <span>选中内容</span>
+                <div className="flex items-center gap-1">
+                  {(["define", "explain"] as const).map((action) => (
+                    <Button key={action} aria-pressed={selection.action === action} className="h-6 px-2 text-[10px]"
+                      onClick={() => setSelectionAction(action)} size="xs" variant={selection.action === action ? "secondary" : "ghost"}>
+                      {action === "define" ? "定义" : "解释"}
+                    </Button>
+                  ))}
+                  <Button aria-label="关闭划词引用" onClick={() => { setSelection(null); onCloseSelection?.(); }} size="icon-xs" variant="ghost"><X className="size-3.5" /></Button>
+                </div>
+              </div>
+              <p>{selection.selectedText}</p>
             </div>
-            <Button
-              disabled={selectedSession.id === currentSessionId}
-              onClick={() => navigate(`/w/${encodeURIComponent(workspaceId)}/chat/${encodeURIComponent(selectedSession.id)}`)}
-              size="xs"
-              title={selectedSession.id === currentSessionId ? "这就是当前主区会话" : "在主区打开这个会话"}
-              variant="outline"
-            >
-              <ArrowUpRight className="size-3.5" />
-              {selectedSession.id === currentSessionId ? "当前" : "打开主区"}
-            </Button>
-          </div>
+          ) : null}
           <Conversation className="right-rail-conversation__messages-shell">
             <ConversationContent
               aria-live="polite"
               className="right-rail-conversation__messages"
             >
-              {messages.isPending ? (
+              {messages.isPending && activeSessionId ? (
                 <div className="right-rail-empty"><LoaderCircle className="size-4 animate-spin" />正在读取对话…</div>
               ) : messages.isError ? (
                 <div className="right-rail-empty is-error">对话读取失败，请稍后重试。</div>
               ) : messages.data?.length ? (
                 messages.data.map((message) => (
-                  <AiMessage
-                    className={`right-rail-rich-message right-rail-rich-message--${message.role === "user" ? "user" : "assistant"}`}
-                    from={message.role === "user" ? "user" : "assistant"}
-                    key={message.id}
-                  >
-                    <div className="right-rail-rich-message__identity">
-                      <span className="right-rail-message__avatar">
-                        {message.role === "user" ? <UserRound className="size-3" /> : <Bot className="size-3" />}
-                      </span>
-                      <span>{message.role === "user" ? "你" : "LearnGraph"}</span>
-                      {message.status === "streaming" ? <LoaderCircle className="size-3 animate-spin" /> : null}
-                    </div>
-                    <MessageContent className="right-rail-rich-message__bubble">
-                    <RailMessageContent
-                      message={message}
-                      onAction={handleRailAction}
-                    />
-                    </MessageContent>
-                  </AiMessage>
+                  <RailConversationMessage key={message.id} message={message} onAction={handleRailAction} />
                 ))
               ) : (
                 <div className="right-rail-empty"><MessageCircle className="size-4" /><strong>这个会话还没有消息</strong><span>在下方输入问题即可开始侧边问答。</span></div>
@@ -916,69 +876,18 @@ export function SideConversationRail({
             </ConversationContent>
             <ConversationScrollButton />
           </Conversation>
-          <form
-            className="right-rail-conversation__composer"
-            onSubmit={(event) => void send(event)}
+          <RailConversationComposer
+            busy={Boolean(activeSessionId && streamingSessionIds.has(activeSessionId))}
+            disabled={!canSend || Boolean(activeSessionId && messages.isPending) || createSideSession.isPending || selectedSession?.status === "closed"}
+            inputRef={composerRef} label="侧边会话输入" placeholder="输入消息…" sendLabel="发送侧边会话消息" stopLabel="停止侧边会话生成"
+            value={draft} onChange={setDraft} onSubmit={() => void send()} onStop={() => void stop()} controls={modelControl}
           >
-            <Textarea
-              aria-label="侧边会话输入"
-              className="right-rail-conversation__textarea"
-              disabled={messages.isPending}
-              onChange={(event) => setDraft(event.currentTarget.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  if (!streamingSessionIds.has(selectedSession.id)) {
-                    void send();
-                  }
-                }
-              }}
-              placeholder="在侧边会话中继续提问…"
-              ref={composerRef}
-              rows={2}
-              value={draft}
-            />
-            <div className="right-rail-conversation__composer-actions">
-              <span>Enter 发送 · Shift+Enter 换行</span>
-              <div>
-                {streamingSessionIds.has(selectedSession.id) ? (
-                  <Button
-                    aria-label="停止侧边会话生成"
-                    onClick={() => void stop()}
-                    size="icon-xs"
-                    title="停止生成"
-                    type="button"
-                    variant="outline"
-                  >
-                    <Square className="size-3.5" />
-                  </Button>
-                ) : (
-                  <Button
-                    aria-label="发送侧边会话消息"
-                    disabled={!draft.trim() || createSideSession.isPending}
-                    size="icon-xs"
-                    title="发送"
-                    type="submit"
-                    variant="default"
-                  >
-                    <Send className="size-3.5" />
-                  </Button>
-                )}
-              </div>
-            </div>
-          </form>
-          <div className="right-rail-conversation__footer">
-            <span>{streamingSessionIds.has(selectedSession.id) ? "正在生成 · 主画布信息会同步保留" : "侧边问答 · 支持完整消息卡片与文件预览"}</span>
-            {selectedSession.id !== currentSessionId ? (
-              <Button
-                onClick={() => navigate(`/w/${encodeURIComponent(workspaceId)}/chat/${encodeURIComponent(selectedSession.id)}`)}
-                size="xs"
-                variant="ghost"
-              >
-                打开主区 <ArrowUpRight className="size-3" />
-              </Button>
-            ) : null}
-          </div>
+            {!modelsPending && !canSend ? <div className="mb-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+              <span>没有可用的模型，请先配置。</span>
+              <Button onClick={() => navigate(`/w/${workspaceId}/settings/providers`)} size="xs" type="button" variant="outline">配置</Button>
+            </div> : null}
+            {selectedSession?.status === "closed" ? <p className="mb-2 text-xs text-muted-foreground">该会话已结束，请新建侧边对话。</p> : null}
+          </RailConversationComposer>
         </div>
       ) : (
         <div className="right-rail-empty right-rail-empty--tall">
@@ -1015,13 +924,7 @@ export function SessionFilePreviewRail({
     () => list.find((file) => fileKey(file) === selectedFileKey) ?? null,
     [list, selectedFileKey],
   );
-  const preview = useQuery({
-    queryKey: ["workspaces", workspaceId, "file-preview", selectedFile?.file_id],
-    queryFn: () => downloadFile(selectedFile!.file_id!),
-    enabled: Boolean(selectedFile?.file_id),
-    staleTime: 60_000,
-  });
-
+  const [downloading, setDownloading] = useState(false);
   useEffect(() => {
     if (!list.length) {
       setSelectedFileKey(null);
@@ -1034,17 +937,19 @@ export function SessionFilePreviewRail({
     );
   }, [list]);
 
-  function downloadSelected() {
-    if (!selectedFile?.file_id || !preview.data) return;
-    const url = URL.createObjectURL(preview.data);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = selectedFile.filename;
-    anchor.click();
-    // Let the browser enqueue the download before releasing the object URL.
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  async function downloadSelected() {
+    if (!selectedFile?.file_id || downloading) return;
+    setDownloading(true);
+    try {
+      const url = await fileStreamUrl(selectedFile.file_id);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = selectedFile.filename;
+      anchor.click();
+    } catch (reason) {
+      toast.error(reason instanceof Error ? reason.message : "下载失败");
+    } finally { setDownloading(false); }
   }
-
   if (!enabled) {
     return (
       <section aria-label="会话文件预览" className="right-rail-panel right-rail-files">
@@ -1106,24 +1011,21 @@ export function SessionFilePreviewRail({
             <div className="right-rail-files__preview">
               <header className="right-rail-files__preview-head">
                 <div className="min-w-0"><strong title={selectedFile.filename}>{selectedFile.filename}</strong><span>{fileKind(selectedFile.filename, selectedFile.mime_type).label}</span></div>
-                <Button disabled={!preview.data} onClick={downloadSelected} size="icon-xs" title="下载文件" variant="ghost"><Download className="size-3.5" /></Button>
+                <Button disabled={!selectedFile.file_id || downloading} onClick={() => void downloadSelected()} size="icon-xs" title="下载文件" variant="ghost"><Download className="size-3.5" /></Button>
               </header>
               <div className="right-rail-files__preview-body">
                 {!selectedFile.file_id ? (
                   <div className="right-rail-empty"><FolderOpen className="size-4" />该文件只存在于会话工作区，暂时没有可下载内容。</div>
-                ) : preview.isPending ? (
-                  <div className="right-rail-empty"><LoaderCircle className="size-4 animate-spin" />正在准备预览…</div>
-                ) : preview.isError ? (
-                  <div className="right-rail-empty is-error">文件读取失败，请下载后查看。</div>
-                ) : preview.data ? (
-                  <FilePreviewCanvas
-                    blob={preview.data}
+                ) : (
+                  <FilePreviewContent
+                    fileId={selectedFile.file_id}
+                    fileSize={selectedFile.size_bytes}
                     className="right-rail-files__canvas"
                     filename={selectedFile.filename}
                     imageZoom
                     mimeType={selectedFile.mime_type}
                   />
-                ) : null}
+                )}
               </div>
             </div>
           ) : null}

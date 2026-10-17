@@ -1,0 +1,12 @@
+.markdown-task-checkbox {
+  width: 17px;
+  height: 17px;
+  margin-inline-end: 7px;
+  vertical-align: -2px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.markdown-task-checkbox:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}

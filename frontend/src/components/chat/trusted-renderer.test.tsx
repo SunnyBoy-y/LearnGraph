@@ -1,9 +1,12 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { SandboxArtifact } from '@/components/chat/sandbox-artifact'
 import { TrustedComponentRenderer } from '@/components/chat/trusted-component-renderer'
+import { StreamUI } from '@/components/chat/stream-ui'
+
+vi.mock('@/components/chat/code-trainer-editor', () => ({ CodeTrainerEditor: ({ value }: {value: string}) => <textarea aria-label="代码编辑器" value={value} readOnly /> }))
 
 // Keep SandboxArtifact renderable in jsdom without pulling the full Shiki
 // pipeline. CodeBlock only mounts when `source_code` is present; the mock makes
@@ -55,6 +58,40 @@ describe('SandboxArtifact trusted-renderer states', () => {
 })
 
 describe('TrustedComponentRenderer third-party delegation', () => {
+  it('renders the registered code trainer and keeps source markup inert', () => {
+    render(<TrustedComponentRenderer fallbackId="trainer-inert-markup" data={{
+      component_type: 'code_trainer', schema_version: '1.0',
+      props: { title: '代码练习', language: 'javascript', starter_code: 'console.log("<script>alert(1)</script>")' },
+    }} />)
+    expect(screen.getByRole('textbox', { name: '代码编辑器' })).toHaveValue('console.log("<script>alert(1)</script>")')
+    expect(screen.getByRole('button', { name: '运行', exact: true })).toBeEnabled()
+    expect(document.querySelector('script')).toBeNull()
+  })
+  it('keeps existing submissions separate from streamed graph actions in the same answer', () => {
+    const onAction = vi.fn()
+    render(<>
+      <TrustedComponentRenderer fallbackId="existing-input" onAction={onAction} data={{
+        component_type: 'fill_blank', schema_version: '1.0',
+        props: { title: '已有输入控件', submit_label: '提交答案' }, allowed_events: ['submit'],
+      }} />
+      <StreamUI partId="new-graph" onAction={onAction} data={{
+        protocol: 'suip/0.1', component: 'graph', block_id: 'people', revision: 3, state: 'completed',
+        props: { title: '流式关系图' }, nodes: [{ id: 'ming', label: '小明' }], edges: [], rows: [], items: [],
+      }} />
+    </>)
+    fireEvent.change(screen.getByRole('textbox', { name: '已有输入控件' }), { target: { value: '已有答案' } })
+    fireEvent.click(screen.getByRole('button', { name: '提交答案' }))
+    expect(onAction).toHaveBeenNthCalledWith(1, {
+      componentId: 'existing-input', componentType: 'fill_blank', event: 'submit', payload: { value: '已有答案' },
+    })
+    fireEvent.keyDown(screen.getByRole('button', { name: '小明' }), { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: '让 AI 解释此节点' }))
+    expect(onAction).toHaveBeenNthCalledWith(2, {
+      componentId: 'new-graph', componentType: 'stream_ui', event: 'graph.node.explain',
+      payload: { revision: 3, node_id: 'ming' },
+    })
+    expect(screen.getByRole('textbox', { name: '已有输入控件' })).toHaveValue('已有答案')
+  })
   it('delegates sandbox_artifact delivery to SandboxArtifact instead of the JSON dump', () => {
     render(
       <TrustedComponentRenderer

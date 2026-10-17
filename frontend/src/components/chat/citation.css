@@ -1,0 +1,92 @@
+.citation-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: min(180px, 100%);
+  height: 20px;
+  margin: 0 3px;
+  border: 0;
+  border-radius: 9999px;
+  padding: 2px 7px;
+  background: #f3f3f3;
+  color: #737373;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+  vertical-align: baseline;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+.citation-pill:hover, .citation-pill[data-state="open"] { background: #e9e9e9; }
+.citation-pill:focus-visible { outline: 2px solid #a3a3a3; outline-offset: 2px; }
+.citation-pill-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.citation-pill-count { flex: none; }
+.citation-favicon { display: inline-flex; width: 13px; height: 13px; flex: none; align-items: center; justify-content: center; }
+.citation-favicon img { display: block; width: 100%; height: 100%; border-radius: 50%; object-fit: contain; }
+.citation-favicon svg { width: 100%; height: 100%; }
+.citation-hover-card[data-slot="popover-content"] {
+  z-index: 100;
+  box-sizing: border-box;
+  width: 412px;
+  max-width: calc(100vw - 32px);
+  max-height: var(--radix-popover-content-available-height);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #eaeaea;
+  border-radius: 18px;
+  padding: 6px 14px;
+  background: #fff;
+  color: #242424;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .10);
+  text-align: left;
+  font-family: var(--font-sans, sans-serif);
+  transform-origin: var(--radix-popover-content-transform-origin);
+  animation: none;
+}
+.citation-hover-card[data-state="open"] { animation: citation-card-in 170ms ease-out; }
+.citation-hover-card[data-side="top"] { --citation-entry-offset: 3px; }
+.citation-hover-card[data-side="bottom"] { --citation-entry-offset: -3px; }
+.citation-source-item {
+  display: block;
+  position: relative;
+  margin: 0 -6px;
+  border-radius: 9px;
+  padding: 13px 6px;
+  color: inherit;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+  transition: background-color 150ms ease;
+}
+.citation-source-item + .citation-source-item::before {
+  position: absolute;
+  top: 0;
+  right: 6px;
+  left: 6px;
+  border-top: 1px solid #eee;
+  content: "";
+}
+a.citation-source-item:hover { background: #f8f8f8; }
+a.citation-source-item:focus-visible { outline: 2px solid #a3a3a3; outline-offset: 1px; }
+.citation-source-header { display: flex; align-items: center; gap: 8px; color: #777; font-size: 13px; font-weight: 400; line-height: 20px; }
+.citation-source-header .citation-favicon { width: 16px; height: 16px; }
+.citation-source-header > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.citation-source-title { display: -webkit-box; overflow: hidden; margin-top: 8px; color: #242424; font-size: 15px; font-weight: 400; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+.citation-source-meta { display: block; margin-top: 8px; color: #858585; font-size: 13px; line-height: 1.45; }
+.dark .citation-pill { background: var(--bg-dialog); color: var(--text-secondary); }
+.dark .citation-pill:hover, .dark .citation-pill[data-state="open"] { background: var(--bg-hover); color: var(--text-primary); }
+.dark .citation-pill:focus-visible, .dark a.citation-source-item:focus-visible { outline-color: var(--focus-ring); }
+.dark .citation-hover-card[data-slot="popover-content"] { border-color: var(--border-subtle); background: var(--bg-dialog); color: var(--text-primary); }
+.dark a.citation-source-item:hover { background: var(--bg-hover); }
+.dark .citation-source-item + .citation-source-item::before { background: var(--border-subtle); }
+.dark .citation-source-title { color: var(--text-primary); }
+.dark .citation-source-header, .dark .citation-source-meta { color: var(--text-secondary); }
+@keyframes citation-card-in {
+  from { opacity: 0; transform: translateY(var(--citation-entry-offset, -3px)); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .citation-hover-card[data-state="open"] { animation: none; }
+  .citation-pill, .citation-source-item { transition: none; }
+}
