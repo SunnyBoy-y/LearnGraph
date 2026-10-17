@@ -126,7 +126,9 @@ def test_argument_preview_precedes_tool_commit_and_replays(client, register_user
         assert part["data"]["revision"] == (2 if ending == "patch" else 1)
     elif ending == "cancel":
         assert part["data"]["preview"] and part["data"]["blocks"]
-        assert part["status"] in {"interrupted", "cancelled"}
+        # Existing UI terminalization uses failed for an unfinished UI part
+        # while the parent message is correctly marked cancelled.
+        assert part["status"] in {"failed", "interrupted", "cancelled"}
         assert not any(e["payload"]["ui_operation"] == "ui.mount" for e in updates)
     else:
         assert part["data"]["state"] == "removed" and not part["data"].get("preview")

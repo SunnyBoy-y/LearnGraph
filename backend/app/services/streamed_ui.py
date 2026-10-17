@@ -139,6 +139,8 @@ class UIArgumentStream:
         required = {"op", "block_id"} | ({"component"} if raw["op"] == "mount" else {"base_revision"})
         if any((key,) not in self.complete for key in required):
             return None
+        if any(key in raw and not isinstance(raw[key], dict) for key in ("props", "upsert")):
+            raise ValueError("UI props and upsert must be objects")
         if raw["op"] == "mount" and ("props", "title") not in self.complete:
             return None
         command = {key: raw[key] for key in required}

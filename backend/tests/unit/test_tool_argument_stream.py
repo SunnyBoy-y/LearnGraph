@@ -31,10 +31,11 @@ def test_chat_adapter_exposes_arguments_before_completed_call(provider_type):
     provider.reset_transport()
 
 
-def test_anthropic_exposes_json_fragments_and_requests_eager_file_input():
+@pytest.mark.parametrize("tool_name", ["sandbox_write_file", "ui_stream"])
+def test_anthropic_exposes_json_fragments_and_requests_eager_input(tool_name):
     fragments = ['{"path":"work/a.py",', '"content":"print(42)"}']
     packets = [
-        ("content_block_start", {"index": 0, "content_block": {"type": "tool_use", "id": "call", "name": "sandbox_write_file", "input": {}}}),
+        ("content_block_start", {"index": 0, "content_block": {"type": "tool_use", "id": "call", "name": tool_name, "input": {}}}),
         *[("content_block_delta", {"index": 0, "delta": {"type": "input_json_delta", "partial_json": part}}) for part in fragments],
         ("message_stop", {}),
     ]
@@ -46,7 +47,7 @@ def test_anthropic_exposes_json_fragments_and_requests_eager_file_input():
     provider = AnthropicMessagesProvider(provider_id="p", model_id="model", base_url="https://example.com", api_key="test",
         transport=httpx.MockTransport(respond))
     events = list(provider.stream_chat([ProviderChatMessage(role="user", content="write")], tools=[{
-        "type": "function", "function": {"name": "sandbox_write_file", "parameters": {"type": "object", "properties": {}}},
+        "type": "function", "function": {"name": tool_name, "parameters": {"type": "object", "properties": {}}},
     }]))
     assert [e.type for e in events] == ["tool_call_delta", "tool_call_delta", "tool_calls", "completed"]
     assert "".join(e.tool_calls[0]["function"]["arguments"] for e in events if e.type == "tool_call_delta") == "".join(fragments)
