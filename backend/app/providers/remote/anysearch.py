@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import httpx
 
-from app.domain.schemas.research import SearchResult
+from app.domain.schemas.search import SearchResult
 from app.providers.remote.search import (
     SearchProviderError,
     SearchProviderResponseError,

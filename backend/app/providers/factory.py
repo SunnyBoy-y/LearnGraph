@@ -19,7 +19,6 @@ from app.domain.settings import FUNCTIONAL_MODEL_DEFAULTS_SETTING_KEY
 from app.providers.local.memory import LocalWorkspaceMemoryProvider
 from app.providers.local.model import LocalDemoModelProvider, UnavailableModelProvider
 from app.providers.catalog import (
-    DEEP_RESEARCH_PROVIDER_TYPES,
     FETCH_PROVIDER_TYPES,
     IMAGE_GENERATION_PROVIDER_TYPES,
     IMAGE_SEARCH_PROVIDER_TYPES,
@@ -43,7 +42,6 @@ from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.image_generation import ImageGenerationProviderPort
 from app.providers.ports.model import ModelProviderPort
 from app.providers.ports.memory import MemoryProviderPort
-from app.providers.ports.research import DeepResearchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.ports.transcription import TranscriptionProviderPort
 from app.providers.ports.tts import TTSProviderPort
@@ -66,7 +64,7 @@ def _resolve_provider_base_url(
     Bridge / trusted-desktop direct) so real-machine services stay reachable
     from inside the whole-app Docker deployment — covering model, embedding,
     image, transcription, search (SearXNG), fetch (Crawl4AI/Firecrawl), deep
-    research and memory lanes alike. Non-loopback remote URLs, fixed-origin
+    search and memory lanes alike. Non-loopback remote URLs, fixed-origin
     providers and source installs (``npm run dev`` / personal_desktop) pass
     through unchanged: zero impact outside Docker.
     """
@@ -129,19 +127,6 @@ from app.providers.remote.ollama import (
 from app.providers.remote.ollama_cloud import (
     OllamaCloudChatProvider,
     OllamaCloudSearchProvider,
-)
-from app.providers.remote.research import (
-    HTTPDeepResearchProvider,
-    UnavailableDeepResearchProvider,
-)
-from app.providers.remote.research_vendors import (
-    ExaDeepResearchProvider,
-    GeminiDeepResearchProvider,
-    JinaDeepSearchProvider,
-    OpenAIDeepResearchProvider,
-    PerplexityDeepResearchProvider,
-    QwenDeepResearchProvider,
-    TavilyDeepResearchProvider,
 )
 from app.providers.remote.fetch import (
     Crawl4AIHTTPFetchProvider,
@@ -246,7 +231,7 @@ def _web_fetch_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
 
 
 def research_policy_domains(db: Session, workspace_id: str) -> frozenset[str]:
-    """Load the workspace source allowlist shared by search and Deep Research.
+    """Load the workspace source allowlist used by search.
 
     Uses the unified ``access.allowlist`` once persisted; before that, falls
     back to the legacy ``research.policy`` list so existing workspaces keep
@@ -1643,92 +1628,6 @@ def embedding_provider_for_workspace(
     )
 
 
-def deep_research_provider_for_workspace(
-    db: Session,
-    workspace_id: str,
-    settings: Settings,
-) -> DeepResearchProviderPort | None:
-    default_provider_id, default_model_id = _functional_model_target(
-        db, workspace_id, "deep_research"
-    )
-    statement = (
-        select(ProviderConfig)
-        .where(
-            ProviderConfig.workspace_id == workspace_id,
-            ProviderConfig.enabled.is_(True),
-            ProviderConfig.remote_capability.is_(True),
-            ProviderConfig.provider_type.in_(DEEP_RESEARCH_PROVIDER_TYPES),
-        )
-    )
-    if default_provider_id:
-        statement = statement.where(ProviderConfig.id == default_provider_id)
-    provider = db.scalar(statement.order_by(*_provider_priority_order()))
-    if provider is None:
-        return None
-    if not provider.base_url:
-        return UnavailableDeepResearchProvider(provider.id, "Configured research provider has no base URL")
-    try:
-        api_key = _secret_for_provider(db, workspace_id, provider, settings)
-    except Exception as exc:  # intentional log-and-skip
-        _log_secret_failure(workspace_id, provider, exc)
-        return UnavailableDeepResearchProvider(provider.id, "Configured research secret cannot be decrypted")
-    if not api_key:
-        return UnavailableDeepResearchProvider(provider.id, "Configured research provider has no encrypted secret")
-    capabilities = dict(provider.capabilities or {})
-    vendor_adapters = {
-        "gemini_deep_research": (
-            GeminiDeepResearchProvider,
-            GeminiDeepResearchProvider.DEFAULT_AGENT,
-        ),
-        "openai_deep_research": (
-            OpenAIDeepResearchProvider,
-            OpenAIDeepResearchProvider.DEFAULT_MODEL,
-        ),
-        "perplexity_deep_research": (
-            PerplexityDeepResearchProvider,
-            PerplexityDeepResearchProvider.DEFAULT_MODEL,
-        ),
-        "tavily_deep_research": (
-            TavilyDeepResearchProvider,
-            TavilyDeepResearchProvider.DEFAULT_MODEL,
-        ),
-        "exa_deep_research": (
-            ExaDeepResearchProvider,
-            ExaDeepResearchProvider.DEFAULT_MODEL,
-        ),
-        "qwen_deep_research": (
-            QwenDeepResearchProvider,
-            QwenDeepResearchProvider.DEFAULT_MODEL,
-        ),
-        "jina_deep_research": (
-            JinaDeepSearchProvider,
-            JinaDeepSearchProvider.DEFAULT_MODEL,
-        ),
-    }
-    selected = vendor_adapters.get(provider.provider_type)
-    if selected is not None:
-        adapter, default_model = selected
-        # The research model is a workspace choice; the adapter only supplies a
-        # documented default when the row has not declared one.
-        model = str(
-            default_model_id
-            or capabilities.get("deep_research_model")
-            or capabilities.get("default_model")
-            or default_model
-        ).strip()
-        return adapter(
-            provider_id=provider.id,
-            base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
-            api_key=api_key,
-            model=model or default_model,
-            declared_capabilities=capabilities,
-        )
-    return HTTPDeepResearchProvider(
-        provider_id=provider.id,
-        base_url=_resolve_provider_base_url(settings, provider.provider_type, provider.base_url),
-        api_key=api_key,
-        declared_capabilities=provider.capabilities,
-    )
 
 
 def _sandbox_fetch_unavailable_reason(

@@ -80,7 +80,6 @@ from app.repositories.domain import (
     UsageRepository,
 )
 from app.providers.catalog import (
-    DEEP_RESEARCH_PROVIDER_TYPES,
     EMBEDDING_PROVIDER_TYPES,
     FETCH_PROVIDER_TYPES,
     IMAGE_GENERATION_PROVIDER_TYPES,
@@ -137,7 +136,6 @@ from app.providers.remote.codex import (
     poll_codex_device_login,
     start_codex_device_login,
 )
-from app.providers.remote.research_vendors import QwenDeepResearchProvider
 from app.providers.remote.custom_balance import (
     API_KEY_PLACEHOLDER as CUSTOM_BALANCE_API_KEY_PLACEHOLDER,
     BASE_URL_PLACEHOLDER as CUSTOM_BALANCE_BASE_URL_PLACEHOLDER,
@@ -159,11 +157,6 @@ from app.providers.remote.balance import (
 )
 from app.providers.remote.memory import Mem0PlatformAdapter, mem0_entity_id
 from app.providers.remote.anysearch import AnySearchSearchProvider
-from app.providers.remote.research import (
-    DeepResearchProviderError,
-    DeepResearchProviderTimeout,
-    HTTPDeepResearchProvider,
-)
 from app.providers.remote.search import (
     CloudSearchProvider,
     SearchProviderError,
@@ -192,7 +185,7 @@ from app.services.provider_secrets import (
 # Roles whose models are manageable through the discovery snapshot.  This is
 # exactly the set ``models()`` supports, so model enablement, capability
 # snapshots, catalog sync, and default-model fallbacks stay coherent for
-# image / vision / ASR / embedding / deep-research Providers — not just
+# image / vision / ASR / embedding Providers — not just
 # chat-model Providers.
 _MODEL_MANAGEMENT_PROVIDER_TYPES = frozenset(
     {
@@ -202,7 +195,6 @@ _MODEL_MANAGEMENT_PROVIDER_TYPES = frozenset(
         *VISION_PROVIDER_TYPES,
         *TRANSCRIPTION_PROVIDER_TYPES,
         *EMBEDDING_PROVIDER_TYPES,
-        "qwen_deep_research",
     }
 )
 
@@ -323,7 +315,10 @@ class ProviderService:
         self.audit = AuditRepository(db, workspace_id)
 
     def list(self) -> list[ProviderConfig]:
-        providers = list(self.providers.list())
+        providers = [
+            item for item in self.providers.list()
+            if provider_type_spec(item.provider_type) is not None
+        ]
 
         def priority(provider: ProviderConfig) -> int:
             raw = (provider.capabilities or {}).get("provider_priority", 0)
@@ -546,18 +541,6 @@ class ProviderService:
                 "hosted_web_search": False,
                 "default_search_route": "external",
             }
-        qwen_research_defaults: dict[str, object] = {}
-        if payload.provider_type == "qwen_deep_research":
-            known = list(QwenDeepResearchProvider.KNOWN_MODELS)
-            qwen_research_defaults = {
-                "brand_id": "qwen",
-                "capability_source": "official_catalog",
-                "discovered_model_ids": known,
-                "discovered_model_count": len(known),
-                "model_states": {model_id: True for model_id in known},
-                "default_model": QwenDeepResearchProvider.DEFAULT_MODEL,
-                "deep_research_model": QwenDeepResearchProvider.DEFAULT_MODEL,
-            }
         # Sanitize optional custom headers used by proxy / relay stations.
         incoming_capabilities = dict(payload.capabilities or {})
         selected_speech_model_id = str(
@@ -618,7 +601,6 @@ class ProviderService:
             **codex_defaults,
             **ollama_defaults,
             **copilot_defaults,
-            **qwen_research_defaults,
             **incoming_capabilities,
             "provider_role": spec.role,
             "declaration_status": "unverified_user_input",
@@ -1073,7 +1055,6 @@ class ProviderService:
             "image_search": "图搜",
             "search": "搜索",
             "fetch": "抓取",
-            "deep_research": "研究",
             "transcription": "转写",
             "embedding": "Embedding",
             "memory": "记忆",
@@ -1123,10 +1104,6 @@ class ProviderService:
         if provider.provider_type in VISION_PROVIDER_TYPES:
             return str(
                 caps.get("default_vision_model_id") or caps.get("default_model") or ""
-            ).strip()
-        if provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
-            return str(
-                caps.get("deep_research_model") or caps.get("default_model") or ""
             ).strip()
         return str(caps.get("default_model") or "").strip()
 
@@ -1423,8 +1400,6 @@ class ProviderService:
                     "A disabled model cannot be selected as the default model",
                 )
             capabilities["default_model"] = payload.default_model
-            if provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
-                capabilities["deep_research_model"] = payload.default_model
             if provider.provider_type in EMBEDDING_PROVIDER_TYPES:
                 capabilities["default_embedding_model_id"] = payload.default_model
         if payload.default_image_generation_model_id is not None:
@@ -1657,18 +1632,6 @@ class ProviderService:
             provider.remote_capability = True
             capabilities["remote_calls_enabled"] = True
             capabilities["provider_role"] = "image_search"
-            provider.status = "enabled_unverified"
-        elif enabled and provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
-            secret = self._active_secret_record(provider.id)
-            if secret is None or not provider.base_url:
-                raise AppError(
-                    409,
-                    "provider_not_configured",
-                    "Deep research requires a base URL and encrypted secret before enabling",
-                )
-            provider.remote_capability = True
-            capabilities["remote_calls_enabled"] = True
-            capabilities.setdefault("provider_role", "deep_research")
             provider.status = "enabled_unverified"
         elif enabled and provider.provider_type in MEMORY_PROVIDER_TYPES:
             secret = self._active_secret_record(provider.id)
@@ -2079,7 +2042,7 @@ class ProviderService:
     def _model_default_field(provider: ProviderConfig) -> str:
         """Return the capability field that holds a Provider's default model.
 
-        Image / vision / transcription / embedding / deep-research Providers
+        Image / vision / transcription / embedding Providers
         keep their default in a role-specific field instead of ``default_model``
         (which stays a mirror only for vision and embedding).
         """
@@ -2092,8 +2055,6 @@ class ProviderService:
             return "default_transcription_model_id"
         if provider_type in EMBEDDING_PROVIDER_TYPES:
             return "default_embedding_model_id"
-        if provider_type == "qwen_deep_research":
-            return "deep_research_model"
         return "default_model"
 
     @staticmethod
@@ -2476,7 +2437,7 @@ class ProviderService:
         Unlike ``probe()`` this never flips ``enabled``/``status`` and never
         disables same-role peers.  Chat / image / vision Providers are verified
         through model discovery (GET /models — zero-cost); search / fetch /
-        deep-research / memory Providers use their role-specific health probe.
+        memory Providers use their role-specific health probe.
         """
         provider = self.providers.require(provider_id, "provider")
         role = (
@@ -2527,14 +2488,6 @@ class ProviderService:
                 "status": "healthy",
                 "zero_cost": False,
                 "details": self._probe_fetch(provider),
-            }
-        elif provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
-            result = {
-                "provider_id": provider.id,
-                "role": role,
-                "status": "healthy",
-                "zero_cost": False,
-                "details": self._probe_deep_research(provider),
             }
         elif provider.provider_type in MEMORY_PROVIDER_TYPES:
             health = self._mem0_adapter(provider).health()
@@ -3411,15 +3364,7 @@ class ProviderService:
                     }
                 ],
             }
-        if provider.provider_type not in {
-            *MODEL_PROVIDER_TYPES,
-            *IMAGE_GENERATION_PROVIDER_TYPES,
-            *IMAGE_SEARCH_PROVIDER_TYPES,
-            *VISION_PROVIDER_TYPES,
-            *TRANSCRIPTION_PROVIDER_TYPES,
-            *EMBEDDING_PROVIDER_TYPES,
-            "qwen_deep_research",
-        }:
+        if provider.provider_type not in _MODEL_MANAGEMENT_PROVIDER_TYPES:
             raise AppError(
                 409,
                 "provider_has_no_models",
@@ -3489,11 +3434,6 @@ class ProviderService:
             capabilities["default_model"] = configured_default
         else:
             capabilities["default_model"] = configured_default
-        if provider.provider_type == "qwen_deep_research":
-            capabilities.setdefault(
-                "deep_research_model",
-                capabilities.get("default_model") or QwenDeepResearchProvider.DEFAULT_MODEL,
-            )
         provider.capabilities = capabilities
         self.db.commit()
         self.db.refresh(provider)
@@ -3524,8 +3464,6 @@ class ProviderService:
                         if provider.provider_type in EMBEDDING_PROVIDER_TYPES
                         else ["image_search"]
                         if provider.provider_type in IMAGE_SEARCH_PROVIDER_TYPES
-                        else ["deep_research"]
-                        if provider.provider_type == "qwen_deep_research"
                         else ["llm"]
                     ),
                     "streaming": True,
@@ -3622,9 +3560,6 @@ class ProviderService:
             provider.status = "healthy"
         elif provider.provider_type in FETCH_PROVIDER_TYPES:
             details = self._probe_fetch(provider)
-            provider.status = "healthy"
-        elif provider.provider_type in DEEP_RESEARCH_PROVIDER_TYPES:
-            details = self._probe_deep_research(provider)
             provider.status = "healthy"
         elif provider.provider_type in MEMORY_PROVIDER_TYPES:
             health = self._mem0_adapter(provider).health()
@@ -3819,30 +3754,11 @@ class ProviderService:
         except FetchProviderError as exc:
             raise AppError(502, "provider_probe_failed", str(exc)) from exc
 
-    def _probe_deep_research(self, provider: ProviderConfig) -> dict[str, object]:
-        if not provider.base_url:
-            raise AppError(409, "provider_not_configured", "Provider base URL is missing")
-        try:
-            adapter = HTTPDeepResearchProvider(
-                provider_id=provider.id,
-                base_url=provider.base_url,
-                api_key=self._decrypt_secret(provider.id),
-                declared_capabilities=provider.capabilities,
-            )
-            return adapter.probe()
-        except DeepResearchProviderTimeout as exc:
-            raise AppError(
-                504, "provider_probe_timeout", "Deep Research Provider probe timed out"
-            ) from exc
-        except DeepResearchProviderError as exc:
-            raise AppError(502, "provider_probe_failed", str(exc)) from exc
 
     def _discover(self, provider: ProviderConfig) -> list[str]:
         # Static catalogues for endpoints without a public model list.
         if provider.provider_type == "codex_chatgpt":
             return list(CODEX_KNOWN_MODELS)
-        if provider.provider_type == "qwen_deep_research":
-            return list(QwenDeepResearchProvider.KNOWN_MODELS)
         if not provider.base_url:
             raise AppError(409, "provider_not_configured", "Provider base URL is missing")
         extra_headers = self._sanitize_extra_headers(
@@ -4163,7 +4079,9 @@ class PluginService:
         self.audit = AuditRepository(db, workspace_id)
 
     def list(self) -> list[PluginRecord]:
-        return list(self.plugins.list())
+        # Subapps use PluginRecord only as the FK owner of their manifest.
+        # They are conversation artifacts, not user-installed extensions.
+        return list(self.db.scalars(self.plugins.query().where(PluginRecord.plugin_type != "agent_subapp")))
 
     def toggle(self, plugin_id: str, payload: PluginToggleRequest) -> PluginRecord:
         plugin = self.plugins.require(plugin_id, "plugin")
@@ -4439,7 +4357,7 @@ class SettingsService:
             "risk": "high",
         },
         "research.policy": {
-            "description": "Workspace source-domain allowlist for search and Deep Research",
+            "description": "Workspace source-domain allowlist for search",
             "default": {"allowed_domains": []},
             "risk": "high",
         },

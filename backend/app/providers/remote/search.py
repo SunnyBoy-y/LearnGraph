@@ -6,7 +6,7 @@ from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import httpx
 
-from app.domain.schemas.research import SearchResult
+from app.domain.schemas.search import SearchResult
 
 
 class SearchProviderError(RuntimeError):

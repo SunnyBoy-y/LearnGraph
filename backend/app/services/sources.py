@@ -18,7 +18,7 @@ from app.providers.remote.fetch import (
 )
 from app.providers.remote.search import normalize_domain
 from app.repositories.audit import AuditRepository
-from app.repositories.domain import ResearchRepository, SourceRecordRepository
+from app.repositories.domain import SourceRecordRepository
 
 
 class SourceService:
@@ -34,7 +34,6 @@ class SourceService:
         self.actor_id = actor_id
         self.fetch_provider = fetch_provider
         self.sources = SourceRecordRepository(db, workspace_id)
-        self.research = ResearchRepository(db, workspace_id)
         self.audit = AuditRepository(db, workspace_id)
 
     def list(self) -> list[SourceRecord]:
@@ -66,11 +65,6 @@ class SourceService:
             impacts=[
                 ImpactItem(resource_type="source_citation", count=citations, action="delete"),
                 ImpactItem(resource_type="source_link", count=links, action="delete"),
-                ImpactItem(
-                    resource_type="research_job",
-                    count=1 if source.research_job_id else 0,
-                    action="preserve_history",
-                ),
             ],
         )
 
@@ -164,8 +158,6 @@ class SourceService:
             authorized_domain = require_public_http_url(payload.url, allowed_domains)
         except UnsafeFetchURL as exc:
             raise AppError(422, "fetch_url_blocked", "The source URL is not allowed by the fetch safety policy") from exc
-        if payload.research_job_id:
-            self.research.require(payload.research_job_id, "research job")
         try:
             document = self.fetch_provider.fetch(payload.url)
         except FetchProviderTimeout as exc:
@@ -205,7 +197,6 @@ class SourceService:
                 content_type=document.content_type,
                 authorized_domain=authorized_domain,
                 cache_status="fresh",
-                research_job_id=payload.research_job_id,
                 metadata_json=document.metadata,
             )
         )

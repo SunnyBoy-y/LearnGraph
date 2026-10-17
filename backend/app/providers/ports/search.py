@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from app.domain.schemas.research import SearchResult
+from app.domain.schemas.search import SearchResult
 
 
 class SearchProviderPort(Protocol):

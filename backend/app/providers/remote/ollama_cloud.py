@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from app.domain.schemas.research import SearchResult
+from app.domain.schemas.search import SearchResult
 from app.providers.ports.model import ProviderStreamEvent
 from app.providers.remote.ollama import (
     coalesce_ollama_chat_messages,

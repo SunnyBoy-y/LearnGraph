@@ -41,8 +41,6 @@ from app.domain.models import (
     PracticeSession,
     ProviderConfig,
     ProviderResponseState,
-    ResearchJob,
-    ResearchJobEvent,
     SourceRecord,
     SuggestedPromptBatch,
     UsageEvent,
@@ -164,14 +162,8 @@ class FileReferenceRepository(ScopedRepository[FileReference]):
         super().__init__(db, FileReference, workspace_id)
 
 
-class ResearchRepository(ScopedRepository[ResearchJob]):
-    def __init__(self, db: Session, workspace_id: str) -> None:
-        super().__init__(db, ResearchJob, workspace_id)
 
 
-class ResearchEventRepository(ScopedRepository[ResearchJobEvent]):
-    def __init__(self, db: Session, workspace_id: str) -> None:
-        super().__init__(db, ResearchJobEvent, workspace_id)
 
 
 class SourceRecordRepository(ScopedRepository[SourceRecord]):

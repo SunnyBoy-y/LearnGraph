@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from app.domain.schemas.research import SearchResult
+from app.domain.schemas.search import SearchResult
 from app.providers.remote.fetch import (
     FetchedDocument,
     FetchProviderError,

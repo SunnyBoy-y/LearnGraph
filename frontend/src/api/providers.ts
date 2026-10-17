@@ -46,8 +46,9 @@ export function listProviderCatalog(): Promise<ProviderTypeCatalogItem[]> {
 
 export function createProvider(
   payload: ProviderCreateRequest,
+  options?: ApiRequestOptions,
 ): Promise<Provider> {
-  return apiClient.post<Provider, ProviderCreateRequest>("/providers", payload);
+  return apiClient.post<Provider, ProviderCreateRequest>("/providers", payload, options);
 }
 
 export function listProviderImportCandidates(): Promise<
@@ -317,10 +318,12 @@ export function getHostBridgeStatus(): Promise<HostBridgeStatus> {
 export function rotateProviderSecret(
   providerId: string,
   apiKey: string,
+  options?: ApiRequestOptions,
 ): Promise<ProviderSecretLifecycle> {
   return apiClient.post<ProviderSecretLifecycle, { api_key: string }>(
     `/providers/${encodeURIComponent(providerId)}/rotate-secret`,
     { api_key: apiKey },
+    options,
   );
 }
 

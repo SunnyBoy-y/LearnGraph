@@ -13,7 +13,6 @@ ProviderRole = Literal[
     "search",
     "image_search",
     "fetch",
-    "deep_research",
     "memory",
     "transcription",
     "tts",
@@ -514,148 +513,6 @@ PROVIDER_TYPE_SPECS: tuple[ProviderTypeSpec, ...] = (
         key_management_url="https://www.firecrawl.dev/app/api-keys",
     ),
     ProviderTypeSpec(
-        provider_type="deep_research_http",
-        role="deep_research",
-        label="Deep Research HTTP",
-        description="Provider-neutral asynchronous Deep Research task endpoint.",
-        requires_base_url=True,
-        requires_secret=True,
-        probe_notice="The probe calls the provider-neutral GET /health endpoint without creating a task.",
-        brand_id="deep_research",
-    ),
-    ProviderTypeSpec(
-        provider_type="gemini_deep_research",
-        role="deep_research",
-        label="Google Gemini Deep Research",
-        description=(
-            "Gemini Interactions API 的深度研究智能体：后台异步执行，自主检索网页并"
-            "产出带 URL 引用的研究报告。使用 AI Studio API Key 即可调用，无需 GCP 项目。"
-        ),
-        requires_base_url=True,
-        requires_secret=True,
-        default_base_url="https://generativelanguage.googleapis.com/v1beta",
-        probe_notice=(
-            "探测仅调用 GET /models 校验密钥，不会创建研究任务，因此不产生研究费用。"
-        ),
-        brand_id="gemini",
-        brand_icon_url="https://cdn.simpleicons.org/googlegemini",
-        documentation_url="https://ai.google.dev/gemini-api/docs/deep-research",
-        key_management_url="https://aistudio.google.com/apikey",
-    ),
-    ProviderTypeSpec(
-        provider_type="openai_deep_research",
-        role="deep_research",
-        label="OpenAI Deep Research（Responses 后台任务）",
-        description=(
-            "以 OpenAI Responses 后台任务驱动联网检索并生成带引用的研究报告。"
-            "专用 o3/o4-mini-deep-research 模型已于 2026-07-23 下线，此接入改用通用"
-            "推理模型搭配 web_search 工具。"
-        ),
-        requires_base_url=True,
-        requires_secret=True,
-        default_base_url="https://api.openai.com/v1",
-        probe_notice=(
-            "探测仅调用 GET /v1/models 校验密钥，不会创建后台任务，因此不产生研究费用。"
-        ),
-        brand_id="openai",
-        documentation_url="https://platform.openai.com/docs/guides/deep-research",
-        key_management_url="https://platform.openai.com/api-keys",
-    ),
-    ProviderTypeSpec(
-        provider_type="perplexity_deep_research",
-        role="deep_research",
-        label="Perplexity Deep Research",
-        description=(
-            "Perplexity 异步 Sonar 深度研究：提交后由平台后台执行多轮检索，"
-            "返回研究报告与来源列表（含标题与摘要）。"
-        ),
-        requires_base_url=True,
-        requires_secret=True,
-        default_base_url="https://api.perplexity.ai",
-        probe_notice=(
-            "探测仅列出既有异步任务以校验密钥，不会创建新研究任务。"
-        ),
-        brand_id="perplexity",
-        brand_icon_url="https://cdn.simpleicons.org/perplexity",
-        documentation_url="https://docs.perplexity.ai/docs/sonar/models/sonar-deep-research",
-        key_management_url="https://www.perplexity.ai/account/api/keys",
-    ),
-    ProviderTypeSpec(
-        provider_type="tavily_deep_research",
-        role="deep_research",
-        label="Tavily Deep Research",
-        description=(
-            "Tavily 研究接口：提交后返回 request_id，由平台后台执行检索与撰写，"
-            "产出 Markdown 报告与结构化来源列表，支持域名白名单。"
-        ),
-        requires_base_url=True,
-        requires_secret=True,
-        default_base_url="https://api.tavily.com",
-        probe_notice="探测仅调用 GET /usage 校验密钥与额度，不会创建研究任务。",
-        brand_id="tavily",
-        brand_icon_url="https://tavily.com/favicon.ico",
-        documentation_url="https://docs.tavily.com/documentation/api-reference/endpoint/research",
-        key_management_url="https://app.tavily.com",
-    ),
-    ProviderTypeSpec(
-        provider_type="exa_deep_research",
-        role="deep_research",
-        label="Exa Deep Research（Agent API）",
-        description=(
-            "Exa Agent API：异步多步研究任务，由子智能体并行检索不同领域，"
-            "返回报告正文与 grounding 引用。深度由 effort 档位控制。"
-        ),
-        requires_base_url=True,
-        requires_secret=True,
-        default_base_url="https://api.exa.ai",
-        probe_notice="探测仅列出既有 Agent 运行以校验密钥，不会创建研究任务。",
-        brand_id="exa",
-        brand_icon_url="https://exa.ai/favicon.ico",
-        documentation_url="https://exa.ai/docs/reference/agent-api/overview",
-        key_management_url="https://dashboard.exa.ai/api-keys",
-    ),
-    ProviderTypeSpec(
-        provider_type="qwen_deep_research",
-        role="deep_research",
-        label="通义千问 Deep Research",
-        description=(
-            "阿里云百炼 qwen-deep-research：自主制定研究计划并多轮检索，"
-            "输出带参考文献的研究报告。可选主线 qwen-deep-research 或快照 "
-            "qwen-deep-research-2025-12-15（支持 MCP 工具）。该接口仅支持流式，"
-            "任务在独立执行器中运行。"
-        ),
-        requires_base_url=True,
-        requires_secret=True,
-        # Static catalogue: mainline + snapshot; not an OpenAI /models list.
-        supports_model_discovery=True,
-        default_base_url="https://dashscope.aliyuncs.com",
-        probe_notice=(
-            "探测仅调用 GET /compatible-mode/v1/models 校验密钥，不会发起研究任务。"
-            "「发现模型」会载入官方 qwen-deep-research 主线与快照模型列表。"
-        ),
-        brand_id="qwen",
-        brand_icon_url="https://models.dev/logos/alibaba.svg",
-        documentation_url="https://help.aliyun.com/zh/model-studio/qwen-deep-research",
-        key_management_url="https://bailian.console.aliyun.com/?tab=model#/api-key",
-    ),
-    ProviderTypeSpec(
-        provider_type="jina_deep_research",
-        role="deep_research",
-        label="Jina DeepSearch",
-        description=(
-            "Jina DeepSearch：OpenAI 兼容的搜索—阅读—推理循环，返回带 url_citation "
-            "注解的答案。该接口仅支持流式，任务在独立执行器中运行。"
-        ),
-        requires_base_url=True,
-        requires_secret=True,
-        default_base_url="https://deepsearch.jina.ai",
-        probe_notice="探测仅调用 Jina 模型列表校验密钥，不会消耗研究额度。",
-        brand_id="jina",
-        brand_icon_url="https://jina.ai/favicon.ico",
-        documentation_url="https://jina.ai/deepsearch/",
-        key_management_url="https://jina.ai/api-dashboard/key-manager",
-    ),
-    ProviderTypeSpec(
         provider_type="openai_compatible_transcription",
         role="transcription",
         label="OpenAI-compatible ASR",
@@ -838,11 +695,6 @@ REST_IMAGE_SEARCH_PROVIDER_TYPES = frozenset(
 FETCH_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "fetch"
 )
-DEEP_RESEARCH_PROVIDER_TYPES = frozenset(
-    item.provider_type
-    for item in PROVIDER_TYPE_SPECS
-    if item.role == "deep_research"
-)
 TRANSCRIPTION_PROVIDER_TYPES = frozenset(
     item.provider_type for item in PROVIDER_TYPE_SPECS if item.role == "transcription"
 )
@@ -873,7 +725,6 @@ def provider_catalog(*, include_development: bool = False) -> list[dict[str, obj
 PROVIDER_IMPORT_TARGETS: dict[str, tuple[tuple[str, str | None], ...]] = {
     "qwen": (
         ("qwen_image_search", None),
-        ("qwen_deep_research", None),
         (
             "openai_compatible_transcription",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -883,20 +734,12 @@ PROVIDER_IMPORT_TARGETS: dict[str, tuple[tuple[str, str | None], ...]] = {
     ),
     "qwen_image_search": (
         ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        ("qwen_deep_research", None),
-        ("openai_compatible_transcription", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        ("openai_compatible_embedding", None),
-    ),
-    "qwen_deep_research": (
-        ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        ("qwen_image_search", None),
         ("openai_compatible_transcription", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         ("openai_compatible_embedding", None),
     ),
     "openai_responses": (
         ("openai_responses_vision", None),
         ("openai_images", None),
-        ("openai_deep_research", None),
         ("openai_compatible_transcription", None),
         ("openai_compatible_embedding", None),
         ("openai_compatible_chat", None),
@@ -904,16 +747,10 @@ PROVIDER_IMPORT_TARGETS: dict[str, tuple[tuple[str, str | None], ...]] = {
     "openai_responses_vision": (
         ("openai_responses", None),
         ("openai_images", None),
-        ("openai_deep_research", None),
         ("openai_compatible_transcription", None),
         ("openai_compatible_embedding", None),
     ),
     "openai_images": (
-        ("openai_responses", None),
-        ("openai_compatible_chat", None),
-        ("openai_compatible_embedding", None),
-    ),
-    "openai_deep_research": (
         ("openai_responses", None),
         ("openai_compatible_chat", None),
         ("openai_compatible_embedding", None),

@@ -7,7 +7,6 @@ export type ProviderRole =
   | "search"
   | "image_search"
   | "fetch"
-  | "deep_research"
   | "memory"
   | "transcription"
   | "tts"

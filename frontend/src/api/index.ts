@@ -18,7 +18,6 @@ export * from "./sessions";
 export * from "./session-sharing";
 export * from "./files";
 export * from "./search";
-export * from "./research";
 export * from "./evidence";
 export * from "./voice";
 export * from "./mastery";

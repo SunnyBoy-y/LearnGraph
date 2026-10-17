@@ -1,4 +1,4 @@
-import type { SearchRequest, SearchResponse } from '@/types/research'
+import type { SearchRequest, SearchResponse } from '@/types/search'
 
 import { apiClient } from './client'
 

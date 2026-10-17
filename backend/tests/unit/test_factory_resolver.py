@@ -2,7 +2,7 @@
 
 背景：可信桌面直连（LEARNGRAPH_HOST_ACCESS_MODE=direct）与 Host Service
 Bridge 必须覆盖 Provider 管理的**所有**出站接口（model/embedding/image/
-transcription/search/fetch/deep-research/memory/MCP），而不只是 Ollama；
+transcription/search/fetch/memory/MCP），而不只是 Ollama；
 同时源码启动（npm run dev / personal_desktop / 非容器）必须零影响——任何
 改写路径在源码模式下原样返回。
 
@@ -87,7 +87,7 @@ class TestDirectCoversAllProviderTypes:
             ("openai_compatible_embedding", "http://127.0.0.1:11434/v1", "http://host.docker.internal:11434/v1"),
             ("openai_compatible_vision", "http://127.0.0.1:1234/v1", "http://host.docker.internal:1234/v1"),
             ("openai_compatible_transcription", "http://127.0.0.1:9000/v1", "http://host.docker.internal:9000/v1"),
-            ("http_deep_research", "http://127.0.0.1:9090", "http://host.docker.internal:9090"),
+            ("http_search", "http://127.0.0.1:9090", "http://host.docker.internal:9090"),
         ],
     )
     def test_rewrites_loopback_preserving_port(self, provider_type: str, base_url: str, expected: str) -> None:

@@ -277,16 +277,6 @@ class BillingService:
             self.db.commit()
         return quote
 
-    def preflight_research_call(self, *, provider_id: str, currency: str,
-                                estimated_cost_amount: Any, now: datetime | None = None, reserve: bool = True) -> BillingQuote:
-        self._require_provider(provider_id)
-        quote = BillingQuote(provider_id, "deep-research", "deep_research", True, currency_code(currency),
-            projected_amount=amount_text(estimated_cost_amount) if estimated_cost_amount is not None else None,
-            workspace_id=self.workspace_id, quoted_at=self._as_utc(now or utc_now()).isoformat(), source="provider_estimate", durable_reservation=True)
-        if reserve:
-            self._lock_budget()
-            self._reserve(quote)
-        return quote
 
     def execute_search(self, provider: Any, query: str, max_results: int, *,
                        allowed_domains: set[str] | None = None,
@@ -300,14 +290,14 @@ class BillingService:
         if maximum_amount and quote.remote_capability:
             currency, limit = maximum_amount
             if quote.currency is None or quote.projected_amount is None:
-                self.release_reservation(quote, reason="research_price_unknown")
-                raise AppError(409, "usage_price_required", "Research search budget requires a known native price")
+                self.release_reservation(quote, reason="search_price_unknown")
+                raise AppError(409, "usage_price_required", "Search budget requires a known native price")
             if quote.currency != currency:
-                self.release_reservation(quote, reason="research_currency_mismatch")
-                raise AppError(422, "research_currency_mismatch", "Choose the search supplier's native currency", {"currency": quote.currency})
+                self.release_reservation(quote, reason="search_currency_mismatch")
+                raise AppError(422, "search_currency_mismatch", "Choose the search supplier's native currency", {"currency": quote.currency})
             if decimal_amount(quote.projected_amount) > decimal_amount(limit):
-                self.release_reservation(quote, reason="research_budget_blocked")
-                raise AppError(402, "research_budget_exceeded", "Search was blocked before execution")
+                self.release_reservation(quote, reason="search_budget_blocked")
+                raise AppError(402, "search_budget_exceeded", "Search was blocked before execution")
         results = None
         try:
             results = provider.search(query, max_results, allowed_domains=allowed_domains)

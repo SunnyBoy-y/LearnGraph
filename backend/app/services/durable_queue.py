@@ -203,7 +203,7 @@ class DurableQueue:
     ) -> bool:
         """Requeue a leased job without consuming its retry budget.
 
-        Used for continuous work such as research polling: the handler is
+        Used for continuous work: the handler is
         lease-fenced and re-arms the same row so polling survives process
         restarts (the row is again eligible after ``available_at``) while the
         worker is free to serve other tenants between polls.
@@ -247,30 +247,6 @@ def enqueue_document_job(workspace_id: str, document_job_id: str, execution_toke
         )
 
 
-def enqueue_research_poll(research_job_id: str, workspace_id: str, actor_id: str) -> DurableJob:
-    """Persist one durable poll job for a remote research task.
-
-    The dedupe key is per research job so exactly one poller exists per task;
-    re-enqueueing (e.g. from cancel or restart reconciliation) returns the same
-    row instead of stacking duplicate pollers.
-    """
-
-    settings = get_settings()
-    with SessionLocal() as db:
-        return DurableQueue(
-            db,
-            lease_seconds=settings.durable_queue_lease_seconds,
-            max_attempts=settings.durable_queue_max_attempts,
-        ).enqueue(
-            workspace_id=workspace_id,
-            kind="research.poll",
-            payload={
-                "research_job_id": research_job_id,
-                "workspace_id": workspace_id,
-                "actor_id": actor_id,
-            },
-            dedupe_key=f"research.poll:{research_job_id}",
-        )
 
 
 def enqueue_memory_extraction(
@@ -304,21 +280,6 @@ def enqueue_memory_extraction(
         )
 
 
-def run_research_poll_once(payload: dict[str, Any]) -> bool:
-    """Poll one remote research task once with a fresh session.
-
-    Returns True when the research job reached a terminal status or polling
-    cannot continue (provider disappeared); False while the task is still
-    active and the poll job should be re-armed.
-    """
-
-    from app.services.research import poll_research_once
-
-    return poll_research_once(
-        str(payload["research_job_id"]),
-        str(payload["workspace_id"]),
-        str(payload.get("actor_id") or "system:durable-queue"),
-    )
 
 
 def run_one_durable_job(worker_id: str) -> bool:
@@ -364,15 +325,6 @@ def run_one_durable_job(worker_id: str) -> bool:
                     str(job.payload["execution_token"]),
                 )
                 queue.complete(job)
-            elif job.kind == "research.poll":
-                terminal = run_research_poll_once(job.payload)
-                if terminal:
-                    queue.complete(job)
-                else:
-                    # Task still active: re-arm with the configured poll
-                    # interval so the worker cycles through tenants instead of
-                    # parking on one long research window.
-                    queue.rearm(job, delay_seconds=max(0.01, settings.research_poll_seconds))
             elif job.kind == "chat.continue_stream":
                 from app.services.chat_durable import run_chat_continue_once
 
@@ -416,70 +368,6 @@ def run_one_durable_job(worker_id: str) -> bool:
         return True
 
 
-def reconcile_research_polling() -> int:
-    """Ensure an active durable poll job for every in-flight remote research task.
-
-    Handles research jobs created before the durable queue (no poll row yet)
-    and defensive re-arming of terminal poll rows that outlived a still-active
-    task. Skipped for terminal and awaiting-approval research jobs (the latter
-    has no provider task yet). Runs at startup while the durable worker is
-    starting. Returns the number of poll jobs ensured.
-
-    v2.0: always owns its own session (no caller-injected ``db``) so a caller
-    can never hand a session across an ``asyncio.to_thread`` boundary.
-    """
-
-    from app.domain.models import ResearchJob
-    from app.services.research import ACTIVE_RESEARCH_STATUSES
-
-    settings = get_settings()
-    session = SessionLocal()
-    ensured = 0
-    try:
-        research_jobs = session.scalars(
-            select(ResearchJob).where(
-                ResearchJob.status.in_(ACTIVE_RESEARCH_STATUSES),
-                ResearchJob.provider_task_id.is_not(None),
-            )
-        ).all()
-        for research_job in research_jobs:
-            dedupe = f"research.poll:{research_job.id}"
-            existing = session.scalar(
-                select(DurableJob).where(
-                    DurableJob.workspace_id == research_job.workspace_id,
-                    DurableJob.kind == "research.poll",
-                    DurableJob.dedupe_key == dedupe,
-                )
-            )
-            if existing is not None and existing.status in {"queued", "leased"}:
-                continue
-            if existing is not None:
-                # Re-arm a terminal poll row so the still-active task resumes.
-                existing.status = "queued"
-                existing.attempt_count = 0
-                existing.lease_owner = None
-                existing.lease_token = None
-                existing.lease_expires_at = None
-                existing.available_at = utc_now()
-            else:
-                session.add(
-                    DurableJob(
-                        workspace_id=research_job.workspace_id,
-                        kind="research.poll",
-                        payload={
-                            "research_job_id": research_job.id,
-                            "workspace_id": research_job.workspace_id,
-                            "actor_id": "system:durable-queue",
-                        },
-                        dedupe_key=dedupe,
-                        max_attempts=settings.durable_queue_max_attempts,
-                    )
-                )
-            ensured += 1
-        session.commit()
-    finally:
-        session.close()
-    return ensured
 
 
 async def durable_queue_worker(stop: asyncio.Event, worker_id: str) -> None:

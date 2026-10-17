@@ -4,7 +4,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.security import Principal
-from app.domain.models import ActionItem, Evidence, Goal, Graph, ProviderConfig, ResearchJob, Roadmap, Workspace
+from app.domain.models import ActionItem, Evidence, Goal, Graph, ProviderConfig, Roadmap, Workspace
 from app.domain.schemas.auth import DashboardAction, DashboardMetric, DashboardResponse
 from app.providers.catalog import SEARCH_PROVIDER_TYPES
 from app.services.authorization import AuthorizationService
@@ -105,14 +105,12 @@ class DashboardService:
         )
         graphs = self._accessible_count(Graph, "graph")
         pending_evidence = self._count(Evidence, Evidence.status == "pending")
-        running_research = self._count(ResearchJob, ResearchJob.status.in_(["queued", "running"]))
         return DashboardResponse(
             workspace_id=self.workspace_id,
             metrics=[
                 DashboardMetric(key="active_goals", label="活跃目标", value=active_goals),
                 DashboardMetric(key="graphs", label="学习图谱", value=graphs),
                 DashboardMetric(key="pending_evidence", label="证据待审", value=pending_evidence, status="attention" if pending_evidence else "normal"),
-                DashboardMetric(key="research_running", label="研究任务", value=running_research),
             ],
             next_actions=self._next_actions(),
             system_status={

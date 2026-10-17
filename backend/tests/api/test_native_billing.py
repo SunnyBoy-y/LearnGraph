@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.core.errors import AppError
 from app.domain.models import BudgetPolicy, ProviderConfig, UsageEvent
-from app.services.billing import BillingService
+from app.services.billing import BillingQuote, BillingService
 from app.services.management import UsageService
 
 
@@ -95,7 +95,7 @@ def test_unknown_is_not_zero_and_provider_report_currency_is_retained(client, re
         with pytest.raises(AppError) as failure:
             quote(billing, provider)
         assert failure.value.code == "usage_price_required"
-        decision = billing.preflight_research_call(provider_id=provider, currency="CNY", estimated_cost_amount="1")
+        decision = BillingQuote(provider, "provider-report", "chat", True, "CNY", projected_amount="1", workspace_id=workspace, source="provider_estimate")
         event = billing.record_usage(decision, input_tokens=0, output_tokens=0, attempt=1,
             provider_reported_cost_amount="0.01234567890123456789", provider_reported_currency="USD")
         assert event.currency == "USD" and event.cost_amount == "0.01234567890123456789"

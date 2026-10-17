@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from app.domain.schemas.research import SearchResult
+from app.domain.schemas.search import SearchResult
 from app.providers.remote.search import (
     dedupe_search_results,
     normalize_result_url,
