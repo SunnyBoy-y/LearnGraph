@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { discoverProviderModels, listProviders } from "@/api/providers";
 import { listSessionMessages, listSessions } from "@/api/sessions";
-import { documentPreviewFile as file, documentPreviewModels, documentPreviewProviders as providers } from "@/dev/document-model-fixtures";
+import { documentPreviewFile as file, documentPreviewModels, documentPreviewProviders as providers } from "@/test/fixtures/document-model";
 import { getSessionComposerPrefs } from "@/lib/session-composer-prefs";
 import { renderWithProviders } from "@/test/render";
 import { DocumentChatPanel } from "./document-chat-panel";
