@@ -55,10 +55,12 @@ x-app-environment: &app-environment
   LEARNGRAPH_MASTER_KEY: ${LEARNGRAPH_MASTER_KEY:-}
   LEARNGRAPH_BOOTSTRAP_ADMIN_PASSWORD: ${LEARNGRAPH_BOOTSTRAP_ADMIN_PASSWORD:-}
   # Demo 身份与演示数据开关（默认开启，与代码默认一致；透传后在根 .env 设置即可生效）。
-  # ENABLE_DEMO_LOGIN=false：应用重启后 seed 禁用 demo 身份（demo / learn-graph-local
-  # 公开凭据），普通登录与 /auth/demo-login 都拒绝；已签发会话立即失效。
+  # Demo 默认禁用；只能在宿主机根目录 .env 显式开启并重建应用容器。
+  # 关闭后普通登录与 /auth/demo-login 都拒绝，已有会话撤销；Demo 为普通用户。
   # ENABLE_DEMO_SEED=false：不再写入演示数据（不影响身份）。详见 backend/.env.example。
-  LEARNGRAPH_ENABLE_DEMO_LOGIN: ${LEARNGRAPH_ENABLE_DEMO_LOGIN:-true}
+  LEARNGRAPH_ENABLE_DEMO_LOGIN: ${LEARNGRAPH_ENABLE_DEMO_LOGIN:-false}
+  LEARNGRAPH_DEMO_USERNAME: ${LEARNGRAPH_DEMO_USERNAME:-demo}
+  LEARNGRAPH_DEMO_PASSWORD: ${LEARNGRAPH_DEMO_PASSWORD:-learn-graph-local}
   LEARNGRAPH_ENABLE_DEMO_SEED: ${LEARNGRAPH_ENABLE_DEMO_SEED:-true}
   # 登录会话有效期（小时）：默认 12h 需频繁重登，自托管建议 720h（30 天）少打扰
   LEARNGRAPH_AUTH_SESSION_HOURS: ${LEARNGRAPH_AUTH_SESSION_HOURS:-720}
@@ -143,6 +145,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        APP_VERSION: ${LEARNGRAPH_APP_VERSION:-v0.5}
         # 国内构建若 deb.debian.org (Fastly) 偶发 502，可在根 .env 设
         # LEARNGRAPH_DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn 切换镜像源。
         DEBIAN_MIRROR: ${LEARNGRAPH_DEBIAN_MIRROR:-deb.debian.org}

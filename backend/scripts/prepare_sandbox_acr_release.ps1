@@ -110,7 +110,7 @@ Write-Output "Or copy the digest shown on the ACR console (image version -> dige
 Write-Output ""
 $repoOnly = $target.Split(':')[0]
 if ($Platform -eq "linux/arm64") {
-    Write-Output "ARM64 deployment: use the ARM64 tag above, or the unified v0.6"
+    Write-Output "ARM64 deployment: use the ARM64 tag above, or a matching unified"
     Write-Output "  multi-platform tag after it is published; Docker will select ARM64."
 }
 else {

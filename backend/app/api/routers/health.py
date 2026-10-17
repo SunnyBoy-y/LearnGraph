@@ -5,13 +5,20 @@ import os
 from fastapi import APIRouter
 from sqlalchemy import select, text
 
-from app.api.deps import DB
+from app.api.deps import DB, AppSettings
 from app.core.admission import snapshot_admission_metrics
+from app.core.config import running_in_container
 from app.domain.models import ProviderConfig
 from app.domain.schemas.common import HealthResponse
 
 
 router = APIRouter(tags=["health"])
+
+
+@router.get("/version")
+def app_version(settings: AppSettings) -> dict[str, str]:
+    """Release identity is available even when the database/updater is offline."""
+    return {"version": settings.app_version, "runtime_mode": "docker" if running_in_container() else "source"}
 
 
 @router.get("/livez")
@@ -30,7 +37,7 @@ async def livez() -> dict[str, str | int]:
 
 
 @router.get("/health", response_model=HealthResponse)
-def health(db: DB) -> HealthResponse:
+def health(db: DB, settings: AppSettings) -> HealthResponse:
     """健康检查。
 
     无需认证或工作区 Header。返回服务状态、数据库类型、API 版本，以及是否存在已启用的远程能力。
@@ -48,7 +55,7 @@ def health(db: DB) -> HealthResponse:
     return HealthResponse(
         status="ok",
         service="learngraph-backend",
-        version="0.1.0",
+        version=settings.app_version,
         database="sqlite",
         remote_capabilities_enabled=remote_enabled is not None,
         agent_stream_admission=snapshot_admission_metrics(),

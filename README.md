@@ -136,8 +136,7 @@ docker compose up -d --build
 
 启动后访问 **http://127.0.0.1:18000**，使用容器日志中首次打印的管理员临时密码登录（用户名为 `admin`），登录后请立即修改密码。
 
-> 默认配置会创建**可登录**的 Demo 身份，如需禁用请配置本地".env"文件
-> 
+> 默认 Demo 账户为**禁用的普通用户**，不具备系统管理员权限。需要体验时，在宿主机根目录 `.env` 中显式设置 `LEARNGRAPH_ENABLE_DEMO_LOGIN=true`（仅开发/本地环境有效），再执行 `docker compose up -d --force-recreate app`。网页不能开启 Demo；账号密码只由服务端读取，前端不内置凭据。改回 `false` 并重建应用容器后，普通登录、快捷登录和已有 Demo 会话都会失效。
 
 | 服务 | 默认地址 | 说明 |
 | --- | --- | --- |
@@ -462,6 +461,8 @@ LearnGraph/
 
 ---
 
+资料页、会话文件和待发送附件共用阅读器。PDF 使用字节分段读取，EPUB 2/3 按目录和章节读取，超大文本与 CSV/TSV 按片段阅读，音视频交给浏览器流式播放。DOC/XLS/PPT，以及超过 16 MiB 的 DOCX/XLSX/PPTX/RTF，在禁网沙箱中转换为 PDF 后阅读；部署时须重建并切换包含 LibreOffice 的 `backend/sandbox/Dockerfile` 镜像，旧镜像会返回明确的转换服务错误。本地待发送 Office 文件须点击「上传并阅读」后转换。转换源文件受 `max_document_parse_bytes` 限制（默认 200 MiB）；EPUB 单个章节/资源上限 4 MiB，单章附加资源合计上限 16 MiB，不支持 DRM 加密书籍。
+
 ## 🔐 安全与可信边界
 
 - `X-Workspace-ID` 是作用域提示；后端会重新校验 Membership、权限与资源范围。
@@ -511,6 +512,88 @@ Android 单元测试在独立任务中通过 `:app:testDebugUnitTest` 执行（�
 真实 Docker 往返测试也已入库，需配置隔离的 sandboxd 服务后单独执行
 `uv run --locked --extra test --extra voice pytest tests/integration/test_sandboxd_roundtrip.py -q`。
 `frontend/tests-orphaned` 保留已移除模块的历史用例；`frontend/e2e` 是依赖本机浏览器、账号和服务的诊断脚本，均不参与常规 CI。
+
+## 应用内版本更新与回退
+
+「设置 → 关于 → 版本与更新」支持 GitHub 正式 Release 检测、更新日志、一键升级、
+部署进度、失败自动回滚、历史部署回退以及可选的自动安装。单实例 Compose
+替换有短暂停机，正在进行的对话/语音可能断开，页面会自动重连。
+
+更新器是运行在 **Docker 宿主机** 上的独立 Python 3.10+ 进程，仅使用标准库，
+需要 Docker CLI 和支持 `up --wait` 的 Compose v2。Windows Docker Desktop 和
+Linux 均可使用。应用容器不持有 Docker socket。已有部署需要先安装一次此功能的
+基线镜像，之后在网页内更新。仅系统管理员可访问版本接口。
+
+在原部署目录执行：
+
+```sh
+python -m updater --init-only
+# 使用 VERSION 中的原始 Release tag 构建基线版本（当前为 v0.5）。
+node scripts/compose.mjs up -d --build
+# 独立运行，生产环境交给 systemd / Windows 任务计划程序保持运行。
+python -m updater --project-dir .
+```
+
+如果原部署使用了额外 Compose 文件，启动和更新器都必须携带同一组文件：
+
+```sh
+python -m updater --compose-file docker-compose.yml --compose-file docker-compose.sandbox.yml --compose-file docker-compose.updater.yml
+```
+
+Windows 在仓库根目录运行 `pwsh -File updater/install-windows.ps1` 即可隐藏启动更新器，
+并为当前账户安装登录启动快捷方式（无需修改用户密码或发布远端 Release）。
+Linux 可使用 [systemd 服务示例](updater/learngraph-updater.service)，修改其中的
+目录与运行用户后安装；Windows 可将 `python -m updater --project-dir <部署绝对路径>`
+设为任务计划程序的开机任务，运行账户需有 Docker 访问权限。更新器默认监听
+`0.0.0.0:34116`，供容器通过 `host.docker.internal` 访问；用宿主机防火墙限制
+端口到 Docker 网络。请求需服务 token，且拒绝浏览器 Origin，不提供任意命令接口。
+凭据在 `data/updater/token`，只读挂载给应用；不要公开此文件或整个部署目录。
+
+根目录 `VERSION` 是应用版本的唯一发布源，保留 Release tag 原文（包含 `v`）。
+健康接口、公开 `/api/v1/version`、OpenAPI 版本、页面与镜像 OCI 版本标签使用相同值。
+发布前先修改 `VERSION`，然后创建名称完全相同的 GitHub Release tag；workflow 与
+Dockerfile 都会拒绝版本不匹配的构建。`npm` / Python 包使用的 `0.5.0` 是包元数据，
+不用于推断应用发布版本。本地构建请使用 Compose 脚本，它自动将 `VERSION` 注入 build args；
+直接使用 `docker build` 时显式传入 `--build-arg APP_VERSION=<VERSION 原文>`。
+
+默认每小时检查 `SunnyBoy-y/LearnGraph` 的稳定 `vX.Y` / `vX.Y.Z` Release（也支持无 `v`），
+所以现有 `v0.5` / `v0.4` / `v0.3` 无需重命名即可被检测。数字比较时将缺省 patch
+视为 0，显示、请求与镜像 tag 始终保留原文。
+支持 ETag 条件请求。Fork 可通过 `--repository OWNER/REPO --image ghcr.io/owner/learngraph`
+指定来源。私有仓库在更新器环境设置 `LEARNGRAPH_UPDATE_GITHUB_TOKEN`；
+私有镜像先以运行更新器的账户执行 `docker login ghcr.io`。
+
+发布正式 Release 会触发现有 Docker workflow，先构建与冒烟检查，再向 GHCR 推送
+与 Release **完整 tag 相同**的镜像。镜像必须允许部署账户拉取（公开项目首次发布后
+检查 GHCR package 可见性）。Release 比镜像先可见时，下载失败的任务不会修改容器；
+镜像发布完成后可在网页手动重试。自动安装默认关闭，失败版本不会反复自动安装；
+手动回退会关闭自动安装，避免下次检查立即升回去。
+
+更新器同步切换 `app`、`preview`、`egress-proxy`，不替换 `sandboxd` 或沙箱 runner，
+也不自动更新 Compose/宿主机脚本；需要改变这些部署协议的版本应采用人工迁移。
+切换前保留旧/新镜像的本地标签及不可变 image ID，在线备份 SQLite 并校验，
+切换后验证全部容器健康状态与数据库就绪接口。失败时恢复原镜像；更新器若在
+切换中重启，也会依据落盘任务恢复原部署。回滚失败会明确显示「需要人工处理」。
+
+`docker/update-compatibility` 是发布者维护的兼容代号。只有新旧镜像的
+`io.learngraph.update-compatibility` 标签相同才允许在线切换/回退；不兼容的
+数据库、部署配置、sandboxd 协议变更必须增加此代号，并走人工迁移流程。
+此标记是发布契约，不会自动证明数据库兼容。更新器不自动还原数据库，
+以免丢弃更新后的数据；备份位于 `data/updater/private/<任务ID>.db`。
+数据库备份、校验与拷贝默认各允许 900 秒，大库可通过 `--backup-timeout` 调整。
+这是数据库备份，不包含附件/主密钥的全量灾备；请另行备份整个数据卷。
+
+当前镜像选择持久化为根目录的 `docker-compose.update.json`，普通重启和
+`npm run docker -- ...` 会保持该选择。直接使用 Docker Compose 时必须追加该文件：
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.updater.yml -f docker-compose.update.json up -d --no-build --pull never
+```
+
+首次更新前该文件尚不存在，无需追加。不要使用旧的 `scripts/docker-update.sh`
+与网页更新器同时更新；两者不共享事务锁。任务、备份和镜像暂不自动清理，管理员
+可按实际磁盘预算清理已不再需要回退的历史；删除保留镜像后对应回退将安全失败。
+手动操作 Compose 同样应避开网页更新任务。
 
 ## 📚 开发者文档
 

@@ -445,7 +445,6 @@ npm.cmd run check</code></pre>
             <div><span>Model</span><strong>OpenAI Responses · OpenAI-compatible Chat · Anthropic Messages · DeepSeek · Qwen DashScope（原生搜索通道）· Ollama · GitHub Copilot · Codex · Ollama Cloud</strong><small>统一为 ProviderChatMessage / ProviderStreamEvent；多角色模型（fast / thinking / agentic）</small></div>
             <div><span>Search</span><strong>通用搜索 Provider + Qwen 原生联网（enable_source / enable_citation）</strong><small>搜索来源与 [ref_N] 角标仅 DashScope 原生协议支持，按能力快照门控；搜索不可用时显式失败，不生成来源</small></div>
             <div><span>Fetch</span><strong>沙箱热池抓取 · Crawl4AI HTTP · Firecrawl · Qwen hosted</strong><small>URL 安全校验、超时和响应结构限制；沙箱抓取复用热容器池</small></div>
-            <div><span>Research</span><strong>Deep Research HTTP</strong><small>独立 Provider，不与普通搜索混淆</small></div>
             <div><span>Image</span><strong>文生图 / 图生图 / 参考图编辑（gpt-image-2 · qwen-image-edit · qwen_image_search）</strong><small>图片模型独立 lane，拦截误作文本模型</small></div>
             <div><span>ASR</span><strong>DashScope 转录（实时 + 录音转写）</strong><small>qwen 行兜底路由 · input_audio 直连 · 异步录音识别；沙箱内音频走宿主侧 ASR 桥</small></div>
             <div><span>Storage</span><strong>Local filesystem · MinIO</strong><small>通过迁移流程切换</small></div>
@@ -1413,7 +1412,7 @@ docker compose up -d --build</code></pre>
           </div>
           <h3>认证、供应链与发布治理</h3>
           <div class="definition-list compact">
-            <div><span class="status status-current">认证加固</span><p>首次登录强制改密（独立页面 + 刷新恢复）、认证限流防灌水；按端点明确权限边界、避免尾斜杠绕过。Demo 身份（demo/learn-graph-local）在开发环境（LEARNGRAPH_ENV=development）默认可登录、非开发环境默认关闭；ENABLE_DEMO_LOGIN=false 重启后身份即被禁用（普通登录同样拒绝），演示数据另由 ENABLE_DEMO_SEED 单独控制（见 backend/.env.example）。</p></div>
+            <div><span class="status status-current">认证加固</span><p>首次登录强制改密（独立页面 + 刷新恢复）、认证限流防灌水；按端点明确权限边界、避免尾斜杠绕过。Demo 默认是禁用的普通用户，旧版管理员标记会在启动时移除；Docker 部署只能在宿主机根目录 .env 显式设置 LEARNGRAPH_ENABLE_DEMO_LOGIN=true 并重建应用容器后启用（仅开发/本地环境有效）。前端不内置账号密码，入口由后端配置控制；关闭后普通登录、快捷登录与已有会话均失效。演示数据仍由 LEARNGRAPH_ENABLE_DEMO_SEED 独立控制。</p></div>
             <div><span class="status status-current">供应链</span><p>沙箱镜像 lockfile + 供应链清单校验、镜像只持久化 RepoDigest、MCP 凭据接入版本化密钥存储加密、工具输出脱敏（URL 凭据/密钥赋值）。</p></div>
             <div><span class="status status-current">资源配额</span><p>沙箱 inode / 文件数 / 目录数 / 快照保留限额；浏览器预览 Range 截断；宿主内存/CPU/磁盘保留水位。</p></div>
             <div><span class="status status-current">发布门禁</span><p>上线前全盘审计（生产构建、登录并发、SSE 心跳、越权、限流、关页计费、首屏体积）→ 分级修复 → 回归验证 → 按"个人/小团队、单实例单进程"边界放行（CONDITIONAL_GO）。</p></div>

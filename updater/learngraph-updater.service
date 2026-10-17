@@ -1,0 +1,20 @@
+[Unit]
+Description=LearnGraph independent deployment updater
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# Replace directory and account with the ORIGINAL deployment's directory/account.
+# The account must have Docker CLI access and read access to the deployment .env.
+User=learngraph
+WorkingDirectory=/opt/learngraph
+ExecStart=/usr/bin/python3 -m updater --project-dir /opt/learngraph
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

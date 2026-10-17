@@ -1,0 +1,14 @@
+# First run `python -m updater --init-only` on the Docker host.
+# Add this override to the SAME Compose files used by the original deployment.
+services:
+  app:
+    environment:
+      LEARNGRAPH_UPDATE_AGENT_URL: ${LEARNGRAPH_UPDATE_AGENT_URL:-http://host.docker.internal:34116}
+      LEARNGRAPH_UPDATE_AGENT_TOKEN_FILE: /run/secrets/learngraph-updater-token
+    volumes:
+      - type: bind
+        source: ./data/updater/token
+        target: /run/secrets/learngraph-updater-token
+        read_only: true
+        bind:
+          create_host_path: false

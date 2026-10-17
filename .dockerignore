@@ -33,6 +33,8 @@ backend/data
 backend/.env
 frontend/.env
 data
+docker-compose.update.json
+updater
 docs
 doc
 blog-output

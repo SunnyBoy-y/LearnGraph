@@ -17,6 +17,7 @@
 //   npm run docker -- down # = node scripts/compose.mjs down
 
 import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -36,9 +37,27 @@ if (created) {
 }
 
 const args = process.argv.slice(2)
-const result = spawnSync('docker', ['compose', ...args], {
+const appVersion = readFileSync(path.join(repoRoot, 'VERSION'), 'utf8').trim()
+if (!/^v?(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?$/.test(appVersion)) throw new Error('Invalid VERSION release tag')
+// Keep a web-installed version pinned across manual Compose operations.
+// Extra files still follow their original order; managed images are last.
+const files = ['-f', 'docker-compose.yml']
+if (existsSync(path.join(repoRoot, 'data/updater/token'))) files.push('-f', 'docker-compose.updater.yml')
+const forwarded = []
+for (let index = 0; index < args.length; index += 1) {
+  if (args[index] === '-f' || args[index] === '--file') {
+    files.push(args[index], args[++index])
+  } else if (args[index].startsWith('--file=')) {
+    files.push(args[index])
+  } else {
+    forwarded.push(args[index])
+  }
+}
+if (existsSync(path.join(repoRoot, 'docker-compose.update.json'))) files.push('-f', 'docker-compose.update.json')
+const result = spawnSync('docker', ['compose', ...files, ...forwarded], {
   cwd: repoRoot,
   stdio: 'inherit',
+  env: { ...process.env, LEARNGRAPH_APP_VERSION: appVersion },
 })
 
 if (result.error) {

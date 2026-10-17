@@ -4,9 +4,12 @@ on:
   pull_request:
     paths:
       - "Dockerfile"
+      - "VERSION"
       - ".dockerignore"
       - "docker-compose.yml"
       - "docker-compose.sandbox.yml"
+      - "docker-compose.updater.yml"
+      - "updater/**"
       - "docker/**"
       - "frontend/**"
       - "backend/app/**"
@@ -22,9 +25,12 @@ on:
       - "v*"
     paths:
       - "Dockerfile"
+      - "VERSION"
       - ".dockerignore"
       - "docker-compose.yml"
       - "docker-compose.sandbox.yml"
+      - "docker-compose.updater.yml"
+      - "updater/**"
       - "docker/**"
       - "frontend/**"
       - "backend/app/**"
@@ -34,6 +40,8 @@ on:
       - "sandboxd/**"
       - ".github/workflows/docker.yml"
   workflow_dispatch:
+  release:
+    types: [published]
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
@@ -49,9 +57,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
 
       - name: Lowercase image name
         run: echo "IMAGE_NAME=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/learngraph" >> "$GITHUB_ENV"
+
+      - name: Release version and database compatibility
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+          tag = os.environ['RELEASE_TAG']
+          version = pathlib.Path('VERSION').read_text().strip()
+          if not re.fullmatch(r'v?(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?', version):
+              raise SystemExit('VERSION must use a stable release tag, for example v0.5 or v1.2.3')
+          if tag and tag != version:
+              raise SystemExit(f'Release tag {tag!r} differs from VERSION {version!r}; update VERSION before publishing')
+          compatibility = pathlib.Path('docker/update-compatibility').read_text().strip()
+          assert re.fullmatch(r'[0-9]+', compatibility)
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'APP_VERSION={version}\nUPDATE_COMPATIBILITY={compatibility}\n')
+          PY
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,6 +98,8 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
+            type=ref,event=tag
+            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
@@ -92,7 +122,13 @@ jobs:
           tags: |
             learngraph:ci
             ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ env.APP_VERSION }}
+          build-args: |
+            APP_VERSION=${{ env.APP_VERSION }}
+            UPDATE_COMPATIBILITY=${{ env.UPDATE_COMPATIBILITY }}
+            SOURCE_REPOSITORY=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -143,6 +179,11 @@ jobs:
           # internal (dynamic sandbox containers join it by name).
           docker network inspect --format '{{.Internal}} {{.Name}}' learngraph-egress | grep -q 'true'
 
+      - name: Verify updater with real isolated containers
+        env:
+          LEARNGRAPH_UPDATE_TEST_BASE: learngraph:ci
+        run: python -m updater.tests.docker_roundtrip
+
       - name: Push image
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
@@ -151,7 +192,13 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ env.APP_VERSION }}
+          build-args: |
+            APP_VERSION=${{ env.APP_VERSION }}
+            UPDATE_COMPATIBILITY=${{ env.UPDATE_COMPATIBILITY }}
+            SOURCE_REPOSITORY=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

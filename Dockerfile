@@ -50,6 +50,16 @@ COPY backend/sandbox ./sandbox
 
 FROM python:3.12-slim-bookworm AS runtime
 
+ARG APP_VERSION=v0.5
+ARG UPDATE_COMPATIBILITY=1
+ARG SOURCE_REPOSITORY=https://github.com/SunnyBoy-y/LearnGraph
+LABEL org.opencontainers.image.version=$APP_VERSION \
+      org.opencontainers.image.source=$SOURCE_REPOSITORY \
+      io.learngraph.update-compatibility=$UPDATE_COMPATIBILITY
+ENV LEARNGRAPH_APP_VERSION=$APP_VERSION
+COPY VERSION /app/VERSION
+RUN python -c "import os,pathlib; expected=pathlib.Path('/app/VERSION').read_text().strip(); assert os.environ['LEARNGRAPH_APP_VERSION']==expected, 'APP_VERSION must exactly match VERSION / GitHub Release tag'"
+
 # 可选：国内构建时用 DEBIAN_MIRROR 覆盖 deb.debian.org（Fastly 线路偶发 502，
 # 例如 --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn）。默认不变。
 ARG DEBIAN_MIRROR=deb.debian.org
