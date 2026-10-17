@@ -12,7 +12,7 @@ from test_stream_ui_http import UIProvider
 
 
 @pytest.mark.parametrize("runtime", [False, True])
-@pytest.mark.parametrize("ending", ["valid", "malformed", "unsafe", "patch", "repaired"])
+@pytest.mark.parametrize("ending", ["valid", "malformed", "unsafe", "patch", "repaired", "cancel"])
 def test_argument_preview_precedes_tool_commit_and_replays(client, register_user, auth_headers, monkeypatch, runtime, ending):
     from app.api.routers import chat as router
     from app.domain.models import MessagePartRecord
@@ -69,6 +69,11 @@ def test_argument_preview_precedes_tool_commit_and_replays(client, register_user
                     with SessionLocal() as other:
                         assert other.get(MessagePartRecord, part.id).data["preview"]
                     checks.append(True)
+                    if mode == "cancel":
+                        from app.domain.models import MessageControl
+                        control = service.db.get(MessageControl, part.message_version_id)
+                        control.cancel_requested = True
+                        service.db.commit()
             yield ProviderStreamEvent("tool_calls", tool_calls=[{"id": "fragmented", "type": "function",
                 "function": {"name": "ui_stream", "arguments": raw if mode == "repaired" else "".join(pieces)}}])
             yield ProviderStreamEvent("completed", finish_reason="tool_calls")
@@ -102,7 +107,7 @@ def test_argument_preview_precedes_tool_commit_and_replays(client, register_user
     response = client.post(f"/api/v1/sessions/{sid}/messages/stream", headers=headers,
                            json={"content": "逐段生成", "agent_mode": True})
     events = [json.loads(line[5:]) for line in response.text.splitlines() if line.startswith("data:")]
-    assert events[-1]["type"] == "message.completed", response.text[-5000:]
+    assert events[-1]["type"] == ("message.cancelled" if ending == "cancel" else "message.completed"), response.text[-5000:]
     assert checks
     updates = [e for e in events if e.get("payload", {}).get("ui_operation")]
     previews = [e for e in updates if e["payload"]["ui_operation"] == "ui.preview"]
@@ -119,6 +124,10 @@ def test_argument_preview_precedes_tool_commit_and_replays(client, register_user
     if ending in {"valid", "patch", "repaired"}:
         assert part["data"]["state"] == "completed" and len(part["data"]["blocks"]) == 3
         assert part["data"]["revision"] == (2 if ending == "patch" else 1)
+    elif ending == "cancel":
+        assert part["data"]["preview"] and part["data"]["blocks"]
+        assert part["status"] in {"interrupted", "cancelled"}
+        assert not any(e["payload"]["ui_operation"] == "ui.mount" for e in updates)
     else:
         assert part["data"]["state"] == "removed" and not part["data"].get("preview")
     replay = client.get(f"/api/v1/sessions/{sid}/messages/{history['id']}/events", headers=headers).json()
