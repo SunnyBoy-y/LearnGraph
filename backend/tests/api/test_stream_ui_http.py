@@ -80,7 +80,8 @@ def test_ui_stream_live_history_replay_actions_and_retry(client, register_user, 
     assert parts[0]["data"]["nodes"] == [] and len(parts[1]["data"]["nodes"]) == 2
     assert [part["data"]["revision"] for part in parts] == [0, 1, 2]
     mid = events[-1]["message_id"]
-    history = client.get(f"/api/v1/sessions/{sid}/messages", headers=headers).json()["items"][-1]
+    history = next(item for item in client.get(f"/api/v1/sessions/{sid}/messages", headers=headers).json()["items"]
+                   if item["id"] == mid)
     durable = next(part for part in history["parts"] if part["type"] == "ui")
     assert durable["id"] == parts[0]["id"] and durable["data"]["state"] == "completed"
     assert "[[artifact:" not in history["content"]
