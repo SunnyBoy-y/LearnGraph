@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Query, status
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
@@ -11,6 +13,9 @@ from app.domain.schemas.extensions import (
     ExternalCatalogSourceView,
     ExternalSkillSearchResponse,
     McpRegistrySearchResponse,
+    McpRegistryDetailResponse,
+    McpMarketTranslateRequest,
+    McpMarketTranslateResponse,
     MCPCapabilitySnapshotView,
     MCPInvokeRequest,
     MCPOAuthBeginRequest,
@@ -47,6 +52,9 @@ from app.domain.schemas.extensions import (
     SkillManualImportRequest,
     SkillMarketInstallRequest,
     SkillMarketListResponse,
+    SkillMarketDetailResponse,
+    SkillMarketTranslateRequest,
+    SkillMarketTranslateResponse,
     SkillMkdirRequest,
     SkillNpxImportRequest,
     SkillNpxImportResponse,
@@ -67,9 +75,12 @@ from app.domain.schemas.extensions import (
 from app.services.mcp_skills import MCPAndSkillService
 from app.services.skill_archive_import import SkillArchiveImportService
 from app.services.skill_catalog_sources import ExternalCatalogService
+from app.services.mcp_market import McpMarketService
+from app.services.mcp_market_translation import McpMarketTranslationService
 from app.services.skill_github_import import SkillGitHubImportService
 from app.services.skill_local_probe import SkillLocalProbeService
 from app.services.skill_market import SkillMarketService
+from app.services.skill_clawhub import ClawHubSkillMarket
 from app.services.skill_package import (
     SkillPackageService,
     ensure_official_skill_packages,
@@ -77,6 +88,7 @@ from app.services.skill_package import (
 from app.services.skill_sandbox_run import SkillSandboxRunService
 from app.services.skill_semantic_review import SkillSemanticReviewService
 from app.services.skill_translation import SkillTranslationService
+from app.services.skill_market_translation import SkillMarketTranslationService
 
 
 router = APIRouter(tags=["mcp-skills"])
@@ -569,13 +581,35 @@ def list_skill_market(
     q: str = Query(default="", max_length=120),
     page: int = Query(default=1, ge=1, le=10_000),
     page_size: int = Query(default=12, ge=1, le=48),
+    cursor: str | None = Query(default=None, max_length=4000),
 ) -> SkillMarketListResponse:
     manager = SkillMarketService(
         db, context.workspace_id, context.principal.user_id, settings
     )
     return manager.list_cards(
-        refresh=refresh, query=q, page=page, page_size=page_size
+        refresh=refresh, query=q, page=page, page_size=page_size, cursor=cursor
     )
+
+
+@router.get("/skills/market/detail", response_model=SkillMarketDetailResponse)
+def skill_market_detail(
+    db: DB, context: CurrentWorkspace, settings: AppSettings,
+    market_id: str = Query(min_length=1, max_length=200),
+    version: str | None = Query(default=None, min_length=1, max_length=80),
+) -> SkillMarketDetailResponse:
+    return ClawHubSkillMarket(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).detail(market_id, version=version)
+
+
+@router.post("/skills/market/translate", response_model=SkillMarketTranslateResponse)
+def translate_skill_market_view(
+    payload: SkillMarketTranslateRequest, db: DB, context: CurrentWorkspace, settings: AppSettings,
+) -> SkillMarketTranslateResponse:
+    context.require_permission("workspace.write")
+    return SkillMarketTranslationService(
+        db, context.workspace_id, context.principal.user_id, settings,
+    ).translate(payload)
 
 
 @router.post(
@@ -643,13 +677,34 @@ def browse_mcp_registry(
     context: CurrentWorkspace,
     settings: AppSettings,
     q: str = Query(default="", max_length=120),
-    cursor: str | None = Query(default=None, max_length=300),
+    cursor: str | None = Query(default=None, max_length=2000),
     limit: int = Query(default=12, ge=1, le=20),
+    catalog: Literal["official", "smithery"] = Query(default="official"),
 ) -> McpRegistrySearchResponse:
-    """浏览官方 MCP Registry 市场（游标分页；支持一键预填可用的远程服务器）。"""
-    return ExternalCatalogService(
+    """浏览真实 MCP 市场（官方 Registry / Smithery）。"""
+    return McpMarketService(
         db, context.workspace_id, context.principal.user_id, settings
-    ).browse_mcp_registry(query=q, cursor=cursor, limit=limit)
+    ).browse(catalog=catalog, query=q, cursor=cursor, limit=limit)
+
+
+@router.post("/mcp/registry/translate", response_model=McpMarketTranslateResponse)
+def translate_mcp_market_view(
+    payload: McpMarketTranslateRequest, db: DB, context: CurrentWorkspace, settings: AppSettings,
+) -> McpMarketTranslateResponse:
+    context.require_permission("workspace.write")
+    return McpMarketTranslationService(db, context.workspace_id, context.principal.user_id, settings).translate(payload)
+
+
+@router.get("/mcp/registry/detail", response_model=McpRegistryDetailResponse)
+def mcp_registry_detail(
+    db: DB, context: CurrentWorkspace, settings: AppSettings,
+    name: str = Query(min_length=1, max_length=200),
+    version: str = Query(default="latest", min_length=1, max_length=100),
+    catalog: Literal["official", "smithery"] = Query(default="official"),
+) -> McpRegistryDetailResponse:
+    return McpMarketService(
+        db, context.workspace_id, context.principal.user_id, settings
+    ).detail(name, catalog=catalog, version=version)
 
 
 @router.post(

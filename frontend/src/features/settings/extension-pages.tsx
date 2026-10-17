@@ -8,7 +8,6 @@ import {
   RefreshCcw,
   Search,
   ShieldCheck,
-  Sparkles,
   TerminalSquare,
   Trash2,
 } from "lucide-react";
@@ -18,7 +17,6 @@ import { toast } from "sonner";
 import {
   authorizeMcpServer,
   authorizeSkill,
-  browseMcpRegistry,
   checkSkillUpdate,
   confirmSkillDeletion,
   deleteMcpServer,
@@ -28,7 +26,6 @@ import {
   listBuiltinNativeTools,
   listMcpServers,
   listPlugins,
-  listProviders,
   listSkills,
   refreshMcpServer,
   refreshOfficialSkills,
@@ -73,11 +70,12 @@ import {
 } from "@/features/settings/control-pages";
 import { SkillPackageEditor } from "@/features/settings/skill-package-editor";
 import { AddSkillDialog } from "@/features/settings/skills-hub-extras";
+import { McpMarketPanel } from "@/features/settings/mcp-market-panel";
 import type {
   BuiltinNativeTool,
   MCPServer,
   MCPServerCreate,
-  McpRegistrySearchItem,
+  McpRegistryDetail,
   PermissionDecision,
   Skill,
   SkillCreate,
@@ -119,12 +117,12 @@ function normalizeHubTab(raw: string | null): ExtensionsHubTab {
 /** Unified Extensions Center (D-076): single entry for overview (incl. plugins), Skills, MCP, components, sandbox. */
 export function ExtensionsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const tab = normalizeHubTab(searchParams.get("tab"));
+  const tab = normalizeHubTab(searchParams.get("extensionTab"));
 
   const setTab = (next: string) => {
     const normalized = normalizeHubTab(next);
     setSearchParams(
-      normalized === "overview" ? {} : { tab: normalized },
+      (current) => { const next = new URLSearchParams(current); next.set("extensionTab", normalized); return next; },
       { replace: true },
     );
   };
@@ -191,10 +189,12 @@ export function ExtensionsOverviewPanel({
   const { workspaceId = "" } = useParams();
   const queryClient = useQueryClient();
   const plugins = useQuery({ queryKey: ["plugins"], queryFn: listPlugins });
-  const providers = useQuery({
-    queryKey: ["providers"],
-    queryFn: listProviders,
-  });
+  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
+  const mcpServers = useQuery({ queryKey: ["mcp-servers"], queryFn: listMcpServers });
+  const [introduction, setIntroduction] = useState<{
+    name: string; category: string; description: string; version: string;
+    source: string; permissions: string[]; capabilities: string[];
+  } | null>(null);
   const toggle = useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
       togglePlugin(id, { enabled }),
@@ -204,7 +204,7 @@ export function ExtensionsOverviewPanel({
     },
     onError: (error) => toast.error(error.message),
   });
-  if (plugins.isPending || providers.isPending)
+  if (plugins.isPending || skills.isPending || mcpServers.isPending)
     return embedded ? (
       <LoadingState />
     ) : (
@@ -212,46 +212,74 @@ export function ExtensionsOverviewPanel({
         <LoadingState />
       </PageFrame>
     );
-  if (plugins.isError || providers.isError)
+  if (plugins.isError || skills.isError || mcpServers.isError)
     return embedded ? (
       <ErrorState
         message={
-          (plugins.error ?? providers.error)?.message ?? "扩展状态读取失败"
+          (plugins.error ?? skills.error ?? mcpServers.error)?.message ?? "扩展状态读取失败"
         }
       />
     ) : (
       <PageFrame>
         <ErrorState
           message={
-            (plugins.error ?? providers.error)?.message ?? "扩展状态读取失败"
+            (plugins.error ?? skills.error ?? mcpServers.error)?.message ?? "扩展状态读取失败"
           }
         />
       </PageFrame>
     );
+  // Older servers may still include the internal manifest owner of a subapp.
+  const installedPlugins = plugins.data.filter((plugin) => plugin.plugin_type !== "agent_subapp");
   const capabilityRows = [
-    ...providers.data.map((provider) => ({
-      detail: `${provider.provider_type} · ${provider.remote_capability ? "远程能力已验证" : "未声明远程能力"}`,
-      icon: Sparkles,
-      key: `provider:${provider.id}`,
-      name: provider.display_name,
-      status: provider.enabled ? provider.status : "disabled",
-      target: `/w/${workspaceId}/settings/providers`,
+    ...skills.data.map((skill) => ({
+      category: "Skill",
+      description: typeof skill.manifest_json.description === "string"
+        ? skill.manifest_json.description : "为 AI 提供专门的任务说明与工具使用指引，可在 Skills Hub 查看和管理。",
+      icon: Puzzle,
+      key: `skill:${skill.id}`,
+      name: skill.name,
+      status: skill.enabled ? skill.status : "disabled",
+      version: skill.version,
+      source: skill.source,
+      permissions: skill.required_permissions,
+      capabilities: skill.required_tools,
     })),
-    ...plugins.data.map((plugin) => ({
-      detail: `${plugin.plugin_type} · v${plugin.version} · ${plugin.capabilities.join(" / ") || "未声明 capability"}`,
+    ...mcpServers.data.map((server) => ({
+      category: "MCP",
+      description: typeof server.manifest_json.description === "string"
+        ? server.manifest_json.description : "通过 MCP 连接外部工具与服务，工具调用受工作区授权控制。",
+      icon: Network,
+      key: `mcp:${server.id}`,
+      name: server.display_name,
+      status: server.enabled ? server.status : "disabled",
+      version: server.version,
+      source: server.source,
+      permissions: server.required_permissions,
+      capabilities: server.discovered_tools,
+    })),
+    ...installedPlugins.map((plugin) => ({
+      category: plugin.plugin_type === "trusted_component" ? "可信组件" : "插件",
+      description: plugin.plugin_type === "document_processor"
+        ? "处理上传的文档，为学习与对话提供可读取的内容。"
+        : plugin.plugin_type === "trusted_component"
+          ? "提供经过注册与授权的交互组件，可在可信组件分区查看和管理。"
+          : "为工作区提供扩展能力，具体用途以声明的能力与权限为准。",
       icon: PackageCheck,
       key: `plugin:${plugin.id}`,
       name: plugin.name,
       status: plugin.enabled ? plugin.status : "disabled",
-      target: `#installed-plugins`,
+      version: plugin.version,
+      source: plugin.plugin_key,
+      permissions: plugin.permissions,
+      capabilities: plugin.capabilities,
     })),
   ];
   const body = (
     <>
       <Surface className="p-5">
           <SectionHeading
-            description="状态、版本和远程能力均来自服务端"
-            title="实际能力记录"
+            description="查看已安装的 Skills、MCP、插件与可信组件。模型服务在「模型与服务」中管理。"
+            title="已安装扩展"
           />
           {capabilityRows.length ? (
             <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -259,16 +287,16 @@ export function ExtensionsOverviewPanel({
                 const Icon = item.icon;
                 return (
                   <div className="rounded-xl border p-4" key={item.key}>
-                    <Icon className="size-4 text-primary" />
-                    <p className="mt-3 text-sm font-semibold">{item.name}</p>
+                    <div className="flex items-center justify-between gap-2"><Icon className="size-4 text-primary" /><Badge variant="outline">{item.category}</Badge></div>
+                    <p className="mt-3 break-words text-sm font-semibold">{item.name}</p>
                     <div className="mt-2">
                       <StatePill status={item.status} />
                     </div>
-                    <p className="mt-2 text-[11px] leading-5 text-muted-foreground">
-                      {item.detail}
+                    <p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">
+                      {item.description}
                     </p>
-                    <Button asChild className="mt-3" size="xs" variant="outline">
-                      <Link to={item.target}>查看记录</Link>
+                    <Button className="mt-3" onClick={() => setIntroduction(item)} size="xs" variant="outline">
+                      查看介绍
                     </Button>
                   </div>
                 );
@@ -276,24 +304,24 @@ export function ExtensionsOverviewPanel({
             </div>
           ) : (
             <p className="py-12 text-center text-sm text-muted-foreground">
-              当前工作区没有 Provider 或 Plugin 记录。
+              当前工作区没有已安装扩展。可前往 Skills Hub 或 MCP 分区添加。
             </p>
           )}
           <div className="mt-5 flex flex-wrap gap-2">
             <Button asChild size="sm" variant="outline">
-              <Link to={`/w/${workspaceId}/settings/extensions?tab=skills`}>
+              <Link to={`/w/${workspaceId}/settings/tools?tab=extensions&extensionTab=skills`}>
                 <Puzzle className="size-4" />
                 Skills 安装与授权
               </Link>
             </Button>
             <Button asChild size="sm" variant="outline">
-              <Link to={`/w/${workspaceId}/settings/extensions?tab=mcp`}>
+              <Link to={`/w/${workspaceId}/settings/tools?tab=extensions&extensionTab=mcp`}>
                 <Network className="size-4" />
                 MCP 管理
               </Link>
             </Button>
             <Button asChild size="sm" variant="outline">
-              <Link to={`/w/${workspaceId}/settings/extensions?tab=sandbox`}>
+              <Link to={`/w/${workspaceId}/settings/tools?tab=extensions&extensionTab=sandbox`}>
                 <TerminalSquare className="size-4" />
                 沙箱管理
               </Link>
@@ -304,9 +332,9 @@ export function ExtensionsOverviewPanel({
         <div className="border-b p-5">
           <SectionHeading title="已安装插件" />
         </div>
-        {plugins.data.length ? (
+        {installedPlugins.length ? (
           <div className="divide-y">
-            {plugins.data.map((plugin) => (
+            {installedPlugins.map((plugin) => (
               <div
                 className="flex flex-col gap-4 px-5 py-4 sm:flex-row sm:items-center"
                 key={plugin.id}
@@ -357,13 +385,27 @@ export function ExtensionsOverviewPanel({
           </p>
         )}
       </Surface>
+      <Dialog open={introduction !== null} onOpenChange={(open) => { if (!open) setIntroduction(null); }}>
+        <DialogContent className="max-h-[80dvh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{introduction?.name}</DialogTitle>
+            <DialogDescription>{introduction?.description}</DialogDescription>
+          </DialogHeader>
+          {introduction ? <dl className="space-y-4 text-sm">
+            <div><dt className="text-muted-foreground">类型与版本</dt><dd className="mt-1">{introduction.category} · v{introduction.version}</dd></div>
+            <div><dt className="text-muted-foreground">来源 / 标识</dt><dd className="mt-1 break-words">{introduction.source || "未声明"}</dd></div>
+            <div><dt className="text-muted-foreground">声明的能力 / 工具</dt><dd className="mt-1 break-words">{introduction.capabilities.join("、") || "未声明"}</dd></div>
+            <div><dt className="text-muted-foreground">所需权限</dt><dd className="mt-1 break-words">{introduction.permissions.join("、") || "未声明额外权限"}</dd></div>
+          </dl> : null}
+        </DialogContent>
+      </Dialog>
     </>
   );
   if (embedded) return body;
   return (
     <PageFrame>
       <PageIntro
-        description="展示当前工作区后端返回的 Provider 与 Plugin 记录。"
+        description="查看当前工作区已安装扩展的用途、能力与权限。"
         eyebrow="Extension registry"
         title="扩展与可信组件中心"
       />
@@ -372,7 +414,7 @@ export function ExtensionsOverviewPanel({
   );
 }
 
-function InstallMcpDialog({
+export function InstallMcpDialog({
   busy,
   onInstall,
 }: {
@@ -389,42 +431,12 @@ function InstallMcpDialog({
   const [bearerToken, setBearerToken] = useState("");
   const [tools, setTools] = useState("");
   const [permissions, setPermissions] = useState("network");
-  const [registryQuery, setRegistryQuery] = useState("");
-  const [registryItems, setRegistryItems] = useState<McpRegistrySearchItem[]>(
-    [],
-  );
-  const [registryCursor, setRegistryCursor] = useState<string | null>(null);
-  const [registrySearching, setRegistrySearching] = useState(false);
-  const loadRegistry = async (options: { reset: boolean; q?: string }) => {
-    setRegistrySearching(true);
-    try {
-      const result = await browseMcpRegistry({
-        q: (options.q ?? registryQuery).trim() || undefined,
-        cursor: options.reset ? undefined : (registryCursor ?? undefined),
-        limit: 8,
-      });
-      setRegistryItems((previous) =>
-        options.reset ? result.items : [...previous, ...result.items],
-      );
-      setRegistryCursor(result.next_cursor);
-      if (options.reset && !result.items.length) {
-        toast.info("MCP Registry 未找到匹配的服务器");
-      }
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : "MCP Registry 加载失败",
-      );
-    } finally {
-      setRegistrySearching(false);
-    }
-  };
-  useEffect(() => {
-    if (open) {
-      void loadRegistry({ reset: true, q: "" });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load once per open
-  }, [open]);
-  const applyRegistryItem = (item: McpRegistrySearchItem) => {
+  const [installTab, setInstallTab] = useState("market");
+  const applyRegistryItem = (detail: McpRegistryDetail) => {
+    const item = detail.item;
+    setBearerToken("");
+    setTools(detail.tools.map((tool) => tool.name).join(","));
+    setInstallTab("manual");
     const shortName =
       item.title || (item.name.split("/").pop() ?? item.name);
     setServerKey(
@@ -437,14 +449,14 @@ function InstallMcpDialog({
     setServerKeyError("");
     setDisplayName(shortName);
     setSource(item.repository_url || item.website_url || item.name);
-    if (item.version) setVersion(item.version);
-    if (item.endpoint_url) setEndpoint(item.endpoint_url);
+    setVersion(item.version || "");
+    setEndpoint(item.endpoint_url || "");
     if (item.env_hints.length) {
-      toast.message(`该服务器声明了环境变量：${item.env_hints.join(", ")}`);
+      toast.message(`该服务器声明了配置要求：${item.env_hints.join(", ")}`);
     }
     toast.success(
       item.supported
-        ? "已从 Registry 一键预填；请确认工具与权限后注册"
+        ? "已从市场填入注册表；请确认工具与权限后注册"
         : item.endpoint_url
           ? `已预填；注意：${item.unsupported_reason || "远程类型可能不兼容"}`
           : "已预填基础信息；该服务器未提供远程端点，需要自行填写 Endpoint",
@@ -494,98 +506,17 @@ function InstallMcpDialog({
           注册 MCP
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-2xl">
+      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-5xl">
         <DialogHeader>
-          <DialogTitle>注册 Streamable HTTP MCP</DialogTitle>
+          <DialogTitle>添加 MCP</DialogTitle>
           <DialogDescription>
             注册后仍需刷新能力快照并明确授权，才可执行真实调用。
           </DialogDescription>
         </DialogHeader>
-        <div className="rounded-lg border bg-muted/30 p-3">
-          <p className="text-xs font-medium text-muted-foreground">
-            MCP 市场 · 官方 Registry（registry.modelcontextprotocol.io）——
-            可注册的远程服务器支持一键预填
-          </p>
-          <div className="mt-2 flex gap-2">
-            <Input
-              onChange={(event) => setRegistryQuery(event.currentTarget.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void loadRegistry({ reset: true });
-                }
-              }}
-              placeholder="搜索，例如 github / postgres / browser；留空浏览全部"
-              value={registryQuery}
-            />
-            <Button
-              disabled={registrySearching}
-              onClick={() => void loadRegistry({ reset: true })}
-              size="sm"
-              type="button"
-              variant="outline"
-            >
-              {registrySearching ? "加载中…" : "搜索"}
-            </Button>
-          </div>
-          {registryItems.length ? (
-            <div className="mt-2 max-h-64 space-y-1 overflow-auto">
-              {registryItems.map((item) => (
-                <button
-                  className="flex w-full items-center gap-2 rounded border bg-background p-2 text-left text-xs enabled:hover:border-primary disabled:opacity-60"
-                  disabled={!item.supported && !item.endpoint_url}
-                  key={item.name}
-                  onClick={() => applyRegistryItem(item)}
-                  title={item.supported ? undefined : item.unsupported_reason}
-                  type="button"
-                >
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate">
-                      <span className="font-medium">
-                        {item.title || item.name.split("/").pop()}
-                      </span>
-                      <span className="ml-2 font-mono text-[10px] text-muted-foreground">
-                        {item.name}
-                      </span>
-                    </span>
-                    <span className="block truncate text-muted-foreground">
-                      {item.description || item.repository_url}
-                    </span>
-                    {!item.supported ? (
-                      <span className="block truncate text-[10px] text-amber-700 dark:text-amber-300">
-                        {item.unsupported_reason}
-                      </span>
-                    ) : null}
-                  </span>
-                  {item.env_hints.length ? (
-                    <Badge variant="outline">需配置密钥</Badge>
-                  ) : null}
-                  {item.supported ? (
-                    <Badge variant="secondary">一键填入</Badge>
-                  ) : item.endpoint_url ? (
-                    <Badge variant="outline">{item.transport}</Badge>
-                  ) : (
-                    <Badge variant="outline">仅本地包</Badge>
-                  )}
-                </button>
-              ))}
-              {registryCursor ? (
-                <Button
-                  className="w-full"
-                  disabled={registrySearching}
-                  onClick={() => void loadRegistry({ reset: false })}
-                  size="sm"
-                  type="button"
-                  variant="ghost"
-                >
-                  {registrySearching ? "加载中…" : "加载更多"}
-                </Button>
-              ) : null}
-            </div>
-          ) : registrySearching ? (
-            <p className="mt-2 text-xs text-muted-foreground">加载中…</p>
-          ) : null}
-        </div>
+        <Tabs value={installTab} onValueChange={setInstallTab}>
+          <TabsList><TabsTrigger value="market">市场</TabsTrigger><TabsTrigger value="manual">手动注册</TabsTrigger></TabsList>
+          <TabsContent className="pt-4" value="market"><McpMarketPanel onSelect={applyRegistryItem} /></TabsContent>
+          <TabsContent className="pt-4" value="manual">
         <form className="space-y-4" onSubmit={submit}>
           <div className="grid gap-3 sm:grid-cols-2">
             <Label>
@@ -685,6 +616,8 @@ function InstallMcpDialog({
             </Button>
           </DialogFooter>
         </form>
+          </TabsContent>
+        </Tabs>
       </DialogContent>
     </Dialog>
   );

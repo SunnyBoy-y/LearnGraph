@@ -64,7 +64,10 @@ class SkillArchiveImportService:
         self.settings = settings
         self.market = SkillMarketService(db, workspace_id, actor_id, settings)
 
-    def import_archive(self, payload: SkillArchiveImportRequest) -> SkillRecord:
+    def import_archive(
+        self, payload: SkillArchiveImportRequest, *, origin_type: str = "archive_import",
+        origin_ref: str | None = None, source: str = "archive_import", version: str = "1.0.0",
+    ) -> SkillRecord:
         raw = _decode_archive(payload.archive_base64)
         try:
             archive = zipfile.ZipFile(io.BytesIO(raw))
@@ -122,8 +125,8 @@ class SkillArchiveImportService:
         request = SkillManualImportRequest(
             skill_key=skill_key,
             name=payload.name or (str(meta.get("name")) if meta.get("name") else None),
-            source="archive_import",
-            version="1.0.0",
+            source=source,
+            version=version,
             files=[
                 SkillManualImportFile(path=path, contents=data.decode("utf-8"))
                 for path, data in entries
@@ -131,8 +134,8 @@ class SkillArchiveImportService:
         )
         return self.market.import_manual(
             request,
-            origin_type="archive_import",
-            origin_ref=f"zip:{(payload.filename or 'upload')[:200]}",
+            origin_type=origin_type,
+            origin_ref=origin_ref or f"zip:{(payload.filename or 'upload')[:200]}",
             report_extra={
                 "archive_sha256": hashlib.sha256(raw).hexdigest(),
                 "archive_size_bytes": len(raw),

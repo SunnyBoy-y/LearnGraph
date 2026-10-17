@@ -222,6 +222,8 @@ export interface SkillValidateResult {
 }
 
 export interface SkillMarketCard {
+  version: string;
+  installable: boolean;
   market_id: string;
   slug: string;
   name: string;
@@ -242,6 +244,7 @@ export interface SkillMarketCard {
 }
 
 export interface SkillMarketList {
+  next_cursor: string | null;
   source: string;
   refreshed_at: IsoDateTime | null;
   cards: SkillMarketCard[];
@@ -250,6 +253,40 @@ export interface SkillMarketList {
   total: number;
   total_pages: number;
   query: string;
+}
+
+export interface SkillMarketFile {
+  path: string;
+  size_bytes: number | null;
+  sha256: string;
+  content_type: string;
+}
+
+export interface SkillMarketDetail {
+  market_id: string;
+  name: string;
+  owner: string;
+  version: string;
+  description: string;
+  homepage_url: string;
+  skill_md: string;
+  instructions_markdown: string;
+  instructions_error: string | null;
+  files: SkillMarketFile[];
+  files_error: string | null;
+  changelog: string;
+  installable: boolean;
+}
+
+export interface SkillMarketTranslation {
+  market_id: string;
+  version: string;
+  target_locale: string;
+  translator_model_id: string;
+  cached: boolean;
+  description: string;
+  instructions_markdown: string;
+  changelog: string;
 }
 
 export interface SkillManualImportFile {
@@ -353,6 +390,8 @@ export interface ExternalSkillSearchResult {
 }
 
 export interface McpRegistrySearchItem {
+  catalog?: "official" | "smithery";
+  catalog_url?: string;
   name: string;
   title: string;
   description: string;
@@ -373,6 +412,32 @@ export interface McpRegistrySearchResult {
   query: string;
   items: McpRegistrySearchItem[];
   next_cursor: string | null;
+}
+
+export interface McpRegistryDetail {
+  item: McpRegistrySearchItem;
+  registry_url: string;
+  remotes: Record<string, unknown>[];
+  package_details: Record<string, unknown>[];
+  tools: { name: string; description?: string; inputSchema?: Record<string, unknown> }[];
+  configuration: { name?: string; description?: string; isRequired?: boolean; isSecret?: boolean; location?: string }[];
+  published_at: string;
+  updated_at: string;
+  raw: Record<string, unknown>;
+  translation_source_hash?: string;
+}
+
+export interface McpMarketTranslation {
+  name: string;
+  catalog: string;
+  version: string;
+  source_hash: string;
+  target_locale: string;
+  translator_model_id: string;
+  cached: boolean;
+  description: string;
+  configuration_descriptions: string[];
+  tool_descriptions: string[];
 }
 
 export interface SkillGitHubCandidate {

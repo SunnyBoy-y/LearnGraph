@@ -1,4 +1,4 @@
-"""skills.sh market seed + GitHub raw cache and workspace install (D-078)."""
+"""ClawHub market entry point, legacy cached installs, and manual package imports."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -307,51 +307,12 @@ class SkillMarketService:
         query: str = "",
         page: int = 1,
         page_size: int = 12,
+        cursor: str | None = None,
     ) -> SkillMarketListResponse:
-        self.ensure_seeds()
-        if refresh:
-            self.refresh_from_github(limit=len(MARKET_SEEDS))
-        page = max(1, int(page or 1))
-        page_size = min(48, max(1, int(page_size or 12)))
-        q = (query or "").strip()
-        statement = select(SkillMarketCacheEntry)
-        if q:
-            like = f"%{q}%"
-            statement = statement.where(
-                or_(
-                    SkillMarketCacheEntry.name.ilike(like),
-                    SkillMarketCacheEntry.slug.ilike(like),
-                    SkillMarketCacheEntry.source.ilike(like),
-                    SkillMarketCacheEntry.description.ilike(like),
-                    SkillMarketCacheEntry.market_id.ilike(like),
-                )
-            )
-        total = int(
-            self.db.scalar(select(func.count()).select_from(statement.subquery())) or 0
-        )
-        rows = list(
-            self.db.scalars(
-                statement.order_by(
-                    SkillMarketCacheEntry.rank, SkillMarketCacheEntry.market_id
-                )
-                .offset((page - 1) * page_size)
-                .limit(page_size)
-            ).all()
-        )
-        cards = [self._card(row) for row in rows]
-        refreshed = self.db.scalar(
-            select(func.max(SkillMarketCacheEntry.fetched_at))
-        )
-        total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
-        return SkillMarketListResponse(
-            source="seed+github",
-            refreshed_at=refreshed,
-            cards=cards,
-            page=page,
-            page_size=page_size,
-            total=total,
-            total_pages=total_pages,
-            query=q,
+        from app.services.skill_clawhub import ClawHubSkillMarket
+
+        return ClawHubSkillMarket(self.db, self.workspace_id, self.actor_id, self.settings).list_cards(
+            refresh=refresh, query=query, page=page, page_size=page_size, cursor=cursor
         )
 
     def _card(self, row: SkillMarketCacheEntry) -> SkillMarketCardView:
@@ -435,6 +396,12 @@ class SkillMarketService:
         )
 
     def install(self, payload: SkillMarketInstallRequest) -> SkillRecord:
+        if payload.market_id.startswith("clawhub:"):
+            from app.services.skill_clawhub import ClawHubSkillMarket
+
+            return ClawHubSkillMarket(
+                self.db, self.workspace_id, self.actor_id, self.settings
+            ).install(payload)
         self.ensure_seeds()
         row = self.db.scalar(
             select(SkillMarketCacheEntry).where(

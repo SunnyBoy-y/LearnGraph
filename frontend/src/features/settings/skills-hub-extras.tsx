@@ -8,13 +8,11 @@ import {
   FileArchive,
   FilePlus2,
   FolderSearch,
-  Globe,
   Languages,
   Link2,
   Plus,
   RefreshCcw,
   Search,
-  ShieldCheck,
   Store,
   TerminalSquare,
 } from "lucide-react";
@@ -29,11 +27,9 @@ import {
   importSkillNpx,
   installSkillFromMarket,
   installSkillGitHub,
-  listSkillCatalogSources,
   listSkillMarket,
   previewSkillGitHub,
   scanSkillLocalProbe,
-  searchExternalSkillCatalog,
   translateSkill,
   updateSkillLocalProbePolicy,
 } from "@/api";
@@ -41,7 +37,6 @@ import {
   ErrorState,
   LoadingState,
   SectionHeading,
-  StatePill,
 } from "@/components/shared/page-elements";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -65,9 +60,10 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { SkillMarketDetailDialog } from "@/features/settings/skill-market-detail-dialog";
 import type {
-  ExternalSkillSearchItem,
   Skill,
+  SkillMarketCard,
   SkillGitHubPreview,
   SkillNpxImportResult,
 } from "@/types/extensions";
@@ -265,353 +261,111 @@ export function SkillTranslateDialog({
   );
 }
 
-/** 市场 tab：预缓存市场 + 外部目录发现（ClawHub / skills.sh）。 */
-function MarketPanel({ onInstalled }: { onInstalled?: () => void }) {
+/** 市场 tab：ClawHub 公开目录与版本固定安装。 */
+export function MarketPanel({ onInstalled }: { onInstalled?: () => void }) {
   const queryClient = useQueryClient();
   const [marketQuery, setMarketQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [cursors, setCursors] = useState<(string | undefined)[]>([undefined]);
   const [marketPage, setMarketPage] = useState(1);
-  const [catalogId, setCatalogId] = useState("clawhub");
-  const [externalQuery, setExternalQuery] = useState("");
-  const [externalItems, setExternalItems] = useState<ExternalSkillSearchItem[]>(
-    [],
-  );
   const pageSize = 12;
+  const cursor = cursors[marketPage - 1];
+  const [detailCard, setDetailCard] = useState<SkillMarketCard | null>(null);
 
   useEffect(() => {
+    if (marketQuery.trim() === debouncedQuery) return;
     const timer = window.setTimeout(() => {
       setDebouncedQuery(marketQuery.trim());
       setMarketPage(1);
+      setCursors([undefined]);
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [marketQuery]);
+  }, [marketQuery, debouncedQuery]);
 
   const market = useQuery({
-    queryKey: ["skill-market", debouncedQuery, marketPage, pageSize],
-    queryFn: () =>
-      listSkillMarket({
-        q: debouncedQuery,
-        page: marketPage,
-        pageSize,
-      }),
+    queryKey: ["skill-market", "clawhub", debouncedQuery, marketPage, cursor],
+    queryFn: () => listSkillMarket({ q: debouncedQuery, page: marketPage, pageSize, cursor }),
+    staleTime: 60_000,
   });
-
   const installMarket = useMutation({
-    mutationFn: (marketId: string) =>
-      installSkillFromMarket({ market_id: marketId }),
+    mutationFn: (card: SkillMarketCard) => installSkillFromMarket({ market_id: card.market_id, version: card.version || undefined }),
     onSuccess: (skill) => {
       toast.success(`已安装「${skill.name}」，请授权后使用`);
+      setDetailCard(null);
       void queryClient.invalidateQueries({ queryKey: ["skills"] });
       onInstalled?.();
     },
     onError: (error) => toast.error(error.message),
   });
-
   const refreshMarket = useMutation({
-    mutationFn: () =>
-      listSkillMarket({
-        refresh: true,
-        q: debouncedQuery,
-        page: 1,
-        pageSize,
-      }),
+    mutationFn: () => listSkillMarket({ refresh: true, q: debouncedQuery, page: 1, pageSize }),
     onSuccess: (data) => {
-      // Reset to page 1 and write fresh data into the active query key.
       setMarketPage(1);
-      queryClient.setQueryData(
-        ["skill-market", debouncedQuery, 1, pageSize],
-        data,
-      );
-      void queryClient.invalidateQueries({ queryKey: ["skill-market"] });
-      const ready = data.cards.filter((card) => card.fetch_status === "ready")
-        .length;
-      const failed = data.cards.filter((card) => card.fetch_status === "failed")
-        .length;
-      toast.success(
-        failed
-          ? `缓存已刷新：${ready} 就绪，${failed} 失败（见卡片错误）`
-          : `市场缓存已刷新（${data.total} 条 · ${ready} 就绪）`,
-      );
+      setCursors([undefined]);
+      queryClient.setQueryData(["skill-market", "clawhub", debouncedQuery, 1, undefined], data);
+      toast.success("ClawHub 市场已刷新");
     },
     onError: (error) => toast.error(`刷新失败：${error.message}`),
   });
-
-  const catalogs = useQuery({
-    queryKey: ["skill-catalog-sources"],
-    queryFn: listSkillCatalogSources,
-  });
-
-  const searchExternal = useMutation({
-    mutationFn: () => searchExternalSkillCatalog(catalogId, externalQuery.trim()),
-    onSuccess: (result) => {
-      setExternalItems(result.items);
-      if (!result.items.length) toast.info("外部目录没有匹配结果");
-    },
-    onError: (error) => toast.error(error.message),
-  });
-
-  const totalPages = market.data?.total_pages ?? 0;
-  const total = market.data?.total ?? 0;
-
+  const busy = market.isFetching || refreshMarket.isPending;
+  const data = market.data;
+  const hasNext = debouncedQuery ? marketPage < (data?.total_pages ?? 0) : Boolean(data?.next_cursor);
   return (
-    <div className="space-y-5">
-      <div>
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <SectionHeading
-            description="预缓存条目 · 安装后需授权"
-            title="市场"
-          />
-          <Button
-            disabled={refreshMarket.isPending || market.isFetching}
-            onClick={() => refreshMarket.mutate()}
-            size="sm"
-            variant="outline"
-          >
-            <RefreshCcw
-              className={`size-4 ${refreshMarket.isPending ? "animate-spin" : ""}`}
-            />
-            {refreshMarket.isPending ? "刷新中…" : "刷新缓存"}
-          </Button>
-        </div>
-        <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
-          <div className="relative min-w-0 flex-1">
-            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              className="pl-9"
-              onChange={(event) => setMarketQuery(event.currentTarget.value)}
-              placeholder="搜索名称、来源、描述…"
-              value={marketQuery}
-            />
-          </div>
-          <p className="shrink-0 text-xs text-muted-foreground">
-            {market.isPending || refreshMarket.isPending
-              ? "加载中…"
-              : `共 ${total} 条 · 第 ${marketPage}/${Math.max(totalPages, 1)} 页`}
-          </p>
-        </div>
-        {market.isPending && !market.data ? (
-          <LoadingState />
-        ) : market.isError ? (
-          <ErrorState message={market.error.message} />
-        ) : (
-          <>
-            <p className="mt-2 text-xs text-muted-foreground">
-              来源 {market.data?.source ?? "—"}
-              {market.data?.refreshed_at
-                ? ` · ${new Date(market.data.refreshed_at).toLocaleString()}`
-                : ""}
-              {market.data?.query ? ` · 「${market.data.query}」` : ""}
-            </p>
-            {market.data?.cards.length ? (
-              <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                {market.data.cards.map((card) => (
-                  <div className="rounded-xl border p-4" key={card.market_id}>
-                    <div className="flex items-start gap-2">
-                      <Store className="mt-0.5 size-4 shrink-0 text-primary" />
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-semibold">
-                          {card.name}
-                        </p>
-                        <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-                          {card.source}
-                        </p>
-                      </div>
-                      <StatePill status={card.fetch_status} />
-                    </div>
-                    <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted-foreground">
-                      {card.description || "暂无简介"}
-                    </p>
-                    <div className="mt-3 flex flex-wrap gap-1">
-                      {card.official ? (
-                        <Badge className="gap-1" variant="default">
-                          <ShieldCheck className="size-3" />
-                          官方
-                        </Badge>
-                      ) : null}
-                      <Badge variant="secondary">
-                        {card.installs.toLocaleString()} installs
-                      </Badge>
-                      {card.has_scripts ? (
-                        <Badge variant="outline">scripts</Badge>
-                      ) : null}
-                      <Badge variant="outline">{card.file_count} files</Badge>
-                    </div>
-                    {card.fetch_error ? (
-                      <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-300">
-                        {card.fetch_error}
-                      </p>
-                    ) : null}
-                    <Button
-                      className="mt-3"
-                      disabled={
-                        installMarket.isPending || card.file_count === 0
-                      }
-                      onClick={() => installMarket.mutate(card.market_id)}
-                      size="xs"
-                    >
-                      <Download className="size-3" />
-                      安装
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="py-10 text-center text-sm text-muted-foreground">
-                没有匹配条目。试试刷新缓存或手动导入。
-              </p>
-            )}
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-              <Button
-                disabled={marketPage <= 1 || market.isFetching}
-                onClick={() => setMarketPage((page) => Math.max(1, page - 1))}
-                size="sm"
-                variant="outline"
-              >
-                <ChevronLeft className="size-4" />
-                上一页
-              </Button>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>跳到</span>
-                <Input
-                  className="h-8 w-16"
-                  min={1}
-                  onChange={(event) => {
-                    const value = Number(event.currentTarget.value);
-                    if (Number.isFinite(value) && value >= 1) {
-                      setMarketPage(
-                        Math.min(
-                          Math.max(1, Math.floor(value)),
-                          Math.max(totalPages, 1),
-                        ),
-                      );
-                    }
-                  }}
-                  type="number"
-                  value={marketPage}
-                />
-                <span>/ {Math.max(totalPages, 1)}</span>
-              </div>
-              <Button
-                disabled={
-                  totalPages === 0 ||
-                  marketPage >= totalPages ||
-                  market.isFetching
-                }
-                onClick={() =>
-                  setMarketPage((page) =>
-                    totalPages ? Math.min(totalPages, page + 1) : page,
-                  )
-                }
-                size="sm"
-                variant="outline"
-              >
-                下一页
-                <ChevronRight className="size-4" />
-              </Button>
-            </div>
-          </>
-        )}
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <SectionHeading title="ClawHub 市场" description="浏览热门 Skill，或搜索 ClawHub 公开目录 · 安装后需授权" />
+        <Button disabled={busy} onClick={() => refreshMarket.mutate()} size="sm" variant="outline">
+          <RefreshCcw className={busy ? "size-4 animate-spin" : "size-4"} />刷新列表
+        </Button>
       </div>
-
-      <div className="rounded-xl border p-4">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <SectionHeading
-            description="联邦索引：从外部目录发现 Skill，安装仍走固定来源导入"
-            title="外部目录发现"
-          />
-          <div className="flex flex-wrap gap-1.5">
-            {(catalogs.data ?? [])
-              .filter((source) => source.kind === "skill")
-              .map((source) => (
-                <Button
-                  disabled={!source.enabled}
-                  key={source.id}
-                  onClick={() => {
-                    setCatalogId(source.id);
-                    setExternalItems([]);
-                  }}
-                  size="xs"
-                  title={source.enabled ? source.notes : `${source.notes}（未启用）`}
-                  variant={catalogId === source.id ? "default" : "outline"}
-                >
-                  <Globe className="size-3" />
-                  {source.label}
-                </Button>
-              ))}
-          </div>
-        </div>
-        <div className="mt-4 flex gap-2">
-          <Input
-            onChange={(event) => setExternalQuery(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && externalQuery.trim().length >= 2) {
-                searchExternal.mutate();
-              }
-            }}
-            placeholder="搜索外部目录，例如 pdf / research / database…"
-            value={externalQuery}
-          />
-          <Button
-            disabled={
-              searchExternal.isPending || externalQuery.trim().length < 2
-            }
-            onClick={() => searchExternal.mutate()}
-            size="sm"
-            variant="outline"
-          >
-            {searchExternal.isPending ? "搜索中…" : "搜索"}
-          </Button>
-        </div>
-        {externalItems.length ? (
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            {externalItems.map((item) => (
-              <div
-                className="rounded-xl border p-4"
-                key={`${item.catalog}:${item.external_id}`}
-              >
-                <div className="flex items-start gap-2">
-                  <Globe className="mt-0.5 size-4 shrink-0 text-primary" />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold">{item.name}</p>
-                    <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
-                      {item.external_id}
-                      {item.version ? ` · v${item.version}` : ""}
-                      {item.owner ? ` · ${item.owner}` : ""}
-                    </p>
-                  </div>
-                  <Badge variant="outline">{item.catalog}</Badge>
+      <div className="relative">
+        <Search className="absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input aria-label="搜索 ClawHub Skill" className="pl-9" placeholder="搜索 ClawHub 中的 Skill…" value={marketQuery} onChange={(event) => setMarketQuery(event.target.value)} />
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <a className="inline-flex items-center gap-1 hover:text-foreground" href="https://clawhub.ai" target="_blank" rel="noreferrer">来源 ClawHub<ExternalLink className="size-3" /></a>
+        <span>{debouncedQuery ? `搜索结果 · 第 ${marketPage} 页` : `按下载量排序 · 第 ${marketPage} 页`}</span>
+      </div>
+      {market.isPending ? <LoadingState /> : market.isError ? <ErrorState message={market.error.message} /> : <>
+        {data?.cards.length ? <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {data.cards.map((card) => (
+            <div className="flex min-w-0 flex-col rounded-xl border p-4" key={card.market_id}>
+              <div className="flex items-start gap-2">
+                <Store className="mt-0.5 size-4 shrink-0 text-primary" />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold" title={card.name}>{card.name}</p>
+                  <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{card.source}</p>
                 </div>
-                {item.description ? (
-                  <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted-foreground">
-                    {item.description}
-                  </p>
-                ) : null}
-                <p className="mt-2 text-[11px] text-muted-foreground">
-                  {item.install_hint}
-                </p>
-                {item.homepage_url ? (
-                  <Button asChild className="mt-3" size="xs" variant="outline">
-                    <a
-                      href={item.homepage_url}
-                      rel="noreferrer noopener"
-                      target="_blank"
-                    >
-                      <ExternalLink className="size-3" />
-                      打开来源
-                    </a>
-                  </Button>
-                ) : null}
+                {card.version && <Badge variant="outline">v{card.version}</Badge>}
               </div>
-            ))}
-          </div>
-        ) : (
-          <p className="mt-4 text-xs text-muted-foreground">
-            {catalogs.data?.find((source) => source.id === catalogId)?.enabled
-              ? "输入至少 2 个字符搜索所选目录。结果仅用于发现；安装请通过市场或 URL/npx 导入以保持内容可审。"
-              : "所选目录未启用；可在后端设置中开启（如 LEARNGRAPH_SKILLS_SH_ENABLED）。"}
-          </p>
-        )}
-      </div>
+              <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted-foreground">{card.description || "暂无简介"}</p>
+              <div className="mt-3 flex flex-wrap gap-1">
+                {card.installs > 0 && <Badge variant="secondary">{card.installs.toLocaleString()} 次下载</Badge>}
+                {!card.installable && <Badge variant="outline">暂无公开版本</Badge>}
+                {card.installable && !card.version && <Badge variant="outline">安装时获取版本</Badge>}
+              </div>
+              <div className="mt-auto flex flex-wrap items-center gap-3 pt-4">
+                <Button size="xs" variant="outline" onClick={() => setDetailCard(card)}>查看详情</Button>
+                <Button disabled={installMarket.isPending || !card.installable || busy || marketQuery.trim() !== debouncedQuery} onClick={() => installMarket.mutate(card)} size="xs">
+                  <Download className="size-3" />{installMarket.isPending && installMarket.variables?.market_id === card.market_id ? "安装中…" : "安装"}
+                </Button>
+                <a className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground" href={card.homepage_url} target="_blank" rel="noreferrer">查看来源<ExternalLink className="size-3" /></a>
+              </div>
+            </div>
+          ))}
+        </div> : <p className="py-10 text-center text-sm text-muted-foreground">{debouncedQuery ? "ClawHub 中没有匹配的 Skill，试试其他关键词。" : "当前页暂无条目，可继续翻页或刷新列表。"}</p>}
+      </>}
+        <div className="flex items-center justify-between gap-2 pt-1">
+          <Button disabled={marketPage <= 1 || busy} onClick={() => setMarketPage((page) => Math.max(1, page - 1))} size="sm" variant="outline"><ChevronLeft className="size-4" />上一页</Button>
+          <span className="text-xs text-muted-foreground">第 {marketPage} 页</span>
+          <Button disabled={!hasNext || busy} onClick={() => {
+            if (!debouncedQuery) setCursors((previous) => [...previous.slice(0, marketPage), data?.next_cursor ?? undefined]);
+            setMarketPage((page) => page + 1);
+          }} size="sm" variant="outline">下一页<ChevronRight className="size-4" /></Button>
+        </div>
+      <SkillMarketDetailDialog card={detailCard} onClose={() => setDetailCard(null)} installing={installMarket.isPending} onInstall={(detail) => {
+        if (detailCard) installMarket.mutate({ ...detailCard, version: detail.version });
+      }} />
     </div>
   );
 }

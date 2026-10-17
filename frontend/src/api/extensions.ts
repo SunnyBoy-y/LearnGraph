@@ -8,6 +8,8 @@ import type {
   MCPServer,
   MCPServerCreate,
   McpRegistrySearchResult,
+  McpRegistryDetail,
+  McpMarketTranslation,
   PermissionDecision,
   Skill,
   SkillCreate,
@@ -21,6 +23,8 @@ import type {
   SkillLocalProbeScan,
   SkillManualImport,
   SkillMarketList,
+  SkillMarketDetail,
+  SkillMarketTranslation,
   SkillNpxImportResult,
   SkillPackageCreate,
   SkillSecurityScanResult,
@@ -186,6 +190,7 @@ export function listSkillMarket(options?: {
   q?: string;
   page?: number;
   pageSize?: number;
+  cursor?: string;
 }): Promise<SkillMarketList> {
   const refresh = options?.refresh ?? false;
   const q = options?.q?.trim() ?? "";
@@ -197,15 +202,27 @@ export function listSkillMarket(options?: {
       ...(q ? { q } : {}),
       page,
       page_size: pageSize,
+      ...(options?.cursor ? { cursor: options.cursor } : {}),
     },
+  });
+}
+
+export function translateSkillMarket(payload: { market_id: string; version: string; target_locale: string; provider_id?: string | null; model_id?: string | null }): Promise<SkillMarketTranslation> {
+  return apiClient.post<SkillMarketTranslation, typeof payload>("/skills/market/translate", payload);
+}
+
+export function getSkillMarketDetail(marketId: string, version?: string): Promise<SkillMarketDetail> {
+  return apiClient.get<SkillMarketDetail>("/skills/market/detail", {
+    query: { market_id: marketId, ...(version ? { version } : {}) },
   });
 }
 
 export function installSkillFromMarket(payload: {
   market_id: string;
+  version?: string;
   skill_key?: string;
 }): Promise<Skill> {
-  return apiClient.post<Skill, { market_id: string; skill_key?: string }>(
+  return apiClient.post<Skill, { market_id: string; skill_key?: string; version?: string }>(
     "/skills/market/install",
     payload,
   );
@@ -301,12 +318,14 @@ export function searchExternalSkillCatalog(
 }
 
 export function browseMcpRegistry(options?: {
+  catalog?: "official" | "smithery";
   q?: string;
   cursor?: string;
   limit?: number;
 }): Promise<McpRegistrySearchResult> {
   return apiClient.get<McpRegistrySearchResult>("/mcp/registry/browse", {
     query: {
+      ...(options?.catalog ? { catalog: options.catalog } : {}),
       ...(options?.q?.trim() ? { q: options.q.trim() } : {}),
       ...(options?.cursor ? { cursor: options.cursor } : {}),
       limit: options?.limit ?? 12,
@@ -321,6 +340,17 @@ export function searchMcpRegistry(
   return apiClient.get<McpRegistrySearchResult>("/mcp/registry/search", {
     query: { q, limit },
   });
+}
+
+export function getMcpRegistryDetail(name: string, catalog: "official" | "smithery" = "official", version = "latest"): Promise<McpRegistryDetail> {
+  return apiClient.get<McpRegistryDetail>("/mcp/registry/detail", { query: { name, catalog, version } });
+}
+
+export function translateMcpMarket(payload: {
+  name: string; catalog: "official" | "smithery"; version: string; target_locale: string;
+  provider_id?: string | null; model_id?: string | null; source_hash?: string;
+}): Promise<McpMarketTranslation> {
+  return apiClient.post<McpMarketTranslation, typeof payload>("/mcp/registry/translate", payload);
 }
 
 export function getSkillLocalProbePolicy(): Promise<SkillLocalProbePolicy> {

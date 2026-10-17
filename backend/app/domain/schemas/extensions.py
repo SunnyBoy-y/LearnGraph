@@ -615,6 +615,8 @@ class SkillMarketCardView(BaseModel):
     file_count: int = 0
     has_scripts: bool = False
     official: bool = False
+    version: str = ""
+    installable: bool = False
 
 
 class SkillMarketListResponse(BaseModel):
@@ -626,12 +628,58 @@ class SkillMarketListResponse(BaseModel):
     total: int = 0
     total_pages: int = 0
     query: str = ""
+    next_cursor: str | None = None
+
+
+class SkillMarketFileView(BaseModel):
+    path: str
+    size_bytes: int | None = None
+    sha256: str = ""
+    content_type: str = ""
+
+
+class SkillMarketDetailResponse(BaseModel):
+    market_id: str
+    name: str
+    owner: str
+    version: str
+    description: str = ""
+    homepage_url: str
+    skill_md: str = ""
+    instructions_markdown: str = ""
+    instructions_error: str | None = None
+    files: list[SkillMarketFileView] = Field(default_factory=list)
+    files_error: str | None = None
+    changelog: str = ""
+    installable: bool = False
+
+
+class SkillMarketTranslateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    market_id: str = Field(min_length=1, max_length=200)
+    version: str = Field(min_length=1, max_length=80)
+    target_locale: str = Field(default="zh-CN", pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$", max_length=32)
+    provider_id: str | None = Field(default=None, min_length=1, max_length=64)
+    model_id: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class SkillMarketTranslateResponse(BaseModel):
+    market_id: str
+    version: str
+    target_locale: str
+    translator_model_id: str
+    cached: bool
+    description: str
+    instructions_markdown: str
+    changelog: str
 
 
 class SkillMarketInstallRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     market_id: str = Field(min_length=1, max_length=200)
+    version: str | None = Field(default=None, min_length=1, max_length=80)
     skill_key: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9._-]{1,79}$")
 
 
@@ -863,6 +911,8 @@ class McpRegistrySearchItem(BaseModel):
     # True only when the entry exposes a Streamable HTTP remote we can register.
     supported: bool = False
     unsupported_reason: str = ""
+    catalog: str = "official"
+    catalog_url: str = ""
 
 
 class McpRegistrySearchResponse(BaseModel):
@@ -870,6 +920,44 @@ class McpRegistrySearchResponse(BaseModel):
     query: str
     items: list[McpRegistrySearchItem] = Field(default_factory=list)
     next_cursor: str | None = None
+
+
+class McpRegistryDetailResponse(BaseModel):
+    item: McpRegistrySearchItem
+    registry_url: str
+    remotes: list[dict[str, Any]] = Field(default_factory=list)
+    package_details: list[dict[str, Any]] = Field(default_factory=list)
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    configuration: list[dict[str, Any]] = Field(default_factory=list)
+    published_at: str = ""
+    updated_at: str = ""
+    raw: dict[str, Any] = Field(default_factory=dict)
+    translation_source_hash: str = ""
+
+
+class McpMarketTranslateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    catalog: Literal["official", "smithery"] = "official"
+    version: str = Field(default="latest", min_length=1, max_length=100)
+    target_locale: str = Field(default="zh-CN", pattern=r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$", max_length=32)
+    provider_id: str | None = Field(default=None, min_length=1, max_length=64)
+    model_id: str | None = Field(default=None, min_length=1, max_length=160)
+    source_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class McpMarketTranslateResponse(BaseModel):
+    name: str
+    catalog: str
+    version: str
+    source_hash: str
+    target_locale: str
+    translator_model_id: str
+    cached: bool
+    description: str
+    configuration_descriptions: list[str]
+    tool_descriptions: list[str]
 
 
 class SkillGitHubPreviewRequest(BaseModel):

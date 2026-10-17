@@ -80,6 +80,12 @@ class ExternalCatalogService:
                 auth_required=False,
                 notes="官方 MCP 服务器注册中心（v0.1 冻结 API，匿名读取）。",
             ),
+            ExternalCatalogSourceView(
+                id="smithery", label="Smithery", kind="mcp",
+                enabled=bool(self.settings.mcp_smithery_enabled),
+                base_url=self.settings.mcp_smithery_url, auth_required=False,
+                notes="公开 MCP 服务器目录、连接配置与工具说明。",
+            ),
         ]
 
     # -- skill catalogs -----------------------------------------------------
@@ -197,8 +203,6 @@ class ExternalCatalogService:
         """Browse the official registry as a marketplace (cursor pagination)."""
 
         query = (query or "").strip()
-        if query and len(query) < 2:
-            query = ""
         return self._query_mcp_registry(query=query, cursor=cursor, limit=limit)
 
     def _query_mcp_registry(
@@ -216,7 +220,7 @@ class ExternalCatalogService:
         if query:
             params["search"] = query
         if cursor:
-            params["cursor"] = str(cursor)[:300]
+            params["cursor"] = str(cursor)
         url = f"{base}/v0.1/servers?" + urllib.parse.urlencode(params)
         payload = self._get_json(url)
         raw_items = payload.get("servers") if isinstance(payload, dict) else None
@@ -229,7 +233,7 @@ class ExternalCatalogService:
         if isinstance(payload, dict) and isinstance(payload.get("metadata"), dict):
             raw_cursor = payload["metadata"].get("nextCursor") or payload["metadata"].get("next_cursor")
             if isinstance(raw_cursor, str) and raw_cursor.strip():
-                next_cursor = raw_cursor.strip()[:300]
+                next_cursor = raw_cursor.strip()
         return McpRegistrySearchResponse(
             registry_url=self.settings.mcp_registry_url,
             query=query,
@@ -331,9 +335,10 @@ class ExternalCatalogService:
                 data = response.read(MAX_CATALOG_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             raise AppError(
-                502,
+                exc.code if exc.code in {404, 429} else 502,
                 "catalog_unavailable",
                 f"External catalog returned HTTP {exc.code}",
+                {"retry_after": exc.headers.get("Retry-After")} if exc.code == 429 else None,
             ) from exc
         except Exception as exc:  # noqa: BLE001 — network failures must not 500
             raise AppError(502, "catalog_unavailable", str(exc)[:500]) from exc

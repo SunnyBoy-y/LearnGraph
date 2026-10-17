@@ -725,7 +725,7 @@ CAPABILITY_SEARCH_MAX_QUERY_CHARS = 500
 CAPABILITY_SEARCH_MAX_RESULTS = 8
 CAPABILITY_ACTIVATE_MAX_IDS = 4
 CAPABILITY_ACTIVATE_MAX_SKILL_CONTRACT_CHARS = 32_000
-CAPABILITY_FAMILIES = ("skill", "mcp", "builtin_extension")
+CAPABILITY_FAMILIES = ("skill", "mcp", "builtin_extension", "runtime")
 CAPABILITY_KINDS = (
     "builtin_tool",
     "skill_package",
@@ -1299,7 +1299,7 @@ class MCPAndSkillService:
         may *know* exists; authorization and execution still go through the
         existing grant/snapshot/policy gates.
         """
-        descriptors: list[dict[str, Any]] = []
+        descriptors: list[dict[str, Any]] = list(getattr(self, "runtime_tool_descriptors", []))
         for tool, spec in BUILTIN_TOOL_SPECS.items():
             descriptors.append(self._builtin_descriptor(tool, spec))
         for skill in self._authorized_packages():
@@ -1914,8 +1914,9 @@ class MCPAndSkillService:
             "Authorized LearnGraph Agent Skill packages for this turn. "
             "Treat each block as optional skill instructions when the user's "
             "request matches its scope. When you decide to follow one of these "
-            "skills, FIRST call the `lg_skill_used` function with its `skill_key` "
-            "so the user sees which skill was triggered, then apply its "
+            "inlined skills, call `lg_skill_used` with its `skill_key` so the user "
+            "sees which skill was triggered. Loading a skill with `lg_skill_read` "
+            "already announces it; do not make a second announcement call. Apply its "
             "instructions. Follow the instructions; do not invent "
             "host-side scripts or claim you executed package scripts unless a "
             "sandbox tool result confirms it. Package scripts are never automatic "
