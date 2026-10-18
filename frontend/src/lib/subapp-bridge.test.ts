@@ -454,7 +454,7 @@ describe('createSubappChannel P3 media injection', () => {
     channel.handleIframeLoad()
     await flushPromises()
 
-    expect(getBlob).toHaveBeenCalledWith('/files/abc123/content')
+    expect(getBlob).toHaveBeenCalledWith('/files/abc123/content', {}, undefined)
     const mediaPosts = mediaPostCalls(iframe)
     expect(mediaPosts).toHaveLength(1)
     const payload = (mediaPosts[0][0] as Record<string, unknown>).payload as Record<string, unknown>

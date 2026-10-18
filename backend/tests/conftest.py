@@ -55,7 +55,11 @@ def pytest_configure(config: pytest.Config) -> None:
     """Keep pytest's tmp_path fixtures inside the writable project tree."""
 
     if not config.option.basetemp:
-        config.option.basetemp = Path(__file__).parent / ".pytest-tmp" / f"run-{os.getpid()}"
+        temp_root = Path(__file__).parent / ".pytest-tmp"
+        # pytest creates basetemp itself, but does not create missing parents.
+        # This directory is ignored by Git and absent on a clean CI runner.
+        temp_root.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = temp_root / f"run-{os.getpid()}"
 
 
 def _assert_engine_is_not_real_database() -> None:

@@ -22,6 +22,8 @@ PUBLIC_PREFIXES = (
     "/api/v1/openapi.json",
 )
 
+PUBLIC_OPERATIONS = {("GET", "/api/v1/version")}
+
 
 def _iter_operations(client):
     spec = client.get("/openapi.json").json()
@@ -68,9 +70,15 @@ def test_openapi_all_endpoints_reject_anonymous(client):
     failures = []
     checked = 0
     for path, method, _op in _iter_operations(client):
-        if path.startswith(PUBLIC_PREFIXES):
+        if path.startswith(PUBLIC_PREFIXES) or (method, path) in PUBLIC_OPERATIONS:
             continue
-        r = client.request(method, path)
+        # Media streams authenticate with a scoped ticket, rather than the
+        # Authorization header. Supply an invalid ticket to exercise auth;
+        # omitting the required query parameter only tests schema validation.
+        params = {"ticket": "invalid-auth-scan-ticket"} if (method, path) == (
+            "GET", "/api/v1/files/{file_id}/stream"
+        ) else None
+        r = client.request(method, path, params=params)
         if r.status_code != 401:
             failures.append((method, path, r.status_code))
         checked += 1
@@ -84,7 +92,7 @@ def test_openapi_workspace_endpoints_require_workspace_header(client, register_u
     failures = []
     checked = 0
     for path, method, _op in _iter_operations(client):
-        if path.startswith(PUBLIC_PREFIXES):
+        if path.startswith(PUBLIC_PREFIXES) or (method, path) in PUBLIC_OPERATIONS:
             continue
         if path.startswith((
             "/api/v1/auth/",
