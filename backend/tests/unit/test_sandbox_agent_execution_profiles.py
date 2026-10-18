@@ -259,10 +259,15 @@ def test_unsupported_thinking_mode_falls_back_and_records_effective(monkeypatch)
     job = _job(role_key="reason", tools=[])
     job.payload_json["thinking_mode"] = "xhigh"
 
-    outcome = execute_subagent_job(_settings(), job, _task())
+    # Keep this provider-selection unit test on the injected executor path.
+    # The default path now runs a persisted managed session, covered by the
+    # managed-agent API tests, and requires a real SQLAlchemy session/job.
+    runtime = FakeToolRuntime()
+    outcome = execute_subagent_job(_settings(), job, _task(), tool_runtime=runtime)
 
     assert outcome.status == "SUCCEEDED"
     assert attempts[:2] == ["xhigh", "high"]
+    assert runtime.executed == []
     result = outcome.deliverables["agent_result"]
     assert result["thinking_mode_requested"] == "xhigh"
     assert result["thinking_mode_effective"] == "high"
