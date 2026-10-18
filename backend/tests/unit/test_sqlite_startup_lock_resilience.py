@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -28,7 +27,6 @@ from app.core.database import snapshot_sqlite_metrics
 from app.core.database import _prune_sqlite_migration_backups
 from app.core.config import get_settings
 
-_HOLD_SECONDS = 3.0
 _FTS_UPDATE_TRIGGER = "session_messages_fts_update"
 _STREAMING_MARKER = "old.status <> 'streaming'"
 
@@ -92,7 +90,7 @@ def test_init_database_needs_no_write_lock_when_schema_is_current():
     assert _STREAMING_MARKER in (_stored_trigger_sql(_FTS_UPDATE_TRIGGER) or "")
 
 
-def test_init_database_retries_a_write_locked_by_a_sibling():
+def test_init_database_retries_a_write_locked_by_a_sibling(monkeypatch):
     """需要真写（重建索引）时，兄弟进程释放写锁前按退避重试而非抛错。"""
 
     init_database()
@@ -100,29 +98,56 @@ def test_init_database_retries_a_write_locked_by_a_sibling():
     with _connect(path) as raw:
         raw.execute("DROP INDEX IF EXISTS ix_messages_workspace_session_created")
 
+    from app.core import database
+
+    locked = threading.Event()
     release = threading.Event()
+    retried = threading.Event()
+    holder_errors: list[Exception] = []
+    startup_thread = threading.get_ident()
+    record_retry = database.record_sqlite_locked_retry
+
+    def record_retry_and_release() -> None:
+        record_retry()
+        if threading.get_ident() == startup_thread:
+            retried.set()
+            release.set()
+
+    monkeypatch.setattr(database, "record_sqlite_locked_retry", record_retry_and_release)
 
     def _hold() -> None:
-        connection = _connect(path)
-        connection.execute("BEGIN IMMEDIATE")
-        release.wait(30)
-        connection.execute("ROLLBACK")
-        connection.close()
+        try:
+            connection = _connect(path)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                locked.set()
+                # A deadline only prevents a broken test from hanging. Success
+                # releases the real write lock after startup observes a retry.
+                release.wait(60)
+                connection.execute("ROLLBACK")
+            finally:
+                connection.close()
+        except Exception as exc:
+            holder_errors.append(exc)
+            locked.set()
 
     holder = threading.Thread(target=_hold, daemon=True)
     holder.start()
-    time.sleep(0.2)  # 让持锁线程先拿到锁
-    timer = threading.Timer(_HOLD_SECONDS, release.set)
-    timer.start()
 
     before = snapshot_sqlite_metrics()["locked_retries"]
     try:
-        init_database()  # 第一次写必然撞上 2s busy_timeout，之后重试成功
+        assert locked.wait(10), "sibling writer did not acquire its lock"
+        assert not holder_errors, holder_errors
+        # Keep contention through precheck/backup and the configured busy
+        # timeout, regardless of runner speed or SQLite timeout settings.
+        init_database()
     finally:
         release.set()
-        timer.cancel()
         holder.join(10)
 
+    assert not holder.is_alive(), "sibling writer did not release its lock"
+    assert not holder_errors, holder_errors
+    assert retried.is_set(), "startup must observe a real SQLite lock retry"
     assert snapshot_sqlite_metrics()["locked_retries"] > before, (
         "启动路径没有走重试：busy_timeout 到点后应该退避重试而不是抛错"
     )
