@@ -7,7 +7,7 @@ import * as api from '@/api/stickers';
 import type { Sticker, StickerStatus } from '@/api/stickers';
 
 vi.mock('@/api', () => ({ listProviders: vi.fn(async () => []) }));
-vi.mock('@/api/stickers', () => ({ getStickerStatus: vi.fn(), searchStickers: vi.fn(), configureStickers: vi.fn(), rebuildStickerIndex: vi.fn(), importStickerPack: vi.fn(), updateSticker: vi.fn(), setStickerPackEnabled: vi.fn(), getStickerPipeline: vi.fn(), configureStickerPipeline: vi.fn(), analyzeStickerPack: vi.fn(), downloadStickerPack: vi.fn(), getStickerMarket: vi.fn(), installMarketPack: vi.fn(), marketStickerBlob: vi.fn(), getSticker: vi.fn(), analyzeSticker: vi.fn() }));
+vi.mock('@/api/stickers', () => ({ getStickerStatus: vi.fn(), searchStickers: vi.fn(), configureStickers: vi.fn(), rebuildStickerIndex: vi.fn(), reorderStickerPacks: vi.fn(), importStickerPack: vi.fn(), updateSticker: vi.fn(), setStickerPackEnabled: vi.fn(), getStickerPipeline: vi.fn(), configureStickerPipeline: vi.fn(), analyzeStickerPack: vi.fn(), downloadStickerPack: vi.fn(), getStickerMarket: vi.fn(), installMarketPack: vi.fn(), removeMarketPack: vi.fn(), marketStickerBlob: vi.fn(), getSticker: vi.fn(), analyzeSticker: vi.fn() }));
 vi.mock('@/features/auth/auth-context-value', () => ({ useAuth: () => ({ workspaceId: 'ws-stickers', userId: 'owner', effectivePermissions: ['workspace.manage'] }) }));
 vi.mock('@/components/chat/sticker-image', () => ({ StickerImage: ({ alt }: { alt: string }) => <img alt={alt} /> }));
 
@@ -16,7 +16,7 @@ let status: StickerStatus;
 
 beforeEach(() => {
   vi.clearAllMocks();
-  status = { mode: 'follow', provider_id: '', model_id: '', ai_enabled: true, keyword_available: true, index: { status: 'keyword', completed: 0, total: 1, error: null, model_id: null, fingerprint: null, active_model_id: null }, packs: [{ id: 'private', name: '我的猫咪', builtin: false, enabled: true, license: '私有素材', source: 'private-import' }] };
+  status = { mode: 'follow', provider_id: '', model_id: '', ai_enabled: true, keyword_available: true, active_count: 1, active_limit: 100, stored_count: 1, index: { status: 'keyword', completed: 0, total: 1, error: null, model_id: null, fingerprint: null, active_model_id: null }, packs: [{ id: 'private', name: '我的猫咪', builtin: false, enabled: true, license: '私有素材', source: 'private-import', count: 1, active_count: 1 }] };
   vi.mocked(api.getStickerStatus).mockImplementation(async () => status);
   vi.mocked(api.searchStickers).mockResolvedValue({ method: 'keyword', total: 1, candidates: [sticker] });
   vi.mocked(api.configureStickers).mockImplementation(async patch => ({ ...status, ...patch }));
@@ -25,14 +25,17 @@ beforeEach(() => {
   vi.mocked(api.getStickerPipeline).mockResolvedValue({ auto_analyze: false, available: false, model_id: null, queued: 0, completed: 0, failed: 0, packs: [] });
   vi.mocked(api.getSticker).mockResolvedValue(sticker);
   vi.mocked(api.analyzeSticker).mockResolvedValue({ queued: 1 });
+  vi.mocked(api.reorderStickerPacks).mockImplementation(async () => status);
+  vi.mocked(api.setStickerPackEnabled).mockImplementation(async () => status);
 });
 
 describe('sticker integration', () => {
-  it('shows keyword fallback and changes retrieval mode through persisted settings', async () => {
+  it('keeps retrieval settings consolidated under sticker settings', async () => {
     renderWithProviders(<StickerSettingsPanel />);
-    expect(await screen.findByText('关键词检索始终可用')).toBeInTheDocument();
     expect(await screen.findByText('坏笑猫')).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText('检索方式'), { target: { value: 'keyword' } });
+    expect(screen.queryByText('关键词检索始终可用')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('表情设置'));
+    fireEvent.change(await screen.findByLabelText('检索方式'), { target: { value: 'keyword' } });
     await waitFor(() => expect(api.configureStickers).toHaveBeenCalledWith({ mode: 'keyword' }, expect.anything()));
   });
 
@@ -54,11 +57,35 @@ describe('sticker integration', () => {
     await waitFor(() => expect(api.updateSticker).toHaveBeenCalledWith(expect.objectContaining({ semantics: expect.objectContaining({ tags: ['得意', '心虚'], ocr: '嘿嘿' }) }), expect.anything()));
   });
 
-  it('keeps keyword availability visible when vector indexing fails', async () => {
+  it('places import beside the filter and displays the active-only quota', async () => {
+    renderWithProviders(<StickerSettingsPanel />);
+    const filter = await screen.findByRole('combobox', { name: '筛选表情包' });
+    const upload = screen.getByRole('button', { name: '导入表情包' });
+    expect(upload.parentElement).toBe(filter.parentElement);
+    expect(await screen.findByText('已启用 1 / 100 张')).toBeInTheDocument();
+    expect(screen.queryByText(/总计 24 MiB/)).not.toBeInTheDocument();
+  });
+
+  it('persists keyboard pack ordering and per-pack activation with partial counts', async () => {
+    status.active_count = 100;
+    status.stored_count = 132;
+    status.packs = [{ ...status.packs[0]!, count: 120, active_count: 100 }, { id: 'builtin', name: '内置回应', builtin: true, enabled: true, license: 'MIT', source: 'builtin', count: 12, active_count: 0 }];
+    renderWithProviders(<StickerSettingsPanel />);
+    expect(await screen.findByText('已启用 100 / 120 张')).toBeInTheDocument();
+    expect(screen.getByText('等待名额 · 共 12 张')).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('button', { name: '拖动排序：内置回应' }), { key: 'ArrowUp' });
+    await waitFor(() => expect(api.reorderStickerPacks).toHaveBeenCalledWith(['builtin', 'private'], expect.anything()));
+    await waitFor(() => expect(screen.getByRole('switch', { name: '启用表情包：内置回应' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('switch', { name: '启用表情包：内置回应' }));
+    await waitFor(() => expect(api.setStickerPackEnabled).toHaveBeenCalledWith('builtin', false));
+  });
+
+  it('places vector indexing failures in consolidated sticker settings', async () => {
     status.index = { ...status.index, status: 'failed', model_id: 'configured-model', error: '预算不足' };
     renderWithProviders(<StickerSettingsPanel />);
+    fireEvent.click(await screen.findByText('表情设置'));
     expect(await screen.findByRole('alert')).toHaveTextContent('关键词检索不受影响');
-    expect(screen.getByText('关键词检索始终可用')).toBeInTheDocument();
+    expect(screen.queryByText('关键词检索始终可用')).not.toBeInTheDocument();
   });
 
   it('selects a registry entry from the composer picker', async () => {

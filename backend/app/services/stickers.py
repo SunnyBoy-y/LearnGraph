@@ -8,13 +8,15 @@ import math
 import re
 import unicodedata
 import zipfile
+from contextlib import ExitStack
 from datetime import timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from tempfile import TemporaryFile
+from typing import Any, BinaryIO
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, defer
 
@@ -22,8 +24,8 @@ from app.core.config import Settings, get_settings
 from app.core.database import SessionLocal
 from app.core.errors import AppError
 from app.domain.models import (
-    DurableJob, ProviderConfig, StickerAsset, StickerIndexGeneration,
-    StickerIndexState, StickerPack, StickerVector, Workspace,
+    DurableJob, FileRecord, ProviderConfig, StickerAsset, StickerIndexGeneration,
+    StickerIndexState, StickerPack, StickerVector, Workspace, WorkspaceSetting,
     utc_now,
 )
 from app.providers.factory import embedding_provider_for_workspace
@@ -33,8 +35,8 @@ from app.services.memory_enhancement import load_enhancement_config
 
 ASSET_ROOT = Path(__file__).resolve().parents[1] / "assets" / "stickers"
 MAX_FILE_BYTES = 4 * 1024 * 1024
-MAX_IMPORT_BYTES = 24 * 1024 * 1024
-MAX_IMPORT_FILES = 100
+MAX_IMPORT_FILES = 1000
+MAX_ACTIVE_STICKERS = 100
 SEMANTIC_FIELDS = ("description", "ocr", "tags", "emotion", "intent", "use_when", "avoid_when", "standalone")
 
 
@@ -128,12 +130,152 @@ class StickerService:
             pass
         self.db.commit()
 
-    def visible_assets(self) -> list[StickerAsset]:
-        return list(self.db.scalars(select(StickerAsset).options(defer(StickerAsset.asset_base64), defer(StickerAsset.poster_base64)).join(StickerPack).where(
-            StickerAsset.workspace_id == self.workspace_id, StickerPack.workspace_id == self.workspace_id,
-            StickerPack.enabled.is_(True), StickerAsset.enabled.is_(True),
+    def hidden_pack_ids(self) -> set[str]:
+        prefix = f"stickers.hidden:{self.actor_id}:"
+        records = self.db.scalars(select(WorkspaceSetting).where(
+            WorkspaceSetting.workspace_id == self.workspace_id,
+            WorkspaceSetting.key.startswith(prefix),
+        )).all()
+        return {record.key[len(prefix):] for record in records if record.value.get("hidden")}
+
+    def save_preference(self, key: str, values: dict[str, Any]) -> None:
+        record = self.db.scalar(select(WorkspaceSetting).where(
+            WorkspaceSetting.workspace_id == self.workspace_id, WorkspaceSetting.key == key,
+        ))
+        if record is None:
+            try:
+                with self.db.begin_nested():
+                    self.db.add(WorkspaceSetting(workspace_id=self.workspace_id, key=key, value=values))
+                    self.db.flush()
+                return
+            except IntegrityError:
+                record = self.db.scalar(select(WorkspaceSetting).where(
+                    WorkspaceSetting.workspace_id == self.workspace_id, WorkspaceSetting.key == key,
+                ))
+        record.value = {**record.value, **values}
+        self.db.flush()
+
+    @staticmethod
+    def base64_storage_bytes(size: int) -> int:
+        return 4 * ((size + 2) // 3)
+
+    def workspace_storage_used(self) -> int:
+        file_bytes = self.db.scalar(select(func.coalesce(func.sum(FileRecord.size_bytes), 0)).where(
+            FileRecord.workspace_id == self.workspace_id,
+            FileRecord.lifecycle_status != "deleted",
+        )) or 0
+        sticker_bytes = self.db.scalar(select(func.coalesce(func.sum(
+            func.coalesce(func.length(StickerAsset.asset_base64), 0) + func.coalesce(func.length(StickerAsset.poster_base64), 0)
+        ), 0)).where(StickerAsset.workspace_id == self.workspace_id)) or 0
+        return int(file_bytes) + int(sticker_bytes)
+
+    def ensure_workspace_storage(self, incoming_bytes: int) -> None:
+        quota_bytes = int(self.settings.workspace_storage_quota_bytes or 0)
+        if quota_bytes > 0 and self.workspace_storage_used() + incoming_bytes > quota_bytes:
+            raise AppError(413, "workspace_storage_quota_exceeded", "工作区存储空间不足，请删除文件或提高存储配额")
+
+    def enqueue_automatic_analysis(self) -> None:
+        from app.services.sticker_pipeline import StickerPipeline
+        StickerPipeline(self).enqueue(automatic=True)
+
+    def claim_private_pack(self, source_key: str, name: str, license_text: str) -> tuple[StickerPack, bool]:
+        pack = StickerPack(workspace_id=self.workspace_id, owner_id=self.actor_id, source_key=source_key, name=name[:120] or "导入的表情包", builtin=False, license=license_text, source="private-import")
+        try:
+            with self.db.begin_nested():
+                self.db.add(pack)
+                self.db.flush()
+        except IntegrityError:
+            existing = self.db.scalar(select(StickerPack).where(
+                StickerPack.workspace_id == self.workspace_id,
+                StickerPack.owner_id == self.actor_id,
+                StickerPack.source_key == source_key,
+            ))
+            if existing is not None:
+                return existing, False
+            raise
+        return pack, True
+
+    def library_inventory(self) -> list[dict[str, Any]]:
+        prefix = f"stickers.hidden:{self.actor_id}:"
+        preferences = {record.key[len(prefix):]: record.value for record in self.db.scalars(select(WorkspaceSetting).where(
+            WorkspaceSetting.workspace_id == self.workspace_id, WorkspaceSetting.key.startswith(prefix),
+        )).all()}
+        record = self.db.scalar(select(WorkspaceSetting).where(
+            WorkspaceSetting.workspace_id == self.workspace_id, WorkspaceSetting.key == f"stickers.order:{self.actor_id}",
+        ))
+        order = {pack_id: position for position, pack_id in enumerate(record.value.get("pack_ids", []))} if record else {}
+        packs = self.db.scalars(select(StickerPack).where(
+            StickerPack.workspace_id == self.workspace_id,
             or_(StickerPack.builtin.is_(True), StickerPack.owner_id == self.actor_id),
-        ).order_by(StickerPack.builtin.desc(), StickerAsset.name, StickerAsset.id)).all())
+        ).order_by(StickerPack.builtin.desc(), StickerPack.created_at, StickerPack.id)).all()
+        packs = [pack for pack in packs if not preferences.get(pack.id, {}).get("hidden")]
+        packs.sort(key=lambda pack: order.get(pack.id, len(order)))
+        counts = dict(self.db.execute(select(StickerAsset.pack_id, func.count(StickerAsset.id)).where(
+            StickerAsset.workspace_id == self.workspace_id, StickerAsset.enabled.is_(True),
+            StickerAsset.pack_id.in_([pack.id for pack in packs]),
+        ).group_by(StickerAsset.pack_id)).all())
+        remaining = MAX_ACTIVE_STICKERS
+        inventory = []
+        for pack in packs:
+            enabled = pack.enabled and preferences.get(pack.id, {}).get("enabled", True)
+            count = counts.get(pack.id, 0)
+            active_count = min(remaining, count) if enabled else 0
+            remaining -= active_count
+            inventory.append({"pack": pack, "enabled": enabled, "count": count, "active_count": active_count})
+        return inventory
+
+    def set_library_order(self, pack_ids: list[str]) -> None:
+        available = {entry["pack"].id for entry in self.library_inventory()}
+        if len(pack_ids) != len(set(pack_ids)) or any(pack_id not in available for pack_id in pack_ids):
+            raise AppError(422, "sticker_order_invalid", "排序包含重复、已移除或无权访问的表情包，请刷新后重试")
+        self.save_preference(f"stickers.order:{self.actor_id}", {"pack_ids": pack_ids})
+        self.reconcile()
+        self.enqueue_automatic_analysis()
+
+    def set_library_pack_enabled(self, pack_id: str, enabled: bool) -> None:
+        entry = next((entry for entry in self.library_inventory() if entry["pack"].id == pack_id), None)
+        if entry is None:
+            raise AppError(404, "sticker_pack_not_found", "表情包不存在")
+        if enabled and not entry["pack"].enabled:
+            if entry["pack"].builtin:
+                raise AppError(409, "sticker_pack_disabled", "这套内置表情已被工作区停用，请联系管理员启用")
+            entry["pack"].enabled = True
+        self.save_preference(f"stickers.hidden:{self.actor_id}:{pack_id}", {"enabled": enabled})
+        self.reconcile()
+        if enabled:
+            self.enqueue_automatic_analysis()
+
+    def set_pack_in_library(self, pack_id: str, added: bool) -> None:
+        pack = self.db.scalar(select(StickerPack).where(
+            StickerPack.id == pack_id, StickerPack.workspace_id == self.workspace_id,
+            or_(StickerPack.builtin.is_(True), StickerPack.owner_id == self.actor_id),
+        ))
+        if pack is None:
+            raise AppError(404, "sticker_pack_not_found", "表情包不存在")
+        reenabled = added and not pack.enabled
+        if reenabled:
+            if pack.builtin:
+                raise AppError(409, "sticker_pack_disabled", "这套内置表情已被工作区停用，请联系管理员启用")
+            pack.enabled = True
+        self.save_preference(f"stickers.hidden:{self.actor_id}:{pack.id}", {"hidden": not added, "enabled": added})
+        self.db.flush()
+        if reenabled:
+            self.reconcile()
+        else:
+            self.db.commit()
+        if added:
+            self.enqueue_automatic_analysis()
+
+    def visible_assets(self) -> list[StickerAsset]:
+        assets = []
+        for entry in self.library_inventory():
+            if not entry["active_count"]:
+                continue
+            assets.extend(self.db.scalars(select(StickerAsset).options(defer(StickerAsset.asset_base64), defer(StickerAsset.poster_base64)).where(
+                StickerAsset.workspace_id == self.workspace_id, StickerAsset.pack_id == entry["pack"].id,
+                StickerAsset.enabled.is_(True),
+            ).order_by(StickerAsset.created_at, StickerAsset.id).limit(entry["active_count"])).all())
+        return assets
 
     def require_asset(self, sticker_id: str, *, content_hash: str | None = None) -> StickerAsset:
         asset = self.db.scalar(select(StickerAsset).join(StickerPack).where(
@@ -150,6 +292,8 @@ class StickerService:
 
     def part_data(self, sticker_id: str) -> dict[str, Any]:
         asset = self.require_asset(sticker_id)
+        if asset.id not in {entry.id for entry in self.visible_assets()}:
+            raise AppError(404, "sticker_not_found", "这张表情未启用，请调整表情包开关或排序")
         data = {"sticker_id": asset.id, "pack_id": asset.pack_id, "asset_version": asset.content_hash, "alt": asset.name + ("：" + str(asset.semantics.get("description")) if asset.semantics.get("description") else ""), "meaning": str(asset.semantics.get("description") or asset.name)[:300]}
         from app.services.sticker_market import catalog
         credit = next((entry for pack in catalog() if pack["source_id"] == "openmoji" for entry in pack["stickers"] if entry["sha256"] == asset.content_hash), None)
@@ -271,7 +415,12 @@ class StickerService:
         return digest(timestamp.isoformat(timespec="microseconds"))
 
     def indexable_assets(self) -> list[StickerAsset]:
-        return list(self.db.scalars(select(StickerAsset).options(defer(StickerAsset.asset_base64), defer(StickerAsset.poster_base64)).join(StickerPack).where(StickerAsset.workspace_id == self.workspace_id, StickerAsset.enabled.is_(True), StickerPack.enabled.is_(True)).order_by(StickerAsset.id)).all())
+        owners = set(self.db.scalars(select(StickerPack.owner_id).where(StickerPack.workspace_id == self.workspace_id)).all())
+        assets = {}
+        for owner_id in owners:
+            for asset in StickerService(self.db, self.workspace_id, owner_id, self.settings).visible_assets():
+                assets[asset.id] = asset
+        return sorted(assets.values(), key=lambda asset: asset.id)
 
     def status(self) -> dict[str, Any]:
         self.ensure_builtin()
@@ -281,10 +430,11 @@ class StickerService:
         active = self.db.get(StickerIndexGeneration, state.active_generation_id) if state.active_generation_id else None
         visible = self.visible_assets()
         indexed = dict(self.db.execute(select(StickerVector.sticker_id, StickerVector.semantic_hash).where(StickerVector.generation_id == desired.id, StickerVector.sticker_id.in_([asset.id for asset in visible]))).all()) if desired else {}
-        packs = list(self.db.scalars(select(StickerPack).where(StickerPack.workspace_id == self.workspace_id, or_(StickerPack.builtin.is_(True), StickerPack.owner_id == self.actor_id)).order_by(StickerPack.builtin.desc(), StickerPack.created_at)).all())
+        inventory = self.library_inventory()
         return {"mode": state.mode, "provider_id": state.provider_id, "model_id": state.model_id, "ai_enabled": state.ai_enabled,
                 "keyword_available": True, "index": {"status": desired.status if desired else "keyword", "completed": sum(indexed.get(asset.id) == asset.semantic_hash for asset in visible), "total": len(visible), "error": desired.error if desired else None, "model_id": desired.profile.get("model_id") if desired else None, "fingerprint": desired.fingerprint if desired else None, "active_model_id": active.profile.get("model_id") if active else None},
-                "packs": [{"id": pack.id, "name": pack.name, "builtin": pack.builtin, "enabled": pack.enabled, "license": pack.license, "source": pack.source} for pack in packs]}
+                "active_count": len(visible), "active_limit": MAX_ACTIVE_STICKERS, "stored_count": sum(entry["count"] for entry in inventory),
+                "packs": [{"id": entry["pack"].id, "name": entry["pack"].name, "builtin": entry["pack"].builtin, "enabled": entry["enabled"], "license": entry["pack"].license, "source": entry["pack"].source, "count": entry["count"], "active_count": entry["active_count"]} for entry in inventory]}
 
     def configure(self, values: dict[str, Any]) -> dict[str, Any]:
         state = self.state()
@@ -299,6 +449,7 @@ class StickerService:
         self.ensure_builtin()
         query = query[:600]
         assets = self.visible_assets()
+        asset_order = {asset.id: position for position, asset in enumerate(assets)}
         if pack_id:
             assets = [asset for asset in assets if asset.pack_id == pack_id]
         query_terms = terms(query)
@@ -313,7 +464,7 @@ class StickerService:
                 score += 2
             if not query.strip() or score > 0:
                 ranked.append((asset, score))
-        ranked.sort(key=lambda item: (-item[1], item[0].name, item[0].id))
+        ranked.sort(key=lambda item: (-item[1], asset_order[item[0].id]))
         merged = {asset.id: 1 / (60 + rank) for rank, (asset, _) in enumerate(ranked, 1)}
         method = "keyword"
         state = self.state()
@@ -347,7 +498,7 @@ class StickerService:
                 self.db.rollback()
         avoid_terms = terms(avoid)
         candidates = [asset for asset in assets if asset.id in merged and not (avoid_terms & terms(" ".join(asset.semantics.get("avoid_when", []))))]
-        candidates.sort(key=lambda asset: (-merged[asset.id], asset.name, asset.id))
+        candidates.sort(key=lambda asset: (-merged[asset.id], asset_order[asset.id]))
         return {"method": method, "total": len(candidates), "candidates": [self.view(asset) for asset in candidates[offset:offset + max(1, min(limit, 24))]]}
 
     def provider(self, profile: dict[str, Any]):
@@ -370,62 +521,81 @@ class StickerService:
         self.db.commit()
         return vectors
 
-    def import_pack(self, files: list[tuple[str, bytes]], name: str, license_text: str = "用户私有导入，未授予公开分发许可") -> dict[str, Any]:
+    def import_pack(self, files: list[tuple[str, bytes | BinaryIO]], name: str, license_text: str = "用户私有导入，未授予公开分发许可") -> dict[str, Any]:
+        with ExitStack() as resources:
+            return self._import_pack(files, name, license_text, resources)
+
+    def _import_pack(self, files: list[tuple[str, bytes | BinaryIO]], name: str, license_text: str, resources: ExitStack) -> dict[str, Any]:
         self.ensure_builtin()
-        if sum(len(content) for _, content in files) > MAX_IMPORT_BYTES:
-            raise AppError(413, "sticker_import_too_large", "导入总大小不能超过 24 MiB")
-        entries: list[tuple[str, bytes]] = []
+        if not files or len(files) > MAX_IMPORT_FILES:
+            raise AppError(422, "sticker_import_invalid", f"每次最多处理 {MAX_IMPORT_FILES} 个文件，请分批导入")
+        sources = []
+        total_bytes = 0
+        for filename, content in files:
+            source = io.BytesIO(content) if isinstance(content, bytes) else content
+            source.seek(0, 2)
+            total_bytes += source.tell()
+            source.seek(0)
+            sources.append((filename, source))
+        if total_bytes > self.settings.max_upload_bytes:
+            raise AppError(413, "sticker_import_too_large", "导入超过系统上传安全上限，请分批导入或调整部署的 max_upload_bytes")
+        entries: list[tuple[str, BinaryIO | zipfile.ZipInfo, zipfile.ZipFile | None]] = []
         metadata: dict[str, Any] = {}
         license_document = ""
         notice_document = ""
         provenance: dict[str, Any] = {}
         if any(filename.casefold().endswith(".zip") for filename, _ in files) and len(files) != 1:
             raise AppError(422, "sticker_archive_invalid", "ZIP 表情包请单独导入，图片可以多选")
-        for filename, content in files:
+        for filename, source in sources:
             if filename.casefold().endswith(".zip"):
                 try:
-                    with zipfile.ZipFile(io.BytesIO(content)) as archive:
-                        infos = archive.infolist()
-                        if len(infos) > MAX_IMPORT_FILES + 10 or sum(item.file_size for item in infos) > MAX_IMPORT_BYTES:
-                            raise ValueError("ZIP 文件过多或解压后过大")
-                        for item in infos:
-                            path = PurePosixPath(item.filename.replace("\\", "/"))
-                            if path.is_absolute() or ".." in path.parts or ":" in item.filename or (item.external_attr >> 16) & 0o170000 == 0o120000:
-                                raise ValueError("ZIP 包含不安全路径")
-                            if item.is_dir():
-                                continue
-                            if item.file_size > MAX_FILE_BYTES:
-                                raise ValueError("单个文件不能超过 4 MiB")
-                            if path.name.casefold() in {"license", "license.txt", "license.md"}:
-                                if item.file_size > 64 * 1024:
-                                    raise ValueError("许可证文件过大")
-                                license_document = archive.read(item).decode("utf-8", errors="replace")
-                            elif path.name.casefold() in {"notice", "notice.txt", "notice.md"}:
-                                if item.file_size > 64 * 1024:
-                                    raise ValueError("署名文件过大")
-                                notice_document = archive.read(item).decode("utf-8", errors="replace")
-                            elif path.name == "manifest.json":
-                                if item.file_size > 256 * 1024:
-                                    raise ValueError("描述清单过大")
-                                manifest = json.loads(archive.read(item))
-                                if not isinstance(manifest, dict) or not isinstance(manifest.get("stickers", []), list):
-                                    raise ValueError("无效的表情描述清单")
-                                metadata = {str(path.parent / str(entry.get("file"))): entry for entry in manifest.get("stickers", []) if isinstance(entry, dict)}
-                                name = name.strip() or str(manifest.get("name") or "导入的表情包")
-                                license_text = str(manifest.get("license") or license_text)[:4000]
-                                provenance = {key: str(manifest.get(key) or "")[:2000] for key in ("attribution", "license_id", "license_url")}
-                                provenance["original_source"] = str(manifest.get("original_source") or manifest.get("source") or "")[:2000]
-                            elif path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".apng"}:
-                                entries.append((str(path), archive.read(item)))
+                    archive = resources.enter_context(zipfile.ZipFile(source))
+                    infos = archive.infolist()
+                    if len(infos) > MAX_IMPORT_FILES + 10 or sum(item.file_size for item in infos) > self.settings.max_upload_bytes:
+                        raise ValueError("ZIP 文件过多或解压后过大")
+                    for item in infos:
+                        path = PurePosixPath(item.filename.replace("\\", "/"))
+                        if path.is_absolute() or ".." in path.parts or ":" in item.filename or (item.external_attr >> 16) & 0o170000 == 0o120000:
+                            raise ValueError("ZIP 包含不安全路径")
+                        if item.is_dir():
+                            continue
+                        if item.file_size > MAX_FILE_BYTES:
+                            raise ValueError("单个文件不能超过 4 MiB")
+                        if path.name.casefold() in {"license", "license.txt", "license.md"}:
+                            if item.file_size > 64 * 1024:
+                                raise ValueError("许可证文件过大")
+                            license_document = archive.read(item).decode("utf-8", errors="replace")
+                        elif path.name.casefold() in {"notice", "notice.txt", "notice.md"}:
+                            if item.file_size > 64 * 1024:
+                                raise ValueError("署名文件过大")
+                            notice_document = archive.read(item).decode("utf-8", errors="replace")
+                        elif path.name == "manifest.json":
+                            if item.file_size > 256 * 1024:
+                                raise ValueError("描述清单过大")
+                            manifest = json.loads(archive.read(item))
+                            if not isinstance(manifest, dict) or not isinstance(manifest.get("stickers", []), list):
+                                raise ValueError("无效的表情描述清单")
+                            metadata = {str(path.parent / str(entry.get("file"))): entry for entry in manifest.get("stickers", []) if isinstance(entry, dict)}
+                            name = name.strip() or str(manifest.get("name") or "导入的表情包")
+                            license_text = str(manifest.get("license") or license_text)[:4000]
+                            provenance = {key: str(manifest.get(key) or "")[:2000] for key in ("attribution", "license_id", "license_url")}
+                            provenance["original_source"] = str(manifest.get("original_source") or manifest.get("source") or "")[:2000]
+                        elif path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".apng"}:
+                            entries.append((str(path), item, archive))
                 except (zipfile.BadZipFile, ValueError, KeyError, RuntimeError, OSError) as exc:
                     raise AppError(422, "sticker_archive_invalid", str(exc)[:200]) from exc
             else:
-                entries.append((filename, content))
-        if not entries or len(entries) > MAX_IMPORT_FILES or sum(len(content) for _, content in entries) > MAX_IMPORT_BYTES:
-            raise AppError(422, "sticker_import_invalid", "每次需要导入 1–100 张图片，总大小不超过 24 MiB")
+                entries.append((filename, source, None))
+        if not entries or len(entries) > MAX_IMPORT_FILES:
+            raise AppError(422, "sticker_import_invalid", f"每次需要导入 1–{MAX_IMPORT_FILES} 张图片")
         prepared = []
         seen = set()
-        for filename, content in entries:
+        scratch = resources.enter_context(TemporaryFile())
+        for filename, entry_source, archive in entries:
+            try:
+                content = archive.read(entry_source) if archive else entry_source.read(MAX_FILE_BYTES + 1)
+            except (zipfile.BadZipFile, ValueError, RuntimeError, OSError) as exc:
+                raise AppError(422, "sticker_archive_invalid", "无法读取 ZIP 中的图片") from exc
             if len(content) > MAX_FILE_BYTES:
                 raise AppError(413, "sticker_file_too_large", "单张表情不能超过 4 MiB")
             try:
@@ -451,18 +621,29 @@ class StickerService:
             semantics = clean_semantics(entry)
             if not semantics["tags"]:
                 semantics["tags"] = [title]
-            prepared.append((content_hash, content, poster.getvalue(), mime_type, title, semantics))
+            offset = scratch.tell()
+            scratch.write(content)
+            poster_content = poster.getvalue()
+            scratch.write(poster_content)
+            prepared.append((content_hash, offset, len(content), len(poster_content), mime_type, title, semantics))
+        if not prepared:
+            raise AppError(422, "sticker_import_invalid", "未找到可导入的图片")
         source_key = digest(sorted(seen))
         existing = self.db.scalar(select(StickerPack).where(StickerPack.workspace_id == self.workspace_id, StickerPack.owner_id == self.actor_id, StickerPack.source_key == source_key))
         if existing:
             return {"pack_id": existing.id, "imported": 0, "duplicates": len(entries), "private": True}
-        pack = StickerPack(workspace_id=self.workspace_id, owner_id=self.actor_id, source_key=source_key, name=name[:120] or "导入的表情包", builtin=False, license=license_document or license_text, source="private-import")
-        self.db.add(pack)
-        self.db.flush()
+        self.ensure_workspace_storage(sum(self.base64_storage_bytes(content_size) + self.base64_storage_bytes(poster_size) for _, _, content_size, poster_size, _, _, _ in prepared))
+        pack, created = self.claim_private_pack(source_key, name, license_document or license_text)
+        if not created:
+            return {"pack_id": pack.id, "imported": 0, "duplicates": len(entries), "private": True}
         from app.domain.models import WorkspaceSetting
         self.db.add(WorkspaceSetting(workspace_id=self.workspace_id, key=f"stickers.pack_metadata:{pack.id}", value={**provenance, "notice": notice_document}))
-        for content_hash, content, poster, mime_type, title, semantics in prepared:
+        for content_hash, offset, content_size, poster_size, mime_type, title, semantics in prepared:
+            scratch.seek(offset)
+            content = scratch.read(content_size)
+            poster = scratch.read(poster_size)
             self.db.add(StickerAsset(workspace_id=self.workspace_id, pack_id=pack.id, name=title, content_hash=content_hash, mime_type=mime_type, asset_base64=base64.b64encode(content).decode(), poster_base64=base64.b64encode(poster).decode(), semantics=semantics, semantic_hash=digest([title, semantics])))
+            self.db.flush()
         self.db.flush()
         self.reconcile()
         from app.services.sticker_pipeline import StickerPipeline
@@ -488,6 +669,8 @@ class StickerService:
         pack.enabled = enabled
         self.db.flush()
         self.reconcile()
+        if enabled:
+            self.enqueue_automatic_analysis()
 
 
 def reconcile_sticker_indexes() -> None:

@@ -71,6 +71,8 @@ class StickerMarketService:
             StickerPack.workspace_id == self.stickers.workspace_id,
             or_(StickerPack.builtin.is_(True), StickerPack.owner_id == self.stickers.actor_id),
         )).all())
+        hidden = self.stickers.hidden_pack_ids()
+        inventory = {entry["pack"].id: entry for entry in self.stickers.library_inventory()}
         result = []
         for pack in catalog():
             if normalized(query) not in normalized(" ".join([pack["name"], pack["description"], pack["category"], *[entry["name"] + " " + " ".join(entry.get("tags", [])) for entry in pack["stickers"]]])):
@@ -80,17 +82,18 @@ class StickerMarketService:
             result.append({
                 **{key: pack[key] for key in ("id", "name", "description", "category", "author", "version", "source", "license", "license_id", "style", "source_id", "license_url", "attribution", "approval_required")},
                 "count": len(pack["stickers"]), "bytes": sum((ASSET_ROOT / entry["file"]).stat().st_size for entry in pack["stickers"]),
-                "installed_pack_id": current.id if current else None, "enabled": current.enabled if current else False,
+                "installed_pack_id": current.id if current and current.id not in hidden else None, "enabled": inventory.get(current.id, {}).get("enabled", False) if current else False,
                 "previews": [{"name": entry["name"], "index": index, "description": entry["description"]} for index, entry in enumerate(pack["stickers"])],
             })
-        return {"packs": result, "total_packs": len(catalog()), "total_assets": sum(len(pack["stickers"]) for pack in catalog()), "sources": sorted({pack["source_id"] for pack in catalog()}), "policy": "无需申请 API Key 或厂商接入审批；仍须保留许可、署名并遵守各素材条款。用户导入不会发布到市场，不抓取未授权商店。"}
+        return {"packs": result, "total_packs": len(catalog()), "total_assets": sum(len(pack["stickers"]) for pack in catalog()), "sources": sorted({pack["source_id"] for pack in catalog()})}
 
     def install(self, pack_id: str) -> dict[str, Any]:
         pack = market_pack(pack_id)
         if pack.get("builtin"):
             self.stickers.ensure_builtin()
-            current = next(row for row in self.listing()["packs"] if row["id"] == pack_id)
-            return {"pack_id": current["installed_pack_id"], "imported": 0, "duplicates": len(pack["stickers"]), "private": False}
+            current = self.db.scalar(select(StickerPack).where(StickerPack.workspace_id == self.stickers.workspace_id, StickerPack.builtin.is_(True), StickerPack.source_key == "fluent-v1"))
+            self.stickers.set_pack_in_library(current.id, True)
+            return {"pack_id": current.id, "imported": 0, "duplicates": len(pack["stickers"]), "private": False}
         content = market_archive(pack_id)
         try:
             result = self.stickers.import_pack([(f"{pack_id}.zip", content)], pack["name"])
@@ -102,7 +105,16 @@ class StickerMarketService:
             installed.source = pack["source"]
             installed.license = pack["license"]
             self.db.commit()
+        self.stickers.set_pack_in_library(result["pack_id"], True)
         return result
+
+    def remove(self, pack_id: str) -> dict[str, Any]:
+        market_pack(pack_id)
+        current = next(row for row in self.listing()["packs"] if row["id"] == pack_id)
+        installed_id = current["installed_pack_id"]
+        if installed_id:
+            self.stickers.set_pack_in_library(installed_id, False)
+        return {"pack_id": installed_id, "removed": bool(installed_id)}
 
     def export(self, pack_id: str) -> bytes:
         pack = self.db.scalar(select(StickerPack).where(

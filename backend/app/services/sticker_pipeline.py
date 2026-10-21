@@ -107,7 +107,7 @@ class StickerPipeline:
         target = {"provider_id": provider.provider_id, "model_id": provider.model_id}
         queued = 0
         pack_ids = [pack.id for pack in packs]
-        assets = self.db.scalars(select(StickerAsset).where(StickerAsset.workspace_id == self.stickers.workspace_id, StickerAsset.pack_id.in_(pack_ids), StickerAsset.enabled.is_(True))).all()
+        assets = [asset for asset in self.stickers.visible_assets() if asset.pack_id in pack_ids]
         for asset in assets:
             if sticker_id and asset.id != sticker_id:
                 continue
@@ -156,6 +156,8 @@ def run_sticker_semantics(db, job: DurableJob) -> None:
     pipeline = StickerPipeline(service)
     try:
         asset = service.require_asset(job.payload["sticker_id"])
+        if asset.id not in {entry.id for entry in service.visible_assets()}:
+            return
         if asset.semantic_hash != job.payload["semantic_hash"] or asset.content_hash != job.payload["content_hash"]:
             return
         if job.payload.get("automatic"):

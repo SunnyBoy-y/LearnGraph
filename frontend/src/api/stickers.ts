@@ -30,6 +30,9 @@ export interface StickerSettings {
 
 export interface StickerStatus extends StickerSettings {
   keyword_available: boolean;
+  active_count?: number;
+  active_limit?: number;
+  stored_count?: number;
   index: {
     status: string;
     completed: number;
@@ -39,14 +42,15 @@ export interface StickerStatus extends StickerSettings {
     fingerprint: string | null;
     active_model_id: string | null;
   };
-  packs: Array<{ id: string; name: string; builtin: boolean; enabled: boolean; license: string; source: string }>;
+  packs: Array<{ id: string; name: string; builtin: boolean; enabled: boolean; license: string; source: string; count?: number; active_count?: number }>;
 }
 
 export const getStickerStatus = () => apiClient.get<StickerStatus>('/stickers');
 export const searchStickers = (query: string, semantic = false, options: { packId?: string; offset?: number } = {}) => apiClient.get<{ method: string; total: number; candidates: Sticker[] }>('/stickers/search', { query: { q: query, semantic, limit: 24, pack_id: options.packId, offset: options.offset } });
 export const configureStickers = (settings: Partial<StickerSettings>) => apiClient.put<StickerStatus>('/stickers/settings', settings);
 export const rebuildStickerIndex = () => apiClient.post<StickerStatus>('/stickers/rebuild', {});
-export const setStickerPackEnabled = (id: string, enabled: boolean) => apiClient.put<StickerStatus>(`/stickers/packs/${encodeURIComponent(id)}`, { enabled });
+export const setStickerPackEnabled = (id: string, enabled: boolean) => apiClient.put<StickerStatus>(`/stickers/library/packs/${encodeURIComponent(id)}`, { enabled });
+export const reorderStickerPacks = (pack_ids: string[]) => apiClient.put<StickerStatus>('/stickers/library/order', { pack_ids });
 export const updateSticker = (sticker: Sticker) => apiClient.put<Sticker>(`/stickers/${encodeURIComponent(sticker.id)}`, { name: sticker.name, semantics: sticker.semantics });
 export const stickerBlob = (id: string, poster: boolean) => apiClient.getBlob(`/stickers/${encodeURIComponent(id)}/content`, { query: { poster } }, 5 * 1024 * 1024);
 
@@ -83,10 +87,11 @@ export interface StickerPipelineStatus {
   assets?: Array<{ sticker_id: string; status: string }>;
 }
 
-export const getStickerMarket = (query = '') => apiClient.get<{ packs: StickerMarketPack[]; policy: string; total_packs?: number; total_assets?: number; sources?: string[] }>('/stickers/market', { query: { q: query } });
+export const getStickerMarket = (query = '') => apiClient.get<{ packs: StickerMarketPack[]; total_packs?: number; total_assets?: number; sources?: string[] }>('/stickers/market', { query: { q: query } });
 export const installMarketPack = (id: string) => apiClient.post<{ pack_id: string; imported: number }>(`/stickers/market/${encodeURIComponent(id)}/install`, {});
+export const removeMarketPack = (id: string) => apiClient.delete<{ pack_id: string | null; removed: boolean }>(`/stickers/market/${encodeURIComponent(id)}/install`);
 export const marketStickerBlob = (id: string, index: number) => apiClient.getBlob(`/stickers/market/${encodeURIComponent(id)}/preview/${index}`, undefined, 5 * 1024 * 1024);
-export const downloadStickerPack = (id: string, market = false) => apiClient.getBlob(`/stickers/${market ? 'market' : 'packs'}/${encodeURIComponent(id)}/download`, undefined, 32 * 1024 * 1024);
+export const downloadStickerPack = (id: string, market = false) => apiClient.getBlob(`/stickers/${market ? 'market' : 'packs'}/${encodeURIComponent(id)}/download`, undefined, 512 * 1024 * 1024);
 export const getStickerPipeline = () => apiClient.get<StickerPipelineStatus>('/stickers/pipeline');
 export const configureStickerPipeline = (auto_analyze: boolean) => apiClient.put<StickerPipelineStatus>('/stickers/pipeline', { auto_analyze });
 export const analyzeStickerPack = (id: string) => apiClient.post<{ queued: number }>(`/stickers/packs/${encodeURIComponent(id)}/analyze`, { consent: true });

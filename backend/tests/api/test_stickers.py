@@ -9,10 +9,11 @@ from uuid import uuid4
 import httpx
 import pytest
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.database import SessionLocal
-from app.domain.models import DurableJob, ProviderConfig, StickerAsset, StickerIndexGeneration, StickerIndexState, StickerVector, User
+from app.core.errors import AppError
+from app.domain.models import DurableJob, ProviderConfig, StickerAsset, StickerIndexGeneration, StickerIndexState, StickerPack, StickerVector, User
 from app.domain.models import utc_now
 from app.providers.remote.embedding import OpenAICompatibleEmbeddingProvider
 from app.services.durable_queue import run_one_durable_job
@@ -422,6 +423,67 @@ def test_market_install_idempotent_private_and_roundtrip_export(client, register
     assert client.post("/api/v1/stickers/packs/unknown/analyze", headers=headers, json={"consent": False}).status_code == 422
 
 
+@pytest.mark.parametrize("market_id", ["fluent-daily", "fluent-warm"])
+def test_market_remove_restore_preserves_assets_and_filters_hybrid(client, register_user, monkeypatch, market_id):
+    workspace, headers, actor = identity(client, register_user)
+    configured(workspace, actor, monkeypatch)
+    installed = client.post(f"/api/v1/stickers/market/{market_id}/install", headers=headers).json()
+    pack_id = installed["pack_id"]
+    assets = client.get(f"/api/v1/stickers/search?pack_id={pack_id}", headers=headers).json()["candidates"]
+    assert assets
+    asset = assets[0]
+    finish_index(workspace)
+    removed = client.delete(f"/api/v1/stickers/market/{market_id}/install", headers=headers)
+    assert removed.status_code == 200, removed.text
+    assert removed.json() == {"pack_id": pack_id, "removed": True}
+    assert client.delete(f"/api/v1/stickers/market/{market_id}/install", headers=headers).json()["removed"] is False
+    listing = client.get("/api/v1/stickers/market", headers=headers).json()["packs"]
+    assert next(pack for pack in listing if pack["id"] == market_id)["installed_pack_id"] is None
+    assert pack_id not in [pack["id"] for pack in client.get("/api/v1/stickers", headers=headers).json()["packs"]]
+    for semantic in ("false", "true"):
+        result = client.get(f"/api/v1/stickers/search?q={asset['name']}&pack_id={pack_id}&semantic={semantic}", headers=headers).json()
+        assert result["candidates"] == []
+    assert client.get(f"/api/v1/stickers/{asset['id']}/content", headers=headers).status_code == 200
+    assert client.get(f"/api/v1/stickers/packs/{pack_id}/download", headers=headers).status_code == 200
+    with SessionLocal() as db:
+        service = StickerService(db, workspace, actor)
+        with pytest.raises(AppError) as error:
+            service.part_data(asset["id"])
+        assert error.value.status_code == 404
+        if market_id == "fluent-daily":
+            assert asset["id"] in [item.id for item in StickerService(db, workspace, "other-member").visible_assets()]
+    restored = client.post(f"/api/v1/stickers/market/{market_id}/install", headers=headers)
+    assert restored.status_code == 201, restored.text
+    assert restored.json()["pack_id"] == pack_id and restored.json()["imported"] == 0
+    result = client.get(f"/api/v1/stickers/search?pack_id={pack_id}", headers=headers).json()
+    assert {item["id"] for item in result["candidates"]} == {item["id"] for item in assets}
+
+
+def test_market_restore_disabled_private_pack_and_removal_isolation(client, register_user):
+    workspace, headers, actor = identity(client, register_user)
+    installed = client.post("/api/v1/stickers/market/fluent-warm/install", headers=headers).json()
+    pack_id = installed["pack_id"]
+    assert client.put(f"/api/v1/stickers/packs/{pack_id}", headers=headers, json={"enabled": False}).status_code == 200
+    restored = client.post("/api/v1/stickers/market/fluent-warm/install", headers=headers)
+    assert restored.status_code == 201 and restored.json()["pack_id"] == pack_id
+    assert client.get(f"/api/v1/stickers/search?pack_id={pack_id}", headers=headers).json()["candidates"]
+    _, other_headers, _ = identity(client, register_user)
+    assert client.delete("/api/v1/stickers/market/fluent-warm/install", headers=other_headers).json()["removed"] is False
+    with SessionLocal() as db:
+        with pytest.raises(AppError):
+            StickerService(db, workspace, "other-member").set_pack_in_library(pack_id, False)
+        assert pack_id not in StickerService(db, workspace, actor).hidden_pack_ids()
+    assert client.delete("/api/v1/stickers/market/unknown/install", headers=headers).status_code == 404
+    assert client.delete("/api/v1/stickers/market/fluent-warm/install").status_code == 401
+
+
+def test_market_cannot_override_workspace_builtin_disable(client, register_user):
+    _, headers, _ = identity(client, register_user)
+    builtin = next(pack for pack in client.get("/api/v1/stickers/market", headers=headers).json()["packs"] if pack["id"] == "fluent-daily")
+    assert client.put(f"/api/v1/stickers/packs/{builtin['installed_pack_id']}", headers=headers, json={"enabled": False}).status_code == 200
+    assert client.post("/api/v1/stickers/market/fluent-daily/install", headers=headers).status_code == 409
+
+
 def test_market_archive_detects_modified_asset(monkeypatch, tmp_path):
     from app.services import sticker_market
     pack = catalog()[1]
@@ -604,3 +666,158 @@ def test_single_sticker_analysis_only_queues_selected_asset_and_is_private(clien
     assert client.get(f"/api/v1/stickers/{selected['id']}", headers=other_headers).status_code == 404
     assert client.post(f"/api/v1/stickers/{selected['id']}/analyze", headers=other_headers, json={"consent": True}).status_code == 404
     assert client.get("/api/v1/stickers/pipeline", headers=other_headers).json()["assets"] == []
+
+
+def test_large_library_enables_first_100_images_and_persists_personal_order(client, register_user):
+    workspace, headers, actor = identity(client, register_user)
+    archive = create_archive({f"image-{index:03}.png": image_bytes((index, 20, 30, 255)) for index in range(130)})
+    uploaded = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("large.zip", archive))])
+    assert uploaded.status_code == 201, uploaded.text
+    assert uploaded.json()["imported"] == 130
+    pack_id = uploaded.json()["pack_id"]
+    status = client.get("/api/v1/stickers", headers=headers).json()
+    assert status["active_count"] == status["active_limit"] == 100
+    assert status["stored_count"] == 142
+    builtin_id = next(pack["id"] for pack in status["packs"] if pack["builtin"])
+    assert next(pack for pack in status["packs"] if pack["id"] == pack_id)["active_count"] == 88
+    with SessionLocal() as db:
+        ordered = db.scalars(select(StickerAsset).where(StickerAsset.pack_id == pack_id).order_by(StickerAsset.created_at, StickerAsset.id)).all()
+        first_id, boundary_id = ordered[0].id, ordered[88].id
+        with pytest.raises(AppError):
+            StickerService(db, workspace, actor).part_data(boundary_id)
+    assert client.get(f"/api/v1/stickers/{boundary_id}/content", headers=headers).status_code == 200
+    assert client.get(f"/api/v1/stickers/search?pack_id={pack_id}", headers=headers).json()["total"] == 88
+    response = client.put("/api/v1/stickers/library/order", headers=headers, json={"pack_ids": [pack_id, builtin_id]})
+    assert response.status_code == 200, response.text
+    assert [pack["id"] for pack in response.json()["packs"]] == [pack_id, builtin_id]
+    assert [pack["active_count"] for pack in response.json()["packs"]] == [100, 0]
+    assert client.get("/api/v1/stickers/search", headers=headers).json()["candidates"][0]["id"] == first_id
+    assert client.get("/api/v1/stickers", headers=headers).json()["packs"][0]["id"] == pack_id
+    response = client.put(f"/api/v1/stickers/library/packs/{pack_id}", headers=headers, json={"enabled": False})
+    assert response.status_code == 200 and response.json()["active_count"] == 12
+    assert client.get(f"/api/v1/stickers/search?pack_id={pack_id}", headers=headers).json()["total"] == 0
+    assert client.get(f"/api/v1/stickers/{first_id}/content", headers=headers).status_code == 200
+    response = client.put(f"/api/v1/stickers/library/packs/{pack_id}", headers=headers, json={"enabled": True})
+    assert response.json()["active_count"] == 100
+    with SessionLocal() as db:
+        assert len(StickerService(db, workspace, "different-member").visible_assets()) == 12
+        assert StickerService(db, workspace, actor).part_data(boundary_id)
+    for ids in ([pack_id, pack_id], ["unknown"], [str(uuid4())]):
+        assert client.put("/api/v1/stickers/library/order", headers=headers, json={"pack_ids": ids}).status_code == 422
+    _, foreign_headers, _ = identity(client, register_user)
+    assert client.put(f"/api/v1/stickers/library/packs/{pack_id}", headers=foreign_headers, json={"enabled": True}).status_code == 404
+
+
+def test_import_over_24_mib_uses_spooled_sources_and_platform_safety_limit(client, register_user, monkeypatch):
+    from app.core.config import get_settings
+    from app.domain.models import StickerPack
+    workspace, headers, _ = identity(client, register_user)
+    padding = b"x" * (3 * 1024 * 1024)
+    entries = {f"image-{index}.png": image_bytes((index, 50, 30, 255)) + padding for index in range(9)}
+    archive = create_archive(entries)
+    assert len(archive) > 24 * 1024 * 1024
+    response = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("over-24-mib.zip", archive))])
+    assert response.status_code == 201, response.text
+    assert response.json()["imported"] == 9
+    with SessionLocal() as db:
+        assert db.scalar(select(StickerPack).where(StickerPack.id == response.json()["pack_id"]))
+    monkeypatch.setattr(get_settings(), "max_upload_bytes", 1024)
+    response = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("too-large.zip", archive))])
+    assert response.status_code == 413
+    assert "max_upload_bytes" in response.text
+    compressed = io.BytesIO()
+    with zipfile.ZipFile(compressed, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("expanded.png", image_bytes() + b"x" * 4096)
+    response = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("compressed.zip", compressed.getvalue()))])
+    assert response.status_code == 422
+
+
+def test_import_streaming_limit_rejects_before_multipart_spooling(client, register_user, monkeypatch):
+    from app.core.config import get_settings
+    import starlette.formparsers as parser
+
+    _, headers, _ = identity(client, register_user)
+    monkeypatch.setattr(get_settings(), "max_upload_bytes", 1024 * 1024)
+    original, spools = parser.SpooledTemporaryFile, []
+
+    def tracked_spool(*args, **kwargs):
+        result = original(*args, **kwargs)
+        spools.append(result)
+        return result
+
+    monkeypatch.setattr(parser, "SpooledTemporaryFile", tracked_spool)
+
+    def chunks():
+        yield b'--fixture\r\nContent-Disposition: form-data; name="files"; filename="large.png"\r\nContent-Type: image/png\r\n\r\n'
+        for _ in range(20):
+            yield b"x" * (128 * 1024)
+        yield b"\r\n--fixture--\r\n"
+
+    response = client.post("/api/v1/stickers/import", headers={**headers, "Content-Type": "multipart/form-data; boundary=fixture"}, content=chunks())
+    assert response.status_code == 413
+    assert spools == []
+
+
+def test_private_stickers_count_toward_workspace_storage_quota(client, register_user, monkeypatch):
+    from app.core.config import get_settings
+
+    workspace, headers, _ = identity(client, register_user)
+    first = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("red.png", image_bytes("red")))])
+    assert first.status_code == 201, first.text
+    with SessionLocal() as db:
+        used = db.scalar(select(func.coalesce(func.sum(
+            func.coalesce(func.length(StickerAsset.asset_base64), 0) + func.coalesce(func.length(StickerAsset.poster_base64), 0)
+        ), 0)).where(StickerAsset.workspace_id == workspace))
+    monkeypatch.setattr(get_settings(), "workspace_storage_quota_bytes", int(used))
+    duplicate = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("red.png", image_bytes("red")))])
+    assert duplicate.status_code == 201 and duplicate.json()["imported"] == 0
+    response = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("blue.png", image_bytes("blue")))])
+    assert response.status_code == 413
+    assert "workspace_storage_quota_exceeded" in response.text
+
+
+def test_private_pack_claim_recovers_from_a_unique_source_conflict(client, register_user):
+    workspace, _, actor = identity(client, register_user)
+    source_key = "simultaneous-import"
+    with SessionLocal() as winner_db:
+        winner = StickerPack(workspace_id=workspace, owner_id=actor, source_key=source_key, name="先完成的导入", builtin=False, license="私有素材", source="private-import")
+        winner_db.add(winner)
+        winner_db.commit()
+        winner_id = winner.id
+    with SessionLocal() as db:
+        claimed, created = StickerService(db, workspace, actor).claim_private_pack(source_key, "稍后的导入", "私有素材")
+        assert created is False
+        assert claimed.id == winner_id
+
+
+def test_reordering_immediately_enqueues_newly_active_auto_analysis(client, register_user, monkeypatch):
+    workspace, headers, _ = identity(client, register_user)
+    vision_fixture(workspace, monkeypatch)
+    assert client.put("/api/v1/stickers/pipeline", headers=headers, json={"auto_analyze": True}).status_code == 200
+    first = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("first.zip", create_archive({f"first-{index:03}.png": image_bytes((index, 50, 80, 255)) for index in range(120)})))])
+    second = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("second.zip", create_archive({f"second-{index:03}.png": image_bytes((index + 130, 60, 90, 255)) for index in range(20)})))])
+    assert first.status_code == second.status_code == 201
+    first_id, second_id = first.json()["pack_id"], second.json()["pack_id"]
+    before = client.get("/api/v1/stickers/pipeline", headers=headers).json()
+    assert before["queued"] == 88
+    builtin_id = next(pack["id"] for pack in client.get("/api/v1/stickers", headers=headers).json()["packs"] if pack["builtin"])
+    reordered = client.put("/api/v1/stickers/library/order", headers=headers, json={"pack_ids": [second_id, first_id, builtin_id]})
+    assert reordered.status_code == 200, reordered.text
+    assert [pack["active_count"] for pack in reordered.json()["packs"]] == [20, 80, 0]
+    after = client.get("/api/v1/stickers/pipeline", headers=headers).json()
+    assert after["queued"] == 108
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(DurableJob.id)).where(DurableJob.workspace_id == workspace, DurableJob.kind == "sticker.semantic", DurableJob.payload["pack_id"].as_string() == second_id)) == 20
+
+
+def test_semantic_pipeline_only_queues_active_images(client, register_user, monkeypatch):
+    workspace, headers, actor = identity(client, register_user)
+    vision_fixture(workspace, monkeypatch)
+    archive = create_archive({f"image-{index:03}.png": image_bytes((index, 70, 90, 255)) for index in range(120)})
+    uploaded = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("large.zip", archive))]).json()
+    response = client.post(f"/api/v1/stickers/packs/{uploaded['pack_id']}/analyze", headers=headers, json={"consent": True})
+    assert response.status_code == 202 and response.json()["queued"] == 88
+    with SessionLocal() as db:
+        active = {asset.id for asset in StickerService(db, workspace, actor).visible_assets()}
+        jobs = db.scalars(select(DurableJob).where(DurableJob.workspace_id == workspace, DurableJob.kind == "sticker.semantic")).all()
+        assert all(job.payload["sticker_id"] in active for job in jobs)
