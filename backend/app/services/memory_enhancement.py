@@ -248,6 +248,8 @@ def save_enhancement_config(
                 "previous_indexed_count": previous_count,
                 "current_model_key": current_key,
             }
+    from app.services.stickers import StickerService
+    StickerService(db, workspace_id, "system:stickers").reconcile()
     return normalized, cache_invalidated
 
 

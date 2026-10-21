@@ -3771,3 +3771,65 @@ class VoiceRelaySecret(Base, TimestampMixin):
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
+
+
+class StickerPack(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "sticker_packs"
+    __table_args__ = (UniqueConstraint("workspace_id", "owner_id", "source_key", name="uq_sticker_pack_source"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(String(64), default="")
+    source_key: Mapped[str] = mapped_column(String(160))
+    name: Mapped[str] = mapped_column(String(120))
+    builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    license: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(Text, default="")
+
+
+class StickerAsset(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "sticker_assets"
+    __table_args__ = (UniqueConstraint("pack_id", "content_hash", name="uq_sticker_asset_hash"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    pack_id: Mapped[str] = mapped_column(ForeignKey("sticker_packs.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    mime_type: Mapped[str] = mapped_column(String(80))
+    asset_path: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    asset_base64: Mapped[str | None] = mapped_column(Text, nullable=True)
+    poster_base64: Mapped[str | None] = mapped_column(Text, nullable=True)
+    semantics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    semantic_hash: Mapped[str] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class StickerIndexState(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "sticker_index_states"
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(24), default="follow")
+    provider_id: Mapped[str] = mapped_column(String(36), default="")
+    model_id: Mapped[str] = mapped_column(String(160), default="")
+    ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    desired_generation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    active_generation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class StickerIndexGeneration(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "sticker_index_generations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    profile: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(24), default="queued")
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[int] = mapped_column(Integer, default=0)
+    dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+
+
+class StickerVector(Base, TimestampMixin, WorkspaceScopedMixin):
+    __tablename__ = "sticker_vectors"
+    __table_args__ = (UniqueConstraint("generation_id", "sticker_id", name="uq_sticker_vector_generation"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    generation_id: Mapped[str] = mapped_column(ForeignKey("sticker_index_generations.id", ondelete="CASCADE"), index=True)
+    sticker_id: Mapped[str] = mapped_column(ForeignKey("sticker_assets.id", ondelete="CASCADE"), index=True)
+    semantic_hash: Mapped[str] = mapped_column(String(64))
+    vector: Mapped[list[float]] = mapped_column(JSON)

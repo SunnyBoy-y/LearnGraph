@@ -30,6 +30,7 @@ export const REASONING_TEXT_PART_TYPES = new Set<MessagePart["type"]>([
  * ahead of the final-answer text. Failed attempts belong in the thinking chain.
  */
 export const ARTIFACT_PART_TYPES = new Set<MessagePart["type"]>([
+  "sticker",
   "image",
   "sandbox",
   "sandbox_artifact",

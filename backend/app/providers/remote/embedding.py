@@ -38,6 +38,7 @@ class OpenAICompatibleEmbeddingProvider:
         # Token usage of the most recent embed() call, in the same shape the
         # chat adapters use so BillingService can record it uniformly.
         self.last_usage: dict[str, int] = {}
+        self.dimensions: int | None = None
         self._base_url = normalize_openai_api_base_url(base_url)
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
@@ -64,7 +65,7 @@ class OpenAICompatibleEmbeddingProvider:
                 try:
                     response = client.post(
                         f"{self._base_url}/embeddings",
-                        json={"model": self.model_id, "input": batch},
+                        json={"model": self.model_id, "input": batch, **({"dimensions": self.dimensions} if self.dimensions is not None else {})},
                     )
                 except httpx.TimeoutException as exc:
                     raise ProviderTimeoutError("Embedding request timed out") from exc

@@ -5,6 +5,7 @@ import {
   type ComponentProps,
 } from "react";
 import { useNavigate } from "react-router-dom";
+import { StickerPart } from "./sticker-image";
 import {
   Check,
   ChevronDown,
@@ -2038,6 +2039,8 @@ export function MessagePartRenderer({
       return <SandboxStatusPart data={part.data} status={part.status} />;
     case "subagent_task":
       return <SubagentTaskPart data={part.data} status={part.status} />;
+    case "sticker":
+      return <StickerPart data={part.data} />;
     case "image":
       return <ImagePart data={part.data} status={part.status} />;
     case "attachment":

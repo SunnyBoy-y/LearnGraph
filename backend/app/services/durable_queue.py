@@ -330,6 +330,20 @@ def run_one_durable_job(worker_id: str) -> bool:
 
                 run_chat_continue_once(job.payload)
                 queue.complete(job)
+            elif job.kind == "sticker.semantic":
+                from app.services.sticker_pipeline import run_sticker_semantics
+
+                db.expunge(job)
+                run_sticker_semantics(db, job)
+                queue.complete(job)
+            elif job.kind == "sticker.index":
+                from app.services.stickers import run_sticker_index_batch
+
+                db.expunge(job)
+                if run_sticker_index_batch(db, job):
+                    queue.complete(job)
+                else:
+                    queue.rearm(job, delay_seconds=0.1)
             elif job.kind == "memory.extract":
                 from app.domain.models import Workspace
                 from app.services.memory_enhancement import extract_session_memories
@@ -382,6 +396,8 @@ async def durable_queue_worker(stop: asyncio.Event, worker_id: str) -> None:
             import logging
             try:
                 await asyncio.to_thread(reconcile_learning_builds)
+                from app.services.stickers import reconcile_sticker_indexes
+                await asyncio.to_thread(reconcile_sticker_indexes)
             except Exception:
                 logging.getLogger(__name__).exception("Learning package reconciliation failed")
             next_learning_sweep = time.monotonic() + 15

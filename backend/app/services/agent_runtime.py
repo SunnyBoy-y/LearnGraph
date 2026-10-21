@@ -225,6 +225,8 @@ class AgentToolRuntime:
         definitions.extend(self._chart_tool_definitions())
         from app.services.stream_ui import tool_definitions as stream_ui_tools
         definitions.extend(stream_ui_tools())
+        from app.services.stickers import tool_definitions as sticker_tools
+        definitions.extend(sticker_tools())
         definitions.extend(self._learning_orchestration_tool_definitions())
         definitions.extend(self._voice_practice_tool_definitions())
         # Read-only observation of interactive sub-application events (T1.4).
@@ -3192,6 +3194,27 @@ class AgentToolRuntime:
             )
         try:
             arguments = self._parse_arguments(function.get("arguments"), tool_name=name)
+            if name in {"search_stickers", "send_sticker"}:
+                from app.services.stickers import StickerService
+                from app.domain.models import MessagePartRecord, WorkspaceSetting
+
+                sticker_service = StickerService(self.extensions.db, self.workspace_id, self.actor_id, self.settings or get_settings())
+                if not sticker_service.state().ai_enabled:
+                    raise AppError(403, "stickers_disabled", "用户已关闭 AI 主动使用表情包")
+                style = self.extensions.db.scalar(select(WorkspaceSetting).where(WorkspaceSetting.workspace_id == self.workspace_id, WorkspaceSetting.key == "chat.response_style"))
+                if style and isinstance(style.value, dict) and style.value.get("emoji") == -2:
+                    raise AppError(403, "stickers_disabled", "用户已禁用表情")
+                if name == "search_stickers":
+                    result = sticker_service.search(str(arguments.get("query") or ""), 5, avoid=str(arguments.get("avoid") or ""))
+                    candidates = [{"id": item["id"], "name": item["name"], "meaning": str(item["semantics"].get("description") or item["name"])[:180], "use_when": item["semantics"].get("use_when", [])[:2], "avoid_when": item["semantics"].get("avoid_when", [])[:2], "standalone": item["semantics"].get("standalone", False)} for item in result["candidates"]]
+                    return self._success({"method": result["method"], "candidates": candidates, "may_abstain": True}, {"tool": name}, [])
+                if not assistant_version_id or not assistant_message_id:
+                    raise AppError(422, "sticker_message_required", "表情发送需要有效的回复版本")
+                existing = self.extensions.db.scalar(select(MessagePartRecord).where(MessagePartRecord.workspace_id == self.workspace_id, MessagePartRecord.message_version_id == assistant_version_id, MessagePartRecord.part_type == "sticker"))
+                if existing:
+                    return self._success({"sent": True, "sticker_id": existing.data.get("sticker_id")}, {"tool": name}, [])
+                data = sticker_service.part_data(str(arguments.get("sticker_id") or ""))
+                return self._success({"selected": True, "sticker_id": data["sticker_id"], "meaning": data["meaning"], "instruction": "这是已选择的回复内容；若贴纸已足够，无需重复解释。"}, {"tool": name, "artifact": {"type": "sticker", "status": "completed", "data": data}}, [])
             default_budget = 4000 if name in {"sandbox_exec", "sandbox_bash", "sandbox_get_job"} else AGENT_TOOL_RESULT_MAX_BYTES // 4
             self._result_max_bytes = min(AGENT_TOOL_RESULT_MAX_BYTES, max(4096, int(arguments.get("max_output_tokens", default_budget)) * 4))
             if name == "ui_stream":

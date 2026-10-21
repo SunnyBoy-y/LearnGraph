@@ -1,0 +1,307 @@
+{
+  "name": "Fluent · 日常回应",
+  "license": "MIT · Copyright (c) Microsoft Corporation. 原图未修改，中文语义由 LearnGraph 整理。",
+  "source": "https://github.com/microsoft/fluentui-emoji/tree/1ffb34c752ecf5d402f04cfb4b392c77f57c54bc",
+  "version": "fluent-v1",
+  "stickers": [
+    {
+      "name": "庆祝",
+      "file": "reaction-1.png",
+      "upstream": "assets/Party popper/3D/party_popper_3d.png",
+      "unicode": "🎉",
+      "description": "终于完成了，庆祝成功和好消息",
+      "tags": [
+        "庆祝",
+        "上线",
+        "成功",
+        "恭喜",
+        "太棒了",
+        "终于"
+      ],
+      "intent": [
+        "祝贺",
+        "庆祝"
+      ],
+      "use_when": [
+        "取得进展",
+        "分享好消息"
+      ],
+      "avoid_when": [
+        "真实损失",
+        "哀悼"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "开心",
+      "file": "reaction-2.png",
+      "upstream": "assets/Grinning face/3D/grinning_face_3d.png",
+      "unicode": "😀",
+      "description": "友好开心，轻松打招呼",
+      "tags": [
+        "开心",
+        "高兴",
+        "你好",
+        "哈哈"
+      ],
+      "intent": [
+        "友好回应"
+      ],
+      "use_when": [
+        "轻松聊天"
+      ],
+      "avoid_when": [
+        "严肃悲伤"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "笑哭",
+      "file": "reaction-3.png",
+      "upstream": "assets/Face with tears of joy/3D/face_with_tears_of_joy_3d.png",
+      "unicode": "😂",
+      "description": "轻松的好笑或自嘲，不嘲笑真实痛苦",
+      "tags": [
+        "笑哭",
+        "笑死",
+        "绷不住",
+        "搞笑",
+        "自嘲"
+      ],
+      "intent": [
+        "幽默",
+        "自嘲"
+      ],
+      "use_when": [
+        "朋友间玩笑"
+      ],
+      "avoid_when": [
+        "真实损失",
+        "悲伤",
+        "焦虑"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "思考",
+      "file": "reaction-4.png",
+      "upstream": "assets/Thinking face/3D/thinking_face_3d.png",
+      "unicode": "🤔",
+      "description": "表示正在思考或好奇，不代替实际解答",
+      "tags": [
+        "思考",
+        "想想",
+        "疑惑",
+        "好奇"
+      ],
+      "intent": [
+        "思考",
+        "好奇"
+      ],
+      "use_when": [
+        "轻松讨论"
+      ],
+      "avoid_when": [
+        "紧急求助"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "赞",
+      "file": "reaction-5.png",
+      "upstream": "assets/Thumbs up/Default/3D/thumbs_up_3d_default.png",
+      "unicode": "👍",
+      "description": "赞同、肯定或确认收到",
+      "tags": [
+        "点赞",
+        "赞",
+        "认可",
+        "收到",
+        "同意",
+        "好的"
+      ],
+      "intent": [
+        "肯定",
+        "确认"
+      ],
+      "use_when": [
+        "肯定进展",
+        "简单确认"
+      ],
+      "avoid_when": [
+        "需要详细说明"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "鼓掌",
+      "file": "reaction-6.png",
+      "upstream": "assets/Clapping hands/Default/3D/clapping_hands_3d_default.png",
+      "unicode": "👏",
+      "description": "真诚肯定成果，鼓励进步",
+      "tags": [
+        "鼓掌",
+        "厉害",
+        "真棒",
+        "进步"
+      ],
+      "intent": [
+        "鼓励",
+        "赞赏"
+      ],
+      "use_when": [
+        "取得成果"
+      ],
+      "avoid_when": [
+        "讽刺他人"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "感谢",
+      "file": "reaction-7.png",
+      "upstream": "assets/Folded hands/Default/3D/folded_hands_3d_default.png",
+      "unicode": "🙏",
+      "description": "表达感谢与诚恳请求",
+      "tags": [
+        "感谢",
+        "谢谢",
+        "拜托",
+        "感激"
+      ],
+      "intent": [
+        "感谢"
+      ],
+      "use_when": [
+        "表达谢意"
+      ],
+      "avoid_when": [
+        "轻率承诺"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "感动",
+      "file": "reaction-8.png",
+      "upstream": "assets/Face holding back tears/3D/face_holding_back_tears_3d.png",
+      "unicode": "🥹",
+      "description": "温柔感动或委屈，需结合上下文",
+      "tags": [
+        "感动",
+        "委屈",
+        "泪目",
+        "温柔"
+      ],
+      "intent": [
+        "表达共情"
+      ],
+      "use_when": [
+        "温暖回应"
+      ],
+      "avoid_when": [
+        "调侃痛苦"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "得意坏笑",
+      "file": "reaction-9.png",
+      "upstream": "assets/Smirking face/3D/smirking_face_3d.png",
+      "unicode": "😏",
+      "description": "小得意、友好调侃或被识破后的玩笑",
+      "tags": [
+        "得意",
+        "坏笑",
+        "嘿嘿",
+        "被抓包",
+        "心虚",
+        "中计"
+      ],
+      "intent": [
+        "友好调侃"
+      ],
+      "use_when": [
+        "熟悉对话中的玩笑"
+      ],
+      "avoid_when": [
+        "正式道歉",
+        "严肃悲伤",
+        "重要事务"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "惊讶",
+      "file": "reaction-10.png",
+      "upstream": "assets/Face with open mouth/3D/face_with_open_mouth_3d.png",
+      "unicode": "😮",
+      "description": "对意外的小事表达惊讶",
+      "tags": [
+        "惊讶",
+        "震惊",
+        "天哪",
+        "居然",
+        "意外"
+      ],
+      "intent": [
+        "夸张反应"
+      ],
+      "use_when": [
+        "轻松的出乎意料"
+      ],
+      "avoid_when": [
+        "真实事故"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "支持",
+      "file": "reaction-11.png",
+      "upstream": "assets/Red heart/3D/red_heart_3d.png",
+      "unicode": "❤️",
+      "description": "温暖的关心、支持与感谢",
+      "tags": [
+        "支持",
+        "关心",
+        "爱心",
+        "温暖",
+        "陪伴"
+      ],
+      "intent": [
+        "支持",
+        "关心"
+      ],
+      "use_when": [
+        "用户接受温暖表达"
+      ],
+      "avoid_when": [
+        "未经邀请的亲密暗示"
+      ],
+      "standalone": true
+    },
+    {
+      "name": "加油",
+      "file": "reaction-12.png",
+      "upstream": "assets/Flexed biceps/Default/3D/flexed_biceps_3d_default.png",
+      "unicode": "💪",
+      "description": "支持努力、鼓励继续前进",
+      "tags": [
+        "加油",
+        "坚持",
+        "努力",
+        "冲",
+        "打气"
+      ],
+      "intent": [
+        "鼓励"
+      ],
+      "use_when": [
+        "用户希望获得鼓励"
+      ],
+      "avoid_when": [
+        "否定真实困难"
+      ],
+      "standalone": true
+    }
+  ]
+}

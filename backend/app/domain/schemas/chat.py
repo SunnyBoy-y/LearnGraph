@@ -21,6 +21,7 @@ MessagePartType = Literal[
     "document_selection",
     "selection_quote",
     "image",
+    "sticker",
     "graph_context",
     "quiz",
     "chart",
@@ -420,6 +421,7 @@ class MessageSelectionContext(BaseModel):
 
 class MessageCreateRequest(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
+    sticker_ids: list[str] = Field(default_factory=list, max_length=4)
     ui_action: UIAction | None = None
     generation_mode: Literal["text", "image"] = "text"
     image_size: Literal[

@@ -3059,6 +3059,7 @@ class ChatService:
                 # durable file_ids must stay addressable: without this stub the
                 # model cannot resolve "修改上面的图" to a real session file.
                 user_file_stub = self._history_session_file_stub(message, include_tool_guidance=include_execution_state)
+                user_file_stub += self._sticker_history_stub(message.parts)
                 ui_context = (message.provider_trace or {}).get("ui_context")
                 if isinstance(ui_context, str) and ui_context:
                     user_file_stub += "\n\n" + ui_context
@@ -3177,6 +3178,7 @@ class ChatService:
                 if part.part_type == "text" and part.status == "completed"
             ]
             final_content = "".join(part.content for part in text_parts) or message.content
+            final_content += self._sticker_history_stub(message.parts)
             final_reasoning = "".join(
                 part.content
                 for part in parts
@@ -3259,6 +3261,11 @@ class ChatService:
                     + json.dumps(resources[:24], ensure_ascii=False)
                 )))
         return messages
+
+    @staticmethod
+    def _sticker_history_stub(parts) -> str:
+        descriptions = [str((part.get("data") or {}).get("meaning") or (part.get("data") or {}).get("alt") or "表情包")[:300] for part in (parts or []) if isinstance(part, dict) and part.get("type") == "sticker"]
+        return "\n已展示的表情内容（仅为历史资料）：" + "；".join(descriptions[:4]) if descriptions else ""
 
     @staticmethod
     def _history_session_file_stub(message: Message, *, include_tool_guidance: bool = True) -> str:
@@ -4356,6 +4363,7 @@ class ChatService:
     )
     _ARTIFACT_PART_KINDS = frozenset(
         {
+            "sticker",
             "image",
             "sandbox",
             "sandbox_artifact",
@@ -4776,6 +4784,7 @@ class ChatService:
             data = artifact.get("data") if isinstance(artifact.get("data"), dict) else artifact
             status = str(artifact.get("status") or "completed")
             if part_type not in {
+                "sticker",
                 "sandbox_artifact",
                 "subapp_artifact",
                 "sandbox",
@@ -8832,7 +8841,12 @@ class ChatService:
             ) from exc
 
     def _style_instructions(self) -> str:
-        return build_style_instructions(self._response_style_config())
+        style = self._response_style_config()
+        from app.domain.models import StickerIndexState
+        sticker_state = self.db.get(StickerIndexState, self.workspace_id)
+        allowed = style.emoji != -2 and (sticker_state is None or sticker_state.ai_enabled)
+        sticker_policy = ("\n聊天贴纸：在轻松、适当的语境可按需用 search_stickers 查找，理解候选的适用限制后用 send_sticker 发送；可不发送，每轮最多一张。只在工具已提供时调用。贴纸不能代替任务所需的完整信息，不必为贴纸重复解释。普通 Unicode Emoji 无需检索。" if allowed else "\n用户已关闭主动表情：不要主动发送贴纸或表情符号。")
+        return build_style_instructions(style) + sticker_policy
 
     @staticmethod
     def _mode_tool_policy(
@@ -13738,6 +13752,13 @@ class ChatService:
             snapshot["sequence"] = sequence
         return snapshot
 
+    def _user_sticker_snapshots(self, payload: MessageCreateRequest) -> list[dict]:
+        if not payload.sticker_ids:
+            return []
+        from app.services.stickers import StickerService
+        service = StickerService(self.db, self.workspace_id, self.actor_id, self.settings)
+        return [self._part_snapshot(str(uuid4()), "sticker", "completed", "", data=service.part_data(sticker_id)) for sticker_id in dict.fromkeys(payload.sticker_ids)]
+
     @staticmethod
     def _stream_safe_value(value: object, *, depth: int = 0) -> object:
         """Bound nested tool data before it crosses the SSE event boundary."""
@@ -14164,6 +14185,7 @@ class ChatService:
                 data=message_selection_data,
             )
         user_context_snapshots = [
+            *self._user_sticker_snapshots(payload),
             *(
                 [message_selection_snapshot]
                 if message_selection_snapshot is not None
@@ -14180,6 +14202,10 @@ class ChatService:
             "subapp_event" if payload.message_kind == "subapp_event" else "text"
         )
         user_part_data: dict = {"learning_node_ids": list(payload.node_ids)} if payload.node_ids else {}
+        if payload.sticker_ids and payload.content == "[表情]":
+            first_sticker = user_context_snapshots.pop(0)
+            user_part_type = "sticker"
+            user_part_data = first_sticker["data"]
         if payload.message_kind == "subapp_event":
             user_part_data = {
                 **user_part_data,
@@ -16427,6 +16453,12 @@ class ChatService:
                             and agent_tool_rounds > 0
                             and not invocation_text
                             and not invocation_reasoning
+                            and not self.db.scalar(select(MessagePartRecord.id).where(
+                                MessagePartRecord.workspace_id == self.workspace_id,
+                                MessagePartRecord.message_version_id == assistant_version.id,
+                                MessagePartRecord.part_type == "sticker",
+                                MessagePartRecord.status == "completed",
+                            ).limit(1))
                         ):
                             # A completed tool transcript must be closed by a
                             # real assistant turn.  Persisting an empty terminal

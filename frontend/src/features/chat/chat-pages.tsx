@@ -13,6 +13,8 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { createUuid } from "@/lib/uuid";
+import { StickerPicker } from "@/components/chat/sticker-picker";
+import type { Sticker } from "@/api/stickers";
 import { useLatestCallback } from "@/hooks/use-latest-callback";
 import { useLiveChatMessages } from "./use-live-chat-messages";
 import {
@@ -1684,7 +1686,8 @@ function UserMessage({
 }) {
   const copyMessage = async () => {
     try {
-      await navigator.clipboard.writeText(message.content);
+      const stickerText = message.parts.filter(part => part.type === "sticker").map(part => `[表情：${String(part.data?.alt ?? "表情包")}]`).join("\n");
+      await navigator.clipboard.writeText([message.content === "[表情]" ? "" : message.content, stickerText].filter(Boolean).join("\n"));
       toast.success("已复制消息");
     } catch {
       toast.error("无法复制消息");
@@ -1755,13 +1758,13 @@ function UserMessage({
           <div className="space-y-2">
             {message.parts
               .filter((part) =>
-                ["attachment", "document_selection", "selection_quote"].includes(
+                ["attachment", "document_selection", "selection_quote", "sticker"].includes(
                   part.type,
                 ),
               )
               .map((part) => <ChatStreamPartRenderer key={part.id} part={part} />)}
             <ExpandableContent
-              className="user-message-text-expandable"
+              className={message.parts.some(part => part.type === "sticker") && !message.parts.some(part => part.type === "text") ? "hidden" : "user-message-text-expandable"}
               contentClassName="user-message-text-expandable__body"
               label="消息正文"
               lineLimit={USER_MESSAGE_LINE_LIMIT}
@@ -2003,8 +2006,8 @@ function AssistantMessageInner({
   });
   // Budget approval needs a clickable card outside the collapsed thinking fold.
   const fullText = shown.parts
-    .filter((part) => part.type === "text" || part.type === "acknowledgement")
-    .map((part) => part.content ?? "")
+    .filter((part) => part.type === "text" || part.type === "acknowledgement" || part.type === "sticker")
+    .map((part) => part.type === "sticker" ? `[表情：${String(part.data?.alt ?? "表情包")}]` : part.content ?? "")
     .filter((content) => content && content.trim() !== "正在思考")
     .join("\n");
     const renderPart = (part: MessagePart) => {
@@ -5830,11 +5833,12 @@ export function ChatCanvasPage() {
         sandboxPreflighted?: boolean;
         selectionContext?: MessageSelectionContext | null;
         uiAction?: MessageCreateRequest["ui_action"];
+        sticker?: Sticker;
         /** Code trainer sends source for model analysis without server tools. */
         analysisOnly?: boolean;
       } = {},
     ) => {
-      const content = contentValue.trim();
+      const content = contentValue.trim() || (options.sticker ? "[表情]" : "");
       if (!content) return;
       // Voice mode owns the turn. Any other entry into send() — the selection
       // menu, learngraph:compose, a route prompt, a retry or the pending-send
@@ -5933,12 +5937,17 @@ export function ChatCanvasPage() {
         content,
         parts: [
           ...optimisticAttachmentParts(options.attachmentFiles ?? []),
-          {
+          ...(options.sticker ? [{
+            id: `temp-sticker-${stamp}`,
+            type: "sticker" as const,
+            status: "completed" as const,
+            data: { sticker_id: options.sticker.id, asset_version: options.sticker.content_hash, alt: options.sticker.name },
+          }] : [{
             id: `temp-user-part-${stamp}`,
-            type: "text",
-            status: "completed",
+            type: "text" as const,
+            status: "completed" as const,
             content,
-          },
+          }]),
         ],
         provider_trace: {},
         created_at: new Date().toISOString(),
@@ -6089,6 +6098,7 @@ export function ChatCanvasPage() {
         : undefined;
       const request: MessageCreateRequest = {
         content,
+        sticker_ids: options.sticker ? [options.sticker.id] : undefined,
         ui_action: options.uiAction,
         generation_mode: requestedGenerationMode,
         image_size:
@@ -10869,6 +10879,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                  ? createPortal(modelMenu, topbarModelSlot)
                  : modelMenu;
              })()}
+              {!voiceModeOpen && generationMode === "text" ? <StickerPicker disabled={sessionIsClosed || status === "streaming" || status === "submitted"} onSelect={sticker => void send("", { sticker })} /> : null}
               {!voiceModeOpen ? <PromptInputButton
                 aria-label={isListening ? "停止语音输入" : "开始语音输入"}
                 aria-pressed={isListening}

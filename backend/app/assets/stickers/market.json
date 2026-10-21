@@ -1,0 +1,1923 @@
+[
+  {
+    "author": "Microsoft",
+    "version": "1.0.0",
+    "license": "MIT · Copyright (c) Microsoft Corporation. 原图未修改，中文语义由 LearnGraph 整理。",
+    "license_file": "LICENSE",
+    "source": "https://github.com/microsoft/fluentui-emoji/tree/1ffb34c752ecf5d402f04cfb4b392c77f57c54bc",
+    "license_id": "MIT",
+    "style": "3D",
+    "id": "fluent-daily",
+    "name": "Fluent · 日常回应",
+    "description": "庆祝、思考、感谢与支持，12 张日常回应。已随应用内置。",
+    "category": "日常",
+    "builtin": true,
+    "stickers": [
+      {
+        "name": "庆祝",
+        "file": "reaction-1.png",
+        "upstream": "assets/Party popper/3D/party_popper_3d.png",
+        "unicode": "🎉",
+        "description": "终于完成了，庆祝成功和好消息",
+        "tags": [
+          "庆祝",
+          "上线",
+          "成功",
+          "恭喜",
+          "太棒了",
+          "终于"
+        ],
+        "intent": [
+          "祝贺",
+          "庆祝"
+        ],
+        "use_when": [
+          "取得进展",
+          "分享好消息"
+        ],
+        "avoid_when": [
+          "真实损失",
+          "哀悼"
+        ],
+        "standalone": true,
+        "sha256": "70a8e2f9daf1646be9e773751b7f3b6b281a2415cf29c3c3aeebd9c923cdc3e0"
+      },
+      {
+        "name": "开心",
+        "file": "reaction-2.png",
+        "upstream": "assets/Grinning face/3D/grinning_face_3d.png",
+        "unicode": "😀",
+        "description": "友好开心，轻松打招呼",
+        "tags": [
+          "开心",
+          "高兴",
+          "你好",
+          "哈哈"
+        ],
+        "intent": [
+          "友好回应"
+        ],
+        "use_when": [
+          "轻松聊天"
+        ],
+        "avoid_when": [
+          "严肃悲伤"
+        ],
+        "standalone": true,
+        "sha256": "175d214df45fe18f6f106a9a094b695689d98abe6f343295fcbd690a7ee4f0ab"
+      },
+      {
+        "name": "笑哭",
+        "file": "reaction-3.png",
+        "upstream": "assets/Face with tears of joy/3D/face_with_tears_of_joy_3d.png",
+        "unicode": "😂",
+        "description": "轻松的好笑或自嘲，不嘲笑真实痛苦",
+        "tags": [
+          "笑哭",
+          "笑死",
+          "绷不住",
+          "搞笑",
+          "自嘲"
+        ],
+        "intent": [
+          "幽默",
+          "自嘲"
+        ],
+        "use_when": [
+          "朋友间玩笑"
+        ],
+        "avoid_when": [
+          "真实损失",
+          "悲伤",
+          "焦虑"
+        ],
+        "standalone": true,
+        "sha256": "8af20fb0c64c44a8d8c8d047c1410c5e529a37c3158d496832b380198ed2e9c3"
+      },
+      {
+        "name": "思考",
+        "file": "reaction-4.png",
+        "upstream": "assets/Thinking face/3D/thinking_face_3d.png",
+        "unicode": "🤔",
+        "description": "表示正在思考或好奇，不代替实际解答",
+        "tags": [
+          "思考",
+          "想想",
+          "疑惑",
+          "好奇"
+        ],
+        "intent": [
+          "思考",
+          "好奇"
+        ],
+        "use_when": [
+          "轻松讨论"
+        ],
+        "avoid_when": [
+          "紧急求助"
+        ],
+        "standalone": true,
+        "sha256": "cd29da5c3886e1e25726d3cf6ff79faa2f0d631b1c0873b115be287d358fc4be"
+      },
+      {
+        "name": "赞",
+        "file": "reaction-5.png",
+        "upstream": "assets/Thumbs up/Default/3D/thumbs_up_3d_default.png",
+        "unicode": "👍",
+        "description": "赞同、肯定或确认收到",
+        "tags": [
+          "点赞",
+          "赞",
+          "认可",
+          "收到",
+          "同意",
+          "好的"
+        ],
+        "intent": [
+          "肯定",
+          "确认"
+        ],
+        "use_when": [
+          "肯定进展",
+          "简单确认"
+        ],
+        "avoid_when": [
+          "需要详细说明"
+        ],
+        "standalone": true,
+        "sha256": "a48dbe89a1a16969593db76f5bec45e9e537e0f090e7609caa8d9a3ff598d1d2"
+      },
+      {
+        "name": "鼓掌",
+        "file": "reaction-6.png",
+        "upstream": "assets/Clapping hands/Default/3D/clapping_hands_3d_default.png",
+        "unicode": "👏",
+        "description": "真诚肯定成果，鼓励进步",
+        "tags": [
+          "鼓掌",
+          "厉害",
+          "真棒",
+          "进步"
+        ],
+        "intent": [
+          "鼓励",
+          "赞赏"
+        ],
+        "use_when": [
+          "取得成果"
+        ],
+        "avoid_when": [
+          "讽刺他人"
+        ],
+        "standalone": true,
+        "sha256": "54075bd39fd3e1860ba39898d73e61096c0e0e633ac5e9840beefddaf1d75113"
+      },
+      {
+        "name": "感谢",
+        "file": "reaction-7.png",
+        "upstream": "assets/Folded hands/Default/3D/folded_hands_3d_default.png",
+        "unicode": "🙏",
+        "description": "表达感谢与诚恳请求",
+        "tags": [
+          "感谢",
+          "谢谢",
+          "拜托",
+          "感激"
+        ],
+        "intent": [
+          "感谢"
+        ],
+        "use_when": [
+          "表达谢意"
+        ],
+        "avoid_when": [
+          "轻率承诺"
+        ],
+        "standalone": true,
+        "sha256": "69090ea19b7741e691f878fe3f1649a8d18f42fc59e1912ea799bf4e35045039"
+      },
+      {
+        "name": "感动",
+        "file": "reaction-8.png",
+        "upstream": "assets/Face holding back tears/3D/face_holding_back_tears_3d.png",
+        "unicode": "🥹",
+        "description": "温柔感动或委屈，需结合上下文",
+        "tags": [
+          "感动",
+          "委屈",
+          "泪目",
+          "温柔"
+        ],
+        "intent": [
+          "表达共情"
+        ],
+        "use_when": [
+          "温暖回应"
+        ],
+        "avoid_when": [
+          "调侃痛苦"
+        ],
+        "standalone": true,
+        "sha256": "5e31e32cd02ce014aa2eae0df46f38b0532dd74ff01224309181d6b75519ec76"
+      },
+      {
+        "name": "得意坏笑",
+        "file": "reaction-9.png",
+        "upstream": "assets/Smirking face/3D/smirking_face_3d.png",
+        "unicode": "😏",
+        "description": "小得意、友好调侃或被识破后的玩笑",
+        "tags": [
+          "得意",
+          "坏笑",
+          "嘿嘿",
+          "被抓包",
+          "心虚",
+          "中计"
+        ],
+        "intent": [
+          "友好调侃"
+        ],
+        "use_when": [
+          "熟悉对话中的玩笑"
+        ],
+        "avoid_when": [
+          "正式道歉",
+          "严肃悲伤",
+          "重要事务"
+        ],
+        "standalone": true,
+        "sha256": "bf047787b8a7984d1def106ff6fc92b9178fe32b8c2c2b775daec9bae56165b6"
+      },
+      {
+        "name": "惊讶",
+        "file": "reaction-10.png",
+        "upstream": "assets/Face with open mouth/3D/face_with_open_mouth_3d.png",
+        "unicode": "😮",
+        "description": "对意外的小事表达惊讶",
+        "tags": [
+          "惊讶",
+          "震惊",
+          "天哪",
+          "居然",
+          "意外"
+        ],
+        "intent": [
+          "夸张反应"
+        ],
+        "use_when": [
+          "轻松的出乎意料"
+        ],
+        "avoid_when": [
+          "真实事故"
+        ],
+        "standalone": true,
+        "sha256": "d625adc79700a83d26f15d602f6e8158598f5f80fa8d839014bc938c06222046"
+      },
+      {
+        "name": "支持",
+        "file": "reaction-11.png",
+        "upstream": "assets/Red heart/3D/red_heart_3d.png",
+        "unicode": "❤️",
+        "description": "温暖的关心、支持与感谢",
+        "tags": [
+          "支持",
+          "关心",
+          "爱心",
+          "温暖",
+          "陪伴"
+        ],
+        "intent": [
+          "支持",
+          "关心"
+        ],
+        "use_when": [
+          "用户接受温暖表达"
+        ],
+        "avoid_when": [
+          "未经邀请的亲密暗示"
+        ],
+        "standalone": true,
+        "sha256": "7218cb9f08ed1ef38fcd83fe699a1125d07f50725f4c87a68cb7c9f4efb3c32b"
+      },
+      {
+        "name": "加油",
+        "file": "reaction-12.png",
+        "upstream": "assets/Flexed biceps/Default/3D/flexed_biceps_3d_default.png",
+        "unicode": "💪",
+        "description": "支持努力、鼓励继续前进",
+        "tags": [
+          "加油",
+          "坚持",
+          "努力",
+          "冲",
+          "打气"
+        ],
+        "intent": [
+          "鼓励"
+        ],
+        "use_when": [
+          "用户希望获得鼓励"
+        ],
+        "avoid_when": [
+          "否定真实困难"
+        ],
+        "standalone": true,
+        "sha256": "c765683c47844d18dd1daa38556f27347d059d7cf54b315a41403326f5af8a38"
+      }
+    ],
+    "source_id": "fluent",
+    "approval_required": false,
+    "license_url": "https://opensource.org/license/mit",
+    "attribution": "Microsoft Fluent Emoji · Copyright (c) Microsoft Corporation. · MIT"
+  },
+  {
+    "author": "Microsoft",
+    "version": "1.0.0",
+    "license": "MIT · Copyright (c) Microsoft Corporation. 原图未修改，中文语义由 LearnGraph 整理。",
+    "license_file": "LICENSE",
+    "source": "https://github.com/microsoft/fluentui-emoji/tree/1ffb34c752ecf5d402f04cfb4b392c77f57c54bc",
+    "license_id": "MIT",
+    "style": "3D",
+    "id": "fluent-warm",
+    "name": "Fluent · 温暖陪伴",
+    "description": "抱抱、飞吻、拜托与感动，把关心传达得更柔软。",
+    "category": "陪伴",
+    "stickers": [
+      {
+        "name": "抱抱",
+        "file": "market-1.png",
+        "upstream": "assets/Hugging face/3D/hugging_face_3d.png",
+        "description": "给你一个温暖的拥抱，表达安慰与支持",
+        "tags": [
+          "抱抱",
+          "安慰",
+          "温暖"
+        ],
+        "intent": [
+          "抱抱"
+        ],
+        "use_when": [
+          "朋友需要鼓励",
+          "表达关心"
+        ],
+        "avoid_when": [
+          "正式汇报"
+        ],
+        "standalone": true,
+        "sha256": "2f70a465496f45c146253fc933202a38f4f8e1af8b2a0e2555832456c03f1b2e"
+      },
+      {
+        "name": "眨眼",
+        "file": "market-2.png",
+        "upstream": "assets/Winking face/3D/winking_face_3d.png",
+        "description": "友善眨眼，表示默契、玩笑或你懂的",
+        "tags": [
+          "眨眼",
+          "默契",
+          "开玩笑"
+        ],
+        "intent": [
+          "眨眼"
+        ],
+        "use_when": [
+          "熟人轻松聊天"
+        ],
+        "avoid_when": [
+          "严肃道歉"
+        ],
+        "standalone": true,
+        "sha256": "f14edbaa23f127ee6ee7c4a17b35969405a3c441b3f79c3356cc6406c1bf9ae4"
+      },
+      {
+        "name": "飞吻",
+        "file": "market-3.png",
+        "upstream": "assets/Face blowing a kiss/3D/face_blowing_a_kiss_3d.png",
+        "description": "送出飞吻，表达亲近、喜欢或感谢",
+        "tags": [
+          "飞吻",
+          "喜欢",
+          "亲亲"
+        ],
+        "intent": [
+          "飞吻"
+        ],
+        "use_when": [
+          "双方接受的亲密互动"
+        ],
+        "avoid_when": [
+          "陌生人",
+          "正式工作"
+        ],
+        "standalone": true,
+        "sha256": "5a993350588f243ae13c011b5cb8cc4a5f497d2cc213adfefc5ded40196afe10"
+      },
+      {
+        "name": "酷",
+        "file": "market-4.png",
+        "upstream": "assets/Smiling face with sunglasses/3D/smiling_face_with_sunglasses_3d.png",
+        "description": "戴墨镜自信微笑，表示酷、轻松搞定",
+        "tags": [
+          "酷",
+          "自信",
+          "搞定"
+        ],
+        "intent": [
+          "酷"
+        ],
+        "use_when": [
+          "轻松展示成果"
+        ],
+        "avoid_when": [
+          "夸大任务完成情况"
+        ],
+        "standalone": true,
+        "sha256": "e98cb43a7a531289c82eb57441eb20cd88cb53b895c212d8e3abf05dd2647da1"
+      },
+      {
+        "name": "大哭",
+        "file": "market-5.png",
+        "upstream": "assets/Loudly crying face/3D/loudly_crying_face_3d.png",
+        "description": "眼泪流下，可能表达难过，也可能是夸张感动",
+        "tags": [
+          "哭",
+          "难过",
+          "感动"
+        ],
+        "intent": [
+          "哭"
+        ],
+        "use_when": [
+          "表达受挫或感动，结合上下文"
+        ],
+        "avoid_when": [
+          "嘲笑他人痛苦"
+        ],
+        "standalone": true,
+        "sha256": "9e7b740110d12731e7416c8958b88bfadd75e0e7121ab0245e581e8f70491e02"
+      },
+      {
+        "name": "拜托",
+        "file": "market-6.png",
+        "upstream": "assets/Pleading face/3D/pleading_face_3d.png",
+        "description": "可怜巴巴地请求帮助或表达委屈",
+        "tags": [
+          "拜托",
+          "委屈",
+          "求求了"
+        ],
+        "intent": [
+          "拜托"
+        ],
+        "use_when": [
+          "温和请求",
+          "朋友间撒娇"
+        ],
+        "avoid_when": [
+          "施压",
+          "严肃事故"
+        ],
+        "standalone": true,
+        "sha256": "7dfc89c51118f0adecf886063b5eafce140a613075394ebe22ed9dd2bd9e9c4f"
+      }
+    ],
+    "source_id": "fluent",
+    "approval_required": false,
+    "license_url": "https://opensource.org/license/mit",
+    "attribution": "Microsoft Fluent Emoji · Copyright (c) Microsoft Corporation. · MIT"
+  },
+  {
+    "author": "Microsoft",
+    "version": "1.0.0",
+    "license": "MIT · Copyright (c) Microsoft Corporation. 原图未修改，中文语义由 LearnGraph 整理。",
+    "license_file": "LICENSE",
+    "source": "https://github.com/microsoft/fluentui-emoji/tree/1ffb34c752ecf5d402f04cfb4b392c77f57c54bc",
+    "license_id": "MIT",
+    "style": "3D",
+    "id": "fluent-playful",
+    "name": "Fluent · 轻松吐槽",
+    "description": "无语、偷笑、晚安与收到，熟人之间更有默契。",
+    "category": "趣味",
+    "stickers": [
+      {
+        "name": "无语",
+        "file": "market-7.png",
+        "upstream": "assets/Face with rolling eyes/3D/face_with_rolling_eyes_3d.png",
+        "description": "翻白眼表达无语、不耐烦或熟人间吐槽",
+        "tags": [
+          "无语",
+          "翻白眼",
+          "吐槽"
+        ],
+        "intent": [
+          "无语"
+        ],
+        "use_when": [
+          "明确友好的熟人吐槽"
+        ],
+        "avoid_when": [
+          "攻击用户",
+          "正式道歉"
+        ],
+        "standalone": true,
+        "sha256": "2c1d7babfd5b788a90d960bf3690c39fcdc9cad37b0c7cad6c4b5d6d1b79d8c4"
+      },
+      {
+        "name": "捂嘴笑",
+        "file": "market-8.png",
+        "upstream": "assets/Face with hand over mouth/3D/face_with_hand_over_mouth_3d.png",
+        "description": "捂住嘴轻笑，表达偷乐、惊喜或小尴尬",
+        "tags": [
+          "偷笑",
+          "捂嘴",
+          "嘿嘿"
+        ],
+        "intent": [
+          "偷笑"
+        ],
+        "use_when": [
+          "轻松调侃",
+          "小秘密被识破"
+        ],
+        "avoid_when": [
+          "悲伤",
+          "严肃事故"
+        ],
+        "standalone": true,
+        "sha256": "c87c0277c7b0ade675b69a5c90482041d8b5af42bbccd19bf0b88e8ee0865086"
+      },
+      {
+        "name": "困了",
+        "file": "market-9.png",
+        "upstream": "assets/Sleeping face/3D/sleeping_face_3d.png",
+        "description": "闭眼睡觉，表示困倦、休息或晚安",
+        "tags": [
+          "困",
+          "晚安",
+          "睡觉"
+        ],
+        "intent": [
+          "困"
+        ],
+        "use_when": [
+          "结束轻松聊天",
+          "需要休息"
+        ],
+        "avoid_when": [
+          "紧急求助"
+        ],
+        "standalone": true,
+        "sha256": "c7d1cd5d04ae7214b6ae92b9802b6c860729c755da0020ccec22c7c8171f18fa"
+      },
+      {
+        "name": "震惊",
+        "file": "market-10.png",
+        "upstream": "assets/Face screaming in fear/3D/face_screaming_in_fear_3d.png",
+        "description": "瞪眼张嘴表示强烈震惊或夸张惊吓",
+        "tags": [
+          "震惊",
+          "惊吓",
+          "天哪"
+        ],
+        "intent": [
+          "震惊"
+        ],
+        "use_when": [
+          "朋友间惊讶回应"
+        ],
+        "avoid_when": [
+          "渲染真实危险"
+        ],
+        "standalone": true,
+        "sha256": "fe82efcca47346ff85d85b6e947f9c70dcb9e8ba463b1900053b23f1faf37789"
+      },
+      {
+        "name": "收到",
+        "file": "market-11.png",
+        "upstream": "assets/Saluting face/3D/saluting_face_3d.png",
+        "description": "敬礼表示收到、明白或准备执行",
+        "tags": [
+          "收到",
+          "明白",
+          "敬礼"
+        ],
+        "intent": [
+          "收到"
+        ],
+        "use_when": [
+          "确认收到信息"
+        ],
+        "avoid_when": [
+          "代替实际执行结果"
+        ],
+        "standalone": true,
+        "sha256": "3a18f67e9cb6edaa18e9331451f9b93527aca574c52f9e6d896cce691e737b5a"
+      },
+      {
+        "name": "倒脸笑",
+        "file": "market-12.png",
+        "upstream": "assets/Upside-down face/3D/upside-down_face_3d.png",
+        "description": "倒过来的笑脸表示无奈、尴尬或轻微反讽",
+        "tags": [
+          "无奈",
+          "尴尬",
+          "反讽"
+        ],
+        "intent": [
+          "无奈"
+        ],
+        "use_when": [
+          "轻松自嘲"
+        ],
+        "avoid_when": [
+          "冒犯用户",
+          "严肃悲伤"
+        ],
+        "standalone": true,
+        "sha256": "de4e2d827973cc3c0288daa26559389847a3cf3a1b2597be85f40e7056aeea42"
+      }
+    ],
+    "source_id": "fluent",
+    "approval_required": false,
+    "license_url": "https://opensource.org/license/mit",
+    "attribution": "Microsoft Fluent Emoji · Copyright (c) Microsoft Corporation. · MIT"
+  },
+  {
+    "id": "noto-reactions",
+    "name": "Noto · 彩色日常",
+    "description": "Google Noto 的 24 张日常反应，清晰简洁的彩色风格。",
+    "category": "日常",
+    "author": "Google",
+    "version": "e20cbc2bbec1",
+    "source": "https://github.com/googlefonts/noto-emoji/tree/e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e",
+    "source_id": "noto",
+    "license": "Apache-2.0 · Copyright 2013 Google, Inc. 原始 PNG 未修改，保留上游声明。",
+    "license_id": "Apache-2.0",
+    "license_file": "NOTO-LICENSE.txt",
+    "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+    "attribution": "Noto Emoji · Copyright 2013 Google, Inc. · Apache-2.0",
+    "notice_file": "NOTO-NOTICE.txt",
+    "style": "2D 彩色",
+    "approval_required": false,
+    "stickers": [
+      {
+        "name": "庆祝",
+        "unicode": "🎉",
+        "description": "终于完成了，庆祝成功和好消息",
+        "tags": [
+          "庆祝",
+          "上线",
+          "成功",
+          "恭喜",
+          "太棒了",
+          "终于"
+        ],
+        "intent": [
+          "祝贺",
+          "庆祝"
+        ],
+        "use_when": [
+          "取得进展",
+          "分享好消息"
+        ],
+        "avoid_when": [
+          "真实损失",
+          "哀悼"
+        ],
+        "standalone": true,
+        "file": "noto-1f389.png",
+        "upstream": "2D/png/128/emoji_u1f389.png",
+        "sha256": "d761a0d17048bfe3e96842f3dfe444fe18780f3a2285792f6da7ce1697fc2a19",
+        "author": "Google"
+      },
+      {
+        "name": "开心",
+        "unicode": "😀",
+        "description": "友好开心，轻松打招呼",
+        "tags": [
+          "开心",
+          "高兴",
+          "你好",
+          "哈哈"
+        ],
+        "intent": [
+          "友好回应"
+        ],
+        "use_when": [
+          "轻松聊天"
+        ],
+        "avoid_when": [
+          "严肃悲伤"
+        ],
+        "standalone": true,
+        "file": "noto-1f600.png",
+        "upstream": "2D/png/128/emoji_u1f600.png",
+        "sha256": "b6f38b667fadc5765e956c0b87e2016c57eead7351e5107253536584ae0ef441",
+        "author": "Google"
+      },
+      {
+        "name": "笑哭",
+        "unicode": "😂",
+        "description": "轻松的好笑或自嘲，不嘲笑真实痛苦",
+        "tags": [
+          "笑哭",
+          "笑死",
+          "绷不住",
+          "搞笑",
+          "自嘲"
+        ],
+        "intent": [
+          "幽默",
+          "自嘲"
+        ],
+        "use_when": [
+          "朋友间玩笑"
+        ],
+        "avoid_when": [
+          "真实损失",
+          "悲伤",
+          "焦虑"
+        ],
+        "standalone": true,
+        "file": "noto-1f602.png",
+        "upstream": "2D/png/128/emoji_u1f602.png",
+        "sha256": "15952ae860a14f39726198bc3d0ed948730d8fdde5afaee488140b0f76ee566b",
+        "author": "Google"
+      },
+      {
+        "name": "思考",
+        "unicode": "🤔",
+        "description": "表示正在思考或好奇，不代替实际解答",
+        "tags": [
+          "思考",
+          "想想",
+          "疑惑",
+          "好奇"
+        ],
+        "intent": [
+          "思考",
+          "好奇"
+        ],
+        "use_when": [
+          "轻松讨论"
+        ],
+        "avoid_when": [
+          "紧急求助"
+        ],
+        "standalone": true,
+        "file": "noto-1f914.png",
+        "upstream": "2D/png/128/emoji_u1f914.png",
+        "sha256": "785169a150cb7a3b66e12155899e7b5fdccb687f3f30ea8efdb8bc96419209df",
+        "author": "Google"
+      },
+      {
+        "name": "赞",
+        "unicode": "👍",
+        "description": "赞同、肯定或确认收到",
+        "tags": [
+          "点赞",
+          "赞",
+          "认可",
+          "收到",
+          "同意",
+          "好的"
+        ],
+        "intent": [
+          "肯定",
+          "确认"
+        ],
+        "use_when": [
+          "肯定进展",
+          "简单确认"
+        ],
+        "avoid_when": [
+          "需要详细说明"
+        ],
+        "standalone": true,
+        "file": "noto-1f44d.png",
+        "upstream": "2D/png/128/emoji_u1f44d.png",
+        "sha256": "a17fcf51fee3abc247210f28b130802fc381e01971699bbefa40eaf89adb3a02",
+        "author": "Google"
+      },
+      {
+        "name": "鼓掌",
+        "unicode": "👏",
+        "description": "真诚肯定成果，鼓励进步",
+        "tags": [
+          "鼓掌",
+          "厉害",
+          "真棒",
+          "进步"
+        ],
+        "intent": [
+          "鼓励",
+          "赞赏"
+        ],
+        "use_when": [
+          "取得成果"
+        ],
+        "avoid_when": [
+          "讽刺他人"
+        ],
+        "standalone": true,
+        "file": "noto-1f44f.png",
+        "upstream": "2D/png/128/emoji_u1f44f.png",
+        "sha256": "8c64101727234ab7f2b10cfb5ace2ec98f2360ca0823ce77074ac35e6319534a",
+        "author": "Google"
+      },
+      {
+        "name": "感谢",
+        "unicode": "🙏",
+        "description": "表达感谢与诚恳请求",
+        "tags": [
+          "感谢",
+          "谢谢",
+          "拜托",
+          "感激"
+        ],
+        "intent": [
+          "感谢"
+        ],
+        "use_when": [
+          "表达谢意"
+        ],
+        "avoid_when": [
+          "轻率承诺"
+        ],
+        "standalone": true,
+        "file": "noto-1f64f.png",
+        "upstream": "2D/png/128/emoji_u1f64f.png",
+        "sha256": "622fe626654195732630b7be5683109dc48944001f23688099d03ead4c023bd8",
+        "author": "Google"
+      },
+      {
+        "name": "感动",
+        "unicode": "🥹",
+        "description": "温柔感动或委屈，需结合上下文",
+        "tags": [
+          "感动",
+          "委屈",
+          "泪目",
+          "温柔"
+        ],
+        "intent": [
+          "表达共情"
+        ],
+        "use_when": [
+          "温暖回应"
+        ],
+        "avoid_when": [
+          "调侃痛苦"
+        ],
+        "standalone": true,
+        "file": "noto-1f979.png",
+        "upstream": "2D/png/128/emoji_u1f979.png",
+        "sha256": "f2c37898c2bfead7651ae5e18b38a1297fa2d104f5504c0300ecfd6a7b63314e",
+        "author": "Google"
+      },
+      {
+        "name": "得意坏笑",
+        "unicode": "😏",
+        "description": "小得意、友好调侃或被识破后的玩笑",
+        "tags": [
+          "得意",
+          "坏笑",
+          "嘿嘿",
+          "被抓包",
+          "心虚",
+          "中计"
+        ],
+        "intent": [
+          "友好调侃"
+        ],
+        "use_when": [
+          "熟悉对话中的玩笑"
+        ],
+        "avoid_when": [
+          "正式道歉",
+          "严肃悲伤",
+          "重要事务"
+        ],
+        "standalone": true,
+        "file": "noto-1f60f.png",
+        "upstream": "2D/png/128/emoji_u1f60f.png",
+        "sha256": "8ddbab5be8c85859fb1587ee44d8a5596f2d1160bd1d6b1a097b5aec50f390d7",
+        "author": "Google"
+      },
+      {
+        "name": "惊讶",
+        "unicode": "😮",
+        "description": "对意外的小事表达惊讶",
+        "tags": [
+          "惊讶",
+          "震惊",
+          "天哪",
+          "居然",
+          "意外"
+        ],
+        "intent": [
+          "夸张反应"
+        ],
+        "use_when": [
+          "轻松的出乎意料"
+        ],
+        "avoid_when": [
+          "真实事故"
+        ],
+        "standalone": true,
+        "file": "noto-1f62e.png",
+        "upstream": "2D/png/128/emoji_u1f62e.png",
+        "sha256": "11958561f8ac3bcb5db1ba802de7e248c5e47d0fca709efac24db4a4d605402d",
+        "author": "Google"
+      },
+      {
+        "name": "支持",
+        "unicode": "❤",
+        "description": "温暖的关心、支持与感谢",
+        "tags": [
+          "支持",
+          "关心",
+          "爱心",
+          "温暖",
+          "陪伴"
+        ],
+        "intent": [
+          "支持",
+          "关心"
+        ],
+        "use_when": [
+          "用户接受温暖表达"
+        ],
+        "avoid_when": [
+          "未经邀请的亲密暗示"
+        ],
+        "standalone": true,
+        "file": "noto-2764.png",
+        "upstream": "2D/png/128/emoji_u2764.png",
+        "sha256": "1d41a1bc85be895f01f0b07997e3a5619ab3f685e3edbf8c0ad6853d378e6fe0",
+        "author": "Google"
+      },
+      {
+        "name": "加油",
+        "unicode": "💪",
+        "description": "支持努力、鼓励继续前进",
+        "tags": [
+          "加油",
+          "坚持",
+          "努力",
+          "冲",
+          "打气"
+        ],
+        "intent": [
+          "鼓励"
+        ],
+        "use_when": [
+          "用户希望获得鼓励"
+        ],
+        "avoid_when": [
+          "否定真实困难"
+        ],
+        "standalone": true,
+        "file": "noto-1f4aa.png",
+        "upstream": "2D/png/128/emoji_u1f4aa.png",
+        "sha256": "6b045c171481c0eab16be4967cd1e3e2d93e2f9161de8c727fb143119ae3f354",
+        "author": "Google"
+      },
+      {
+        "name": "抱抱",
+        "description": "给你一个温暖的拥抱，表达安慰与支持",
+        "tags": [
+          "抱抱",
+          "安慰",
+          "温暖"
+        ],
+        "intent": [
+          "抱抱"
+        ],
+        "use_when": [
+          "朋友需要鼓励",
+          "表达关心"
+        ],
+        "avoid_when": [
+          "正式汇报"
+        ],
+        "standalone": true,
+        "file": "noto-1f917.png",
+        "upstream": "2D/png/128/emoji_u1f917.png",
+        "sha256": "18ca8d43504e56fbace0f2fc20b45dbbcd46acdb9a93112da12583302a9032a5",
+        "unicode": "🤗",
+        "author": "Google"
+      },
+      {
+        "name": "眨眼",
+        "description": "友善眨眼，表示默契、玩笑或你懂的",
+        "tags": [
+          "眨眼",
+          "默契",
+          "开玩笑"
+        ],
+        "intent": [
+          "眨眼"
+        ],
+        "use_when": [
+          "熟人轻松聊天"
+        ],
+        "avoid_when": [
+          "严肃道歉"
+        ],
+        "standalone": true,
+        "file": "noto-1f609.png",
+        "upstream": "2D/png/128/emoji_u1f609.png",
+        "sha256": "e8251fdc5aa3cc051d30ba5a507158ccb1ba2d34e60980550ec2cf9777e21a63",
+        "unicode": "😉",
+        "author": "Google"
+      },
+      {
+        "name": "飞吻",
+        "description": "送出飞吻，表达亲近、喜欢或感谢",
+        "tags": [
+          "飞吻",
+          "喜欢",
+          "亲亲"
+        ],
+        "intent": [
+          "飞吻"
+        ],
+        "use_when": [
+          "双方接受的亲密互动"
+        ],
+        "avoid_when": [
+          "陌生人",
+          "正式工作"
+        ],
+        "standalone": true,
+        "file": "noto-1f618.png",
+        "upstream": "2D/png/128/emoji_u1f618.png",
+        "sha256": "098ca6f22dadcedb7c3a6e803fa68739426d4b7826ed17744acc8a70d992b759",
+        "unicode": "😘",
+        "author": "Google"
+      },
+      {
+        "name": "酷",
+        "description": "戴墨镜自信微笑，表示酷、轻松搞定",
+        "tags": [
+          "酷",
+          "自信",
+          "搞定"
+        ],
+        "intent": [
+          "酷"
+        ],
+        "use_when": [
+          "轻松展示成果"
+        ],
+        "avoid_when": [
+          "夸大任务完成情况"
+        ],
+        "standalone": true,
+        "file": "noto-1f60e.png",
+        "upstream": "2D/png/128/emoji_u1f60e.png",
+        "sha256": "f9c79c861760ba2e360fd3a009fc68f0f7075570d0d6a4291e48823c606f9a69",
+        "unicode": "😎",
+        "author": "Google"
+      },
+      {
+        "name": "大哭",
+        "description": "眼泪流下，可能表达难过，也可能是夸张感动",
+        "tags": [
+          "哭",
+          "难过",
+          "感动"
+        ],
+        "intent": [
+          "哭"
+        ],
+        "use_when": [
+          "表达受挫或感动，结合上下文"
+        ],
+        "avoid_when": [
+          "嘲笑他人痛苦"
+        ],
+        "standalone": true,
+        "file": "noto-1f62d.png",
+        "upstream": "2D/png/128/emoji_u1f62d.png",
+        "sha256": "e2eed5a559395fc18f45875458192f9a200d24cb16f0f0fe1c62e8f01d18c3e3",
+        "unicode": "😭",
+        "author": "Google"
+      },
+      {
+        "name": "拜托",
+        "description": "可怜巴巴地请求帮助或表达委屈",
+        "tags": [
+          "拜托",
+          "委屈",
+          "求求了"
+        ],
+        "intent": [
+          "拜托"
+        ],
+        "use_when": [
+          "温和请求",
+          "朋友间撒娇"
+        ],
+        "avoid_when": [
+          "施压",
+          "严肃事故"
+        ],
+        "standalone": true,
+        "file": "noto-1f97a.png",
+        "upstream": "2D/png/128/emoji_u1f97a.png",
+        "sha256": "f8986871de667010851c15ab1f706514f958d7183d4ba4fa3214d1e00d49fdaa",
+        "unicode": "🥺",
+        "author": "Google"
+      },
+      {
+        "name": "无语",
+        "description": "翻白眼表达无语、不耐烦或熟人间吐槽",
+        "tags": [
+          "无语",
+          "翻白眼",
+          "吐槽"
+        ],
+        "intent": [
+          "无语"
+        ],
+        "use_when": [
+          "明确友好的熟人吐槽"
+        ],
+        "avoid_when": [
+          "攻击用户",
+          "正式道歉"
+        ],
+        "standalone": true,
+        "file": "noto-1f644.png",
+        "upstream": "2D/png/128/emoji_u1f644.png",
+        "sha256": "e731313fe55d2670885ad42d1c8cd834c1c0faed7b3d5262c5e1d1e6721e86d5",
+        "unicode": "🙄",
+        "author": "Google"
+      },
+      {
+        "name": "捂嘴笑",
+        "description": "捂住嘴轻笑，表达偷乐、惊喜或小尴尬",
+        "tags": [
+          "偷笑",
+          "捂嘴",
+          "嘿嘿"
+        ],
+        "intent": [
+          "偷笑"
+        ],
+        "use_when": [
+          "轻松调侃",
+          "小秘密被识破"
+        ],
+        "avoid_when": [
+          "悲伤",
+          "严肃事故"
+        ],
+        "standalone": true,
+        "file": "noto-1f92d.png",
+        "upstream": "2D/png/128/emoji_u1f92d.png",
+        "sha256": "ef8870f19330f4d077cc0c3c1b77e10161458a3bee046437c875373b1e76d452",
+        "unicode": "🤭",
+        "author": "Google"
+      },
+      {
+        "name": "困了",
+        "description": "闭眼睡觉，表示困倦、休息或晚安",
+        "tags": [
+          "困",
+          "晚安",
+          "睡觉"
+        ],
+        "intent": [
+          "困"
+        ],
+        "use_when": [
+          "结束轻松聊天",
+          "需要休息"
+        ],
+        "avoid_when": [
+          "紧急求助"
+        ],
+        "standalone": true,
+        "file": "noto-1f634.png",
+        "upstream": "2D/png/128/emoji_u1f634.png",
+        "sha256": "f9224b8818cfa8aabcf2a964137045b7bea5fb34f23d0667488e3692ab3da15b",
+        "unicode": "😴",
+        "author": "Google"
+      },
+      {
+        "name": "震惊",
+        "description": "瞪眼张嘴表示强烈震惊或夸张惊吓",
+        "tags": [
+          "震惊",
+          "惊吓",
+          "天哪"
+        ],
+        "intent": [
+          "震惊"
+        ],
+        "use_when": [
+          "朋友间惊讶回应"
+        ],
+        "avoid_when": [
+          "渲染真实危险"
+        ],
+        "standalone": true,
+        "file": "noto-1f631.png",
+        "upstream": "2D/png/128/emoji_u1f631.png",
+        "sha256": "4d4a174f8091498ba9fa903b44e47a970f2f9c9fa0cc5429b261e6cca829c219",
+        "unicode": "😱",
+        "author": "Google"
+      },
+      {
+        "name": "收到",
+        "description": "敬礼表示收到、明白或准备执行",
+        "tags": [
+          "收到",
+          "明白",
+          "敬礼"
+        ],
+        "intent": [
+          "收到"
+        ],
+        "use_when": [
+          "确认收到信息"
+        ],
+        "avoid_when": [
+          "代替实际执行结果"
+        ],
+        "standalone": true,
+        "file": "noto-1fae1.png",
+        "upstream": "2D/png/128/emoji_u1fae1.png",
+        "sha256": "8643922f714df1ba36083f66f2fee19ca2dcc3efb0f47dc536b3983cad567f19",
+        "unicode": "🫡",
+        "author": "Google"
+      },
+      {
+        "name": "倒脸笑",
+        "description": "倒过来的笑脸表示无奈、尴尬或轻微反讽",
+        "tags": [
+          "无奈",
+          "尴尬",
+          "反讽"
+        ],
+        "intent": [
+          "无奈"
+        ],
+        "use_when": [
+          "轻松自嘲"
+        ],
+        "avoid_when": [
+          "冒犯用户",
+          "严肃悲伤"
+        ],
+        "standalone": true,
+        "file": "noto-1f643.png",
+        "upstream": "2D/png/128/emoji_u1f643.png",
+        "sha256": "0cbb253563bdcf32ae8d0b087cb7f3591f8071001c7ef9558c1b2c2fef158476",
+        "unicode": "🙃",
+        "author": "Google"
+      }
+    ]
+  },
+  {
+    "id": "openmoji-reactions",
+    "name": "OpenMoji · 线描心情",
+    "description": "OpenMoji 的 24 张彩色线描反应，附逐张作者署名。",
+    "category": "日常",
+    "author": "OpenMoji contributors",
+    "version": "aeb8bb3a59e2",
+    "source": "https://github.com/hfg-gmuend/openmoji/tree/aeb8bb3a59e2de39c754ac79180c8131c906acea",
+    "source_id": "openmoji",
+    "license": "CC BY-SA 4.0 · OpenMoji contributors · openmoji.org。原始 PNG 未修改；署名与逐张作者随包保留，改编素材须遵守相同方式共享条件。",
+    "license_id": "CC-BY-SA-4.0",
+    "license_file": "OPENMOJI-LICENSE.txt",
+    "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+    "attribution": "OpenMoji · https://openmoji.org · CC BY-SA 4.0",
+    "style": "彩色线描",
+    "approval_required": false,
+    "stickers": [
+      {
+        "name": "庆祝",
+        "unicode": "🎉",
+        "description": "终于完成了，庆祝成功和好消息",
+        "tags": [
+          "庆祝",
+          "上线",
+          "成功",
+          "恭喜",
+          "太棒了",
+          "终于"
+        ],
+        "intent": [
+          "祝贺",
+          "庆祝"
+        ],
+        "use_when": [
+          "取得进展",
+          "分享好消息"
+        ],
+        "avoid_when": [
+          "真实损失",
+          "哀悼"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f389.png",
+        "upstream": "color/618x618/1F389.png",
+        "sha256": "fb6acda8be547106ad5bd5ee68ee29866dc952703c387590915f8babf80dca6f",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "开心",
+        "unicode": "😀",
+        "description": "友好开心，轻松打招呼",
+        "tags": [
+          "开心",
+          "高兴",
+          "你好",
+          "哈哈"
+        ],
+        "intent": [
+          "友好回应"
+        ],
+        "use_when": [
+          "轻松聊天"
+        ],
+        "avoid_when": [
+          "严肃悲伤"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f600.png",
+        "upstream": "color/618x618/1F600.png",
+        "sha256": "4f598c9d7db8d7124c98a23829c3ef1c7423ced5b436c4ea90956fc97eea2190",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "笑哭",
+        "unicode": "😂",
+        "description": "轻松的好笑或自嘲，不嘲笑真实痛苦",
+        "tags": [
+          "笑哭",
+          "笑死",
+          "绷不住",
+          "搞笑",
+          "自嘲"
+        ],
+        "intent": [
+          "幽默",
+          "自嘲"
+        ],
+        "use_when": [
+          "朋友间玩笑"
+        ],
+        "avoid_when": [
+          "真实损失",
+          "悲伤",
+          "焦虑"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f602.png",
+        "upstream": "color/618x618/1F602.png",
+        "sha256": "bd6ec82f57463f53926fc9ea3e85a9015362c98eaebaa67d2335e101f803be37",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "思考",
+        "unicode": "🤔",
+        "description": "表示正在思考或好奇，不代替实际解答",
+        "tags": [
+          "思考",
+          "想想",
+          "疑惑",
+          "好奇"
+        ],
+        "intent": [
+          "思考",
+          "好奇"
+        ],
+        "use_when": [
+          "轻松讨论"
+        ],
+        "avoid_when": [
+          "紧急求助"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f914.png",
+        "upstream": "color/618x618/1F914.png",
+        "sha256": "b1c6dc001b1a7898d4f8d6b98e31393469ff6b20fbd974802c2512bdb8584491",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "赞",
+        "unicode": "👍",
+        "description": "赞同、肯定或确认收到",
+        "tags": [
+          "点赞",
+          "赞",
+          "认可",
+          "收到",
+          "同意",
+          "好的"
+        ],
+        "intent": [
+          "肯定",
+          "确认"
+        ],
+        "use_when": [
+          "肯定进展",
+          "简单确认"
+        ],
+        "avoid_when": [
+          "需要详细说明"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f44d.png",
+        "upstream": "color/618x618/1F44D.png",
+        "sha256": "ba9bb893723af354fbb738b20569bbd73ed98df6640a17f4330f4e32884f4957",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "鼓掌",
+        "unicode": "👏",
+        "description": "真诚肯定成果，鼓励进步",
+        "tags": [
+          "鼓掌",
+          "厉害",
+          "真棒",
+          "进步"
+        ],
+        "intent": [
+          "鼓励",
+          "赞赏"
+        ],
+        "use_when": [
+          "取得成果"
+        ],
+        "avoid_when": [
+          "讽刺他人"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f44f.png",
+        "upstream": "color/618x618/1F44F.png",
+        "sha256": "e4d8a91b2962b7012dcf90d59a20e631191f9277cd4389f4cbc6cda84ba8c6f9",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "感谢",
+        "unicode": "🙏",
+        "description": "表达感谢与诚恳请求",
+        "tags": [
+          "感谢",
+          "谢谢",
+          "拜托",
+          "感激"
+        ],
+        "intent": [
+          "感谢"
+        ],
+        "use_when": [
+          "表达谢意"
+        ],
+        "avoid_when": [
+          "轻率承诺"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f64f.png",
+        "upstream": "color/618x618/1F64F.png",
+        "sha256": "df99d339f94f24c48851943d590ee75f8500f0d49c1f441795f8bb2fbeee6d5a",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "感动",
+        "unicode": "🥹",
+        "description": "温柔感动或委屈，需结合上下文",
+        "tags": [
+          "感动",
+          "委屈",
+          "泪目",
+          "温柔"
+        ],
+        "intent": [
+          "表达共情"
+        ],
+        "use_when": [
+          "温暖回应"
+        ],
+        "avoid_when": [
+          "调侃痛苦"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f979.png",
+        "upstream": "color/618x618/1F979.png",
+        "sha256": "9ecf1131001bfec02032bd01bb27ff3b67e6392326102cefd3aabedf0cada608",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "得意坏笑",
+        "unicode": "😏",
+        "description": "小得意、友好调侃或被识破后的玩笑",
+        "tags": [
+          "得意",
+          "坏笑",
+          "嘿嘿",
+          "被抓包",
+          "心虚",
+          "中计"
+        ],
+        "intent": [
+          "友好调侃"
+        ],
+        "use_when": [
+          "熟悉对话中的玩笑"
+        ],
+        "avoid_when": [
+          "正式道歉",
+          "严肃悲伤",
+          "重要事务"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f60f.png",
+        "upstream": "color/618x618/1F60F.png",
+        "sha256": "1770d30f311123c6636ce6bb437ed5c06c185e5ed8cac40231f741ea466245f6",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "惊讶",
+        "unicode": "😮",
+        "description": "对意外的小事表达惊讶",
+        "tags": [
+          "惊讶",
+          "震惊",
+          "天哪",
+          "居然",
+          "意外"
+        ],
+        "intent": [
+          "夸张反应"
+        ],
+        "use_when": [
+          "轻松的出乎意料"
+        ],
+        "avoid_when": [
+          "真实事故"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f62e.png",
+        "upstream": "color/618x618/1F62E.png",
+        "sha256": "609f3c66d202fe605b040fd22ee6b8178233cc96707618306b44399baffe6b72",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "支持",
+        "unicode": "❤",
+        "description": "温暖的关心、支持与感谢",
+        "tags": [
+          "支持",
+          "关心",
+          "爱心",
+          "温暖",
+          "陪伴"
+        ],
+        "intent": [
+          "支持",
+          "关心"
+        ],
+        "use_when": [
+          "用户接受温暖表达"
+        ],
+        "avoid_when": [
+          "未经邀请的亲密暗示"
+        ],
+        "standalone": true,
+        "file": "openmoji-2764.png",
+        "upstream": "color/618x618/2764.png",
+        "sha256": "f3d469792b081f3d7631f08a93f4de964159d84b2fd01c7b5ee466abd81584dc",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "加油",
+        "unicode": "💪",
+        "description": "支持努力、鼓励继续前进",
+        "tags": [
+          "加油",
+          "坚持",
+          "努力",
+          "冲",
+          "打气"
+        ],
+        "intent": [
+          "鼓励"
+        ],
+        "use_when": [
+          "用户希望获得鼓励"
+        ],
+        "avoid_when": [
+          "否定真实困难"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f4aa.png",
+        "upstream": "color/618x618/1F4AA.png",
+        "sha256": "613b76658195cab3b9ff6442378368c712a7fb9e683e9f8d80d09e55a221497e",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "抱抱",
+        "description": "给你一个温暖的拥抱，表达安慰与支持",
+        "tags": [
+          "抱抱",
+          "安慰",
+          "温暖"
+        ],
+        "intent": [
+          "抱抱"
+        ],
+        "use_when": [
+          "朋友需要鼓励",
+          "表达关心"
+        ],
+        "avoid_when": [
+          "正式汇报"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f917.png",
+        "upstream": "color/618x618/1F917.png",
+        "sha256": "41a90b9e802c3adb105f406366c0a980412f65647051572986a5a9ff9d448d65",
+        "unicode": "🤗",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "眨眼",
+        "description": "友善眨眼，表示默契、玩笑或你懂的",
+        "tags": [
+          "眨眼",
+          "默契",
+          "开玩笑"
+        ],
+        "intent": [
+          "眨眼"
+        ],
+        "use_when": [
+          "熟人轻松聊天"
+        ],
+        "avoid_when": [
+          "严肃道歉"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f609.png",
+        "upstream": "color/618x618/1F609.png",
+        "sha256": "b3b973d8a3b187474f07ef1f21ce8610ed4dd50a5de9340384623dfc91ed7deb",
+        "unicode": "😉",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "飞吻",
+        "description": "送出飞吻，表达亲近、喜欢或感谢",
+        "tags": [
+          "飞吻",
+          "喜欢",
+          "亲亲"
+        ],
+        "intent": [
+          "飞吻"
+        ],
+        "use_when": [
+          "双方接受的亲密互动"
+        ],
+        "avoid_when": [
+          "陌生人",
+          "正式工作"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f618.png",
+        "upstream": "color/618x618/1F618.png",
+        "sha256": "966b927e8c68433155d591b87f83ef2f14da213ac2cfd09ae435bf7a8ddd5c1b",
+        "unicode": "😘",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "酷",
+        "description": "戴墨镜自信微笑，表示酷、轻松搞定",
+        "tags": [
+          "酷",
+          "自信",
+          "搞定"
+        ],
+        "intent": [
+          "酷"
+        ],
+        "use_when": [
+          "轻松展示成果"
+        ],
+        "avoid_when": [
+          "夸大任务完成情况"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f60e.png",
+        "upstream": "color/618x618/1F60E.png",
+        "sha256": "a04627439215141b0e8f13a592f509f4259f9cbb49b7da17511e79dd88506b4b",
+        "unicode": "😎",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "大哭",
+        "description": "眼泪流下，可能表达难过，也可能是夸张感动",
+        "tags": [
+          "哭",
+          "难过",
+          "感动"
+        ],
+        "intent": [
+          "哭"
+        ],
+        "use_when": [
+          "表达受挫或感动，结合上下文"
+        ],
+        "avoid_when": [
+          "嘲笑他人痛苦"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f62d.png",
+        "upstream": "color/618x618/1F62D.png",
+        "sha256": "bc403528c3b82b779d99cd966867c8513bb454a7368113a88087bd2643f1bb5f",
+        "unicode": "😭",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "拜托",
+        "description": "可怜巴巴地请求帮助或表达委屈",
+        "tags": [
+          "拜托",
+          "委屈",
+          "求求了"
+        ],
+        "intent": [
+          "拜托"
+        ],
+        "use_when": [
+          "温和请求",
+          "朋友间撒娇"
+        ],
+        "avoid_when": [
+          "施压",
+          "严肃事故"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f97a.png",
+        "upstream": "color/618x618/1F97A.png",
+        "sha256": "958c6e7c49478e43777595cb0905f2a2912fab6211b612485bacefec9a4418bc",
+        "unicode": "🥺",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "无语",
+        "description": "翻白眼表达无语、不耐烦或熟人间吐槽",
+        "tags": [
+          "无语",
+          "翻白眼",
+          "吐槽"
+        ],
+        "intent": [
+          "无语"
+        ],
+        "use_when": [
+          "明确友好的熟人吐槽"
+        ],
+        "avoid_when": [
+          "攻击用户",
+          "正式道歉"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f644.png",
+        "upstream": "color/618x618/1F644.png",
+        "sha256": "41c05bf551bab664e320c1c0e4b4ef567bc3f28df2f8965ec5f8597d931b482b",
+        "unicode": "🙄",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "捂嘴笑",
+        "description": "捂住嘴轻笑，表达偷乐、惊喜或小尴尬",
+        "tags": [
+          "偷笑",
+          "捂嘴",
+          "嘿嘿"
+        ],
+        "intent": [
+          "偷笑"
+        ],
+        "use_when": [
+          "轻松调侃",
+          "小秘密被识破"
+        ],
+        "avoid_when": [
+          "悲伤",
+          "严肃事故"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f92d.png",
+        "upstream": "color/618x618/1F92D.png",
+        "sha256": "778c5061b36c7a398a0d8687f3cd18893c5beb81f3f17c00a27801899b863d71",
+        "unicode": "🤭",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "困了",
+        "description": "闭眼睡觉，表示困倦、休息或晚安",
+        "tags": [
+          "困",
+          "晚安",
+          "睡觉"
+        ],
+        "intent": [
+          "困"
+        ],
+        "use_when": [
+          "结束轻松聊天",
+          "需要休息"
+        ],
+        "avoid_when": [
+          "紧急求助"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f634.png",
+        "upstream": "color/618x618/1F634.png",
+        "sha256": "c6743584d5ae363586bed4350dd6726c7ad36b183a7c2de09496365b45b314bf",
+        "unicode": "😴",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "震惊",
+        "description": "瞪眼张嘴表示强烈震惊或夸张惊吓",
+        "tags": [
+          "震惊",
+          "惊吓",
+          "天哪"
+        ],
+        "intent": [
+          "震惊"
+        ],
+        "use_when": [
+          "朋友间惊讶回应"
+        ],
+        "avoid_when": [
+          "渲染真实危险"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f631.png",
+        "upstream": "color/618x618/1F631.png",
+        "sha256": "8d76183b0625f4e4f41c8e10f2e7a37982a6ba1e9d368db5412340bffa58e95a",
+        "unicode": "😱",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "收到",
+        "description": "敬礼表示收到、明白或准备执行",
+        "tags": [
+          "收到",
+          "明白",
+          "敬礼"
+        ],
+        "intent": [
+          "收到"
+        ],
+        "use_when": [
+          "确认收到信息"
+        ],
+        "avoid_when": [
+          "代替实际执行结果"
+        ],
+        "standalone": true,
+        "file": "openmoji-1fae1.png",
+        "upstream": "color/618x618/1FAE1.png",
+        "sha256": "a0fdc2e3f800e7e9dff91ad66f7fdbec2f540aef8b7ce859361ca6001e01cd4f",
+        "unicode": "🫡",
+        "author": "OpenMoji contributors"
+      },
+      {
+        "name": "倒脸笑",
+        "description": "倒过来的笑脸表示无奈、尴尬或轻微反讽",
+        "tags": [
+          "无奈",
+          "尴尬",
+          "反讽"
+        ],
+        "intent": [
+          "无奈"
+        ],
+        "use_when": [
+          "轻松自嘲"
+        ],
+        "avoid_when": [
+          "冒犯用户",
+          "严肃悲伤"
+        ],
+        "standalone": true,
+        "file": "openmoji-1f643.png",
+        "upstream": "color/618x618/1F643.png",
+        "sha256": "2fcff65e8bfd0c5a0817ac65834eece6d4d01a9b97478c76cd426b6a705f1c0e",
+        "unicode": "🙃",
+        "author": "OpenMoji contributors"
+      }
+    ]
+  }
+]

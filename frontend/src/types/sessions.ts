@@ -13,6 +13,7 @@ export type MessagePartType =
   | 'document_selection'
   | 'selection_quote'
   | 'image'
+  | 'sticker'
   | 'graph_context'
   | 'quiz'
   | 'chart'
@@ -215,6 +216,7 @@ export interface DocumentSelectionContext {
 
 export interface MessageCreateRequest {
   content: string
+  sticker_ids?: string[]
   ui_action?: import('@/lib/stream-ui').UIActionRequest
   /** Defaults to text for older callers; chat always sends this explicitly. */
   generation_mode?: 'text' | 'image'

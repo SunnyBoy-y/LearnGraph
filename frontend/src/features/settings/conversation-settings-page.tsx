@@ -12,6 +12,7 @@ import type { WorkspaceSetting } from "@/types/settings";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { AdvancedSettings, SettingRow, SettingsSection } from './settings-primitives';
+import { StickerSettingsPanel } from './sticker-settings';
 function useConversationSettingsPage() {
  const auth = useAuth();
     const queryClient = useQueryClient();
@@ -96,7 +97,7 @@ export function ConversationSettingsPage() {
     const readError = settings.error ?? memoryEnhancement.error;
     if (readError)
         return <ErrorState message={readError.message}/>;
-    return (<PageFrame><PageIntro title="对话与学习" description="设置新对话的默认行为、上下文管理与性能显示。"/><SettingsSection title="默认行为" description=""><SettingRow title="默认响应模式" description="新建对话时的默认状态：极速 / 智能体；已有会话仍记住各自上次选择"><Select disabled={saveDefaultResponseMode.isPending} onValueChange={(value) => saveDefaultResponseMode.mutate(value as ResponseMode)} value={defaultResponseMode}>
+    return (<PageFrame><PageIntro title="对话与学习" description="设置新对话的默认行为、上下文管理与性能显示。"/><StickerSettingsPanel /><SettingsSection title="默认行为" description=""><SettingRow title="默认响应模式" description="新建对话时的默认状态：极速 / 智能体；已有会话仍记住各自上次选择"><Select disabled={saveDefaultResponseMode.isPending} onValueChange={(value) => saveDefaultResponseMode.mutate(value as ResponseMode)} value={defaultResponseMode}>
               <SelectTrigger aria-label="默认响应模式" className="w-[8.5rem] shrink-0">
                 <SelectValue />
               </SelectTrigger>
