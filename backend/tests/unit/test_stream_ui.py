@@ -47,6 +47,16 @@ def test_untrusted_commands_are_rejected(command):
     assert error.value.status_code == 422
 
 
+@pytest.mark.parametrize("background", ["auto", "paper", "warm", "cool", "dark"])
+def test_graph_background_survives_stream_and_replay(background):
+    state = compile_command(mount(props={"title": "图谱", "background": background})).model_dump(mode="json")
+    assert state["props"]["background"] == background
+    patched = compile_command({"op": "patch", "block_id": "demo", "base_revision": 0,
+        "upsert": {"nodes": [{"id": "a", "label": "根节点"}]}}, state)
+    completed = compile_command({"op": "complete", "block_id": "demo", "base_revision": 1}, patched.model_dump(mode="json"))
+    assert completed.props.background == background
+
+
 def test_revision_conflicts_and_terminal_state():
     state = compile_command(mount()).model_dump(mode="json")
     before = copy.deepcopy(state)
@@ -150,3 +160,33 @@ def test_resource_rebase_restores_svg_omitted_by_an_already_prepared_patch():
     restored = merge_resource_results(Snapshot.model_validate(stale), saved)
     assert restored.blocks[0].fallback_svg == FALLBACK_SVG
     assert restored.blocks[0].resource_reason == "timeout"
+
+
+@pytest.mark.parametrize("interaction", ["auto", "static", "explore"])
+def test_presentation_mode_survives_stream_updates(interaction):
+    first = compile_command(mount(component="table", props={"title": "数据", "interaction": interaction}))
+    patched = compile_command({"op": "patch", "block_id": "demo", "base_revision": 0,
+                               "upsert": {"rows": [{"id": "a", "label": "A", "values": {}}]}}, first.model_dump(mode="json"))
+    final = compile_command({"op": "complete", "block_id": "demo", "base_revision": 1}, patched.model_dump(mode="json"))
+    assert final.props.interaction == interaction
+    assert first.rows == []
+
+
+def test_presentation_mode_rejects_arbitrary_ui_instructions():
+    with pytest.raises(AppError):
+        compile_command(mount(props={"title": "数据", "interaction": "eval"}))
+
+
+def test_model_tool_schema_describes_the_actual_embedded_visual_contract():
+    from app.services.stream_ui import tool_definitions
+    schema = tool_definitions()[0]["function"]["parameters"]
+    definitions = schema["$defs"]
+    visual = definitions["EmbeddedVisual"]
+    assert visual["additionalProperties"] is False
+    assert set(visual["properties"]) == {"props", "rows", "nodes", "edges", "items"}
+    assert definitions["DocumentNode"]["properties"]["visual"]["anyOf"][0]["$ref"] == "#/$defs/EmbeddedVisual"
+    assert "title" in definitions["UIProps"]["required"]
+    assert "required" not in schema["properties"]["props"]  # patches may change only one prop
+    assert definitions["UIProps"]["additionalProperties"] is False
+    assert "toc" in schema["properties"]["props"]["properties"]
+    assert "unit" not in definitions["Series"]["properties"]

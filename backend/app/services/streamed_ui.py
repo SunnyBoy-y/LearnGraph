@@ -168,14 +168,19 @@ class UIArgumentStream:
                                 break
                             except (ValueError, UnicodeError):
                                 continue
-                    if "id" in node and node.get("type") in {"paragraph", "heading", "list", "quote", "code", "math"}:
+                    if ("id" in node and node.get("type") in {"paragraph", "heading", "list", "quote", "code", "math", "rail_item"}
+                            and (node.get("type") != "rail_item" or (node.get("parent_id") and str(node.get("label", "")).strip()))):
                         node["state"] = "streaming"
                         entries.append(node)
+                    elif "id" in node and node.get("type") in {"chart", "metric", "table", "graph", "diagram", "timeline"}:
+                        # Establish a stable slot before the data object closes.
+                        entries.append({key: node[key] for key in ("id", "parent_id", "type", "label") if key in node} | {"state": "pending"})
             if entries:
                 command["upsert"][collection] = entries
         # Bound persistence/SSE volume for token-sized chunks, but publish each
         # completed record immediately, even if the next record has not started.
-        if self.last is not None and count == self.last_count and self.since_emit < 128:
+        if (self.last is not None and count == self.last_count and self.since_emit < 128
+                and command["props"] == self.last.get("props")):
             return None
         candidate = copy.deepcopy(command)
         if candidate == self.last:

@@ -1,0 +1,49 @@
+/* Semantic layout choices shared by prose and registered document blocks. */
+:root {
+  --genui-reading-width: 800px;
+  --genui-body-leading: 1.7;
+  --genui-section-gap: 36px;
+}
+.stream-ui[data-density="compact"] { --genui-body-leading: 1.65; --genui-section-gap: 24px; --genui-flow-gap: 12px; }
+.stream-ui[data-density="comfortable"] { --genui-flow-gap: 18px; }
+.stream-ui[data-density="editorial"] { --genui-body-leading: 1.75; --genui-section-gap: 40px; --genui-flow-gap: 22px; }
+.stream-ui[data-width="reading"] { max-width: var(--genui-reading-width); margin-inline: auto; }
+.stream-ui .rich-doc { line-height: var(--genui-body-leading); }
+.stream-ui .rich-doc__flow, .stream-ui .rich-doc__stack, .stream-ui .rich-doc__section { row-gap: var(--genui-flow-gap, 18px); }
+.stream-ui .rich-doc :is(h2,h3,h4,h5,h6) { line-height: 1.4; scroll-margin-top: 80px; text-wrap: balance; }
+.stream-ui .rich-doc h2 { font-size: 21px; }
+.stream-ui .rich-doc h3 { font-size: 17px; }
+.message-component.stream-ui .rich-doc .rich-doc__node > :is(h2,h3,h4,h5,h6) { margin-block: 0; }
+.stream-ui .rich-doc .stream-ui .stream-ui__title { margin: 0; font-size: 16px; line-height: 1.5; }
+.stream-ui .rich-doc__node:has(>h2):not(:first-child) { margin-block-start: calc(var(--genui-section-gap) - var(--genui-flow-gap, 18px)); }
+.stream-ui .rich-doc p { text-wrap: pretty; }
+/* Scoped above prose selectors so navigation never inherits article list/link styles. */
+.message-component.stream-ui .rich-doc .rich-doc__toc { border-block:1px solid var(--border); padding:0; color:var(--muted-foreground); font-size:13px; }
+.message-component.stream-ui .rich-doc .rich-doc__toc details { border:0; padding:0; margin:0; }
+.message-component.stream-ui .rich-doc .rich-doc__toc summary { display:flex; align-items:center; gap:9px; min-height:44px; padding:8px 0; margin:0; font-size:13px; line-height:1.5; list-style:none; user-select:none; }
+.message-component.stream-ui .rich-doc .rich-doc__toc summary::-webkit-details-marker { display:none; }
+.message-component.stream-ui .rich-doc .rich-doc__toc-title { color:var(--foreground); font-weight:600; }
+.message-component.stream-ui .rich-doc .rich-doc__toc-count { margin-left:auto; font-size:12px; color:var(--muted-foreground); font-variant-numeric:tabular-nums; }
+.rich-doc__toc-chevron { transition:transform .16s ease; }
+.rich-doc__toc details[open] .rich-doc__toc-chevron { transform:rotate(180deg); }
+.message-component.stream-ui .rich-doc .rich-doc__toc ol { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px 18px; padding:0 0 12px; margin:0; list-style:none; }
+.message-component.stream-ui .rich-doc .rich-doc__toc li { min-width:0; padding:0 0 0 calc(var(--toc-indent,0)*12px); margin:0; list-style:none; }
+.message-component.stream-ui .rich-doc .rich-doc__toc a { display:grid; grid-template-columns:24px minmax(0,1fr); gap:9px; align-items:baseline; min-height:44px; padding:10px 9px; border-radius:6px; color:var(--muted-foreground); font-size:14px; line-height:1.6; font-weight:400; text-decoration:none; overflow-wrap:anywhere; transition:background-color .16s ease,color .16s ease; }
+.message-component.stream-ui .rich-doc .rich-doc__toc a:hover { background:var(--muted); color:var(--foreground); }
+.message-component.stream-ui .rich-doc .rich-doc__toc a[aria-current=location] { color:var(--genui-accent); background:color-mix(in srgb,var(--genui-accent) 6%,transparent); }
+.rich-doc__toc-number { color:var(--muted-foreground); font-size:12px; font-variant-numeric:tabular-nums; opacity:.75; }
+.rich-doc__toc a[aria-current=location] .rich-doc__toc-number { color:inherit; opacity:1; }
+@media(prefers-reduced-motion:reduce) { .rich-doc__toc-chevron,.message-component.stream-ui .rich-doc .rich-doc__toc a { transition:none; } }
+.rich-doc__tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px; color: var(--muted-foreground); font-size: 12px; }
+.stream-ui[data-ui-component="chart"]:has(.stream-ui__empty) .stream-ui__empty { min-height: clamp(160px, 35vw, 280px); }
+.rich-doc__node:has(>[role="status"]) { min-height: 100px; }
+.rich-doc__resource--chart { min-height: clamp(240px, 48vw, 380px); }
+.rich-doc__resource--metric { min-height: 130px; }
+.stream-ui--embedded .stream-ui__footer { padding: 4px 0; border: 0; }
+@media (max-width: 560px) {
+  .message-component.stream-ui .rich-doc .rich-doc__toc ol { grid-template-columns:minmax(0,1fr); gap:2px; }
+  .stream-ui .rich-doc h2 { font-size: 20px; }
+}
+@media print {
+  .rich-doc__tools, .stream-ui__toolbar { display: none; }
+}

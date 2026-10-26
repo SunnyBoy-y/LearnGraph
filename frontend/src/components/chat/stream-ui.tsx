@@ -1,18 +1,11 @@
-import { Component, lazy, Suspense, useId, useMemo, useRef, useState } from "react";
+import { Component, lazy, Suspense, useMemo, useState } from "react";
 import type {
   ComponentType,
   CSSProperties,
-  PointerEvent,
   ReactNode,
 } from "react";
 import {
-  CalendarDays,
-  FileText,
-  ChartNoAxesCombined,
-  Network,
-  ShieldCheck,
   Sparkles,
-  Table2,
 } from "lucide-react";
 import type { TrustedComponentAction } from "./trusted-component-renderer";
 import { Badge } from "@/components/ui/badge";
@@ -25,14 +18,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { parseUISnapshot } from "@/lib/stream-ui";
+import { committedNumericPreview, parseUISnapshot } from "@/lib/stream-ui";
 import type { UISnapshot } from "@/lib/stream-ui";
 import type { MessagePart } from "@/types/sessions";
 import {
   StreamUIStateScope,
   useStreamUIState,
+  streamUIViewState,
 } from "@/lib/stream-ui-local-state";
+import { GraphCanvas } from "./graph-canvas";
+import { presentation } from "@/genui/presentation-simplifier";
 import "./stream-ui.css";
+import "@/genui/layout-tokens.css";
 
 type ViewProps = {
   snapshot: UISnapshot;
@@ -40,9 +37,10 @@ type ViewProps = {
   failed?: boolean;
   settled?: boolean;
   onExplain?: (nodeId?: string) => void;
+  onBlockExplain?: (blockId: string, payload: Record<string, unknown>) => void;
 };
 const COLORS = [
-  "var(--chart-1)",
+  "var(--genui-accent)",
   "var(--chart-2)",
   "var(--chart-3)",
   "var(--chart-4)",
@@ -62,11 +60,13 @@ function ChartView({ snapshot: s }: ViewProps) {
     "hovered",
     null,
   );
+  const [focused, setFocused] = useState<string | null>(null);
   const [limit, setLimit] = useStreamUIState("limit", 500);
+  const staticChart = s.props.interaction === "static";
   const columns = s.props.columns.filter(
-    (column) => !hidden.includes(column.key),
+    (column) => staticChart || !hidden.includes(column.key),
   );
-  const rows = s.rows.slice(-limit);
+  const rows = staticChart ? s.rows : s.rows.slice(-limit);
   const values = rows.flatMap((row) =>
     columns.flatMap((column) =>
       typeof row.values[column.key] === "number"
@@ -79,10 +79,20 @@ function ChartView({ snapshot: s }: ViewProps) {
   const x = (index: number) =>
     52 + ((index + 0.5) / Math.max(1, rows.length)) * 620;
   const y = (value: number) => 236 - ((value - min) / (max - min)) * 202;
-  const active = rows.find((row) => row.id === hovered);
-  const chartType = mode ?? s.props.chart_type;
+  const active = rows.find((row) => row.id === (focused ?? hovered));
+  const chartType = staticChart ? s.props.chart_type : mode ?? s.props.chart_type;
+  const first = rows[0], last = rows.at(-1), single = columns.length === 1 ? columns[0] : null;
+  const start = single && first?.values[single.key], end = single && last?.values[single.key];
+  const change = typeof start === "number" && typeof end === "number" && start > 0 ? (end - start) / start * 100 : null;
+  const insight = single && typeof end === "number" ? `${last!.label} · ${single.label} ${format(end)}${s.props.unit}${change != null && rows.length > 1 ? `，较${first.label}${change >= 0 ? "增加" : "减少"} ${format(Math.abs(end - (start as number)))}${s.props.unit}` : ""}` : "";
   return (
     <>
+      <div className="stream-ui__chart-context">
+        <span>{[s.props.time_range, s.props.unit && `单位：${s.props.unit}`].filter(Boolean).join(" · ")}</span>
+        {change != null && rows.length > 1 && <strong>{change > 0 ? "+" : ""}{Number(change.toFixed(1))}%</strong>}
+      </div>
+      {s.props.interaction !== "static" && <details className="stream-ui__explore" open={s.props.interaction === "explore" || undefined}>
+      <summary>探索图表</summary>
       <div className="stream-ui__toolbar">
         <div className="stream-ui__segmented" aria-label="图表类型">
           {(["line", "bar"] as const).map((type) => (
@@ -111,6 +121,7 @@ function ChartView({ snapshot: s }: ViewProps) {
               <SelectItem value="500">全部</SelectItem>
               <SelectItem value="10">最近 10 项</SelectItem>
               <SelectItem value="5">最近 5 项</SelectItem>
+              <SelectItem value="3">最近 3 项</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -136,8 +147,10 @@ function ChartView({ snapshot: s }: ViewProps) {
           </Button>
         ))}
       </div>
+      </details>}
+      {s.props.columns.length > 1 && <div className="stream-ui__series" aria-label="数据系列">{s.props.columns.map((column,index)=><span key={column.key} data-hidden={!staticChart && hidden.includes(column.key)}><i style={{background:COLORS[index % COLORS.length]}} />{column.label}</span>)}</div>}
       {!rows.length ? (
-        <Empty />
+        <Empty settled={s.state === "completed"} />
       ) : (
         <>
           <svg
@@ -146,8 +159,8 @@ function ChartView({ snapshot: s }: ViewProps) {
             role="img"
             aria-label={s.props.title}
           >
-            {[0, 1, 2, 3, 4].map((tick) => {
-              const value = min + ((max - min) * tick) / 4;
+            {[0, 1, 2].map((tick) => {
+              const value = min + ((max - min) * tick) / 2;
               return (
                 <g key={tick}>
                   <line
@@ -157,7 +170,7 @@ function ChartView({ snapshot: s }: ViewProps) {
                     y2={y(value)}
                     className="stream-ui__grid"
                   />
-                  <text x={44} y={y(value) + 4} textAnchor="end">
+                  <text x={48} y={y(value) + 4} textAnchor="end">
                     {Intl.NumberFormat("zh", { notation: "compact" }).format(
                       value,
                     )}
@@ -192,7 +205,7 @@ function ChartView({ snapshot: s }: ViewProps) {
                       d={path}
                       fill="none"
                       stroke="currentColor"
-                      strokeWidth={2.5}
+                      strokeWidth={3}
                     />
                   )}
                   {rows.map((row, index) => {
@@ -207,8 +220,10 @@ function ChartView({ snapshot: s }: ViewProps) {
                         key={row.id}
                         cx={x(index)}
                         cy={y(value)}
-                        r={4}
+                        r={index === rows.length - 1 || row.id === (focused ?? hovered) ? 5 : 0}
                         fill="currentColor"
+                        stroke="var(--background)"
+                        strokeWidth={2}
                       >
                         <title>
                           {row.label}: {column.label} {format(value)}
@@ -236,11 +251,14 @@ function ChartView({ snapshot: s }: ViewProps) {
                 </g>
               );
             })}
+            {columns.length === 1 && rows.length > 0 && typeof rows.at(-1)!.values[columns[0].key] === "number" && <text className="stream-ui__endpoint" x={x(rows.length - 1)} y={y(rows.at(-1)!.values[columns[0].key] as number) - 14} textAnchor="middle">{format(rows.at(-1)!.values[columns[0].key])}</text>}
             {rows.map((row, index) => (
               <g
                 key={row.id}
                 onPointerEnter={() => setHovered(row.id)}
-                onFocus={() => setHovered(row.id)}
+                onPointerLeave={() => setHovered(null)}
+                onBlur={() => setFocused(null)}
+                onFocus={() => setFocused(row.id)}
                 tabIndex={0}
                 role="button"
                 aria-label={`${row.label}: ${columns.map((c) => `${c.label} ${format(row.values[c.key])}`).join(", ")}`}
@@ -264,7 +282,7 @@ function ChartView({ snapshot: s }: ViewProps) {
           <div className="stream-ui__tooltip" role="status">
             {active
               ? `${active.label} · ${columns.map((c) => `${c.label} ${format(active.values[c.key])}${s.props.unit}`).join(" · ")}`
-              : "悬停或使用 Tab 查看数据；点击图例切换指标"}
+              : insight}
           </div>
         </>
       )}
@@ -277,199 +295,19 @@ function GraphView({ snapshot: s, onExplain }: ViewProps) {
     "selected",
     null,
   );
-  const [query, setQuery] = useStreamUIState("query", "");
-  const [zoom, setZoom] = useStreamUIState("zoom", 1);
-  const [positions, setPositions] = useStreamUIState<
-    Record<string, { x: number; y: number }>
-  >("positions", {});
-  const drag = useRef<{
-    id: string;
-    x: number;
-    y: number;
-    startX: number;
-    startY: number;
-    moved: boolean;
-  } | null>(null);
-  const svg = useRef<SVGSVGElement>(null);
-  const marker = useId().replace(/:/g, "");
-  const point = (id: string) =>
-    positions[id] ?? {
-      x: 110 + (s.nodes.findIndex((node) => node.id === id) % 3) * 240,
-      y: 70 + Math.floor(s.nodes.findIndex((node) => node.id === id) / 3) * 130,
-    };
-  const height = Math.max(240, Math.ceil(s.nodes.length / 3) * 130 + 40);
   const selectedNode = s.nodes.find((node) => node.id === selected);
-  function move(event: PointerEvent<SVGGElement>) {
-    const state = drag.current;
-    if (!state || !svg.current) return;
-    const transform = svg.current.getScreenCTM()?.inverse();
-    if (!transform) return;
-    const cursor = new DOMPoint(event.clientX, event.clientY).matrixTransform(
-      transform,
-    );
-    if (
-      !state.moved &&
-      Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < 4
-    )
-      return;
-    state.moved = true;
-    setPositions((current) => ({
-      ...current,
-      [state.id]: {
-        x: Math.max(75, Math.min(665, cursor.x / zoom - state.x)),
-        y: Math.max(25, Math.min(height - 25, cursor.y / zoom - state.y)),
-      },
-    }));
-  }
+  const chain = presentation(s).chain;
+  if (chain) return <div className="stream-ui__linear" data-presentation="linear">
+    <ol aria-label={s.props.title}>{chain.map((node, i) => <li key={node.id}>
+      {i > 0 && <span className="stream-ui__flow-arrow" aria-hidden="true">→</span>}
+      <button type="button" aria-pressed={selected === node.id} onClick={() => setSelected(node.id)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") {event.preventDefault(); setSelected(node.id);} }}>{node.label}</button>
+      {i > 0 && s.edges.find(e => e.target === node.id)?.label && <small>{s.edges.find(e => e.target === node.id)?.label}</small>}
+    </li>)}</ol>
+    {selectedNode && <div className="stream-ui__flow-detail"><strong>{selectedNode.label}</strong><p>{selectedNode.description || selectedNode.group}</p>{onExplain && <Button size="sm" variant="ghost" onClick={() => onExplain(selectedNode.id)}>让 AI 解释此节点</Button>}</div>}
+  </div>;
   return (
     <>
-      <div className="stream-ui__toolbar">
-        <Input
-          className="stream-ui__search"
-          aria-label="查找节点"
-          placeholder="查找节点…"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-        />
-        <label>
-          缩放{" "}
-          <input
-            aria-label="图谱缩放"
-            type="range"
-            min="0.5"
-            max="1.8"
-            step="0.1"
-            value={zoom}
-            onChange={(event) => setZoom(Number(event.target.value))}
-          />
-        </label>
-        <Button
-          size="sm"
-          variant="outline"
-          type="button"
-          onClick={() => {
-            setPositions({});
-            setZoom(1);
-            setQuery("");
-          }}
-        >
-          重置
-        </Button>
-      </div>
-      {!s.nodes.length ? (
-        <Empty />
-      ) : (
-        <div className="stream-ui__graph-scroll">
-          <svg
-            ref={svg}
-            viewBox={`0 0 760 ${height}`}
-            style={{ minHeight: Math.min(height, 480) }}
-            role="group"
-            aria-label={s.props.title}
-          >
-            <defs>
-              <marker
-                id={marker}
-                markerWidth="8"
-                markerHeight="8"
-                refX="7"
-                refY="4"
-                orient="auto"
-              >
-                <path d="M0,0 L8,4 L0,8" fill="var(--muted-foreground)" />
-              </marker>
-            </defs>
-            <g transform={`scale(${zoom})`}>
-              {s.edges.map((edge) => {
-                const a = point(edge.source),
-                  b = point(edge.target);
-                const length = Math.hypot(b.x - a.x, b.y - a.y) || 1;
-                const trim = Math.min(70, length * 0.35);
-                return (
-                  <g key={edge.id} className="stream-ui__edge">
-                    <line
-                      x1={a.x + ((b.x - a.x) / length) * trim}
-                      y1={a.y + ((b.y - a.y) / length) * trim}
-                      x2={b.x - ((b.x - a.x) / length) * trim}
-                      y2={b.y - ((b.y - a.y) / length) * trim}
-                      markerEnd={`url(#${marker})`}
-                    />
-                    <text
-                      x={(a.x + b.x) / 2}
-                      y={(a.y + b.y) / 2 - 7}
-                      textAnchor="middle"
-                    >
-                      {edge.label}
-                    </text>
-                  </g>
-                );
-              })}
-              {s.nodes.map((node) => {
-                const p = point(node.id);
-                return (
-                  <g
-                    key={node.id}
-                    transform={`translate(${p.x} ${p.y})`}
-                    className="stream-ui__node"
-                    data-selected={selected === node.id}
-                    opacity={
-                      !query ||
-                      `${node.label} ${node.group}`
-                        .toLowerCase()
-                        .includes(query.toLowerCase())
-                        ? 1
-                        : 0.2
-                    }
-                    role="button"
-                    tabIndex={0}
-                    aria-label={node.label}
-                    aria-pressed={selected === node.id}
-                    onPointerDown={(event) => {
-                      const transform = svg.current?.getScreenCTM()?.inverse();
-                      if (!transform) return;
-                      const cursor = new DOMPoint(
-                        event.clientX,
-                        event.clientY,
-                      ).matrixTransform(transform);
-                      drag.current = {
-                        id: node.id,
-                        startX: event.clientX,
-                        startY: event.clientY,
-                        x: cursor.x / zoom - p.x,
-                        y: cursor.y / zoom - p.y,
-                        moved: false,
-                      };
-                      event.currentTarget.setPointerCapture(event.pointerId);
-                    }}
-                    onPointerMove={move}
-                    onPointerUp={() => {
-                      if (!drag.current?.moved) setSelected(node.id);
-                      drag.current = null;
-                    }}
-                    onPointerCancel={() => {
-                      drag.current = null;
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        setSelected(node.id);
-                      }
-                    }}
-                  >
-                    <rect x={-70} y={-22} width={140} height={44} rx={12} />
-                    <text textAnchor="middle" dy=".35em">
-                      {node.label.length > 12
-                        ? `${node.label.slice(0, 11)}…`
-                        : node.label}
-                    </text>
-                    <title>{node.label}</title>
-                  </g>
-                );
-              })}
-            </g>
-          </svg>
-        </div>
-      )}
+      <GraphCanvas snapshot={s} selected={selected} onSelect={setSelected} />
       {selectedNode && (
         <aside className="stream-ui__detail">
           <strong>{selectedNode.label}</strong>
@@ -505,14 +343,15 @@ function TableView({ snapshot: s }: ViewProps) {
     key: string;
     descending: boolean;
   } | null>("sort", null);
+  const explore = presentation(s).tableExplore;
   const rows = s.rows
-    .filter((row) =>
+    .filter((row) => !explore ||
       `${row.label} ${Object.values(row.values).join(" ")}`
         .toLowerCase()
         .includes(query.toLowerCase()),
     )
     .toSorted((a, b) => {
-      if (!sort) return 0;
+      if (!explore || !sort) return 0;
       const left = a.values[sort.key],
         right = b.values[sort.key];
       const result =
@@ -523,16 +362,17 @@ function TableView({ snapshot: s }: ViewProps) {
     });
   return (
     <>
-      <div className="stream-ui__toolbar">
+      {explore && <div className="stream-ui__toolbar">
         <Input
           className="stream-ui__search"
           aria-label="筛选表格"
+          maxLength={500}
           placeholder="筛选数据…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
         <span>{rows.length} 项</span>
-      </div>
+      </div>}
       <div className="stream-ui__table-scroll">
         <table>
           <thead>
@@ -543,14 +383,14 @@ function TableView({ snapshot: s }: ViewProps) {
                   scope="col"
                   key={column.key}
                   aria-sort={
-                    sort?.key === column.key
+                    explore && sort?.key === column.key
                       ? sort.descending
                         ? "descending"
                         : "ascending"
                       : "none"
                   }
                 >
-                  <Button
+                  {explore ? <Button
                     size="xs"
                     variant="ghost"
                     type="button"
@@ -568,7 +408,7 @@ function TableView({ snapshot: s }: ViewProps) {
                         ? "↓"
                         : "↑"
                       : "↕"}
-                  </Button>
+                  </Button> : column.label}
                 </th>
               ))}
             </tr>
@@ -585,28 +425,18 @@ function TableView({ snapshot: s }: ViewProps) {
           </tbody>
         </table>
       </div>
-      {!rows.length && <Empty />}
+      {!rows.length && <Empty settled={s.state === "completed"} />}
     </>
   );
 }
 
 function TimelineView({ snapshot: s }: ViewProps) {
-  return s.items.length ? (
-    <ol className="stream-ui__timeline">
-      {s.items.map((item) => (
-        <li key={item.id}>
-          <time>{item.date}</time>
-          <details>
-            <summary>{item.label}</summary>
-            <p>{item.description}</p>
-            {item.value != null && <span>{format(item.value)}</span>}
-          </details>
-        </li>
-      ))}
-    </ol>
-  ) : (
-    <Empty />
-  );
+  return s.items.length ? <ol className="stream-ui__events" aria-label="阶段安排">
+    {s.items.map(item => <li key={item.id}>
+      {item.date && <time>{item.date}</time>}
+      <div><strong>{item.label}</strong>{item.description && <p>{item.description}</p>}{item.value != null && <small>{format(item.value)}</small>}</div>
+    </li>)}
+  </ol> : <Empty settled={s.state === "completed"} />;
 }
 
 function MetricView({ snapshot: s }: ViewProps) {
@@ -617,27 +447,32 @@ function MetricView({ snapshot: s }: ViewProps) {
         { "--metric-columns": Math.min(s.items.length, 3) } as CSSProperties
       }
     >
-      {s.items.map((item) => (
-        <li className="metric-card__item" key={item.id}>
+      {s.items.map((item, index) => {
+        // Models may include a unit in a string-valued metric. Keep that unit
+        // subordinate without changing the saved value or action context.
+        const split = typeof item.value === "string" ? item.value.match(/^([约≈]?\s*[+−-]?\d[\d,]*(?:\.\d+)?)\s*(人(?:\/月)?|个月|月|天|年|次|个|元|万元|%|GB|MB|KB|ms|s|小时|分钟|秒)$/u) : null;
+        const value = split ? split[1] + (split[2] === "%" ? "%" : "") : format(item.value);
+        const unit = split ? split[2] === "%" ? "" : split[2] : s.props.unit;
+        return <li className="metric-card__item" data-emphasis={index === 0 ? "primary" : index === 1 ? "secondary" : "context"} key={item.id}>
           <span className="metric-card__label">{item.label}</span>
           <strong className="metric-card__value">
-            <span>{format(item.value)}</span>
-            <small>{s.props.unit}</small>
+            <span>{value}</span>
+            {unit && <small>{unit}</small>}
           </strong>
           {item.description && (
             <small className="metric-card__hint">{item.description}</small>
           )}
-        </li>
-      ))}
+        </li>;
+      })}
     </ul>
   ) : (
-    <Empty />
+    <Empty settled={s.state === "completed"} />
   );
 }
-function Empty() {
+function Empty({settled = false}: {settled?: boolean}) {
   return (
     <div className="stream-ui__empty" role="status">
-      等待数据填充…
+      {settled ? "暂无可显示的数据" : "等待数据填充…"}
     </div>
   );
 }
@@ -651,15 +486,6 @@ const UI_REGISTRY: Record<UISnapshot["component"], ComponentType<ViewProps>> = {
   metric: MetricView,
   document: lazy(() => import("./rich-document")),
 };
-const UI_ICONS = {
-  chart: ChartNoAxesCombined,
-  graph: Network,
-  table: Table2,
-  timeline: CalendarDays,
-  metric: ShieldCheck,
-  document: FileText,
-};
-
 class UIErrorBoundary extends Component<
   { children: ReactNode },
   { failed: boolean }
@@ -699,14 +525,14 @@ function ValidatedUI({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const View = UI_REGISTRY[snapshot.component];
-  const Icon = UI_ICONS[snapshot.component];
+
   const canExplain =
     interactive &&
     !failed &&
     snapshot.state === "completed" &&
     !!onAction &&
     !busy;
-  async function explain(nodeId?: string) {
+  async function explain(nodeId?: string, blockId?: string, viewState?: Record<string, unknown>) {
     if (!canExplain) return;
     setBusy(true);
     setError("");
@@ -714,10 +540,12 @@ function ValidatedUI({
       await onAction?.({
         componentId: partId,
         componentType: "stream_ui",
-        event: nodeId ? "graph.node.explain" : "explain",
+        event: blockId ? "document.block.explain" : nodeId ? "graph.node.explain" : "explain",
         payload: {
           revision: snapshot.revision,
           ...(nodeId ? { node_id: nodeId } : {}),
+          ...(blockId ? {block_id: blockId} : {}),
+          ...(viewState ? {view_state: viewState} : ["chart", "table"].includes(snapshot.component) ? {view_state: streamUIViewState(`${partId}:${snapshot.component}`)} : {}),
         },
       });
     } catch (error) {
@@ -730,6 +558,9 @@ function ValidatedUI({
     <section
       className={`message-component stream-ui${snapshot.component === "document" ? " stream-ui--document" : ""}${embedded ? " stream-ui--embedded" : ""}`}
       data-ui-component={snapshot.component}
+      data-presentation={presentation(snapshot).form}
+      data-density={snapshot.props.density}
+      data-width={snapshot.props.width}
       aria-label={snapshot.props.title}
       aria-busy={snapshot.state === "streaming" && !failed}
     >
@@ -737,16 +568,11 @@ function ValidatedUI({
         {failed || settled ? "内容生成中断，显示已接收部分" : "内容正在生成…"}
       </p>}
       {snapshot.component !== "document" && <header className="stream-ui__heading">
-        {snapshot.component !== "metric" && (
-          <Icon className="size-4 shrink-0" aria-hidden="true" />
-        )}
         <div className="stream-ui__heading-copy">
           <h3 className="stream-ui__title">{snapshot.props.title}</h3>
           {snapshot.props.description && <p>{snapshot.props.description}</p>}
         </div>
-        {(snapshot.component !== "metric" ||
-          snapshot.state === "streaming" ||
-          failed) && (
+        {(snapshot.state === "streaming" || failed) && (
           <Badge
             variant="secondary"
             className="stream-ui__status"
@@ -754,9 +580,7 @@ function ValidatedUI({
           >
             {failed
               ? "生成中断"
-              : snapshot.state === "streaming"
-                ? "正在填充"
-                : "可交互"}
+              : "正在填充"}
           </Badge>
         )}
       </header>}
@@ -772,13 +596,18 @@ function ValidatedUI({
               }
             : undefined
         }
+        onBlockExplain={canExplain ? (blockId, payload) => { void explain(
+          typeof payload.node_id === "string" ? payload.node_id : undefined,
+          blockId,
+          payload.view_state && typeof payload.view_state === "object" ? payload.view_state as Record<string, unknown> : undefined,
+        ); } : undefined}
       /></Suspense>
       {failed && snapshot.component === "document" && <p className="rich-doc__caption" role="status">生成已中断，已生成内容仍可操作。</p>}
-      {!embedded && snapshot.component !== "document" && <footer className="stream-ui__footer">
-        <span>{snapshot.props.source_note}</span>
-        <Button
+      {snapshot.component !== "document" && (!embedded || onAction || snapshot.props.source_note || snapshot.props.data_kind === "example") && <footer className="stream-ui__footer">
+        <span>{[snapshot.props.data_kind === "example" ? "示例数据" : "", snapshot.props.source_note, snapshot.component !== "chart" ? snapshot.props.time_range : ""].filter(Boolean).join(" · ")}</span>
+        {onAction && <Button
           size="sm"
-          variant={snapshot.component === "metric" ? "ghost" : "default"}
+          variant="ghost"
           type="button"
           disabled={!canExplain}
           onClick={() => {
@@ -787,7 +616,7 @@ function ValidatedUI({
         >
           <Sparkles aria-hidden="true" />
           {busy ? "正在提交…" : "让 AI 解释"}
-        </Button>
+        </Button>}
       </footer>}
       {error && <p role="alert">{error}</p>}
     </section>
@@ -813,7 +642,10 @@ export function StreamUI({
   embedded?: boolean;
   settled?: boolean;
 }) {
-  const snapshot = useMemo(() => parseUISnapshot(data), [data]);
+  const snapshot = useMemo(() => {
+    const parsed = parseUISnapshot(data);
+    return parsed ? committedNumericPreview(parsed) : null;
+  }, [data]);
   if (!snapshot)
     return (
       <p className="stream-ui__invalid" role="alert">

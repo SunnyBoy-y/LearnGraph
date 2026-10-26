@@ -14,6 +14,22 @@ COMMAND = {"op": "mount", "block_id": "doc", "component": "document", "props": {
                                   {"id": "later", "parent_id": "root", "type": "paragraph", "text": "第二段"}]}}
 
 
+def test_graph_stream_exposes_background_before_nodes_arrive():
+    raw = json.dumps({"op": "mount", "block_id": "map", "component": "graph",
+        "props": {"title": "思维导图", "background": "warm", "graph_layout": "mindmap", "interaction": "explore"},
+        "upsert": {"nodes": [{"id": "root", "label": "根节点"}], "edges": []}}, ensure_ascii=False)
+    stream, seen = UIArgumentStream(), []
+    for char in raw:
+        command = stream.feed(char)
+        if command:
+            seen.append(compile_command(command))
+    assert not stream.disabled
+    assert any(s.props.background == "warm" and not s.nodes for s in seen)
+    assert seen[-1].props.background == "warm"
+    assert seen[-1].props.graph_layout == "mindmap"
+    assert seen[-1].nodes[0].label == "根节点"
+
+
 @pytest.mark.parametrize("chunk", [1, 3, 17, 128, 4000])
 def test_preview_unicode_strings_and_records_before_call_finishes(chunk):
     raw = json.dumps(COMMAND, ensure_ascii=True)

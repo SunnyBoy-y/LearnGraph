@@ -35,6 +35,7 @@ import {
   listSessionFiles,
   listSessionMessages,
   listSessions,
+  listSettings,
   streamSessionMessage,
 } from "@/api";
 import {
@@ -64,6 +65,7 @@ import {
 } from "./selection-explanation";
 import { createUuid } from "@/lib/uuid";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { readChatThinkingChainDefault } from "@/lib/workspace-settings";
 import { resolveFilePreviewKind, type FilePreviewKind } from "@/lib/file-preview";
 import type { SessionFile } from "@/types/files";
 import type {
@@ -207,6 +209,8 @@ export function SideConversationRail({
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const settings = useQuery({ queryKey: workspaceQueryKey(workspaceId, "settings"), queryFn: listSettings, staleTime: 30_000 });
+  const thinkingChainDefaultOpen = readChatThinkingChainDefault(settings.data);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const streamHandlesRef = useRef<Map<string, RailStreamHandle>>(new Map());
   const mountedRef = useRef(true);
@@ -868,7 +872,7 @@ export function SideConversationRail({
                 <div className="right-rail-empty is-error">对话读取失败，请稍后重试。</div>
               ) : messages.data?.length ? (
                 messages.data.map((message) => (
-                  <RailConversationMessage key={message.id} message={message} onAction={handleRailAction} />
+                  <RailConversationMessage key={message.id} message={message} onAction={handleRailAction} thinkingChainDefaultOpen={thinkingChainDefaultOpen} />
                 ))
               ) : (
                 <div className="right-rail-empty"><MessageCircle className="size-4" /><strong>这个会话还没有消息</strong><span>在下方输入问题即可开始侧边问答。</span></div>

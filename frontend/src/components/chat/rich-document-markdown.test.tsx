@@ -1,5 +1,5 @@
 import "@/test/pdfjs-polyfills";
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "@/test/render";
 import { MessagePartRenderer, TextWithCitations } from "./message-part-renderer";
@@ -8,6 +8,15 @@ import type { MessagePart } from "@/types/sessions";
 vi.mock("@/features/auth/auth-context-value", () => ({ useAuth: () => ({ workspaceId: "ws-test" }) }));
 
 describe("document nodes reuse the product Markdown pipeline", () => {
+  it("renders already-delimited math nodes with KaTeX instead of nested math errors", async () => {
+    const {container} = renderWithProviders(<MessagePartRenderer part={{id:"math-regression",type:"ui",status:"completed",data:{
+      protocol:"suip/0.1",component:"document",block_id:"formula-regression",revision:1,state:"completed",props:{title:"公式"},
+      blocks:[{id:"formula",type:"math",text:String.raw`$$t_{\text{catch}} = \frac{d}{v_{\text{me}}-v_{\text{question}}}$$`}],
+    }}} />);
+    await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+    expect(container.querySelector(".katex-error")).toBeNull();
+    expect(container.querySelector("annotation")?.textContent).not.toContain("$$");
+  });
   it("resolves source references inside layouts with the existing citation component", async () => {
     const ui: MessagePart = {id:"document-citation",type:"ui",status:"completed",data:{
       protocol:"suip/0.1",component:"document",block_id:"citations",revision:1,state:"completed",props:{title:"说明"},

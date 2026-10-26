@@ -14,9 +14,11 @@ def safe_id(value: str) -> str:
 
 
 Id = Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$"), AfterValidator(safe_id)]
+SourceKey = Annotated[str, Field(min_length=1, max_length=100), AfterValidator(safe_id)]
 Text = Annotated[str, Field(max_length=2000)]
 Scalar = Annotated[str, Field(max_length=2000)] | float | bool | None
 Component = Literal["chart", "graph", "timeline", "table", "metric", "document"]
+RailIcon = Literal["zap", "brain-circuit", "search", "layers", "shield", "lightbulb", "circle-dot", "check-check", "blocks", "sliders", "file-text", "database", "chart", "book-open", "target", "code"]
 
 
 class StrictModel(BaseModel):
@@ -28,6 +30,15 @@ class Series(StrictModel):
     label: Annotated[str, Field(min_length=1, max_length=100)]
 
 
+class DataReference(StrictModel):
+    """A collection in a saved tool result, resolved within this conversation."""
+    part_id: Id
+    path: Annotated[list[SourceKey | Annotated[int, Field(ge=0, le=10000)]], Field(max_length=6)] = Field(default_factory=list)
+    label_key: SourceKey | None = None
+    id_key: SourceKey | None = None
+    value_keys: Annotated[dict[Id, SourceKey], Field(max_length=12)] = Field(default_factory=dict)
+
+
 class Props(StrictModel):
     title: Annotated[str, Field(min_length=1, max_length=240)]
     description: Text = ""
@@ -36,6 +47,16 @@ class Props(StrictModel):
     unit: Annotated[str, Field(max_length=40)] = ""
     # Real-world sources or an explicit example label are displayed with the UI.
     source_note: Annotated[str, Field(max_length=500)] = ""
+    density: Literal["compact", "comfortable", "editorial"] = "comfortable"
+    width: Literal["reading", "full"] = "reading"
+    toc: bool = False
+    interaction: Literal["auto", "static", "explore"] = "auto"
+    background: Literal["auto", "paper", "warm", "cool", "dark"] = "auto"
+    graph_layout: Literal["flow", "mindmap"] = "flow"
+    data_ref: DataReference | None = None
+    # Example data must remain visibly identified after replay and export.
+    data_kind: Literal["provided", "example"] = "provided"
+    time_range: Annotated[str, Field(max_length=120)] = ""
 
 
 class Row(StrictModel):
@@ -89,8 +110,9 @@ class DocumentNode(StrictModel):
     type: Literal[
         "paragraph", "heading", "list", "quote", "code", "math", "table", "divider",
         "image", "image_group", "gallery", "figure", "chart", "diagram", "graph",
-        "timeline", "simulation", "interactive", "section", "stack", "row", "columns",
+        "timeline", "metric", "simulation", "interactive", "section", "stack", "row", "columns",
         "grid", "media_text", "tabs", "accordion",
+        "feature_list", "step_list", "status_list", "rail_item",
     ]
     text: Annotated[str, Field(max_length=16000)] = ""
     label: Annotated[str, Field(max_length=240)] = ""
@@ -109,12 +131,18 @@ class DocumentNode(StrictModel):
     inline: bool = False
     values: Annotated[list[Annotated[float, Field(ge=-1000, le=1000)]], Field(max_length=30)] = Field(default_factory=list)
     visual: dict[str, object] | None = None
+    icon: RailIcon | None = None
+    item_status: Literal["pending", "active", "completed", "error"] | None = None
     media: Annotated[list[Media], Field(max_length=6)] = Field(default_factory=list)
     resource_state: Literal["pending", "ready", "unavailable"] = "pending"
     resource_reason: Literal["", "ready", "no_results", "search_failed", "download_failed", "timeout", "disabled", "provider_unavailable", "capacity", "storage_failed"] = ""
 
     @model_validator(mode="after")
     def valid_visual(self):
+        if self.type == "rail_item" and not self.label.strip():
+            raise ValueError("Rail items require a title in label")
+        if self.type != "rail_item" and (self.icon is not None or self.item_status is not None):
+            raise ValueError("Icon and item_status belong to a rail_item")
         if self.type in {"image", "image_group", "gallery"} and self.media:
             # A pre-search caption describes a requested picture, not the
             # picture actually returned. Source metadata owns resolved labels.
@@ -125,14 +153,15 @@ class DocumentNode(StrictModel):
         if self.visual is not None:
             if set(self.visual) - {"props", "rows", "nodes", "edges", "items"}:
                 raise ValueError("Unexpected embedded visual fields")
-            if self.type not in {"chart", "table", "graph", "diagram", "timeline"}:
+            if self.type not in {"chart", "table", "graph", "diagram", "timeline", "metric"}:
                 raise ValueError("Visual data requires a visual node")
             component = "graph" if self.type == "diagram" else self.type
             Snapshot.model_validate({**self.visual, "component": component, "block_id": self.id})
         return self
 
 
-LAYOUT_TYPES = {"section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure"}
+RAIL_TYPES = {"feature_list", "step_list", "status_list"}
+LAYOUT_TYPES = {"section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure"} | RAIL_TYPES
 
 
 def validate_document(blocks: list[DocumentNode]):
@@ -140,6 +169,11 @@ def validate_document(blocks: list[DocumentNode]):
     if len(by_id) != len(blocks):
         raise ValueError("Duplicate document ids")
     for node in blocks:
+        parent_node = by_id.get(node.parent_id)
+        if node.type == "rail_item" and (parent_node is None or parent_node.type not in RAIL_TYPES):
+            raise ValueError("Rail items require a feature_list, step_list or status_list parent")
+        if parent_node and parent_node.type in RAIL_TYPES and node.type != "rail_item":
+            raise ValueError("Rail lists only accept rail_item children")
         seen = {node.id}
         parent = node.parent_id
         while parent is not None:
@@ -150,8 +184,10 @@ def validate_document(blocks: list[DocumentNode]):
                 raise ValueError("Only layout nodes can contain children")
             parent = by_id[parent].parent_id
     for parent in {node.parent_id for node in blocks}:
-        if sum(node.parent_id == parent for node in blocks) > 40:
-            raise ValueError("At most 40 children per container")
+        count = sum(node.parent_id == parent for node in blocks)
+        limit = 12 if parent in by_id and by_id[parent].type in RAIL_TYPES else 40
+        if count > limit:
+            raise ValueError(f"At most {limit} children per container")
     for node in blocks:
         if node.type in {"image", "image_group", "gallery"} and node.media:
             parent = node.parent_id
@@ -206,7 +242,7 @@ class Snapshot(Collections):
             raise ValueError("Edges must reference existing nodes")
         if self.component == "chart":
             keys = {column.key for column in self.props.columns}
-            if not keys:
+            if not keys and self.rows:
                 raise ValueError("Charts require columns")
             for row in self.rows:
                 if any(key not in keys or isinstance(value, bool) or not isinstance(value, (float, int))
@@ -217,7 +253,7 @@ class Snapshot(Collections):
 
 class Command(StrictModel):
     protocol: Literal["suip/0.1"] = "suip/0.1"
-    op: Literal["mount", "patch", "complete", "remove"]
+    op: Literal["mount", "patch", "revise", "complete", "remove"]
     block_id: Id
     base_revision: Annotated[int, Field(ge=0)] = 0
     component: Component | None = None
@@ -246,5 +282,25 @@ class Command(StrictModel):
 class UIAction(StrictModel):
     part_id: Annotated[str, Field(min_length=1, max_length=100)]
     revision: Annotated[int, Field(ge=0)]
-    action: Literal["explain", "graph.node.explain"]
+    action: Literal["explain", "graph.node.explain", "document.block.explain"]
     node_id: Id | None = None
+    block_id: Id | None = None
+    view_state: dict[Literal["mode", "hidden", "limit", "query", "sort"], object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bounded_view(self):
+        import json
+        if len(json.dumps(self.view_state, allow_nan=False)) > 4000:
+            raise ValueError("View state too large")
+        for key, value in self.view_state.items():
+            if key == "mode" and value not in (None, "line", "bar"):
+                raise ValueError("Invalid chart mode")
+            if key == "limit" and (type(value) is not int or value not in {3, 5, 10, 500}):
+                raise ValueError("Invalid range")
+            if key == "query" and (not isinstance(value, str) or len(value) > 500):
+                raise ValueError("Invalid filter")
+            if key == "hidden" and (not isinstance(value, list) or len(value) > 12 or any(not isinstance(item, str) or len(item) > 100 for item in value)):
+                raise ValueError("Invalid series selection")
+            if key == "sort" and value is not None and (not isinstance(value, dict) or set(value) != {"key", "descending"} or not isinstance(value["key"], str) or len(value["key"]) > 100 or type(value["descending"]) is not bool):
+                raise ValueError("Invalid sort")
+        return self

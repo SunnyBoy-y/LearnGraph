@@ -645,3 +645,13 @@ def test_diagnostic_timeout_distinguishes_queued_and_running_search(caplog, monk
     assert list(jobs.poll())[0][1].reason == "timeout"
     assert "phase=search" in caplog.text and "queue=2.00" in caplog.text
     assert key[2] not in caplog.text and not jobs.progress
+
+
+def test_document_catalog_example_compiles_with_the_runtime_schema():
+    import json
+    from app.services.rich_response import _DOCUMENT_CATALOG
+    from app.services.stream_ui import compile_command
+    example = next(line for line in _DOCUMENT_CATALOG.splitlines() if line.startswith('{"props":{"title":"分析报告"'))
+    snapshot = compile_command({"op": "mount", "block_id": "example", "component": "document", **json.loads(example)})
+    assert snapshot.props.toc is True
+    assert {"metric", "chart", "heading"} <= {node.type for node in snapshot.blocks}

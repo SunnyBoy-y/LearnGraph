@@ -14,6 +14,7 @@ function snapshot(component = "chart") {
     state: "streaming",
     props: {
       title: "项目活跃度",
+      interaction: "explore",
       columns: [
         { key: "commits", label: "提交量" },
         { key: "issues", label: "Issue" },
@@ -107,7 +108,7 @@ describe("stream UI", () => {
     ).toHaveAttribute("aria-pressed", "false");
     fireEvent.focus(screen.getByRole("button", { name: "1月: 提交量 38" }));
     expect(screen.getByText("1月 · 提交量 38")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "让 AI 解释" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "让 AI 解释" })).toBeNull();
   });
 
   it("selects graph nodes locally and emits a revision-bound explain action only on request", async () => {

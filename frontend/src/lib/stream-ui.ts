@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { parseIllustrationSvg } from "./safe-illustration";
+import { railIconSchema, railTypes } from "@/genui/rail-list-schema";
 
 const id = z
   .string()
@@ -15,6 +16,7 @@ const scalar = z.union([
   z.boolean(),
   z.null(),
 ]);
+const sourceKey = z.string().min(1).max(100).refine(value => !["__proto__", "prototype", "constructor"].includes(value));
 const column = z
   .object({ key: id, label: z.string().min(1).max(100) })
   .strict();
@@ -69,7 +71,8 @@ export const documentNodeSchema = z.object({
   revision: z.number().int().nonnegative().default(0),
   type: z.enum(["paragraph", "heading", "list", "quote", "code", "math", "table", "divider",
     "image", "image_group", "gallery", "figure", "chart", "diagram", "graph", "timeline",
-    "simulation", "interactive", "section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion"]),
+    "metric", "simulation", "interactive", "section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion",
+    "feature_list", "step_list", "status_list", "rail_item"]),
   text: z.string().max(16000).default(""), label: z.string().max(240).default(""),
   level: z.number().int().min(2).max(6).default(3), columns: z.number().int().min(1).max(3).default(2),
   align: z.enum(["start", "center", "end"]).default("start"), width: z.enum(["reading", "full"]).default("reading"),
@@ -81,13 +84,15 @@ export const documentNodeSchema = z.object({
   inline: z.boolean().default(false),
   values: z.array(z.number().finite().min(-1000).max(1000)).max(30).default([]),
   visual: z.record(z.string(), z.unknown()).nullish(),
+  icon: railIconSchema.nullish(),
+  item_status: z.enum(["pending", "active", "completed", "error"]).nullish(),
   media: z.array(z.object({url: publicMediaURL, file_id: id.nullish(), source_url: z.union([publicMediaURL, z.literal("")]).default(""),
     title: z.string().max(500).default(""), attribution: z.string().max(500).default("")}).strict()).max(6).default([]),
   resource_state: z.enum(["pending", "ready", "unavailable"]).default("pending"),
   resource_reason: z.enum(["", "ready", "no_results", "search_failed", "download_failed", "timeout", "disabled", "provider_unavailable", "capacity", "storage_failed"]).default(""),
 }).strict();
 export type DocumentNode = z.infer<typeof documentNodeSchema>;
-const layoutTypes = new Set(["section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure"]);
+const layoutTypes = new Set(["section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure", ...railTypes]);
 
 export const uiSnapshotSchema = z
   .object({
@@ -110,6 +115,15 @@ export const uiSnapshotSchema = z
         columns: z.array(column).max(12).default([]),
         unit: z.string().max(40).default(""),
         source_note: z.string().max(500).default(""),
+        density: z.enum(["compact", "comfortable", "editorial"]).default("comfortable"),
+        width: z.enum(["reading", "full"]).default("reading"),
+        toc: z.boolean().default(false),
+        data_ref: z.object({part_id: id, path: z.array(z.union([sourceKey, z.number().int().min(0).max(10000)])).max(6).default([]), label_key: sourceKey.nullish(), id_key: sourceKey.nullish(), value_keys: z.record(id, sourceKey).refine(value => Object.keys(value).length <= 12).default({})}).strict().nullish(),
+        data_kind: z.enum(["provided", "example"]).default("provided"),
+        time_range: z.string().max(120).default(""),
+        interaction: z.enum(["auto", "static", "explore"]).optional(),
+        background: z.enum(["auto", "paper", "warm", "cool", "dark"]).optional(),
+        graph_layout: z.enum(["flow", "mindmap"]).optional(),
       })
       .strict(),
     rows: z.array(row).max(500).default([]),
@@ -128,6 +142,11 @@ export const uiSnapshotSchema = z
     if (byId.size !== blocks.length || (blocks.length && snapshot.component !== "document")) bad("Invalid document blocks");
     const counts = new Map<string | null, number>();
     for (const node of blocks) {
+      const parentNode = byId.get(node.parent_id ?? "");
+      if (node.type === "rail_item" && !node.label.trim()) bad("Rail items require a title");
+      if (node.type === "rail_item" && (!parentNode || !railTypes.has(parentNode.type))) bad("Rail item requires a rail list parent");
+      if (parentNode && railTypes.has(parentNode.type) && node.type !== "rail_item") bad("Rail lists only accept rail items");
+      if (node.type !== "rail_item" && (node.icon != null || node.item_status != null)) bad("Icon and item_status belong to rail items");
       if (node.fallback_svg && !["image", "image_group", "gallery"].includes(node.type)) bad("Illustration fallback requires image node");
       const parentId = node.parent_id ?? null;
       counts.set(parentId, (counts.get(parentId) ?? 0) + 1);
@@ -141,13 +160,15 @@ export const uiSnapshotSchema = z
         seen.add(parent); parent = entry.parent_id ?? null;
       }
       if (node.visual) {
-        if (!["chart", "table", "graph", "diagram", "timeline"].includes(node.type) ||
+        if (!["chart", "table", "graph", "diagram", "timeline", "metric"].includes(node.type) ||
           Object.keys(node.visual).some(key => !["props", "rows", "nodes", "edges", "items"].includes(key)) ||
           !parseUISnapshot({ ...node.visual, protocol: "suip/0.1", block_id: node.id,
             component: node.type === "diagram" ? "graph" : node.type, revision: 0, state: "completed" })) bad("Invalid embedded visual");
       }
     }
-    if ([...counts.values()].some(count => count > 40)) bad("Too many children");
+    for (const [parent, count] of counts) {
+      if (count > (railTypes.has(byId.get(parent ?? "")?.type ?? "") ? 12 : 40)) bad("Too many children");
+    }
     for (const key of ["rows", "nodes", "edges", "items"] as const) {
       if (
         new Set(snapshot[key].map((entry) => entry.id)).size !==
@@ -167,7 +188,7 @@ export const uiSnapshotSchema = z
       ctx.addIssue({ code: "custom", message: "Unknown edge endpoint" });
     if (
       snapshot.component === "chart" &&
-      (!keys.size ||
+      ((!keys.size && snapshot.rows.length > 0) ||
         snapshot.rows.some((row) =>
           Object.entries(row.values).some(
             ([key, value]) =>
@@ -202,8 +223,10 @@ export type UISnapshot = z.infer<typeof uiSnapshotSchema>;
 export type UIActionRequest = {
   part_id: string;
   revision: number;
-  action: "explain" | "graph.node.explain";
+  action: "explain" | "graph.node.explain" | "document.block.explain";
   node_id?: string;
+  block_id?: string;
+  view_state?: Record<string, unknown>;
 };
 
 /** A snapshot is the recovery boundary: never parse unfinished JSON on the client. */
@@ -215,6 +238,25 @@ export function parseUISnapshot(data: unknown): UISnapshot | null {
   } catch {
     return null;
   }
+}
+
+/** Older persisted previews may predate the server's numeric commit boundary. */
+export function committedNumericPreview(snapshot: UISnapshot): UISnapshot {
+  if (!snapshot.preview) return snapshot;
+  const candidate = parseUISnapshot(snapshot.preview.base);
+  const base = candidate && !candidate.preview && candidate.block_id === snapshot.block_id && candidate.component === snapshot.component ? candidate : null;
+  if (snapshot.component === "chart" || snapshot.component === "metric") {
+    return {...snapshot, props: base?.props ?? snapshot.props, rows: base?.rows ?? [], items: base?.items ?? []};
+  }
+  if (snapshot.component === "document") {
+    const previous = new Map((base?.blocks ?? []).map(node => [node.id, node]));
+    return {...snapshot, blocks: snapshot.blocks?.map(node => {
+      if (node.type !== "chart" && node.type !== "metric") return node;
+      const old = previous.get(node.id);
+      return old?.type === node.type ? old : {...node, state: "pending" as const, visual: null};
+    })};
+  }
+  return snapshot;
 }
 
 /** All artifact placement markers are transport syntax, even unresolved card IDs. */
