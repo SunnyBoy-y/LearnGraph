@@ -19,6 +19,7 @@ from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.secret_store import KeyringSecretStore
 from app.services.site_backup import RUNTIME_FILES, database_path, managed_roots, read_backup
+from app.services.backup_io import copy_member, work_root, require_space, small_bytes
 
 
 def _copy_database(source: Path, target: Path) -> None:
@@ -28,8 +29,42 @@ def _copy_database(source: Path, target: Path) -> None:
 
 
 def restore_offline(payload: bytes, password: str, settings: Settings, env_file: Path) -> dict:
+    from app.core.database_routing import OperationLease, state_root
+    try:
+        lease = OperationLease(state_root(settings))
+    except BlockingIOError as exc:
+        raise AppError(409, "site_restore_busy", "迁移或另一项恢复正在执行") from exc
+    try:
+        from app.services.database_maintenance import ensure_available
+        ensure_available(settings)
+        return _restore_offline(payload, password, settings, env_file)
+    finally:
+        lease.close()
+
+
+def _restore_offline(payload: bytes, password: str, settings: Settings, env_file: Path) -> dict:
+    from app.services.site_backup import backup_database_kind, ensure_restore_target
+    with read_backup(payload, password, settings.max_backup_bytes, directory=work_root(settings)) as members:
+        return _restore_validated(members, settings, env_file)
+
+
+def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
+    from app.services.site_backup import backup_database_kind, ensure_restore_target
+    if json.loads(members["manifest.json"])["app_version"] != settings.app_version:
+        raise AppError(409, "site_restore_version_mismatch", "请使用与备份相同版本的 LearnGraph 执行全站恢复")
+    url = ensure_restore_target(members, settings)
+    if backup_database_kind(members) == "postgresql":
+        from app.services.site_restore_postgresql import restore_site
+        return restore_site(members, settings, env_file, url)
+    from app.core.database_routing import read_json, source_is_sealed, state_root
+    from sqlalchemy.engine import make_url
+    source_url = make_url(settings.database_url)
+    migration_job = read_json(state_root(settings) / "job.json")
+    if (read_json(state_root(settings) / "active.json") or source_url.get_backend_name() != "sqlite"
+        or migration_job and migration_job.get("state") not in {"CANCELLED", "COMPLETED"}
+        or source_url.database and source_url.database != ":memory:" and source_is_sealed(Path(source_url.database).resolve())):
+        raise AppError(409, "sqlite_restore_after_migration_forbidden", "主业务库已迁移或正在切换，禁止恢复旧 SQLite；请使用 PostgreSQL 原生灾备")
     """Restore the entire DB and replace managed roots, retaining rollback copies."""
-    members = read_backup(payload, password, settings.max_backup_bytes)
     if json.loads(members["manifest.json"])["app_version"] != settings.app_version:
         raise AppError(409, "site_restore_version_mismatch", "请使用与备份相同版本的 LearnGraph 执行全站恢复")
     configuration = json.loads(members["configuration.json"])
@@ -66,15 +101,16 @@ def restore_offline(payload: bytes, password: str, settings: Settings, env_file:
     external_files: list[tuple[Path, bytes | None]] = []
     had_database = database.exists()
     had_env = env_file.exists()
-    with TemporaryDirectory(prefix="lg-site-restore-") as temporary:
+    require_space(database.parent, database.stat().st_size * 2 + sum(info["size"] for info in members.entries.values()))
+    with TemporaryDirectory(prefix="lg-site-restore-", dir=work_root(settings)) as temporary:
         staging = Path(temporary)
         snapshot = staging / "site.db"
-        snapshot.write_bytes(members["database.sqlite3"])
+        copy_member(members, "database.sqlite3", snapshot)
         if had_database:
             _copy_database(database, database_before)
             os.chmod(database_before, 0o600)
         if had_env:
-            env_before.write_bytes(env_file.read_bytes())
+            env_before.write_bytes(small_bytes(env_file))
             os.chmod(env_before, 0o600)
         try:
             for label, root in roots.items():
@@ -82,11 +118,11 @@ def restore_offline(payload: bytes, password: str, settings: Settings, env_file:
                 root.parent.mkdir(parents=True, exist_ok=True)
                 pending = root.with_name(root.name + ".site-restore-" + recovery_id)
                 pending.mkdir(mode=0o700)
-                for name, content in members.items():
+                for name in members:
                     if name.startswith(label + "/"):
                         target = pending / name[len(label) + 1:]
                         target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(content)
+                        copy_member(members, name, target)
                 previous = root.with_name(root.name + ".before-site-restore-" + recovery_id)
                 existed = root.exists()
                 if existed:
@@ -105,13 +141,13 @@ def restore_offline(payload: bytes, password: str, settings: Settings, env_file:
                 if content is not None and restored.get(name):
                     target = Path(restored[name]).resolve()
                     if not any(target.is_relative_to(root) for root in roots.values()):
-                        external_files.append((target, target.read_bytes() if target.exists() else None))
+                        external_files.append((target, small_bytes(target) if target.exists() else None))
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(content)
                     os.chmod(target, 0o600)
             for name in RUNTIME_FILES:
                 target = settings.storage_root.resolve().parent / name
-                original = target.read_bytes() if target.exists() else None
+                original = small_bytes(target) if target.exists() else None
                 external_files.append((target, original))
                 if original is not None:
                     previous = target.with_name(target.name + ".before-site-restore-" + recovery_id)
@@ -145,7 +181,7 @@ def restore_offline(payload: bytes, password: str, settings: Settings, env_file:
             else:
                 database.unlink(missing_ok=True)
             if had_env:
-                env_file.write_bytes(env_before.read_bytes())
+                env_file.write_bytes(small_bytes(env_before))
             else:
                 env_file.unlink(missing_ok=True)
             for target, content in reversed(external_files):
@@ -164,18 +200,30 @@ def restore_offline(payload: bytes, password: str, settings: Settings, env_file:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="停服后恢复 LearnGraph 全站加密备份；覆盖全站数据库和受管文件")
-    parser.add_argument("--backup", required=True, type=Path)
-    parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    parser.add_argument("--backup", type=Path)
+    parser.add_argument("--recover-pending", action="store_true", help="按 PostgreSQL 事务提交标记完成或撤销被中断的恢复")
+    parser.add_argument("--env-file", type=Path, default=Path(os.environ["LEARNGRAPH_DATA_ROOT"]) / "restored.env" if os.environ.get("LEARNGRAPH_DATA_ROOT") else Path(".env"))
     parser.add_argument("--server-stopped", action="store_true", help="确认所有 API、worker 和调度器已停止")
     arguments = parser.parse_args()
     if not arguments.server_stopped:
         parser.error("必须先停止 API、worker 和调度器，再加 --server-stopped")
     settings = Settings()
+    if arguments.recover_pending:
+        from app.services.site_restore_postgresql import recover_offline
+        from app.core.database_routing import OperationLease, state_root
+        lease = OperationLease(state_root(settings))
+        try:
+            print(json.dumps(recover_offline(settings), ensure_ascii=False))
+        finally:
+            lease.close()
+        return
+    if not arguments.backup:
+        parser.error("需要 --backup 或 --recover-pending")
     password = getpass.getpass("备份密码: ")
     try:
         if arguments.backup.stat().st_size > settings.max_backup_bytes:
             raise AppError(413, "site_backup_too_large", "备份超过恢复上限")
-        result = restore_offline(arguments.backup.read_bytes(), password, settings, arguments.env_file)
+        result = restore_offline(arguments.backup, password, settings, arguments.env_file)
     except AppError as exc:
         parser.exit(1, str(exc.message) + "\n")
     print(json.dumps(result, ensure_ascii=False))

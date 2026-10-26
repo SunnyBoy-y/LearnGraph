@@ -232,7 +232,7 @@ def test_environment_conflict_refuses_before_modifying_data(site, tmp_path, monk
 
 def test_rejects_external_database_and_legacy_workspace_zip(site):
     service, settings, _ = site
-    service.settings = settings.model_copy(update={"database_url": "postgresql://example.invalid/db"})
+    service.settings = settings.model_copy(update={"database_url": "mysql://example.invalid/db"})
     with pytest.raises(AppError) as failure:
         service.export(PASSWORD)
     assert failure.value.code == "site_backup_database_unsupported"
