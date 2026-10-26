@@ -1,6 +1,7 @@
 """Event-driven memory extraction regressions (upgrade requirements 1-3).
 
-1. ``memory.extract`` durable jobs dedupe per (session, last message).
+1. Legacy per-message ``memory.extract`` jobs retain their idempotency contract.
+   Production cursor-batched scheduling is covered in test_memory_batch_queue.
 2. Default extraction config is enabled; extraction runs only when the
    workspace memory master switch is on (no extraction sub-switch).
 3. The worker path consumes ``memory.extract`` safely when no model provider

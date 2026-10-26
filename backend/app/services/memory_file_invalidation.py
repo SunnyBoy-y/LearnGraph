@@ -81,7 +81,7 @@ class MemoryFileInvalidationService:
             for chunk in chunks:
                 chunk.lifecycle_status = "stale"
                 stale_chunks += 1
-                if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
+                if self.db.bind is not None and self.db.connection().dialect.name == "sqlite":
                     self.db.execute(
                         text("DELETE FROM document_chunks_fts WHERE chunk_id = :id"),
                         {"id": chunk.id},
@@ -181,7 +181,7 @@ class MemoryFileInvalidationService:
         for chunk in chunks:
             if chunk.lifecycle_status == "active":
                 chunk.lifecycle_status = "stale"
-            if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
+            if self.db.bind is not None and self.db.connection().dialect.name == "sqlite":
                 self.db.execute(
                     text("DELETE FROM document_chunks_fts WHERE chunk_id = :id"),
                     {"id": chunk.id},

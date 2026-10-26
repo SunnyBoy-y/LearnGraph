@@ -102,7 +102,9 @@ def normalize_bm25_score(raw_bm25: float) -> float:
 def probe_memory_search_fts_capability(db: Session) -> str:
     """Return ``trigram``, ``unicode``, or ``unavailable`` for the live FTS table."""
 
-    if db.bind is None or db.bind.dialect.name != "sqlite":
+    if db.bind is not None and db.connection().dialect.name == "postgresql":
+        return "postgresql_trigram"
+    if db.bind is None or db.connection().dialect.name != "sqlite":
         return "unavailable"
     try:
         row = db.execute(
@@ -156,7 +158,7 @@ def memory_search_fts_is_healthy(db: Session) -> bool:
     normal projection path.
     """
 
-    if db.bind is None or db.bind.dialect.name != "sqlite":
+    if db.bind is None or db.connection().dialect.name != "sqlite":
         return True
     if probe_memory_search_fts_capability(db) == "unavailable":
         return True
@@ -181,7 +183,9 @@ def memory_search_fts_is_healthy(db: Session) -> bool:
 def ensure_memory_search_fts(db: Session) -> str:
     """Create the FTS projection if missing and record its tokenizer capability."""
 
-    if db.bind is None or db.bind.dialect.name != "sqlite":
+    if db.bind is not None and db.connection().dialect.name == "postgresql":
+        return "postgresql_trigram"
+    if db.bind is None or db.connection().dialect.name != "sqlite":
         return "unavailable"
     capability = probe_memory_search_fts_capability(db)
     if capability != "unavailable":
@@ -313,7 +317,8 @@ class MemoryProjector:
                   or payload.get("zone") == "archive"
                   or bool(payload.get("auto_recall_suppressed"))
                   or (int(payload.get("atom_schema_version") or 0) >= 1
-                      and payload.get("summary_eligibility", "durable") in {"historical", "excluded"}))
+                      and payload.get("summary_eligibility", "durable") in {"historical", "excluded"}
+                      and not (payload.get("summary_eligibility") == "historical" and payload.get("record_kind") == "event_summary")))
         if hidden:
             self._remove_search_document(memory_id)
             return
@@ -451,7 +456,7 @@ class MemoryProjector:
         self.db.flush()
 
     def _delete_fts_row(self, document_id: str) -> None:
-        if self.db.bind is None or self.db.bind.dialect.name != "sqlite":
+        if self.db.bind is None or self.db.connection().dialect.name != "sqlite":
             return
         self.db.execute(
             text("DELETE FROM memory_search_fts WHERE document_id = :id"),
@@ -459,7 +464,7 @@ class MemoryProjector:
         )
 
     def _upsert_fts(self, document: MemorySearchDocument) -> None:
-        if self.db.bind is None or self.db.bind.dialect.name != "sqlite":
+        if self.db.bind is None or self.db.connection().dialect.name != "sqlite":
             return
         ensure_memory_search_fts(self.db)
         self._delete_fts_row(document.id)
@@ -496,7 +501,7 @@ class MemoryProjector:
 
         fts_capability = ensure_memory_search_fts(self.db)
         self.db.execute(delete(MemorySearchDocument))
-        if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
+        if self.db.bind is not None and self.db.connection().dialect.name == "sqlite":
             try:
                 self.db.execute(text("DELETE FROM memory_search_fts"))
             except Exception as exc:
@@ -571,7 +576,9 @@ class MemoryProjector:
             )
         ).all()
         fts_row_count = 0
-        if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
+        if self.db.bind is not None and self.db.connection().dialect.name == "postgresql":
+            fts_row_count = len(documents)
+        if self.db.bind is not None and self.db.connection().dialect.name == "sqlite":
             try:
                 fts_row_count = int(
                     self.db.execute(text("SELECT count(*) FROM memory_search_fts")).scalar() or 0

@@ -9,6 +9,7 @@ from app.domain.schemas.memory_v2 import MemoryEventAppendRequest
 from app.services.memory_crypto import MemoryPayloadCipher, development_event_secret
 from app.services.memory_event_store import AppendEvent, AppendResult, MemoryEventStore
 from app.services.memory_sensitive_filter import SensitiveDataFilter
+from app.services.memory_safety import require_safe_memory
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,11 @@ class MemoryEventIngestor:
         if request.producer in {"scheduler", "migration"} and not trusted_producer:
             raise PermissionError("event producer is restricted")
         self.sensitive_filter.require_safe(request.payload)
+        if request.event_type.startswith("memory."):
+            require_safe_memory(
+                str(request.payload.get("title") or ""),
+                str(request.payload.get("content") or ""),
+            )
         return self.store.append(
             scope,
             aggregate_type=request.aggregate_type,

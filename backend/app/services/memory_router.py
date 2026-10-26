@@ -33,7 +33,7 @@ ROUTE_LAYER_MAP: dict[MemoryRoute, frozenset[str]] = {
     "episode": frozenset({"L1"}),
     "file": frozenset({"L5"}),
     "learning_state": frozenset({"L5"}),
-    "user_preference": frozenset({"L3"}),
+    "user_preference": frozenset({"L3", "L4"}),
     "strategy": frozenset({"L6"}),
     "memory": frozenset({"L3", "L4"}),
 }
@@ -54,7 +54,7 @@ class MemoryRouteResult:
     retrieval: RetrievalResult
     signals: tuple[IntentSignal, ...] = ()
     trace_id: str | None = None
-    policy_version: str = "memory-router-v2"
+    policy_version: str = "memory-router-v3"
 
 
 # ── Intent patterns ────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ _INTENT_MATRIX: list[tuple[str, re.Pattern[str], float, tuple[MemoryRoute, ...]]
             r"(继续|上次|resume|continue|接着|回到|回到之前|pick\s+up)", re.I
         ),
         0.90,
-        ("task_state", "episode", "project_decision"),
+        ("task_state", "episode", "project_decision", "memory"),
     ),
     # Decision recall
     (

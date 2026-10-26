@@ -19,7 +19,7 @@ from app.domain.memory_event_models import (
 )
 from app.domain.models import (
     MemoryDeletionRecovery, MemoryDraft, MemoryEmbedding, MemoryEvidence,
-    MemoryExtractionState, MemoryJournalEntry, MemoryProfileSnapshot,
+    MemoryExtractionState, MemoryJobState, MemoryJournalEntry, MemoryProfileSnapshot,
     ChatSession, MemoryRecord, MemoryRevision, Message, Workspace, utc_now,
 )
 from app.services.memory_projector import MemoryProjector
@@ -220,6 +220,7 @@ class SessionMemoryDeletionService:
             (MemoryDraft, MemoryDraft.id, targets.draft_ids),
             (MemoryEvidence, MemoryEvidence.id, targets.evidence_ids),
             (MemoryExtractionState, MemoryExtractionState.session_id, session_ids),
+            (MemoryJobState, MemoryJobState.resource_id, session_ids),
             (MemoryEmbedding, MemoryEmbedding.memory_id, targets.memory_ids),
             (MemoryFeedback, MemoryFeedback.memory_id, targets.memory_ids),
             (MemoryAccessLog, MemoryAccessLog.memory_id, targets.memory_ids),

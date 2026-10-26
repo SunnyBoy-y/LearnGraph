@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import and_, or_, select, text
-from app.domain.models import MemoryRecord
+from app.domain.models import MemoryRecord, MemoryRevision
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -21,6 +21,8 @@ from app.services.memory_projector import (
     normalize_bm25_score,
     probe_memory_search_fts_capability,
 )
+from app.services.memory_safety import record_source_reason, unsafe_memory_reason, record_preference_verified
+from app.services.memory_usage import memory_usage, lexical_relevance, classify_memory
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +41,8 @@ class RetrievalCandidate:
     component_scores: dict[str, float] = field(default_factory=dict)
     retrieval_reason: str = "hybrid_memory_search"
     external_source: dict[str, Any] | None = None
+    trust: str = "derived"
+    allowed_effect: str = "context"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +82,9 @@ class MemoryHybridRetriever:
             "quality": 0,
             "duplicate": 0,
             "expired": 0,
+            "unsafe_source": 0,
+            "irrelevant": 0,
+            "usage_policy": 0,
         }
         query_tokens = _tokens(query)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -114,26 +121,70 @@ class MemoryHybridRetriever:
             R.zone != "archive", R.deleted_at.is_(None), R.content_destroyed_at.is_(None),
             R.auto_recall_suppressed.is_(False),
             R.sensitivity.in_(scope.allowed_sensitivity), R.memory_layer.in_(allowed_layers),
-            or_(R.atom_schema_version < 1, R.summary_eligibility.in_(("durable", "current"))),
+            or_(R.atom_schema_version < 1, R.summary_eligibility.in_(("durable", "current")), and_(R.record_kind == "event_summary", R.summary_eligibility == "historical")),
             R.temporal_status.not_in(("cancelled", "rescheduled", "lapsed_unverified", "expired")),
             or_(R.valid_until.is_(None), R.valid_until >= now),
         )
-        statement = (select(D).outerjoin(R, and_(D.target_type == "memory", R.id == D.target_id))
+        statement = (select(D, R).outerjoin(R, and_(D.target_type == "memory", R.id == D.target_id))
             .where(*hard_filters, or_(R.id.is_(None), canonical_ok),
                    or_(D.valid_until.is_(None), D.valid_until >= now), D.confidence >= min_confidence)
             .order_by(D.id).execution_options(yield_per=128))
         # Bound memory/embedding cost AFTER every eligible document can compete.
         pool_limit = max(top_k, min(200, max(24, top_k * 8)))
         pool = {}
-        stream = self.db.scalars(statement)
         try:
-            for document in stream:
+            embedding_enabled = bool(load_enhancement_config(self.db, scope.workspace_id).get("embedding", {}).get("enabled", False))
+        except Exception:
+            embedding_enabled = False
+        stream = self.db.execute(statement)
+        try:
+            for document, record in stream:
+                # Revalidate BEFORE ranking/embedding so unsafe historical
+                # entries cannot crowd out good memories or reach providers.
+                if unsafe_memory_reason(f"{document.subject}\n{document.content}"):
+                    excluded["unsafe_source"] += 1
+                    continue
+                policy = ((record.structured_payload or {}).get("usage_policy") or {}) if record else {}
+                usage_type = document.memory_type if document.target_type == "memory" else "external_reference"
+                title_relevance = lexical_relevance(query, document.subject)
+                # Reject irrelevant themes/episodes and lexical misses before
+                # loading revisions/evidence. Disabled embeddings need no
+                # speculative candidate scans or remote calls.
+                preliminary = memory_usage(
+                    query, document.content, memory_type=usage_type, policy=policy,
+                    same_task=bool(scope.task_id and document.task_id == scope.task_id),
+                    same_conversation=bool(scope.conversation_id and document.conversation_id == scope.conversation_id),
+                    semantic=1.0 if embedding_enabled else 0.0, lexical_override=title_relevance,
+                )
+                if not preliminary.allowed:
+                    excluded["irrelevant" if preliminary.reason == "irrelevant_to_current_request" else "usage_policy"] += 1
+                    continue
+                if document.target_type == "memory" and record is not None:
+                    revision = self.db.scalar(select(MemoryRevision).where(
+                        MemoryRevision.workspace_id == record.workspace_id,
+                        MemoryRevision.memory_id == record.id,
+                        MemoryRevision.revision == record.revision,
+                    ))
+                    if revision is None or not revision.content or revision.content != document.content or record_source_reason(self.db, record, revision.content):
+                        excluded["unsafe_source"] += 1
+                        continue
+                is_preference = classify_memory(document.content, usage_type)["role"] == "preference"
+                verified = (record_preference_verified(self.db, record, document.content) if record else False) if is_preference else True
+                applicability = memory_usage(
+                    query, document.content, memory_type=usage_type, policy=policy,
+                    same_task=bool(scope.task_id and document.task_id == scope.task_id),
+                    same_conversation=bool(scope.conversation_id and document.conversation_id == scope.conversation_id),
+                    semantic=1.0, preference_verified=verified,
+                )
+                if not applicability.allowed:
+                    excluded["usage_policy"] += 1
+                    continue
                 tokens = _tokens(f"{document.subject} {document.content}")
                 lexical = len(query_tokens & tokens) / math.sqrt(len(query_tokens) * len(tokens)) if query_tokens and tokens else 0.0
-                lexical = max(lexical, fts_scores.get(document.id, 0.0))
+                lexical = max(lexical, fts_scores.get(document.id, 0.0), lexical_relevance(query, document.content))
                 entity = float(bool(query_tokens & _tokens(document.entity_aliases_text)))
                 scope_score = 1.0 if document.task_id and document.task_id == scope.task_id else 0.85 if document.workspace_id == scope.workspace_id else 0.70 if document.workspace_id is None else 0.45
-                score = 0.20 * lexical + 0.15 * scope_score + 0.15 * entity + 0.05 + 0.10 * document.importance + 0.05 * document.confidence
+                score = 2.0 * lexical + 0.15 * scope_score + 0.15 * entity + 0.05 * document.importance + 0.05 * document.confidence
                 external = (document.metadata_json or {}).get("external_source") or {}
                 try:
                     observed = datetime.fromisoformat(str(external.get("observed_at") or "").replace("Z", "+00:00")).timestamp()
@@ -145,20 +196,17 @@ class MemoryHybridRetriever:
                 if previous is not None:
                     excluded["duplicate"] += 1
                 if previous is None or rank < previous[0]:
-                    pool[key] = (rank, document)
+                    pool[key] = (rank, document, policy, verified, record)
                 if len(pool) > pool_limit:
                     del pool[max(pool, key=lambda value: pool[value][0])]
         finally:
             stream.close()
         documents = [item[1] for item in sorted(pool.values(), key=lambda item: item[0])]
+        policies = {item[1].id: item[2] for item in pool.values()}
+        preference_checks = {item[1].id: item[3] for item in pool.values()}
+        canonical_records = {item[1].id: item[4] for item in pool.values()}
         semantic_boosts: dict[str, float] = {}
-        embedding_enabled = False
         try:
-            embedding_enabled = bool(
-                load_enhancement_config(self.db, scope.workspace_id)
-                .get("embedding", {})
-                .get("enabled", False)
-            )
             if embedding_enabled and documents:
                 semantic_boosts = semantic_boosts_for_documents(
                     self.db,
@@ -217,14 +265,22 @@ class MemoryHybridRetriever:
                 1.0,
                 max(0.0, float(semantic_boosts.get(document.target_id, 0.0))),
             )
+            applicability = memory_usage(
+                query, document.content, memory_type=document.memory_type if document.target_type == "memory" else "external_reference",
+                policy=policies.get(document.id), semantic=semantic, lexical_override=lexical_relevance(query, document.subject),
+                same_task=bool(scope.task_id and document.task_id == scope.task_id),
+                same_conversation=bool(scope.conversation_id and document.conversation_id == scope.conversation_id),
+                preference_verified=preference_checks.get(document.id, False),
+            )
+            if not applicability.allowed:
+                excluded["irrelevant" if applicability.reason == "irrelevant_to_current_request" else "usage_policy"] += 1
+                continue
             score = (
-                0.25 * semantic
-                + 0.20 * lexical
+                0.65 * applicability.relevance
                 + 0.15 * scope_score
-                + 0.15 * entity
                 + 0.10 * importance
-                + 0.10 * recency
                 + 0.05 * confidence
+                + 0.05 * entity
             )
             if score < min_score:
                 excluded["quality"] += 1
@@ -256,6 +312,12 @@ class MemoryHybridRetriever:
                         if isinstance(getattr(document, "metadata_json", None), dict)
                         else None
                     ),
+                    trust=("user_explicit" if document.target_type == "memory" and (
+                        (record := canonical_records.get(document.id)) is not None
+                        and record.assertion_type == "explicit"
+                    ) else "derived"),
+                    allowed_effect=applicability.allowed_effect,
+                    retrieval_reason=applicability.reason,
                 )
             )
         def _sort_key(item: RetrievalCandidate) -> tuple[float, float, str]:
@@ -297,7 +359,10 @@ class MemoryHybridRetriever:
         SQL uses ``ORDER BY bm25(...) ASC`` (smaller raw bm25 = more relevant).
         """
 
-        if self.db.bind is None or self.db.bind.dialect.name != "sqlite" or not query.strip():
+        if self.db.bind is not None and self.db.connection().dialect.name == "postgresql" and query.strip():
+            from app.core.postgresql_search import memory_scores
+            return memory_scores(self.db, scope, sorted(_tokens(query)), limit)
+        if self.db.bind is None or self.db.connection().dialect.name != "sqlite" or not query.strip():
             return {}
         capability = probe_memory_search_fts_capability(self.db)
         if capability == "unavailable":

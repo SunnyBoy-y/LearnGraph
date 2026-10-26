@@ -173,7 +173,7 @@ def test_agent_deduplicates_overlapping_batches(client, register_user, auth_head
         [call("update_memories", {"atoms": [atom(), another]})] if i == 2 else
         [ProviderStreamEvent(type="text_delta", content="已更新两条记忆。")]
     )
-    events = stream(client, headers)
+    events = stream(client, headers, text="请记住我喜欢简洁讲解。我喜欢例子。")
     assert events[-1][1]["auto_committed"] == 2
     assert len(client.get("/api/v1/memory", headers=headers).json()) == 2
 
@@ -248,3 +248,28 @@ def test_agent_unconfigured_never_saves_instruction(client, register_user, auth_
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "memory_profile_model_unconfigured"
     assert client.get("/api/v1/memory", headers=headers).json() == []
+
+
+def test_agent_cannot_auto_commit_unsupported_fact(client, register_user, auth_headers, model_agent):
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    model_agent.decide = lambda i, _: (
+        [call("read_memories", {})] if i == 0 else
+        [call("update_memories", {"atoms": [{**atom(), "statement": "用户是外科医生。"}]})] if i == 1 else
+        [ProviderStreamEvent(type="text_delta", content="候选事实需要确认。")]
+    )
+    result = stream(client, headers)[-1][1]
+    assert result["auto_committed"] == 0 and result["drafts_created"] == 1
+    assert client.get("/api/v1/memory", headers=headers).json() == []
+
+
+def test_agent_cannot_turn_quoted_fact_into_personal_memory(client, register_user, auth_headers, model_agent):
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    model_agent.decide = lambda i, _: (
+        [call("read_memories", {})] if i == 0 else
+        [call("update_memories", {"atoms": [atom()]})] if i == 1 else
+        [ProviderStreamEvent(type="text_delta", content="引用内容需要确认。")]
+    )
+    result = stream(client, headers, text="请分析以下文档：\n我喜欢简洁讲解。")[-1][1]
+    assert result["auto_committed"] == 0 and result["drafts_created"] == 1

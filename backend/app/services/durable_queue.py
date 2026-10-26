@@ -52,6 +52,7 @@ class DurableQueue:
         dedupe_key: str | None = None,
         priority: int = 0,
         max_attempts: int | None = None,
+        available_at: datetime | None = None,
     ) -> DurableJob:
         if dedupe_key:
             existing = self.db.scalar(
@@ -71,6 +72,7 @@ class DurableQueue:
             dedupe_key=dedupe_key,
             priority=priority,
             max_attempts=max_attempts or self.max_attempts,
+            **({"available_at": available_at} if available_at is not None else {}),
         )
         self.db.add(job)
         try:
@@ -254,15 +256,42 @@ def enqueue_memory_extraction(
     session_id: str,
     actor_id: str,
     last_message_id: str,
-) -> DurableJob:
-    """Event-driven memory extraction trigger (replaces polling sweeps).
+) -> DurableJob | None:
+    """Debounce all new turns behind one persisted extraction cursor.
 
-    Deduplicated per (session, last completed message) so a message is never
-    extracted twice even if the completion event fires more than once.
+    Only queued work is rescheduled. A leased generation is fenced and never
+    overwritten; its worker schedules any unseen remainder after completion.
     """
 
     settings = get_settings()
     with SessionLocal() as db:
+        from app.domain.models import ChatSession, MemoryExtractionState, MemoryJobState
+        from app.services.memory_job_guard import job_id_for
+        from app.services.memory_enhancement import _new_messages_since, _workspace_memory_enabled
+        from app.services.memory_batching import extraction_readiness
+        session = db.scalar(select(ChatSession).where(ChatSession.id == session_id, ChatSession.workspace_id == workspace_id))
+        if session is None or not session.memory_enabled or not session.memory_learning_enabled or not _workspace_memory_enabled(db, workspace_id):
+            return None
+        state = db.scalar(select(MemoryExtractionState).where(MemoryExtractionState.workspace_id == workspace_id, MemoryExtractionState.session_id == session_id))
+        pending = _new_messages_since(db, workspace_id, session_id, state)
+        if not pending:
+            return None
+        readiness = extraction_readiness(pending, session, settings)
+        available = utc_now() + timedelta(seconds=readiness.retry_after_seconds)
+        key = f"memory.extract.batch:{session_id}:{getattr(state, 'last_message_id', None) or 'start'}"
+        progress = db.get(MemoryJobState, job_id_for(workspace_id, "extraction", session_id))
+        checkpoint = dict(progress.checkpoint or {}) if progress else {}
+        if checkpoint.get("message_id"):
+            # A long message can contain several chunks before the full-message
+            # cursor changes; a completed old queue key must not swallow them.
+            key += f":{checkpoint['message_id']}:{checkpoint.get('content_hash', '')}:{checkpoint.get('offset', 0)}"
+            available = utc_now()
+        existing = db.scalar(select(DurableJob).where(DurableJob.workspace_id == workspace_id, DurableJob.dedupe_key == key))
+        if existing is not None:
+            db.execute(update(DurableJob).where(DurableJob.id == existing.id, DurableJob.status == "queued").values(available_at=available))
+            db.commit()
+            db.refresh(existing)
+            return existing
         return DurableQueue(
             db,
             lease_seconds=settings.durable_queue_lease_seconds,
@@ -274,9 +303,10 @@ def enqueue_memory_extraction(
                 "workspace_id": workspace_id,
                 "session_id": session_id,
                 "actor_id": actor_id,
-                "last_message_id": last_message_id,
+                "batch_anchor": getattr(state, "last_message_id", None),
             },
-            dedupe_key=f"memory.extract:{session_id}:{last_message_id}",
+            dedupe_key=key,
+            available_at=available,
         )
 
 
@@ -349,8 +379,9 @@ def run_one_durable_job(worker_id: str) -> bool:
                 from app.services.memory_enhancement import extract_session_memories
 
                 workspace = db.get(Workspace, str(job.payload["workspace_id"]))
+                result = {"status": "workspace_deleted"}
                 if workspace is not None:
-                    extract_session_memories(
+                    result = extract_session_memories(
                         db,
                         workspace,
                         str(job.payload["session_id"]),
@@ -360,7 +391,12 @@ def run_one_durable_job(worker_id: str) -> bool:
                             or "system:memory-extraction"
                         ),
                     )
-                queue.complete(job)
+                if result.get("status") in {"batch_deferred", "busy", "partial", "retry_backoff"}:
+                    queue.rearm(job, delay_seconds=float(result.get("retry_after_seconds") or 30))
+                else:
+                    queue.complete(job)
+                    if result.get("status") == "ok":
+                        enqueue_memory_extraction(str(job.payload["workspace_id"]), str(job.payload["session_id"]), str(job.payload.get("actor_id") or "system:memory-extraction"), "")
             elif job.kind == "subapp.event.process":
                 from app.services.subapp_event_agent import (
                     run_subapp_event_agent_once,

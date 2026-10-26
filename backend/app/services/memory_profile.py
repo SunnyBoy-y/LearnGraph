@@ -54,6 +54,8 @@ from app.services.memory_projector import (
 )
 from app.services.temporal_normalizer import TemporalNormalizer
 from app.services.token_estimate import estimate_tokens
+from app.services.memory_safety import record_source_reason, unsafe_memory_reason, profile_statement_supported, record_preference_verified
+from app.services.memory_usage import classify_memory
 
 
 PROFILE_PROMPT_VERSION = "memory-profile-v3"
@@ -83,18 +85,6 @@ _ALLOWED_OPERATIONS = {
     "RETRACT",
     "NOOP",
 }
-_SENSITIVE_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
-    re.compile(r"\b(?:\d[ -]?){13,19}\b"),
-    re.compile(r"\b\d{17}[\dXx]\b"),
-    re.compile(r"(?i)\b(?:password|passwd|api[_ -]?key|secret)\s*[:=]\s*\S+"),
-)
-_INSTRUCTION_PATTERNS = (
-    re.compile(r"(?i)ignore\s+(?:all\s+)?previous"),
-    re.compile(r"忽略(?:之前|以上|所有).{0,12}(?:指令|规则|要求)"),
-    re.compile(r"(?i)system\s*prompt"),
-    re.compile(r"(?:系统|开发者)消息.{0,10}(?:改成|设为|规则)"),
-)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -138,11 +128,7 @@ def _profile_prose(text: str, references: dict[str, str]) -> str:
 
 
 def _unsafe_memory_reason(text: str) -> str | None:
-    if any(pattern.search(text) for pattern in _SENSITIVE_PATTERNS):
-        return "sensitive_content"
-    if any(pattern.search(text) for pattern in _INSTRUCTION_PATTERNS):
-        return "instruction_shaped_memory"
-    return None
+    return unsafe_memory_reason(text)
 
 
 def _profile_atom_query(workspace_id: str, owner_subject_id: str | None = None):
@@ -225,15 +211,30 @@ def _eligible_profile_records(
                 MemoryEvidence.workspace_id == workspace_id,
                 MemoryEvidence.id.in_(evidence_ids),
                 MemoryEvidence.profile_eligible.is_(True),
+                MemoryEvidence.authorship == "user",
                 MemoryEvidence.deleted_at.is_(None),
             )
         ).all()
     )
-    return [
+    records = [
         record
         for record in candidates
         if trusted_ids.intersection(record.evidence_ids or [])
     ]
+    safe_records = []
+    for record in records:
+        revision = db.scalar(select(MemoryRevision).where(
+            MemoryRevision.workspace_id == workspace_id,
+            MemoryRevision.memory_id == record.id, MemoryRevision.revision == record.revision,
+        ))
+        if revision and revision.content and not record_source_reason(db, record, revision.content):
+            role = classify_memory(revision.content, record.record_kind)["role"]
+            if role in {"task_episode", "hypothesis"}:
+                continue
+            if role == "preference" and not record_preference_verified(db, record, revision.content):
+                continue
+            safe_records.append(record)
+    return safe_records
 
 
 def _atom_fingerprint(records: list[MemoryRecord]) -> str:
@@ -269,7 +270,7 @@ def current_profile_prompt(
         .order_by(MemoryProfileSnapshot.version.desc())
         .limit(1)
     )
-    if snapshot is None or snapshot.status != "ready" or str(snapshot.stale_reason).startswith("refresh_failed") or not snapshot.markdown.strip():
+    if snapshot is None or snapshot.status != "ready" or str(snapshot.stale_reason).startswith("refresh_failed") or not snapshot.markdown.strip() or unsafe_memory_reason(snapshot.markdown):
         return ""
     records = _eligible_profile_records(db, workspace_id, owner_subject_id)
     if snapshot.source_fingerprint != _atom_fingerprint(records):
@@ -1427,6 +1428,11 @@ class MemoryProfileService:
             title = str(raw.get("title") or "").strip()[:240]
             if not statement or not title:
                 continue
+            if _unsafe_memory_reason(f"{title}\n{statement}"):
+                continue
+            supported = operation not in {"CREATE", "UPDATE", "CORRECT", "SUPERSEDE"} or profile_statement_supported(request.text, statement)
+            if supported and operation in {"CREATE", "UPDATE", "CORRECT", "SUPERSEDE"}:
+                title = statement[:60]
             evidence_ids = [
                 str(value) for value in raw.get("evidence_ids") or []
             ]
@@ -1491,10 +1497,12 @@ class MemoryProfileService:
                 "timezone_name": request.timezone_name,
                 "evidence_ids": [evidence.id],
                 "temporal_semantics": temporal_semantics,
+                "usage_policy": classify_memory(statement, str(raw.get("memory_type") or "semantic_memory")),
                 "provenance": {
                     "authorship": "user",
                     "source_kinds": ["user_statement"],
                     "profile_eligible": True,
+                    "admission_version": 1,
                 },
             }
             structured = ensure_plan_canonical_key(structured, title=title)
@@ -1527,7 +1535,7 @@ class MemoryProfileService:
                 )
             )
             drafts_created += 1
-            if confidence >= 0.7:
+            if confidence >= 0.7 and supported:
                 decision = MemoryDraftDecisionRequest(
                     decision="commit",
                     reason="explicit_user_profile_intent",
@@ -1850,7 +1858,7 @@ def reconcile_workspace_temporal_atoms(
             )
         ).all():
             document.status = "lapsed"
-            if db.bind is not None and db.bind.dialect.name == "sqlite":
+            if db.bind is not None and db.connection().dialect.name == "sqlite":
                 db.execute(
                     text("DELETE FROM memory_search_fts WHERE document_id = :id"),
                     {"id": document.id},

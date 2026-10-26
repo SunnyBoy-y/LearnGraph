@@ -238,7 +238,7 @@ class MemoryCommandService:
         ).all()
         deleted_documents = len(documents)
         for document in documents:
-            if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
+            if self.db.bind is not None and self.db.connection().dialect.name == "sqlite":
                 self.db.execute(text("DELETE FROM memory_search_fts WHERE document_id = :id"), {"id": document.id})
             self.db.delete(document)
         deleted_embeddings = self.db.execute(
@@ -386,7 +386,7 @@ class MemoryCommandService:
             select(MemorySearchDocument).where(MemorySearchDocument.target_id == memory_id)
         ).all()
         for document in documents:
-            if self.db.bind is not None and self.db.bind.dialect.name == "sqlite":
+            if self.db.bind is not None and self.db.connection().dialect.name == "sqlite":
                 self.db.execute(text("DELETE FROM memory_search_fts WHERE document_id = :id"), {"id": document.id})
             self.db.delete(document)
         self.db.execute(

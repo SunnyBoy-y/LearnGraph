@@ -92,6 +92,31 @@ def test_memory_architecture_status(client, register_user, auth_headers):
     assert r.status_code == 200, r.text
 
 
+def test_manual_extraction_only_retries_unknown_outcomes_when_explicit(client, register_user, auth_headers, monkeypatch):
+    from app.api.routers import memory as memory_router
+
+    token, ws, _, _ = register_user()
+    observed = []
+
+    def extract(*args, **kwargs):
+        observed.append(kwargs)
+        return {"status": "ok", "drafts_created": 0}
+
+    monkeypatch.setattr(memory_router, "extract_session_memories", extract)
+    headers = auth_headers(token, ws)
+    created = client.post("/api/v1/sessions", headers=headers, json={"title": "retry extraction"})
+    assert created.status_code in (200, 201), created.text
+    response = client.post(
+        f"/api/v1/memory/enhancement/extract/{created.json()['id']}?retry_unknown=true",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert len(observed) == 1
+    assert observed[0]["force"] is True
+    assert observed[0]["retry_unknown"] is True
+    assert observed[0]["actor_id"]
+
+
 def test_memory_context_build(client, register_user, auth_headers):
     """V2 上下文构建：无会话时返回 4xx 或明确空结果，不得 500。"""
     token, ws, _, _ = register_user()

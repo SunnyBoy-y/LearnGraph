@@ -109,7 +109,7 @@ class SessionRetrievalService:
             "mixed"
             if (has_terms and payload.session_ids)
             or (payload.graph_node_ids and not has_terms)
-            else "fts5_bm25_rules"
+            else ("postgresql_trigram_rules" if self.db.connection().dialect.name == "postgresql" else "fts5_bm25_rules")
             if has_terms
             else "session_id"
         )
@@ -205,7 +205,10 @@ class SessionRetrievalService:
         time_to: datetime | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        dialect = self.db.get_bind().dialect.name
+        dialect = self.db.connection().dialect.name
+        if dialect == "postgresql":
+            from app.core.postgresql_search import session_candidates
+            return session_candidates(self.db, self.workspace_id, session_ids, terms, time_from, time_to, limit)
         if dialect != "sqlite":
             raise AppError(
                 503,

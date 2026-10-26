@@ -15,7 +15,7 @@ from app.domain.memory_event_models import (
 from app.domain.memory_event_types import MemoryEventType
 from app.domain.models import (
     ChatSession, MemoryDeletionRecovery, MemoryDraft, MemoryEmbedding,
-    MemoryEvidence, MemoryExtractionState, MemoryJournalEntry, MemoryProfileSnapshot,
+    MemoryEvidence, MemoryExtractionState, MemoryJobState, MemoryJournalEntry, MemoryProfileSnapshot,
     MemoryRecord, MemoryRevision, Message, Project, Workspace, utc_now,
 )
 from app.services.memory_commands import MemoryCommandService
@@ -78,6 +78,7 @@ def test_single_delete_clears_content_copies_and_keeps_other_sessions(env):
     db.add_all([
         MemoryDraft(id="draft", workspace_id="w", session_id="delete", content="draft secret"),
         MemoryExtractionState(workspace_id="w", session_id="delete"),
+        MemoryJobState(id="delete-extraction-job", workspace_id="w", kind="extraction", resource_id="delete", checkpoint={"extraction_call": {"phase": "started"}}),
         MemoryEvidence(id="evidence", workspace_id="w", source_kind="user_statement",
                        source_id="message", message_id="message", authorship="user",
                        content_hash="hash", excerpt="private statement"),
@@ -105,7 +106,7 @@ def test_single_delete_clears_content_copies_and_keeps_other_sessions(env):
     assert keep.state == foreign.state == "active"
     revision = db.scalar(select(MemoryRevision).where(MemoryRevision.memory_id == "owned"))
     assert revision.content is None and not revision.is_active
-    for model in (MemoryDraft, MemoryEvidence, MemoryExtractionState, MemoryEmbedding):
+    for model in (MemoryDraft, MemoryEvidence, MemoryExtractionState, MemoryJobState, MemoryEmbedding):
         assert db.scalar(select(model)) is None
     assert db.scalar(select(MemoryJournalEntry)).payload == {}
     assert db.scalar(select(MemoryDeletionRecovery)).encrypted_payload is None

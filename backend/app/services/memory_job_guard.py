@@ -16,6 +16,7 @@ from app.domain.models import MemoryJobState, utc_now
 
 LEASE_SECONDS = 600
 MAX_ATTEMPTS = 3
+EXTRACTION_CHAR_BUDGET = 7_000
 _current = ContextVar('memory_job_lease', default=None)
 
 def _aware(value):
@@ -27,10 +28,44 @@ def job_id_for(workspace_id, kind, resource_id):
 def current_lease():
     return _current.get()
 
+
+def reset_unknown_extraction_job(db, *, workspace_id, session_id):
+    """Explicitly allow one new request after an ambiguous provider outcome.
+
+    This is deliberately separate from ordinary retries: an operator must opt
+    in through the manual extraction endpoint's ``retry_unknown`` flag.
+    """
+    row = db.get(MemoryJobState, job_id_for(workspace_id, 'extraction', session_id))
+    if row is None or row.status != 'done' or row.result_status != 'model_outcome_unknown':
+        return False
+    now = utc_now()
+    if row.lease_token and _aware(row.lease_until) and _aware(row.lease_until) > now:
+        return False
+    receipt = dict(row.checkpoint or {}).get('extraction_call') or {}
+    if receipt.get('phase') != 'started':
+        return False
+    # Keep a long-message offset, but discard the ambiguous request receipt so
+    # the next lease has a distinct explicit retry lifecycle.
+    row.checkpoint = {
+        key: value
+        for key, value in dict(row.checkpoint or {}).items()
+        if key in {'message_id', 'content_hash', 'offset'}
+    }
+    row.window_key = ''
+    row.status = 'ready'
+    row.attempt_count = 0
+    row.result_status = ''
+    row.last_error = ''
+    row.next_attempt_at = None
+    db.commit()
+    return True
+
+
 class MemoryJobLease:
-    def __init__(self, bind, job_id, token, checkpoint=None, attempt=1):
+    def __init__(self, bind, job_id, token, checkpoint=None, attempt=1, window_key=''):
         self.bind, self.job_id, self.token = bind, job_id, token
         self.checkpoint, self.attempt = dict(checkpoint or {}), attempt
+        self.window_key = window_key
         self._stop = threading.Event()
         self._thread = None
 
@@ -70,6 +105,48 @@ class MemoryJobLease:
         db.execute(update(MemoryJobState).where(
             MemoryJobState.id == self.job_id, MemoryJobState.lease_token == self.token
         ).values(checkpoint=dict(checkpoint)))
+        self.checkpoint = dict(checkpoint)
+
+    @property
+    def extraction_receipt(self):
+        receipt = self.checkpoint.get('extraction_call') or {}
+        return receipt if receipt.get('window') == self.window_key else {}
+
+    def extraction_input(self, messages):
+        """Replay a frozen batch locally, never include subsequently appended turns."""
+        receipt = self.extraction_receipt
+        if not receipt:
+            return extraction_batch(messages, self.checkpoint)
+        by_id = {message.id: message for message in messages}
+        selected, texts, complete = [], {}, []
+        for part in receipt['batch']:
+            message = by_id.get(part['id'])
+            if message is None or hashlib.sha256((message.content or '').encode()).hexdigest() != part['hash']:
+                raise RuntimeError('Extraction source changed; refusing to replay cached results')
+            selected.append(message)
+            texts[message.id] = message.content[part['start']:part['end']]
+            if part['end'] == len(message.content):
+                complete.append(message)
+        return selected, texts, complete, dict(receipt['next_checkpoint'])
+
+    def reserve_extraction_call(self, db, messages, next_checkpoint):
+        """Commit before dispatch: an unknown remote outcome is never auto-replayed."""
+        if self.extraction_receipt:
+            raise RuntimeError('This extraction input has already been dispatched')
+        batch = []
+        for message in messages:
+            digest = hashlib.sha256(message.content.encode()).hexdigest()
+            start = int(self.checkpoint.get('offset', 0)) if self.checkpoint.get('message_id') == message.id and self.checkpoint.get('content_hash') == digest else 0
+            end = next_checkpoint['offset'] if next_checkpoint.get('message_id') == message.id else len(message.content)
+            batch.append({'id': message.id, 'hash': digest, 'start': start, 'end': end})
+        self.save_checkpoint(db, {**self.checkpoint, 'extraction_call': {
+            'window': self.window_key, 'phase': 'started', 'batch': batch,
+            'next_checkpoint': dict(next_checkpoint),
+        }})
+
+    def save_extraction_response(self, db, payload):
+        receipt = {**self.extraction_receipt, 'phase': 'received', 'payload': payload}
+        self.save_checkpoint(db, {**self.checkpoint, 'extraction_call': receipt})
 
     def finish(self, *, success, status, error=''):
         self._stop.set()
@@ -129,23 +206,49 @@ def claim_memory_job(db, *, workspace_id, kind, resource_id, window_key, force=F
         lock_db.commit()
         if result.rowcount != 1:
             return None, 'busy'
-    return MemoryJobLease(bind, job_id, token, checkpoint, attempts).start(), 'claimed'
+    return MemoryJobLease(bind, job_id, token, checkpoint, attempts, window_key).start(), 'claimed'
 
 def guarded_session_job(kind):
     def decorate(fn):
         @wraps(fn)
-        def wrapped(db, workspace, session_id, settings, *, actor_id=None, force=False):
-            from app.domain.models import MemoryExtractionState, ContextSummary, Message
+        def wrapped(db, workspace, session_id, settings, *, actor_id=None, force=False,
+                    retry_unknown=False):
+            from app.domain.models import MemoryExtractionState, ContextSummary, Message, ChatSession
             from app.services.memory_enhancement import _new_messages_since, load_enhancement_config
             state = db.scalar(select(MemoryExtractionState).where(
                 MemoryExtractionState.workspace_id == workspace.id, MemoryExtractionState.session_id == session_id))
+            if kind == 'extraction' and force and retry_unknown:
+                reset_unknown_extraction_job(
+                    db, workspace_id=workspace.id, session_id=session_id,
+                )
+                db.expire_all()
             job = db.get(MemoryJobState, job_id_for(workspace.id, kind, session_id))
             if kind == 'extraction':
                 pending = _new_messages_since(db, workspace.id, session_id, state)
                 if not pending:
                     return {'status': 'no_new_messages', 'drafts_created': 0}
+                checkpoint = dict(job.checkpoint or {}) if job else {}
+                if not force and not checkpoint.get('message_id') and not checkpoint.get('extraction_call'):
+                    from app.services.memory_batching import extraction_readiness
+                    session = db.scalar(select(ChatSession).where(ChatSession.id == session_id, ChatSession.workspace_id == workspace.id))
+                    readiness = extraction_readiness(pending, session, settings)
+                    if not readiness.ready:
+                        return {'status': readiness.reason, 'drafts_created': 0,
+                                'retry_after_seconds': readiness.retry_after_seconds}
                 first = pending[0]
-                source = [getattr(state, 'last_message_id', None), first.id, first.content, dict(job.checkpoint or {}) if job else {}]
+                # Appended turns must not reopen the same failed input or reset
+                # its token budget. A received/ambiguous response pins its own
+                # window across later settings changes; before dispatch, an
+                # extraction configuration change is allowed to unblock a cheap
+                # provider/preflight failure.
+                source = [getattr(state, 'last_message_id', None), first.id, first.content,
+                          {key: checkpoint.get(key) for key in ('message_id', 'content_hash', 'offset')}]
+                receipt = checkpoint.get('extraction_call')
+                if isinstance(receipt, dict) and isinstance(receipt.get('window'), str):
+                    window = receipt['window']
+                else:
+                    config = load_enhancement_config(db, workspace.id)['extraction']
+                    window = hashlib.sha256(json.dumps([source, config], sort_keys=True, default=str).encode()).hexdigest()
             else:
                 latest = db.scalar(select(ContextSummary).where(
                     ContextSummary.workspace_id == workspace.id, ContextSummary.session_id == session_id,
@@ -155,8 +258,8 @@ def guarded_session_job(kind):
                     Message.session_id == session_id, Message.status == 'completed')
                     .order_by(Message.created_at, Message.id).limit(1))
                 source = [getattr(latest, 'version', 0), getattr(first, 'id', None), getattr(first, 'content', '')]
-            config = load_enhancement_config(db, workspace.id)
-            window = hashlib.sha256(json.dumps([source, config], sort_keys=True, default=str).encode()).hexdigest()
+                config = load_enhancement_config(db, workspace.id)
+                window = hashlib.sha256(json.dumps([source, config], sort_keys=True, default=str).encode()).hexdigest()
             db.commit()
             lease, status = claim_memory_job(db, workspace_id=workspace.id, kind=kind,
                 resource_id=session_id, window_key=window, force=force)
@@ -170,7 +273,7 @@ def guarded_session_job(kind):
                     kwargs['actor_id'] = actor_id
                 result = fn(db, workspace, session_id, settings, **kwargs)
                 status = result.get('status', 'error')
-                success = status in {'ok', 'no_new_messages', 'session_deleted'}
+                success = status in {'ok', 'partial', 'no_new_messages', 'session_deleted', 'model_outcome_unknown'}
                 # Cheap skips are not permanent: configuration/thresholds can change.
                 db.commit()
                 lease.finish(success=success, status=status)
@@ -184,7 +287,7 @@ def guarded_session_job(kind):
         return wrapped
     return decorate
 
-def extraction_batch(messages, checkpoint, char_budget=12000):
+def extraction_batch(messages, checkpoint, char_budget=EXTRACTION_CHAR_BUDGET):
     """Return exact text slices and a checkpoint; never advance past unseen text."""
     selected, texts, complete, next_checkpoint = [], {}, [], {}
     remaining = char_budget

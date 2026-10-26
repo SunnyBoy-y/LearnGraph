@@ -441,6 +441,10 @@ def extract_memories_now(
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
+    retry_unknown: bool = Query(
+        False,
+        description="Explicitly retry an extraction whose remote outcome was unknown and may already have been billed.",
+    ),
 ) -> dict:
     return extract_session_memories(
         db,
@@ -449,6 +453,7 @@ def extract_memories_now(
         settings,
         actor_id=context.principal.user_id,
         force=True,
+        retry_unknown=retry_unknown,
     )
 
 
