@@ -23,12 +23,20 @@ def api(tmp_path):
     install_error_handlers(app)
     context = SimpleNamespace(principal=SimpleNamespace(is_system_admin=True))
     settings = SimpleNamespace(update_agent_url="http://host.docker.internal:34116", app_version="v1.0.0",
-                               update_agent_token_file=tmp_path / "token")
+                               update_agent_token_file=tmp_path / "token", storage_root=tmp_path / "storage")
     settings.update_agent_token_file.write_text("a" * 48)
     app.dependency_overrides[workspace_context] = lambda: context
     app.dependency_overrides[get_settings] = lambda: settings
     with TestClient(app) as client:
         yield client, context, settings
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
+def test_health_reports_connected_database_instead_of_sqlite_bootstrap(dialect):
+    db = SimpleNamespace(execute=lambda _: None, scalar=lambda _: None,
+        connection=lambda: SimpleNamespace(dialect=SimpleNamespace(name=dialect)))
+    settings = SimpleNamespace(app_version="v1.0.0",database_url="sqlite:////data/learngraph.db")
+    assert health.health(db,settings).database == dialect
 
 
 @pytest.mark.parametrize("method,path,body", [
@@ -134,3 +142,25 @@ def test_auto_install_policy_requires_a_real_boolean(api):
         response = client.post("/api/v1/updates/policy", json={"auto_install": "false"})
     assert response.status_code == 422
     proxy.assert_not_called()
+
+
+def test_postgresql_keeps_updates_and_auto_install_available(api):
+    from app.core.database_routing import atomic_json, state_root
+    client, _, settings = api
+    atomic_json(state_root(settings) / "active.json", {"phase": "postgresql_active"})
+    with patch.object(updates, "call_agent", new_callable=AsyncMock) as proxy:
+        proxy.return_value = {"accepted": True}
+        assert client.post("/api/v1/updates/jobs", json={"request_id": "a" * 16, "version": "v0.5"}).status_code == 202
+        assert client.post("/api/v1/updates/policy", json={"auto_install": True}).status_code == 200
+        proxy.return_value = {"auto_install": False}
+        assert client.post("/api/v1/updates/policy", json={"auto_install": False}).status_code == 200
+
+
+def test_pending_activation_still_blocks_updates(api):
+    from app.core.database_routing import atomic_json, state_root
+    client, _, settings = api
+    atomic_json(state_root(settings) / "active.json", {"phase": "activation_pending"})
+    with patch.object(updates, "call_agent", new_callable=AsyncMock) as proxy:
+        assert client.post("/api/v1/updates/jobs", json={"request_id": "a" * 16, "version": "v0.5"}).status_code == 409
+        assert client.post("/api/v1/updates/policy", json={"auto_install": True}).status_code == 409
+        proxy.assert_not_called()

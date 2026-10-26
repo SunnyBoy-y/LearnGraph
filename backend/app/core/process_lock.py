@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -64,12 +64,14 @@ def acquire_advisory_lock(
             # wall-clock value as UTC before comparing with the aware `now`.
             expires = expires.replace(tzinfo=timezone.utc)
         if expires is None or expires < now:
-            row.token = token
-            row.expires_at = expires_at
-            row.updated_at = now
             try:
+                changed = db.execute(update(AdvisoryLock).where(
+                    AdvisoryLock.name == name,
+                    AdvisoryLock.token == row.token,
+                    or_(AdvisoryLock.expires_at.is_(None), AdvisoryLock.expires_at < now),
+                ).values(token=token, expires_at=expires_at, updated_at=now))
                 db.commit()
-                return token
+                return token if changed.rowcount == 1 else None
             except IntegrityError:  # pragma: no cover - defensive
                 db.rollback()
                 return None
@@ -89,9 +91,7 @@ def release_advisory_lock(db: Session, name: str, token: str) -> None:
     expires on its own (``ttl_seconds``) so the next claim is not blocked.
     """
     try:
-        row = db.scalar(select(AdvisoryLock).where(AdvisoryLock.name == name))
-        if row is not None and row.token == token:
-            db.delete(row)
-            db.commit()
+        db.execute(delete(AdvisoryLock).where(AdvisoryLock.name == name, AdvisoryLock.token == token))
+        db.commit()
     except OperationalError:
         db.rollback()

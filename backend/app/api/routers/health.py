@@ -41,7 +41,7 @@ def health(db: DB, settings: AppSettings) -> HealthResponse:
     """健康检查。
 
     无需认证或工作区 Header。返回服务状态、数据库类型、API 版本，以及是否存在已启用的远程能力。
-    `status=ok` 只表示应用和 SQLite 可连接，不代表所有外部 Provider 都可用。
+    `status=ok` 只表示应用和当前主库可连接，不代表所有外部 Provider 都可用。
     """
     db.execute(text("SELECT 1"))
     remote_enabled = db.scalar(
@@ -56,7 +56,7 @@ def health(db: DB, settings: AppSettings) -> HealthResponse:
         status="ok",
         service="learngraph-backend",
         version=settings.app_version,
-        database="sqlite",
+        database=db.connection().dialect.name,
         remote_capabilities_enabled=remote_enabled is not None,
         agent_stream_admission=snapshot_admission_metrics(),
     )

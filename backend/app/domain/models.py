@@ -3335,6 +3335,7 @@ class EgressAuthorizationRequest(Base, TimestampMixin, WorkspaceScopedMixin):
             "dedupe_key",
             unique=True,
             sqlite_where=text("status = 'pending'"),
+            postgresql_where=text("status = 'pending'"),
         ),
         Index(
             "ix_egress_auth_requests_workspace_status",

@@ -49,6 +49,11 @@ infrastructure = [
   "pymysql>=1.1,<2",
   "redis>=5,<7",
 ]
+# Main-business SQLite -> PostgreSQL migration and its isolated Docker agent.
+database-migration = [
+  "psycopg[binary]>=3.2,<4",
+  "docker>=7.1,<8",
+]
 # Optional realtime voice runtime. The API/session contract remains usable
 # without this extra; installing it enables the Pipecat + SmallWebRTC adapter.
 voice = [

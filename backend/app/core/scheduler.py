@@ -1394,6 +1394,17 @@ def run_hot_table_archive(*, now: datetime | None = None) -> dict[str, int]:
                 db.commit()
                 table_total = 0
                 while True:
+                    if db.connection().dialect.name == "postgresql":
+                        inserted = int(db.execute(text(
+                            f"WITH removed AS (DELETE FROM {source} WHERE id IN ("
+                            f"SELECT id FROM {source} WHERE created_at < :cutoff ORDER BY id LIMIT :batch) RETURNING *) "
+                            f"INSERT INTO {archive} SELECT * FROM removed"
+                        ), {"cutoff": cutoff, "batch": batch}).rowcount or 0)
+                        db.commit()
+                        table_total += inserted
+                        if inserted < batch:
+                            break
+                        continue
                     inserted = int(
                         db.execute(
                             text(

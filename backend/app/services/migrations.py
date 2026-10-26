@@ -558,6 +558,8 @@ class MigrationService:
         resource_kind = payload.resource_kind or (
             "object_storage" if payload.source_kind in {"local", "local_files"} else "database"
         )
+        if resource_kind == "database":
+            raise AppError(409, "online_database_migration_required", "旧数据库迁移执行器已禁用，请使用系统管理员主业务库在线迁移入口")
         target_name = payload.target_name or f"target-{utc_now().strftime('%Y%m%d%H%M%S%f')}"
         checks: list[dict[str, Any]] = []
         source_locator: dict[str, Any]
@@ -718,6 +720,8 @@ class MigrationService:
     def start(self, job_id: str) -> dict[str, Any]:
         job = self._job(job_id)
         execution = self._execution(job_id)
+        if execution.resource_kind == "database":
+            raise AppError(409, "online_database_migration_required", "旧数据库迁移执行器已禁用")
         if job.status != "PREFLIGHT" or not job.report.get("ready"):
             raise AppError(409, "migration_not_ready", "Migration preflight is not ready")
         if execution.target_locator.get("provider_kind") not in {"sqlite", "local"}:
@@ -1004,6 +1008,8 @@ class MigrationService:
     def rollback(self, job_id: str) -> dict[str, Any]:
         job = self._job(job_id)
         execution = self._execution(job_id)
+        if execution.resource_kind == "database":
+            raise AppError(409, "database_reverse_migration_forbidden", "不支持将主业务库迁回 SQLite")
         if job.status == "COMMITTED" or not execution.can_rollback:
             execution.reverse_migration_required = True
             self.db.commit()

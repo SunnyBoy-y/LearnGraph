@@ -207,7 +207,11 @@ def execute_analyze_events(runtime: Any, arguments: dict[str, Any]) -> tuple[str
             str(row[0] or "unknown"): int(row[1]) for row in session_rows
         }
     elif group_by == "hour":
-        hour_expr = func.strftime("%Y-%m-%dT%H:00", SubAppInteractionEvent.created_at)
+        hour_expr = (
+            func.to_char(SubAppInteractionEvent.created_at, 'YYYY-MM-DD"T"HH24:00')
+            if db.connection().dialect.name == "postgresql"
+            else func.strftime("%Y-%m-%dT%H:00", SubAppInteractionEvent.created_at)
+        )
         hour_rows = db.execute(
             select(hour_expr, func.count(SubAppInteractionEvent.id))
             .where(*filters)

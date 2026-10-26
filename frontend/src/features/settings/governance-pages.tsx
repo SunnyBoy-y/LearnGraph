@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, } from "@/components/ui/select";
 import { DatabaseConfigurationSheet } from "@/features/settings/database-configuration-sheet";
+import { PrimaryDatabaseMigrationPanel } from "@/features/settings/primary-database-migration-panel";
 import { saveBlobViaNative } from "@/lib/native-download";
 import { cn } from "@/lib/utils";
 import type { AuditEvent } from "@/types/audit";
@@ -28,7 +29,6 @@ const migrationTargetOptions: Record<
 > = {
   database: [
     { value: "postgresql", label: "PostgreSQL" },
-    { value: "mysql", label: "MySQL" },
   ],
   object_storage: [{ value: "minio", label: "MinIO" }],
 };
@@ -358,8 +358,8 @@ function FlagStatusIcon({ value }: { value: boolean }) {
 export function MigrationPage() {
   const queryClient = useQueryClient();
   const [resourceKind, setResourceKind] =
-    useState<MigrationResourceKind>("database");
-  const [target, setTarget] = useState("postgresql");
+    useState<MigrationResourceKind>("object_storage");
+  const [target, setTarget] = useState("minio");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [commitOpen, setCommitOpen] = useState(false);
   const [rollbackOpen, setRollbackOpen] = useState(false);
@@ -378,7 +378,7 @@ export function MigrationPage() {
     queryFn: listMigrationAdapters,
     staleTime: 30_000,
   });
-  const activeJobId = selectedJobId ?? migrations.data?.[0]?.id;
+  const activeJobId = selectedJobId ?? migrations.data?.find(item => item.resource_kind === "object_storage")?.id;
   const selectedJob = useQuery({
     queryKey: ["migration", activeJobId],
     queryFn: () => getMigration(activeJobId ?? ""),
@@ -448,7 +448,7 @@ export function MigrationPage() {
         <ErrorState message={migrations.error.message} />
       </PageFrame>
     );
-  const migrationJobs = migrations.data ?? [];
+  const migrationJobs = (migrations.data ?? []).filter(item => item.resource_kind === "object_storage");
   const job = selectedJob.data ?? migrationJobs.find((item) => item.id === activeJobId);
   const currentStateIndex = migrationStateIndex(job);
   const parsedReport = parseMigrationReport(job?.report);
@@ -470,11 +470,13 @@ export function MigrationPage() {
   return (
     <PageFrame>
       <PageIntro
-        description="数据库与对象存储只在维护窗口切换；任何时刻只允许一个活动事实源，不做静默双写。"
+        description="管理主业务数据库与文件存储；数据库在线迁移仅对系统管理员开放。"
         eyebrow="Storage migration"
-        title="数据库与文件存储迁移向导"
+        title="存储与数据迁移"
       />
+      <PrimaryDatabaseMigrationPanel />
       <Surface className="p-5">
+        <SectionHeading title="对象存储迁移" description="以下操作仅影响文件存储，与主业务数据库迁移分别执行。" />
         <div className="flex flex-wrap items-center gap-3">
           <Select
             onValueChange={(value) => {
@@ -490,7 +492,6 @@ export function MigrationPage() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="database">数据库</SelectItem>
               <SelectItem value="object_storage">对象存储</SelectItem>
             </SelectContent>
           </Select>
@@ -555,7 +556,7 @@ export function MigrationPage() {
                   (currentStateIndex >= 0 && index === currentStateIndex)
                 );
               })
-          ).map((state) => {
+          ).filter(state => state !== "COPYING_DATABASE").map((state) => {
             const index = migrationStates.indexOf(state);
             const isActive = currentStateIndex >= 0 && index === currentStateIndex;
             const isDone = currentStateIndex >= 0 && index < currentStateIndex;
@@ -743,10 +744,10 @@ export function MigrationPage() {
           <SectionHeading title="迁移原则" />
           <div className="mt-4 space-y-3">
             {[
-              "任一时刻只有一个业务数据库和一个对象存储接受写入。",
-              "数据库与对象存储分别迁移、分别提交，不把局部成功伪装成整体完成。",
-              "FTS、向量、图布局、缩略图等派生数据迁移后重建。",
-              "COMMITTED 前可切回源；目标开放新写入后只能反向迁移。",
+              "任一时刻只有一个活动对象存储接受写入。",
+              "对象存储迁移单独复制、校验和提交。",
+              "提交前核对文件大小、内容摘要与活动 Binding。",
+              "对象存储提交前可取消；提交后的处理遵循对象存储自身的迁移规则。",
             ].map((item) => (
               <div
                 className="rounded-xl border bg-muted/20 p-3 text-sm leading-6"
@@ -890,7 +891,7 @@ export function MigrationPage() {
           <p className="p-5 text-sm text-destructive">{adapters.error.message}</p>
         ) : (
           <div className="divide-y">
-            {(adapters.data ?? []).map((adapter) => {
+            {(adapters.data ?? []).filter(adapter => adapter.capability !== "database").map((adapter) => {
               const detailEntries = Object.entries(adapter.details ?? {});
               return (
                 <div

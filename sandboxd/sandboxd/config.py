@@ -77,6 +77,8 @@ class SandboxdConfig:
     ttl_sweep_interval_seconds: int
     network_label: str
     seccomp_dir: str
+    managed_database_enabled: bool = False
+    migration_agent_idle_seconds: int = 120
 
     @classmethod
     def from_env(cls) -> "SandboxdConfig":
@@ -130,4 +132,6 @@ class SandboxdConfig:
             seccomp_dir=(os.environ.get("SANDBOXD_SECCOMP_DIR") or str(
                 Path(__file__).resolve().parents[2] / "backend" / "sandbox"
             )).strip(),
+            managed_database_enabled=os.environ.get("SANDBOXD_MANAGED_DATABASE_ENABLED", "false").strip().lower() == "true",
+            migration_agent_idle_seconds=_env_int("SANDBOXD_MIGRATION_AGENT_IDLE_SECONDS", 120, minimum=30, maximum=3600),
         )

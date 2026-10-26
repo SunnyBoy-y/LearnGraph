@@ -12,6 +12,25 @@ from app.core.errors import AppError
 router = APIRouter(prefix="/updates", tags=["updates"])
 
 
+def _update_lease(settings):
+    from app.core.database_routing import OperationLease, read_json, state_root
+    root = state_root(settings)
+    try:
+        lease = OperationLease(root)
+    except BlockingIOError as exc:
+        raise AppError(409, "database_update_interlock", "主业务库迁移正在执行，不能同时更新服务") from exc
+    job = read_json(root / "job.json")
+    active = read_json(root / "active.json")
+    if active and active.get("phase") != "postgresql_active" or job and job.get("state") not in {"COMPLETED", "CANCELLED"}:
+        lease.close()
+        raise AppError(409, "database_update_interlock", "主业务库迁移尚未结束，不能同时更新服务")
+    pending = read_json(root / "site-restore.json")
+    if pending and pending.get("state") not in {"COMPLETED", "ROLLED_BACK"}:
+        lease.close()
+        raise AppError(409, "database_update_interlock", "请先完成全站恢复")
+    return lease
+
+
 class UpdateJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_id: str = Field(pattern=r"^[A-Za-z0-9-]{16,64}$")
@@ -64,9 +83,18 @@ async def check(context: SystemAdminContext, settings: AppSettings):
 
 @router.post("/jobs", status_code=202)
 async def create_job(payload: UpdateJobRequest, context: SystemAdminContext, settings: AppSettings):
-    return await call_agent(settings, "POST", "/v1/jobs", payload.model_dump(exclude_none=True))
+    lease = _update_lease(settings)
+    try:
+        return await call_agent(settings, "POST", "/v1/jobs", payload.model_dump(exclude_none=True))
+    finally:
+        lease.close()
 
 
 @router.post("/policy")
 async def policy(payload: UpdatePolicy, context: SystemAdminContext, settings: AppSettings):
-    return await call_agent(settings, "POST", "/v1/policy", payload.model_dump())
+    lease = _update_lease(settings) if payload.auto_install else None
+    try:
+        return await call_agent(settings, "POST", "/v1/policy", payload.model_dump())
+    finally:
+        if lease:
+            lease.close()

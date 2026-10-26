@@ -33,6 +33,18 @@ class MigrationConfirmRequest(BaseModel):
     confirm: Literal[True]
 
 
+class PrimaryDatabaseMigrationRequest(BaseModel):
+    confirm: Literal[True]
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+    managed: bool = True
+    auto_activate: bool = True
+
+
+class PrimaryDatabaseActivationRequest(BaseModel):
+    confirm: Literal[True]
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+
+
 class SiteBackupRequest(BaseModel):
     current_password: SecretStr = Field(min_length=1, max_length=1024)
     backup_password: SecretStr = Field(min_length=12, max_length=1024)

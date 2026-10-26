@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from sandboxd.auth import AdminAuth, ServiceAuth, request_id_header
 from sandboxd.controller import SandboxController, SandboxdError
 from sandboxd.paths import scope_key
+from sandboxd.migration_agent import JOB, ManagedMigrationAgent, MigrationAgentError
 from sandboxd.protocol import (
     AgentExecRequest,
     BootstrapJobRequest,
@@ -79,10 +80,12 @@ def _error_response(exc: SandboxdError, request_id: str | None) -> JSONResponse:
 
 
 class SandboxAPI:
-    def __init__(self, controller: SandboxController, *, service_auth: ServiceAuth, admin_auth: AdminAuth) -> None:
+    def __init__(self, controller: SandboxController, *, service_auth: ServiceAuth, admin_auth: AdminAuth,
+                 migration_agent: ManagedMigrationAgent | None = None) -> None:
         self.controller = controller
         self.service_auth = service_auth
         self.admin_auth = admin_auth
+        self.migration_agent = migration_agent
 
     def _scope(self, request: Request, value: str | None) -> str:
         if not value:
@@ -104,6 +107,32 @@ class SandboxAPI:
 
     def build_router(self) -> APIRouter:
         router = APIRouter(prefix="/v1")
+
+        @router.get("/database-migration-agent", dependencies=[Depends(self.admin_auth)])
+        def migration_agent_status():
+            return {"enabled": bool(self.migration_agent and
+                self.migration_agent.config.managed_database_enabled and
+                self.migration_agent.config.runtime_backend == "docker")}
+
+        def migration_operation(job_id: str, operation: str, request: Request):
+            if not JOB.fullmatch(job_id):
+                raise HTTPException(status_code=422, detail="Invalid migration job")
+            if request.query_params or request.headers.get("content-length", "0") != "0" or request.headers.get("transfer-encoding"):
+                raise HTTPException(status_code=400, detail="Migration lifecycle accepts no parameters or body")
+            if self.migration_agent is None:
+                raise HTTPException(status_code=503, detail="Managed database control is disabled")
+            try:
+                return getattr(self.migration_agent, operation)(job_id)
+            except MigrationAgentError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from None
+
+        @router.post("/database-migration-agent/{job_id}/start", dependencies=[Depends(self.admin_auth)])
+        def start_migration_agent(job_id: str, request: Request):
+            return migration_operation(job_id, "start", request)
+
+        @router.post("/database-migration-agent/{job_id}/stop", dependencies=[Depends(self.admin_auth)])
+        def stop_migration_agent(job_id: str, request: Request):
+            return migration_operation(job_id, "stop", request)
 
         @router.get("/health/live")
         def live() -> dict[str, bool]:

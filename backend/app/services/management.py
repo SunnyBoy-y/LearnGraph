@@ -4123,6 +4123,8 @@ class MigrationService:
         return list(self.jobs.list())
 
     def preflight(self, payload: MigrationPreflightRequest) -> MigrationJob:
+        if payload.resource_kind == "database" or payload.source_kind not in {"local", "local_files"}:
+            raise AppError(409, "online_database_migration_required", "旧数据库迁移入口已禁用，请使用系统管理员在线迁移")
         checks = [
             {"key": "source_readable", "status": "passed" if payload.source_kind == "sqlite" else "not_checked"},
             {"key": "target_adapter", "status": "missing" if payload.target_kind != "sqlite" else "passed"},
@@ -4152,6 +4154,8 @@ class MigrationService:
 
     def start(self, job_id: str) -> None:
         job = self.jobs.require(job_id, "migration job")
+        if job.source_kind not in {"local", "local_files"}:
+            raise AppError(409, "online_database_migration_required", "旧数据库迁移入口已禁用")
         if job.status != "cutover_ready":
             raise AppError(409, "migration_not_ready", "Preflight is not ready; no data was copied")
         raise AppError(

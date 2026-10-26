@@ -10,6 +10,7 @@ service token) never appear in exceptions, reprs, or logs.
 from __future__ import annotations
 
 import threading
+import re
 import uuid
 from typing import Any
 
@@ -328,6 +329,18 @@ class SandboxdClient:
         return response.json()
 
     # --- bootstrap / admin control plane ------------------------------------
+
+    def migration_agent_status(self) -> dict[str, Any]:
+        if not self._admin_token:
+            raise SandboxdUnavailable("sandboxd admin control plane is not configured")
+        return self._request("GET", "/v1/database-migration-agent", admin=True).json()
+
+    def manage_migration_agent(self, job_id: str, operation: str) -> dict[str, Any]:
+        if not self._admin_token:
+            raise SandboxdUnavailable("sandboxd admin control plane is not configured")
+        if not re.fullmatch(r"[a-f0-9]{32}", job_id) or operation not in {"start", "stop"}:
+            raise ValueError("Invalid migration lifecycle request")
+        return self._request("POST", f"/v1/database-migration-agent/{job_id}/{operation}", admin=True).json()
 
     def install_runtime(self, runtime_kind: str, image_tag: str) -> dict[str, Any]:
         """Ask the daemon to install + pin + smoke a prebuilt runner.

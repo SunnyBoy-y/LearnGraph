@@ -17,6 +17,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import get_settings
+from app.core.database_routing import PrimaryDatabaseEngine, RouteLease, startup_url, install_postgres_writer_order, state_root
 
 
 class Base(DeclarativeBase):
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 SQLITE_BUSY_TIMEOUT_MS = settings.sqlite_busy_timeout_ms
 SQLITE_BUSY_TIMEOUT_SECONDS = SQLITE_BUSY_TIMEOUT_MS / 1_000
 
+settings.database_url = startup_url(settings)
 database_url = make_url(settings.database_url)
 is_sqlite = database_url.get_backend_name() == "sqlite"
 if is_sqlite and database_url.database and database_url.database != ":memory:":
@@ -48,7 +50,7 @@ engine = create_engine(
         "timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
     }
     if is_sqlite
-    else {},
+    else {"connect_timeout": 5, **({"options": (str(database_url.query.get("options", "")) + " -c default_transaction_read_only=on").strip()} if settings.sqlite_read_only else {})},
     **(
         # Each active agent stream holds one connection for the whole SSE
         # generation, so the SQLAlchemy default pool (5 + 10 overflow) can be
@@ -62,8 +64,6 @@ engine = create_engine(
             "pool_timeout": settings.sqlite_pool_timeout_seconds,
             "pool_pre_ping": True,
         }
-        if is_sqlite
-        else {}
     ),
 )
 
@@ -532,6 +532,17 @@ def install_sqlite_write_gate(target_engine: Any) -> None:
 
 if is_sqlite:
     install_sqlite_write_gate(engine)
+
+# Keep the public Engine identity stable for every captured bind, including
+# ad-hoc Session(bind), telemetry, heartbeats and long-lived service objects.
+source_engine = engine
+if is_sqlite:
+    from app.core.sqlite_capture import SQLiteCapture
+    sqlite_capture = SQLiteCapture(source_engine)
+else:
+    sqlite_capture = None
+    install_postgres_writer_order(source_engine)
+engine = PrimaryDatabaseEngine(source_engine, settings)
 
 
 def run_sqlite_gate_watchdog(threshold_seconds: float | None = None) -> dict[str, Any]:
@@ -1052,6 +1063,15 @@ def backup_sqlite_before_migration(pending: list[str]) -> Path | None:
 
 
 def init_database() -> None:
+    # A concurrently starting API/preview participant must finish all SQLite
+    # schema checks before a different process can seal the source.
+    with RouteLease(state_root(settings), exclusive=False):
+        with engine.connect():
+            pass  # refresh a route activated since module import
+        _init_database_under_route_lease()
+
+
+def _init_database_under_route_lease() -> None:
     from app.domain import (  # noqa: F401
         extension_models,
         graph_cover_models,

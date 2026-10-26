@@ -17,6 +17,7 @@ from sandboxd.controller import SandboxController
 from sandboxd.runtime.docker import DockerRuntimeBackend
 from sandboxd.runtime.port import RuntimeBackendPort
 from sandboxd.store import SandboxdStore
+from sandboxd.migration_agent import ManagedMigrationAgent
 
 logger = logging.getLogger("sandboxd.main")
 
@@ -64,16 +65,19 @@ def create_app(
     if runtime is None:
         runtime = _default_runtime(config)
     controller = SandboxController(config, store, runtime)
+    migration_agent = ManagedMigrationAgent(config)
     api = SandboxAPI(
         controller,
         service_auth=ServiceAuth(config.token),
         admin_auth=AdminAuth(config.admin_token),
+        migration_agent=migration_agent,
     )
 
     app = FastAPI(title="sandboxd", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.controller = controller
     app.state.store = store
     app.state.runtime = runtime
+    app.state.migration_agent = migration_agent
     app.middleware("http")(request_id_middleware)
     app.include_router(api.build_router())
 
@@ -96,6 +100,10 @@ def create_app(
                         controller.reconcile_executions()
                     except Exception:
                         logger.exception('Execution reconciliation tick failed')
+                    try:
+                        migration_agent.sweep()
+                    except Exception:
+                        logger.warning("Migration agent lease cleanup failed")
                     stop_event.wait(1)
             execution_thread = threading.Thread(target=recover_executions, name='sandboxd-executions', daemon=True)
             execution_thread.start()

@@ -85,3 +85,46 @@ export interface BackupRestoreResult {
   restore_path: string | null
   restart_required: boolean
 }
+
+export interface PrimaryDatabaseCheck {
+  key: string
+  passed: boolean
+  detail?: string
+}
+
+export interface PrimaryDatabasePreflight {
+  ready: boolean
+  tables: number
+  checks: PrimaryDatabaseCheck[]
+}
+
+export interface PrimaryDatabaseMigration {
+  id?: string
+  state?: string
+  active_database: 'sqlite' | 'postgresql'
+  irreversible: boolean
+  agent_configured: boolean
+  agent_auto_start?: boolean
+  agent_state?: 'starting' | 'running' | 'stopped' | 'cleanup_pending'
+  running: boolean
+  backup_verified?: boolean
+  baseline_verified?: boolean
+  search_verified?: boolean
+  target_verified?: boolean
+  all_checks_passed?: boolean
+  backup_pages_copied?: number
+  backup_pages_total?: number
+  backup_bytes?: number
+  tables_copied?: number
+  tables_total?: number
+  tables_verified?: number
+  rows_copied?: number
+  pending_transactions?: number
+  applied_commit?: number
+  source_commit?: number
+  current_table?: string
+  error?: string
+  image_digest?: string
+  image_progress?: { layers?: Record<string, { status?: string; current?: number; total?: number }> }
+  events?: { sequence: number; state: string; at: string }[]
+}

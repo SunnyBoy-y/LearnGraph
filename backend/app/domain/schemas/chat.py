@@ -310,7 +310,7 @@ class SessionFragmentSearchResponse(BaseModel):
     query: str | None
     scope: Literal["linked", "workspace", "all_authorized"]
     reason: str
-    retrieval_strategy: Literal["session_id", "fts5_bm25_rules", "mixed"]
+    retrieval_strategy: Literal["session_id", "fts5_bm25_rules", "postgresql_trigram_rules", "mixed"]
     hits: list[SessionFragmentSearchHit] = Field(default_factory=list)
 
 

@@ -846,17 +846,18 @@ class DocumentLearningService:
             selection_status = "unverified_degraded"
         else:
             selection_status = "none"
+        search_backend = "postgresql_trigram" if self.db.connection().dialect.name == "postgresql" else "fts5"
         trace = RetrievalTrace(
             workspace_id=self.workspace_id,
             actor_id=self.actor_id,
             query_hash=_hash(payload.query),
             file_ids=file_ids,
             strategy= (
-                "fts5_full_document"
+                search_backend + "_full_document"
                 if full_document
-                else "fts5_bm25+head_context"
+                else ("postgresql_trigram+head_context" if search_backend == "postgresql_trigram" else "fts5_bm25+head_context")
                 if used_head_context_fallback
-                else "fts5_bm25"
+                else ("postgresql_trigram" if search_backend == "postgresql_trigram" else "fts5_bm25")
             ),
             status="completed",
             result_count=len(rows),
@@ -1110,6 +1111,9 @@ class DocumentLearningService:
         if scoped_chunk_ids == []:
             return []
         match_query, fallback_terms = _fts_query(query)
+        if self.db.connection().dialect.name == "postgresql":
+            from app.core.postgresql_search import document_candidates
+            return document_candidates(self.db, self.workspace_id, file_ids, fallback_terms, scoped_chunk_ids, limit)
         scope_clause = " AND c.id IN :chunk_ids" if scoped_chunk_ids is not None else ""
         statement = text(
             f"""

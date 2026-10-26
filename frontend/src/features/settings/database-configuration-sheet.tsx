@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Database, ShieldCheck, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
+import { useAuth } from "@/features/auth/auth-context-value";
 
 import {
   listDatabaseConfigurations,
@@ -54,11 +55,12 @@ export function DatabaseConfigurationSheet({
   onOpenChange,
   onSaved,
 }: DatabaseConfigurationSheetProps) {
+  const { isSystemAdmin } = useAuth();
   const queryClient = useQueryClient();
   const configurations = useQuery({
     queryKey: ["migration-database-configurations"],
     queryFn: listDatabaseConfigurations,
-    enabled: open,
+    enabled: open && isSystemAdmin,
   });
   const current = configurations.data?.find(
     (item) => item.provider_kind === providerKind,
@@ -102,6 +104,7 @@ export function DatabaseConfigurationSheet({
 
   const parsedPort = Number(port);
   const canSubmit =
+    isSystemAdmin &&
     host.trim().length > 0 &&
     databaseName.trim().length > 0 &&
     username.trim().length > 0 &&
@@ -111,6 +114,7 @@ export function DatabaseConfigurationSheet({
     (current?.password_configured || password.length > 0) &&
     !save.isPending;
 
+  if (!isSystemAdmin) return null;
   return (
     <Sheet onOpenChange={onOpenChange} open={open}>
       <SheetContent className="w-[min(480px,100vw)] overflow-y-auto sm:max-w-[480px]">
@@ -120,8 +124,7 @@ export function DatabaseConfigurationSheet({
           </div>
           <SheetTitle>配置 {databaseLabels[providerKind]}</SheetTitle>
           <SheetDescription className="max-w-sm leading-5">
-            连接信息仅供当前工作区迁移预检使用。密码会进入服务端 Secret Store，
-            不会回传浏览器、日志或备份。
+            连接信息用于整个实例的主业务库迁移。请使用专用空库，迁移完成前不要让其他程序写入。密码经部署密钥加密保存，不会回传浏览器。
           </SheetDescription>
         </SheetHeader>
         <form

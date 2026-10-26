@@ -144,6 +144,10 @@ class SandboxdBackend(SandboxBackendPort):
     def _scope(self, session_id: str) -> str:
         return f"{self.settings.sandboxd_deployment_id}|{session_id}"
 
+    def migration_agent(self, operation: str, job_id: str | None = None) -> dict[str, Any]:
+        daemon = self._daemon()
+        return daemon.migration_agent_status() if operation == "status" else daemon.manage_migration_agent(job_id or "", operation)
+
     def _ttl_seconds(self) -> int:
         return max(60, int(self.settings.sandbox_workspace_absolute_ttl_seconds))
 
