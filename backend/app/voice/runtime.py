@@ -21,6 +21,30 @@ class VoiceRuntimeInfo:
     reason: str | None = None
 
 
+def websocket_runtime_url(settings: object | None = None) -> str | None:
+    """Advertise only the in-process, optional duplex WebSocket transport."""
+    if getattr(settings, "voice_wss_enabled", True) is False:
+        return None
+    disabled = {"0", "false", "no", "off"}
+    if any(os.getenv(key, default).strip().lower() in disabled for key, default in (
+        ("LEARNGRAPH_VOICE_RUNTIME_ENABLED", "true"),
+        ("LEARNGRAPH_VOICE_RUNTIME_EMBEDDED", "true"),
+        ("LEARNGRAPH_VOICE_WSS_ENABLED", "true"),
+    )):
+        return None
+    try:
+        required = (
+            "pipecat.transports.websocket.fastapi",
+            "pipecat.workers.runner",
+            "aiortc.codecs.opus",
+        )
+        if not all(importlib.util.find_spec(name) is not None for name in required):
+            return None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return None
+    return "/api/v1/voice/sessions/{session_id}/api/audio"
+
+
 def runtime_info(settings: object | None = None) -> VoiceRuntimeInfo:
     """Return the configured audio worker without importing optional packages."""
 

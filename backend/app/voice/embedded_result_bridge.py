@@ -12,6 +12,8 @@ import asyncio
 import contextlib
 import json
 from typing import Any
+from collections import deque
+from app.voice.speech_floor import VoiceSpeechFloor
 
 from loguru import logger
 
@@ -40,21 +42,81 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
         result_port: Any,
         poll_interval: float = 1.0,
         name: str = "VoiceResultDelivery",
+        floor: VoiceSpeechFloor | None = None,
+        control_dispatch: Any = None,
+        result_dispatch: Any = None,
+        conversation_policy: Any = None,
     ) -> None:
         super().__init__(name=name)
         self._agent = agent
         self._result_port = result_port
+        self.floor = floor if floor is not None else VoiceSpeechFloor()
+        self._control_dispatch = control_dispatch
+        self._result_dispatch = result_dispatch
+        self._conversation_policy = conversation_policy
+        self._shown_scene: tuple | None = None
+        self._controls: deque[tuple[str, str]] = deque()
+        self._control_ids: deque[str] = deque(maxlen=128)
         self._poll_interval = max(0.25, float(poll_interval))
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._user_speaking = False
         self._bot_speaking = False
         self._generating = False
-        self._seen_task_ids: set[str] = set()
+        self._seen_result_keys: set[tuple] = set()
         self._initialized = False
         self._cooldown_until = 0.0
         self._active_speech_id: str | None = None
         self._active_task_id: str | None = None
+        self._active_result_key: tuple | None = None
+
+    @staticmethod
+    def _result_key(result):
+        return (str(result.get("task_id") or result.get("subagent_id") or ""), result.get("result_id"),
+                result.get("requirement_version"), result.get("result_version"))
+
+    def enqueue_control(self, request_id: str, text: str) -> bool:
+        if not request_id or not text.strip() or self._control_dispatch is None or self.floor.closed:
+            return False
+        if request_id in self._control_ids:
+            return True
+        if len(self._controls) >= 8:
+            return False
+        if self._conversation_policy is not None and (
+            self._conversation_policy.quiet or self._conversation_policy.mode in {"display", "verbatim"}
+        ):
+            # Only a newly accepted explicit UI request may resume speech.
+            self._conversation_policy.accept("继续讲解", force=True)
+        self._control_ids.append(request_id)
+        self._controls.append((request_id, text.strip()[:8000]))
+        return True
+
+    async def show_requested_scene(self) -> None:
+        policy = self._conversation_policy
+        if policy is None or policy.mode != "display" or self._result_port is None:
+            return
+        revision = policy.revision
+        read = getattr(self._result_port, "current_results", self._result_port.ready_results)
+        results = await read(limit=200)
+        if revision != policy.revision or policy.mode != "display":
+            return
+        candidates = [r for r in results if r.get("status") in {"ready", "delivered"} and
+                      (r.get("scene") or {}).get("available_anchors")]
+        # Prefer a real visual over a separate research summary for a page request.
+        candidates.sort(key=lambda r: not any(a.startswith("visual-") for a in r["scene"]["available_anchors"]))
+        if not candidates:
+            return
+        result = candidates[0]
+        anchors = result["scene"]["available_anchors"]
+        anchor = next((a for a in anchors if a.startswith("visual-")), anchors[0])
+        identity = (revision, result.get("result_id"), result.get("result_version"), anchor)
+        if identity == self._shown_scene:
+            return
+        show = getattr(self._result_port, "show_scene", None)
+        if callable(show):
+            receipt = await show(result["task_id"], anchor)
+            if revision == policy.revision and receipt.get("status") in {"focused", "requested"}:
+                self._shown_scene = identity
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -64,13 +126,13 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
         # call starts is still eligible for automatic delivery, while truly
         # old ready results from before reconnect remain silent.
         try:
-            initial = await self._result_port.ready_results(limit=200)
+            initial = await self._result_port.ready_results(limit=200) if self._result_port else []
             for item in initial:
                 if not isinstance(item, dict):
                     continue
                 task_id = str(item.get("task_id") or item.get("subagent_id") or "")
                 if task_id and not item.get("manual_delivery"):
-                    self._seen_task_ids.add(task_id)
+                    self._seen_result_keys.add(self._result_key(item))
         except Exception:
             logger.debug("initial voice result snapshot failed", exc_info=True)
         self._initialized = True
@@ -78,6 +140,8 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
 
     async def stop(self) -> None:
         self._stopping.set()
+        self.floor.closed = True
+        self._controls.clear()
         await self._finish_active_speech(interrupted=True)
         task, self._task = self._task, None
         if task is not None and not task.done():
@@ -89,6 +153,12 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+        policy = self._conversation_policy
+        revision = frame.metadata.get("voice_revision")
+        if direction == FrameDirection.DOWNSTREAM and policy is not None and revision is not None and revision != policy.revision:
+            # Fence the whole direct response, including its start/end markers.
+            return
+        self.floor.observe(frame)
         if isinstance(frame, VADUserStartedSpeakingFrame):
             self._user_speaking = True
             self._cooldown_until = asyncio.get_running_loop().time() + 1.0
@@ -123,6 +193,7 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
     async def _finish_active_speech(self, *, interrupted: bool) -> None:
         speech_id, self._active_speech_id = self._active_speech_id, None
         task_id, self._active_task_id = self._active_task_id, None
+        result_key, self._active_result_key = self._active_result_key, None
         if not speech_id:
             return
         try:
@@ -131,7 +202,8 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
             )
             if interrupted and task_id:
                 # Keep the result available, but let the user choose to resume.
-                self._seen_task_ids.add(task_id)
+                if result_key:
+                    self._seen_result_keys.add(result_key)
         except Exception:
             logger.debug("voice speech delivery finish update failed", exc_info=True)
             if interrupted and task_id:
@@ -140,7 +212,8 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
                         task_id,
                         delivery_state="released",
                     )
-                self._seen_task_ids.add(task_id)
+                if result_key:
+                    self._seen_result_keys.add(result_key)
 
     async def _update_speech_delivery(self, speech_id: str, state: str) -> None:
         method = getattr(self._result_port, "update_speech_delivery", None)
@@ -152,22 +225,46 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
         """Called by the transport-downstream ledger at the real audio boundary."""
 
         await self._finish_active_speech(interrupted=interrupted)
+        if interrupted:
+            self.floor.interrupt()
+        else:
+            self.floor.playback_ended()
 
     async def _poll_ready_results(self) -> None:
         while not self._stopping.is_set():
             try:
                 await asyncio.sleep(self._poll_interval)
-                results = await self._result_port.ready_results(limit=200)
+                policy = self._conversation_policy
+                if policy is not None and (policy.quiet or policy.mode in {"display", "verbatim"}):
+                    self._controls.clear()
+                    if policy.mode == "display":
+                        await self.show_requested_scene()
+                    continue
+                if self._controls:
+                    request_id, text = self._controls[0]
+                    lease = self.floor.reserve(f"control:{request_id}")
+                    if lease is not None:
+                        try:
+                            admitted = await self._control_dispatch(request_id, text, lease)
+                            if admitted:
+                                if self._controls and self._controls[0][0] == request_id:
+                                    self._controls.popleft()
+                            else:
+                                self.floor.release(lease)
+                        except (Exception, asyncio.CancelledError):
+                            self.floor.release(lease)
+                            raise
+                    continue
+                results = await self._result_port.ready_results(limit=200) if self._result_port else []
                 current_ids = {
-                    str(item.get("task_id") or item.get("subagent_id") or "")
+                    self._result_key(item)
                     for item in results
                     if isinstance(item, dict)
                 }
-                current_ids.discard("")
                 if not self._initialized:
                     # Reconnect semantics: old ready results stay visible in the
                     # transcript but are not automatically spoken again.
-                    self._seen_task_ids.update(current_ids)
+                    self._seen_result_keys.update(current_ids)
                     self._initialized = True
                     continue
 
@@ -177,18 +274,19 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
                     if isinstance(item, dict)
                     and str(item.get("task_id") or item.get("subagent_id") or "")
                     and (item.get("manual_delivery") or (
-                        str(item.get("task_id") or item.get("subagent_id")) not in self._seen_task_ids
+                        self._result_key(item) not in self._seen_result_keys
                         and item.get("auto_delivery") is not False
                         and item.get("topic_current") is not False
                         and str(item.get("playback_status") or "") not in {"interrupted", "failed"}
                     ))
+                    and (policy is None or policy.allows_result(item))
                 ]
                 if not pending:
                     continue
                 result = pending[0]
                 task_id = str(result.get("task_id") or result.get("subagent_id") or "")
                 if str(result.get("status") or "").casefold() == "stale":
-                    self._seen_task_ids.add(task_id)
+                    self._seen_result_keys.add(self._result_key(result))
                     try:
                         await self._result_port.acknowledge_result(
                             task_id,
@@ -198,40 +296,83 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
                         logger.debug("voice result dismissal failed", exc_info=True)
                     continue
                 if (
-                    self._user_speaking
-                    or self._bot_speaking
-                    or self._generating
-                    or self._active_speech_id is not None
+                    self._active_speech_id is not None
                     or bool(getattr(self._agent, "tool_call_active", False))
                     or asyncio.get_running_loop().time() < self._cooldown_until
                 ):
                     continue
 
+                lease = self.floor.reserve(f"result:{task_id}")
+                if lease is None:
+                    continue
+
                 # Claim the durable delivery before injecting Tutor speech. Two
                 # workers (or an old/new runner overlap) may observe the same ready
                 # row; only the creator of the delivery record may speak.
+                claim_task = asyncio.create_task(self._result_port.acknowledge_result(task_id, delivery_state="delivered"))
                 try:
-                    claim = await self._result_port.acknowledge_result(
-                        task_id,
-                        delivery_state="delivered",
-                    )
+                    claim = await asyncio.shield(claim_task)
+                except asyncio.CancelledError:
+                    # DB work offloaded to a thread outlives cancellation. Await
+                    # its outcome before releasing, or it can create an orphan
+                    # claim after the release has already run.
+                    try:
+                        claim = await claim_task
+                        if claim.get("created"):
+                            await self._result_port.acknowledge_result(task_id, delivery_state="released")
+                    finally:
+                        self.floor.release(lease)
+                    raise
                 except Exception:
+                    self.floor.release(lease)
                     logger.debug("voice result claim failed", exc_info=True)
                     continue
                 if isinstance(claim, dict) and claim.get("created") is False:
-                    self._seen_task_ids.add(task_id)
+                    self.floor.release(lease)
+                    self._seen_result_keys.add(self._result_key(result))
                     continue
 
                 message = self._build_tutor_message(result)
                 try:
+                    if not self.floor.valid(lease):
+                        await self._result_port.acknowledge_result(task_id, delivery_state="released")
+                        self.floor.release(lease)
+                        continue
+                    # Re-read after the durable claim: topic, version and scene may
+                    # change while DB work yields to the next user utterance.
+                    read = getattr(self._result_port, "current_results", self._result_port.ready_results)
+                    current = next((item for item in await read(limit=200)
+                                    if item.get("task_id") == task_id), None)
+                    if (not self.floor.valid(lease) or current is None or
+                        any(current.get(key) != result.get(key) for key in ("result_id", "result_version", "requirement_version")) or
+                        (not result.get("manual_delivery") and (current.get("topic_current") is False or current.get("auto_delivery") is False)) or
+                        (policy is not None and not policy.allows_result({**current, "manual_delivery": bool(result.get("manual_delivery"))}))):
+                        await self._result_port.acknowledge_result(task_id, delivery_state="released")
+                        self.floor.release(lease)
+                        continue
+                    result = current
+                    message = self._build_tutor_message(result)
                     self._active_speech_id = str(claim.get("speech_id") or "") or None
                     self._active_task_id = task_id if self._active_speech_id else None
+                    self._active_result_key = self._result_key(result) if self._active_speech_id else None
                     if self._active_speech_id:
                         await self._update_speech_delivery(self._active_speech_id, "enqueued")
-                    await self._agent.queue_frame(
-                        LLMMessagesAppendFrame(messages=[message], run_llm=True)
-                    )
-                except Exception:
+                    if not self.floor.valid(lease):
+                        self._active_speech_id = self._active_task_id = None
+                        await self._result_port.acknowledge_result(task_id, delivery_state="released")
+                        self.floor.release(lease)
+                        continue
+                    if self._result_dispatch is not None:
+                        admitted = await self._result_dispatch(self._active_speech_id or task_id, message, lease)
+                        if not admitted:
+                            self._active_speech_id = self._active_task_id = None
+                            await self._result_port.acknowledge_result(task_id, delivery_state="released")
+                            self.floor.release(lease)
+                            continue
+                    else:
+                        await self._agent.queue_frame(LLMMessagesAppendFrame(messages=[message], run_llm=True))
+                except (Exception, asyncio.CancelledError):
+                    self.floor.release(lease)
                     self._active_speech_id = None
                     self._active_task_id = None
                     # The Tutor never received the result. Release the claim so a
@@ -244,7 +385,7 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
                     except Exception:
                         logger.debug("voice result claim release failed", exc_info=True)
                     raise
-                self._seen_task_ids.add(task_id)
+                self._seen_result_keys.add(self._result_key(result))
                 self._cooldown_until = asyncio.get_running_loop().time() + 2.0
             except asyncio.CancelledError:
                 raise
@@ -297,7 +438,7 @@ class VoiceResultDeliveryProcessor(FrameProcessor):
             )
         else:
             instruction = (
-                "后台任务已完成。请先回应用户原问题，再用两到三点自然口语总结。"
+                "本轮是后台结果投递，没有新的用户问题。只简短交付下述任务的新结果和必要限制。不要重新回答已完成的问题，不要复述恢复播报等历史控制指令。"
                 "不要逐字朗读 JSON、URL、表格或长 Markdown；详细来源和产物保留在文字任务卡。"
             )
         return {

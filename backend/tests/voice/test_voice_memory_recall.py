@@ -264,11 +264,14 @@ def test_the_request_carries_the_recall_without_touching_the_shared_context():
 
     bridge = VoiceMemoryBridge("vs_1", recall=_instant)
     service, calls = _memory_service(bridge)
-    context = LLMContext(messages=[{"role": "user", "content": "你好"}])
+    context = LLMContext(messages=[{"role": "user", "content": "我喜欢怎样学习？"}])
     before = [dict(item) for item in context.get_messages()]
 
     async def scenario():
-        bridge.start("你好")
+        bridge.start("我喜欢怎样学习？")
+        # Request isolation is tested with a ready recall, independently of
+        # the separately tested real-time deadline and thread scheduling.
+        await bridge._task
         await service.get_chat_completions(context)
 
     asyncio.run(scenario())
@@ -277,7 +280,7 @@ def test_the_request_carries_the_recall_without_touching_the_shared_context():
     assert calls[0]["model"] == "tutor"
     assert messages[0] == {"role": "system", "content": "你是导师"}
     assert BLOCK in messages[1]["content"]
-    assert messages[-1] == {"role": "user", "content": "你好"}
+    assert messages[-1] == {"role": "user", "content": "我喜欢怎样学习？"}
     # The shared context is what later turns are built from: it must be untouched.
     assert [dict(item) for item in context.get_messages()] == before
 
@@ -291,17 +294,17 @@ def test_a_background_result_does_not_steal_the_turns_recall():
     service, calls = _memory_service(bridge)
 
     async def scenario():
-        bridge.start("你好")
+        bridge.start("我喜欢怎样学习？")
         await service.get_chat_completions(
             LLMContext(
                 messages=[
-                    {"role": "user", "content": "你好"},
+                    {"role": "user", "content": "我喜欢怎样学习？"},
                     {"role": "system", "content": "后台任务已完成"},
                 ]
             )
         )
         await service.get_chat_completions(
-            LLMContext(messages=[{"role": "user", "content": "你好"}])
+            LLMContext(messages=[{"role": "user", "content": "我喜欢怎样学习？"}])
         )
 
     asyncio.run(scenario())
@@ -309,6 +312,82 @@ def test_a_background_result_does_not_steal_the_turns_recall():
     assert len(calls) == 2
     assert all(BLOCK not in str(item.get("content")) for item in calls[0]["messages"])
     assert any(BLOCK in str(item.get("content")) for item in calls[1]["messages"])
+
+
+def test_successive_voice_requests_send_prior_dialogue_to_the_provider():
+    """Capture the actual service request after Pipecat's provider conversion."""
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    service, calls = _memory_service(VoiceMemoryBridge("vs_1", recall=_instant))
+    context = LLMContext(messages=[
+        {"role": "system", "content": "你是导师"},
+        {"role": "user", "content": "我叫林川。"},
+    ])
+    turns = [
+        ("你好，林川。", "我叫什么？"),
+        ("你叫林川。", "讲一个图书馆的故事。"),
+        ("图书管理员在深夜寻找一本书。", "用短剧那种风格"),
+        ("管理员：书不在这里。", "对吧？"),
+    ]
+
+    async def scenario():
+        await service.get_chat_completions(context)
+        for answer, query in turns:
+            context.get_messages().extend([
+                {"role": "assistant", "content": answer},
+                {"role": "user", "content": query},
+            ])
+            before = [dict(item) for item in context.get_messages()]
+            await service.get_chat_completions(context)
+            assert context.get_messages() == before
+
+    asyncio.run(scenario())
+    assert len(calls) == 5
+    for call, (answer, query) in zip(calls[1:], turns):
+        messages = call["messages"]
+        assert {"role": "assistant", "content": answer} in messages
+        assert messages[-1] == {"role": "user", "content": query}
+        assert sum(item["role"] == "user" for item in messages) >= 2
+    assert {"role": "user", "content": "我叫林川。"} in calls[1]["messages"]
+    assert [item["content"] for item in calls[-1]["messages"] if item["role"] == "user"] == [
+        "我叫什么？", "讲一个图书馆的故事。", "用短剧那种风格", "对吧？",
+    ]
+
+
+def test_topic_change_preserves_dialogue_without_old_task_or_error_injection(monkeypatch):
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from app.voice.conversation_control import VoiceConversationPolicy
+
+    query = "现在讲一个童话故事。"
+    old_error = "用户以前把 O(n) 和 O(log n) 搞反。"
+    bridge = VoiceMemoryBridge(
+        "vs_1", recall=lambda _session, text: _recall(query=text, block=old_error)
+    )
+    service, calls = _memory_service(bridge)
+    service._task_session_id = "vs_1"
+    service.conversation_policy = VoiceConversationPolicy({"focus_task_ids": ["old-task"]})
+    monkeypatch.setattr(
+        "app.voice.task_context.load_session",
+        lambda *_: pytest.fail("a new topic must not read old task records"),
+    )
+    context = LLMContext(messages=[
+        {"role": "system", "content": "你是导师"},
+        {"role": "user", "content": "我喜欢短故事。"},
+        {"role": "assistant", "content": "好，接下来讲短一些。"},
+        {"role": "user", "content": query},
+    ])
+
+    async def scenario():
+        bridge.start(query)
+        await bridge._task
+        await service.get_chat_completions(context)
+
+    asyncio.run(scenario())
+    messages = calls[0]["messages"]
+    assert {"role": "user", "content": "我喜欢短故事。"} in messages
+    assert {"role": "assistant", "content": "好，接下来讲短一些。"} in messages
+    assert not any("[voice-task-data]" in str(item.get("content", "")) for item in messages)
+    assert not any(old_error in str(item.get("content", "")) for item in messages)
 
 
 # ------------------------------------------------------------- the memory read path

@@ -6,27 +6,15 @@ its own model provider; it only shares the workspace's durable sandbox files
 (which is the point of a sandbox sub-agent).  Results are stored in an
 in-process registry and polled with ``sandbox_subagent_status``.
 
-v1.1 (P0 semantics): the status machine now distinguishes real success from
-budget-exhausted / empty / timed-out / cancelled outcomes:
-
-- ``completed`` — a non-empty final answer was produced without exhausting the
-  round budget (the only status that means "delivered").
-- ``partial``   — the round or tool-call budget ran out but the sub-agent may
-  have left usable files/text behind; the parent should inspect the workspace.
-- ``failed``    — an unexpected exception, or an empty final answer.
-- ``timed_out`` — the wall-clock deadline expired.
-- ``cancelled`` — a cancellation request was honoured.
-
-``write_set`` (optional) restricts file mutations to declared path prefixes;
-``max_tool_calls`` (optional) caps tool execution; both keep a sub-agent from
-silently writing outside its lane.  ``sandbox_session_id`` is now injected into
-every tool call so the sub-agent is pinned to the parent's declared session
-instead of letting ``_resolve_session`` pick another one.
+Execution has no task time, round, token, cost or tool-call cap. Historical
+budget fields are accepted for compatibility but ignored. Cooperative
+cancellation, tool scope and write-set checks remain active.
 """
 
 from __future__ import annotations
 
 import json
+from itertools import count
 import logging
 import threading
 import time
@@ -83,7 +71,6 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "重活交给 sandbox_exec 或 sandbox_bash。\n"
     "3. 完成后用纯文本输出最终结果（包含关键文件路径、结论、数据摘要）。\n"
     "4. 不要输出思考过程，只输出任务结果。\n"
-    "5. 如果预算或轮数即将耗尽，仍然输出当前进度与已写入文件路径，不要留空。\n"
 )
 
 
@@ -95,8 +82,9 @@ class SubagentSpec:
     chat_session_id: str
     prompt: str
     tools: list[str] | None
-    max_rounds: int
-    max_seconds: int
+    # Historical callers may still pass these fields; execution ignores them.
+    max_rounds: int | None = None
+    max_seconds: int | None = None
     sandbox_session_id: str | None = None
     write_set: tuple[str, ...] | None = None
     max_tool_calls: int | None = None
@@ -213,7 +201,6 @@ def _run_subagent(
     settings = get_settings()
     job.status = "running"
     job.started_at = time.time()
-    deadline = job.started_at + spec.max_seconds
     db: Any = None
     final_text = ""
     stream_runtime = None
@@ -256,18 +243,9 @@ def _run_subagent(
             ProviderChatMessage(role="user", content=spec.prompt),
         ]
         tool_calls_total = 0
-        for _round in range(1, spec.max_rounds + 1):
+        for _round in count(1):
             if job.status == "cancelled":
                 _finish_subagent(job, "cancelled", final_text)
-                return
-            if time.time() >= deadline:
-                _finish_subagent(
-                    job,
-                    "timed_out",
-                    final_text or "（子代理超时，未能给出最终答案）",
-                    error_class="TimeoutError",
-                    error_message=f"sub-agent exceeded its {spec.max_seconds}s wall-time budget",
-                )
                 return
             job.rounds = _round
             text_parts: list[str] = []
@@ -293,18 +271,6 @@ def _run_subagent(
                     )
                     return
                 break
-            if (
-                spec.max_tool_calls is not None
-                and tool_calls_total + len(tool_calls) > spec.max_tool_calls
-            ):
-                _finish_subagent(
-                    job,
-                    "partial",
-                    final_text or "（子代理达到工具调用上限，未能给出最终答案）",
-                    error_class="MaxToolCallsExhausted",
-                    error_message=f"sub-agent exceeded its {spec.max_tool_calls}-call tool budget",
-                )
-                return
             messages.append(
                 ProviderChatMessage(
                     role="assistant",
@@ -349,16 +315,6 @@ def _run_subagent(
                 )
                 tool_calls_total += 1
                 job.tool_calls = tool_calls_total
-        else:
-            # Round budget exhausted: never report success.
-            _finish_subagent(
-                job,
-                "partial",
-                final_text or "（子代理达到最大轮数，未能给出最终答案）",
-                error_class="MaxRoundsExhausted",
-                error_message=f"sub-agent reached its {spec.max_rounds}-round cap",
-            )
-            return
         if job.status == "cancelled":
             _finish_subagent(job, "cancelled", final_text)
             return

@@ -5,6 +5,7 @@ import { TaskStatusIcon } from "@/components/shared/task-status-icon";
 import { Button } from "@/components/ui/button";
 import { VoiceTaskScene } from "./voice-task-scene";
 import { ManagedAgentControls } from "./managed-agent-controls";
+import { VoiceConversationNotice, type VoiceConversationState } from "./voice-conversation-notice";
 
 import {
   voiceTaskIsActive,
@@ -16,6 +17,7 @@ import {
 } from "./voice-tasks";
 
 export interface VoiceTaskCanvasProps {
+  conversationPolicy?: VoiceConversationState;
   tasks: VoiceTask[];
   label?: string;
   onCancel?: (taskId: string) => void;
@@ -31,6 +33,7 @@ export interface VoiceTaskCanvasProps {
 }
 
 export function VoiceTaskCanvas({
+  conversationPolicy,
   tasks,
   label = "后台 Agent 任务",
   onCancel,
@@ -69,10 +72,11 @@ export function VoiceTaskCanvas({
     const rank = new Map(orderRef.current.map((taskId, index) => [taskId, index]));
     return [...tasks].sort((a, b) => (rank.get(a.taskId) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.taskId) ?? Number.MAX_SAFE_INTEGER));
   }, [tasks]);
-  if (!tasks.length) return null;
+  if (!tasks.length) return <VoiceConversationNotice policy={conversationPolicy} />;
 
   return (
     <section aria-label={label} className="w-full">
+      <VoiceConversationNotice policy={conversationPolicy} />
       <div className="space-y-4">
         {orderedTasks.map((task) => {
           const focusKey = task.focusTurnId || task.focusId || (task.playbackStatus === "speaking" ? `speech:${task.speechId ?? task.resultId ?? task.taskId}` : undefined);

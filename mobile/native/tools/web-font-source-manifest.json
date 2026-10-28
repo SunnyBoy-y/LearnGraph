@@ -1,0 +1,41 @@
+{
+  "source": "frontend/node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2",
+  "source_sha256": "19f9c92546aa300c312235e3125af1b81394d8db9a4bc4a425cd5b641d2d54e1",
+  "source_package_version": "5.2.9",
+  "fonttools_version": "4.67.0",
+  "note": "Same Web Latin outlines; CJK uses the Android system fallback. Static instances support API 23.",
+  "css_primary_line_metrics": {
+    "units_per_em": 1000,
+    "ascent": 1005,
+    "descent": 295,
+    "line_gap": 0,
+    "use_typo_metrics": true
+  },
+  "fonts": {
+    "geist_regular": {
+      "weight": 400,
+      "bytes": 32060,
+      "sha256": "54a0bb58f34f8c1a423ea2079816ac9bcc145ab1a5721a39c59c0cd4d9448a0d"
+    },
+    "geist_medium": {
+      "weight": 500,
+      "bytes": 32092,
+      "sha256": "d2b9f717b81d2a05da947ec628bc930b0fd36defbe0903101ac2572f38d9a1e7"
+    },
+    "geist_semibold": {
+      "weight": 600,
+      "bytes": 32144,
+      "sha256": "6617619e182f621a0f7dcc0b531cbceb4393a8e7c8e2e1078cc3d64dd8417cff"
+    },
+    "geist_650": {
+      "weight": 650,
+      "bytes": 32104,
+      "sha256": "6f26ef7dd203cde74a54694a6a643b1b9a585b05b212e0996e7c6d7c3b56c0f9"
+    },
+    "geist_bold": {
+      "weight": 700,
+      "bytes": 32068,
+      "sha256": "738b2e13eb6a15885b9fdbf6660c052b7273857e0310cefec2b305d38390a8d4"
+    }
+  }
+}

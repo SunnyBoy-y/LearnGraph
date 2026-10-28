@@ -31,7 +31,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.bus import BusBridgeProcessor
-from pipecat.frames.frames import Frame, LLMRunFrame, MetricsFrame
+from pipecat.frames.frames import Frame, LLMRunFrame, MetricsFrame, LLMMessagesAppendFrame, LLMFullResponseStartFrame, LLMFullResponseEndFrame, AggregatedTextFrame, InterruptionFrame
 from pipecat.metrics.metrics import (
     LLMUsageMetricsData,
     TTFATMetricsData,
@@ -85,6 +85,8 @@ from app.voice.embedded_delegation import (
 from app.voice.embedded_generation import VoiceGenerationGate
 from app.voice.embedded_memory import VoiceMemoryBridge, voice_memory_llm_service_class
 from app.voice.embedded_result_bridge import VoiceResultDeliveryProcessor
+from app.voice.speech_floor import VoiceSpeechFloor, VoiceInputFloorProcessor
+from app.voice.conversation_control import VoiceConversationPolicy, VoiceConversationProcessor, load_conversation_policy
 from app.voice.embedded_timeline import insert_timeline_probes, timeline_enabled
 from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
 from app.voice.embedded_turn_stop import GuardedSmartTurnStopStrategy
@@ -162,13 +164,17 @@ _BASE_SYSTEM_INSTRUCTION = (
     "你是前台中文全双工语音 Tutor，也是任务协调器，不是代码执行器。回答会被直接朗读，"
     "所以使用自然、精准、信息充分且不重复的中文，不使用 emoji、特殊符号、列表或 Markdown。"
     "先判断用户本轮的主要意图，只按一个主分类处理；若同时存在彼此独立的任务，可以并行创建。"
-    "系统会在本轮处理较慢时自动播放一次简短回应，你无需重复说嗯、让我想一想或我看看，继续给出答案或真实任务状态。"
+    "直接进入有用的回答；需要应和时应和要贴合当前主题，不要惯例性地说嗯、让我想一想或我看看。系统仅在长时间没有口头反馈时提供一次真实进度提示。"
+    "用户打断并提出新问题时，只回答最新问题；被打断的旧回答不得重讲或补完，除非用户明确要求继续。用户要求原样复述时只输出指定文字，保留其标点；停止、别重复、只展示页面等控制指令由语音链路执行，不追加确认或解释。"
+    "天气必须调用 get_weather；默认省略 city 使用客户端 IP 近似位置，返回 location_required 才询问城市，用户指定城市时以其为准。播报时说明采用的城市，IP 定位需说是近似位置。新闻必须先调用 get_news，科技新闻选 technology、国际选 world、财经选 business、综合选 general。日期时间使用 get_current_time。其他联网查询使用 search_web。专用源失败时如实说明，不自动改用搜索拼凑天气或新闻。"
+    "先用已授权的短查询工具获取所需事实，不把一次天气或新闻查询升级成多轮研究；仅复杂研究才委派后台。"
+    "新闻的标题、事实、来源和发布时间必须来自同一条检索结果；摘要不够就用 fetch_web_page 阅读该来源。检索日期不等于新闻发布日期，不能把旧闻当作今日新闻；查不到符合日期的结果就明确说明。"
     "\n\n意图一，直接回答：适用于简单事实、解释、建议和闲聊。先给结论，只补充理解结论所必需的信息。"
     "不要复述问题，不要先声明准备怎么回答，不要主动扩展用户未要求的背景。"
     "\n\n意图二，立即委派：适用于需要联网研究、深度分析、读取工作区、写代码、修改文件、执行命令、"
     "制作练习、图谱、产物或其他后台工作的请求。只要目标、对象和期望结果足以启动，就立即调用对应工具创建任务，"
     "不得先反复询问风格、格式、细节或让用户重新描述。未指定的次要细节采用安全、常见、可修改的默认值，"
-    "并写入任务说明；创建后只简短告知任务已受理和将产出什么。联网资料用 delegate_research，深度分析用"
+    "并写入任务说明；创建后只简短告知任务已受理和将产出什么。复杂联网研究用 delegate_research，深度分析用"
     "delegate_reasoning；其余学习或工作区任务用 delegate_tool_task 和对应 capability。"
     "\n\n意图三，必要澄清：只有缺少的信息会改变任务对象、核心目标、数据来源、权限边界，"
     "或使任务无法安全启动时才提问。一次只问一个最关键问题，给出具体选项；得到答案后立即创建任务。"
@@ -284,6 +290,7 @@ def _resolve_voice_provider_config(session_id: str) -> _VoiceProviderConfig:
 def _foreground_text_tool_schemas(
     session: object | None,
     settings: object,
+    journal: Any = None,
 ) -> list[FunctionSchema]:
     """Expose the same authorized Agent tool graph used by text mode.
 
@@ -313,9 +320,13 @@ def _foreground_text_tool_schemas(
                 web_search_enabled=True,
                 memory_enabled=True,
             )
-    except Exception:
-        logger.warning("foreground voice Agent tool graph unavailable", exc_info=True)
-        return []
+    except Exception as exc:
+        raise RuntimeError("Voice tool catalog could not be loaded") from exc
+
+    # Foreground owns short, read-only queries. File/command/write work continues
+    # through durable delegation; exposing the whole graph contradicts that boundary.
+    quick_tools = {"get_current_time", "get_weather", "get_news", "search_web", "fetch_web_page"}
+    definitions = [item for item in definitions if item.get("function", {}).get("name") in quick_tools]
 
     disclosed_names = {
         str(item.get("function", {}).get("name"))
@@ -324,7 +335,7 @@ def _foreground_text_tool_schemas(
     }
 
     def handler_for(name: str):
-        @tool_options(cancel_on_interruption=False, timeout_secs=30)
+        @tool_options(cancel_on_interruption=True, timeout_secs=30)
         async def handler(params: FunctionCallParams) -> None:
             arguments = dict(params.arguments or {})
 
@@ -339,6 +350,14 @@ def _foreground_text_tool_schemas(
                         actor_id=actor_id,
                         settings=settings,
                     )
+                    information_context = {}
+                    if name in {"get_weather", "get_news", "get_current_time"} and getattr(session, "id", None):
+                        from app.domain.models import VoiceSessionRecord
+                        fresh_session = db.get(VoiceSessionRecord, session.id)
+                        if fresh_session is not None:
+                            information_context = (fresh_session.context_snapshot or {}).get("client_environment", {})
+                        # Release the read transaction before network I/O.
+                        db.commit()
                     return runtime.execute(
                         {
                             "function": {
@@ -349,20 +368,36 @@ def _foreground_text_tool_schemas(
                         allowed_domains=[],
                         chat_session_id=chat_session_id,
                         disclosed_tool_names=disclosed_names,
+                        information_context=information_context,
                     )
 
+            turn_id = journal.current_turn_id() if journal is not None else None
+            call_id = params.tool_call_id
+            async def audit(state, **payload):
+                if journal is not None:
+                    await journal._emit(f"tool.{state}", turn_id=turn_id,
+                                        payload={"tool_name": name, "tool_call_id": call_id, **payload})
             try:
+                await audit("started", arguments=arguments)
                 text, metadata, sources = await asyncio.to_thread(execute)
+                status = metadata.get("status", "completed")
+                await audit("failed" if status == "failed" else "completed",
+                            status=status, reason=metadata.get("reason"), sources=sources)
+
                 await params.result_callback(
                     {
-                        "status": "completed",
+                        "status": metadata.get("status", "completed"),
                         "tool_name": name,
                         "text": text,
                         "metadata": metadata,
                         "sources": sources,
                     }
                 )
+            except asyncio.CancelledError:
+                await audit("cancelled")
+                raise
             except Exception as exc:
+                await audit("failed", error=type(exc).__name__)
                 logger.debug("foreground voice Agent tool failed: %s", name, exc_info=True)
                 await params.result_callback(
                     {"status": "failed", "tool_name": name, "error": str(exc)[:500]}
@@ -598,9 +633,11 @@ class TutorAgent(LLMWorker):
         name: str = TUTOR_WORKER_NAME,
         voice_session_id: str = "",
         delegation_port: VoiceDelegationPort | None = None,
+        foreground_tools: list[FunctionSchema] | None = None,
     ):
         self._voice_session_id = voice_session_id
         self._delegation_port = delegation_port
+        self._foreground_tools = tuple(foreground_tools or ())
         super().__init__(name, llm=llm, bridged=(), active=True)
 
     def build_tools(self) -> list:
@@ -608,7 +645,7 @@ class TutorAgent(LLMWorker):
         # This prevents a model from appearing to accept work that has no
         # durable backend.
         if self._delegation_port is None:
-            return []
+            return list(self._foreground_tools)
         from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
         tools = super().build_tools()
         for index, function in enumerate(tools):
@@ -624,7 +661,8 @@ class TutorAgent(LLMWorker):
                 if "capability_id" not in schema.required:
                     schema.required.append("capability_id")
                 tools[index] = schema
-        return tools
+        names = {tool.name if isinstance(tool, FunctionSchema) else tool.__name__ for tool in tools}
+        return tools + [tool for tool in self._foreground_tools if tool.name not in names]
 
     @tool(cancel_on_interruption=False, timeout_secs=5)
     async def get_agent_runtime_status(self, params: FunctionCallParams) -> None:
@@ -954,14 +992,30 @@ def build_pipeline_steps(
     ledger_relay: FrameProcessor | None = None,
     context_playback_guard: FrameProcessor | None = None,
     response_feedback: FrameProcessor | None = None,
+    input_floor: FrameProcessor | None = None,
+    context_floor: FrameProcessor | None = None,
+    conversation_input: FrameProcessor | None = None,
+    conversation_context: FrameProcessor | None = None,
+    conversation_output: FrameProcessor | None = None,
 ) -> list[FrameProcessor]:
     """Assemble the main worker's pipeline in one testable place."""
     steps: list[FrameProcessor] = [transport_input, stt]
+    if input_floor is not None:
+        steps.append(input_floor)
+    if conversation_input is not None:
+        steps.append(conversation_input)
     if user_journal is not None:
         steps.append(user_journal)
-    steps.extend([user_aggregator, bridge])
+    steps.append(user_aggregator)
+    if context_floor is not None:
+        steps.append(context_floor)
+    if conversation_context is not None:
+        steps.append(conversation_context)
+    steps.append(bridge)
     if result_delivery is not None:
         steps.append(result_delivery)
+    if conversation_output is not None:
+        steps.append(conversation_output)
     if response_feedback is not None:
         steps.append(response_feedback)
     if assistant_journal is not None:
@@ -1106,6 +1160,7 @@ async def handle_learngraph_client_message(
     generation_gate: VoiceGenerationGate,
     interrupt_bot: Callable[[], Awaitable[None]],
     interrupts: InterruptIdDeduplicator,
+    speech_scheduler: VoiceResultDeliveryProcessor | None = None,
 ) -> None:
     """Route the browser's ``learngraph-*`` RTVI messages, the call's control plane.
 
@@ -1126,6 +1181,14 @@ async def handle_learngraph_client_message(
     message_type = str(getattr(message, "type", "") or "")
     payload = getattr(message, "data", None)
     data = payload if isinstance(payload, dict) else {}
+
+    if message_type == "learngraph-speech-request":
+        accepted = speech_scheduler is not None and speech_scheduler.enqueue_control(
+            str(data.get("request_id") or ""), str(data.get("text") or ""),
+        )
+        if not accepted and journal is not None:
+            await journal.notice("voice", "speech_request_rejected", "播报请求未受理，请在当前播报结束后重试。")
+        return
 
     if message_type == VOICE_TYPED_TURN_MESSAGE:
         # The browser announces the idempotency key it is about to type with
@@ -1647,27 +1710,88 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     ensure_coordinator_delegation_port_factory()
     delegation_port = resolve_delegation_port(session_id) if session_id else None
+    foreground_text_tools = _foreground_text_tool_schemas(providers.session, settings, journal=journal)
     agent = TutorAgent(
         llm=llm,
         voice_session_id=session_id,
         delegation_port=delegation_port,
+        foreground_tools=foreground_text_tools,
     )
-    foreground_text_tools = _foreground_text_tool_schemas(providers.session, settings)
-    if foreground_text_tools:
-        # Keep voice-specific delegation tools registered by TutorAgent while
-        # adding the full authorized text-mode Agent tool graph to this context.
-        context.set_tools(foreground_text_tools)
-    result_delivery = (
-        VoiceResultDeliveryProcessor(agent=agent, result_port=delegation_port)
-        if delegation_port is not None
-        else None
+    # Activation and initial context must be built from the same authority.
+    context.set_tools(agent.build_tools())
+    speech_floor = VoiceSpeechFloor()
+    conversation_policy = VoiceConversationPolicy(
+        await asyncio.to_thread(load_conversation_policy, session_id) if session_id else None,
+    )
+    conversation_policy.low_latency_mode = (
+        getattr(providers.session, "context_snapshot", None) or {}
+    ).get("low_latency_mode") is True
+    llm.conversation_policy = conversation_policy
+    llm.journal = journal
+    tts.conversation_policy = conversation_policy
+    from app.voice.response_guard import SpeechContentGuard
+    tts.content_guard = SpeechContentGuard()
+    input_floor = VoiceInputFloorProcessor(speech_floor, journal=journal)
+    context_floor = VoiceInputFloorProcessor(speech_floor)
+
+    async def dispatch_speech(request_id, message, lease, *, result=False):
+        admitted = asyncio.get_running_loop().create_future()
+        frame = LLMMessagesAppendFrame(messages=[message], run_llm=True)
+        frame.metadata.update(voice_admission=admitted, voice_speech_lease=lease,
+                              voice_request_id=request_id, voice_result_delivery=result)
+        await input_floor.queue_frame(frame, FrameDirection.DOWNSTREAM)
+        return await asyncio.wait_for(admitted, timeout=5)
+
+    async def dispatch_control(request_id, text, lease):
+        return await dispatch_speech(request_id, {"role": "user", "content": text}, lease)
+
+    async def dispatch_result(request_id, message, lease):
+        return await dispatch_speech(request_id, message, lease, result=True)
+
+    result_delivery = VoiceResultDeliveryProcessor(
+        agent=agent, result_port=delegation_port, floor=speech_floor, control_dispatch=dispatch_control, result_dispatch=dispatch_result,
+        conversation_policy=conversation_policy,
     )
 
     playback_context = VoicePlaybackContext(context) if journal is not None else None
     from app.voice.response_feedback import VoiceResponseFeedback
-    response_feedback = VoiceResponseFeedback(journal) if journal is not None else None
+    response_feedback = VoiceResponseFeedback(journal, policy=conversation_policy, floor=speech_floor) if journal is not None else None
+
+    async def publish_policy(payload):
+        if journal is not None:
+            await journal._emit("conversation.policy", payload=payload)
+
+    async def stop_conversation():
+        generation_gate.invalidate()
+        if memory_bridge is not None:
+            memory_bridge.invalidate()
+        if journal is not None:
+            await journal.turn_interrupted(reason="conversation_control", require_assistant_activity=bool(conversation_policy.plan.request_text))
+        # The control input must survive its own interruption. Broadcasting
+        # upstream through RTVI also cancels this processor's current frame.
+        await conversation_input.push_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+
+    conversation_output = VoiceConversationProcessor(conversation_policy, stage="output")
+
+    async def emit_verbatim(text):
+        # Bypass inference only; use the ordinary journal/TTS/ledger path.
+        revision = conversation_policy.revision
+        for frame in (LLMFullResponseStartFrame(), AggregatedTextFrame(text, aggregated_by="sentence"), LLMFullResponseEndFrame()):
+            if revision != conversation_policy.revision:
+                break
+            frame.metadata.update(voice_verbatim=True, voice_revision=revision)
+            await result_delivery.queue_frame(frame, FrameDirection.DOWNSTREAM)
+
+    conversation_input = VoiceConversationProcessor(conversation_policy, stage="input",
+        interrupt=stop_conversation, publish=publish_policy, floor=speech_floor)
+    conversation_context = VoiceConversationProcessor(conversation_policy, stage="context", journal=journal,
+        emit_response=emit_verbatim, show_scene=result_delivery.show_requested_scene,
+        publish=publish_policy, floor=speech_floor)
     if journal is not None and playback_context is not None:
-        journal.set_playback_context_hook(playback_context.update_spoken)
+        def update_playback_context(turn_id, text):
+            playback_context.update_spoken(turn_id, text)
+            tts.content_guard.observe_released(turn_id, text)
+        journal.set_playback_context_hook(update_playback_context)
 
     pipeline_steps = build_pipeline_steps(
         transport_input=transport.input(),
@@ -1679,6 +1803,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         tts=tts,
         result_delivery=result_delivery,
         response_feedback=response_feedback,
+        input_floor=input_floor,
+        context_floor=context_floor,
+        conversation_input=conversation_input,
+        conversation_context=conversation_context,
+        conversation_output=conversation_output,
         generation_gate=generation_gate,
         latency=latency,
         transport_output=transport.output(),
@@ -1773,6 +1902,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 generation_gate=generation_gate,
                 interrupt_bot=rtvi_processor.interrupt_bot,
                 interrupts=interrupts,
+                speech_scheduler=result_delivery,
             )
 
         async def _fast_interrupt() -> None:
@@ -1808,6 +1938,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 return
             handle_now = await asyncio.to_thread(load_session_row, session_id)
             if handle_now is None or handle_now.status != "active":
+                return
+
+            if (event.get("payload") or {}).get("reason") == "voice_preferences":
+                conversation_policy.low_latency_mode = (
+                    handle_now.context_snapshot or {}
+                ).get("low_latency_mode") is True
+                if response_feedback is not None:
+                    response_feedback.cancel_pending()
+                await publish_policy(conversation_policy.snapshot())
                 return
 
             refreshed = await asyncio.to_thread(context_adapter.load)
@@ -1935,6 +2074,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async def on_client_connected(transport, client):
         nonlocal ice_path_task
         logger.info("Client connected")
+        await publish_policy(conversation_policy.snapshot())
         if result_delivery is not None:
             await result_delivery.start()
         if journal is not None:
@@ -1943,9 +2083,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             # The selected candidate pair is only decided a moment after the
             # transport reports the peer as connected, so this is a bounded
             # background poll rather than a read at connect time.
-            ice_path_task = asyncio.create_task(
-                report_ice_path(journal, _voice_peer_connection(runner_args))
-            )
+            peer = _voice_peer_connection(runner_args)
+            if peer is not None:
+                ice_path_task = asyncio.create_task(report_ice_path(journal, peer))
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

@@ -4373,28 +4373,26 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "function": {
                     "name": "sandbox_subagent",
                     "description": (
-                        "Spawn a nested sandbox sub-agent: it runs its own agent loop in the "
-                        "background with a restricted offline tool subset (file tools, bash, exec, "
-                        "todo, patch, git) and returns a subagent_id. Poll with sandbox_subagent_status. "
-                        "Status outcomes: completed (final answer delivered), partial (round/tool budget "
-                        "ran out but files may exist - inspect the workspace), failed, timed_out, "
-                        "cancelled. Pass write_set (writable path prefixes) to keep the sub-agent out of "
-                        "shared directories; file writes outside write_set are rejected. Use it to "
+                        "Delegate a background task with the main Agent's authorized tools, "
+                        "workspace permissions and shared API budget. The child cannot delegate "
+                        "further tasks. Returns a subagent_id; poll with sandbox_subagent_status. "
+                        "Execution has no task token, cost, time, round or tool-call budget. "
+                        "Status outcomes: completed (final answer delivered), partial (inspect the "
+                        "available results), failed, "
+                        "cancelled. Use the prompt to specify the intended files and deliverables. Use it to "
                         "parallelize independent research/implementation work inside the same workspace."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "prompt": {"type": "string", "description": "Self-contained task description for the sub-agent."},
-                            "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional sandbox tool-name subset; defaults to the offline tool set."},
+                            "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional tool preferences for the task; the child retains the main Agent's authorized capabilities."},
                             "network_capability": {
                                 "type": "string",
                                 "enum": ["OFFLINE", "FETCH", "BROWSER", "RESTRICTED_EGRESS"],
                                 "description": "Optional client intent. The server clamps it to the role/tool profile and may lower it; it never grants direct sandbox networking."
                             },
-                            "max_rounds": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Tool round cap (default 6)."},
-                            "max_tool_calls": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Optional cap on total tool executions."},
-                            "write_set": {"type": "array", "items": {"type": "string"}, "description": "Optional writable workspace path prefixes, e.g. [\"work/subagents/task_a\"]. File writes outside these prefixes are rejected."},
+                            "write_set": {"type": "array", "items": {"type": "string"}, "description": "Optional preferred output directories; ordinary workspace permissions still apply."},
                             "sandbox_session_id": session_property,
                         },
                         "required": ["prompt"],
@@ -4406,7 +4404,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                 "type": "function",
                 "function": {
                     "name": "sandbox_subagent_status",
-                    "description": "Poll the status and final result of a sandbox_subagent job (status: completed/partial/failed/timed_out/cancelled/queued/running). Only completed means a final answer was delivered; partial means the budget ran out but the sub-agent may have left files behind.",
+                    "description": "Poll the status and final result of a sandbox_subagent job (status: completed/partial/failed/timed_out/cancelled/queued/running). Only completed means a final answer was delivered; partial means inspect the available results and remaining work.",
                     "parameters": {
                         "type": "object",
                         "properties": {

@@ -1,3 +1,4 @@
+import { initialVoiceEnvironment, resolveVoiceEnvironment } from "./voice-client-environment";
 import {
   createContext,
   useContext,
@@ -9,6 +10,8 @@ import {
 import { apiClient, ApiError } from "@/api/client";
 import { createUuid } from "@/lib/uuid";
 import { loadIceServers } from "./voice-ice";
+import { authStore } from "@/api/auth-store";
+import { VoiceSocketError, VoiceSocketTransport } from "./voice-wss";
 import { voiceSceneExplanation } from "./voice-scene-explanation";
 import {
   cancelVoiceTask as requestVoiceTaskCancel,
@@ -164,6 +167,9 @@ export interface VoiceRealtimeDeliveryStats {
   lastDropAt: string | null;
 }
 export interface VoiceSessionSnapshot {
+  lowLatencyMode?: boolean;
+  lowLatencySaving?: boolean;
+  conversationPolicy?: { quiet: boolean; background_muted: boolean; wait_for_scene: boolean; mode: string };
   workspaceId: string; sessionId: string; transport: VoiceTransportState; state: VoiceSessionState;
   foregroundActivity: "idle" | "thinking" | "delegating";
   activityTurnId: string | null;
@@ -306,6 +312,7 @@ const sessionCache = new Map<string, VoiceSessionSnapshot>();
 const listeners = new Set<() => void>();
 let abortController: AbortController | null = null;
 let peerConnection: RTCPeerConnection | null = null;
+let voiceSocket: VoiceSocketTransport | null = null;
 let localStream: MediaStream | null = null;
 let localNoiseInput: VoiceNoiseInput | null = null;
 let rawMicrophoneStream: MediaStream | null = null;
@@ -442,6 +449,7 @@ export const VOICE_INTERRUPT_MESSAGE = "learngraph-interrupt";
 export const VOICE_TYPED_TURN_MESSAGE = "learngraph-typed-turn";
 
 function sendRtvi(message: { type: string; data?: unknown }): boolean {
+  if (voiceSocket?.isOpen) return voiceSocket.send(JSON.stringify({ label: RTVI_LABEL, id: createUuid(), ...message }));
   if (dataChannel?.readyState !== "open") return false;
   dataChannel.send(JSON.stringify({ label: RTVI_LABEL, id: createUuid(), ...message }));
   return true;
@@ -1051,14 +1059,29 @@ function finishForegroundActivity(turnId?: string | null) {
 function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
   const payload = event.payload ?? {};
   const type = event.type || event.phase;
+  if (type === "conversation.policy") {
+    const conversationPolicy = {
+      quiet: payload.quiet === true, background_muted: payload.background_muted === true,
+      wait_for_scene: payload.wait_for_scene === true, mode: String(payload.mode || "answer"),
+    };
+    update({ conversationPolicy });
+    if (conversationPolicy.mode !== "display") {
+      taskState = { ...taskState, tasks: taskState.tasks.map(task => task.presentationMode === "display"
+        ? { ...task, focusId: undefined, focusAnchor: undefined, focusTurnId: undefined, presentationMode: undefined }
+        : task) };
+      syncTaskState();
+    }
+    if (remoteAudio) remoteAudio.muted = conversationPolicy.quiet || conversationPolicy.mode === "display" || (localBargeIn?.muted ?? false);
+  }
   const turnId = event.turn_id || String(payload.turn_id ?? payload.turnId ?? "") || undefined;
   const text = String(payload.text ?? payload.content ?? payload.delta ?? "");
   const endingPresentation = type === "user.started" || type === "session.closed" || (type === "session.reconnecting" && snapshot.transport !== "connected")
     || ((type === "turn.finalized" || type === "turn.interrupted") && payload.role !== "user");
   if (endingPresentation) {
     taskState = { ...taskState, tasks: taskState.tasks.map(task => {
+      if (task.presentationMode === "display" && (type === "turn.finalized" || type === "turn.interrupted")) return task;
       if (!task.focusId || (!["user.started", "session.closed", "session.reconnecting"].includes(type) && task.focusTurnId && task.focusTurnId !== turnId)) return task;
-      return { ...task, focusId: undefined, focusAnchor: undefined, focusTurnId: undefined };
+      return { ...task, focusId: undefined, focusAnchor: undefined, focusTurnId: undefined, presentationMode: undefined };
     }) };
     syncTaskState();
   }
@@ -1103,7 +1126,8 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
     noteRealtimeDelivery(type, "replayed", turnId);
   }
   if (isVoiceTaskEventType(type)) {
-    if (type === "scene.focus" && turnId && finishedActivityTurns.has(turnId)) return;
+    if (type === "scene.focus" && payload.presentation_mode === "display" && snapshot.conversationPolicy?.mode !== "display") return;
+    if (type === "scene.focus" && turnId && finishedActivityTurns.has(turnId) && payload.presentation_mode !== "display") return;
     const previousTaskId = String(payload.previous_task_id ?? payload.previousTaskId ?? "");
     const currentTaskId = String(payload.task_id ?? payload.taskId ?? payload.subagent_id ?? payload.subagentId ?? "");
     if (previousTaskId && currentTaskId && previousTaskId !== currentTaskId) {
@@ -1164,7 +1188,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
       return;
     case "session.ready": {
       // Pipeline readiness cannot certify recovery of a disconnected peer.
-      const broken = peerConnection && (["failed", "disconnected"].includes(peerConnection.connectionState)
+      const broken = voiceSocket ? !voiceSocket.isOpen : peerConnection && (["failed", "disconnected"].includes(peerConnection.connectionState)
         || ["failed", "disconnected"].includes(peerConnection.iceConnectionState));
       update({
         ...(!broken ? { transport: "connected" as const, state: "listening" as const, error: null } : {}),
@@ -1194,7 +1218,7 @@ function processVoiceEvent(event: VoiceEventEnvelope, live = false) {
     case "session.reconnecting":
       // A replayed disconnect describes the previous peer. The live media
       // connection and open data channel own current transport readiness.
-      if (peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open") return;
+      if (voiceSocket?.isOpen || (peerConnection?.connectionState === "connected" && dataChannel?.readyState === "open")) return;
       update({ transport: "reconnecting", error: null });
       return;
     case "session.closed":
@@ -1560,7 +1584,21 @@ function readVoiceCursor(sessionId: string): { seq: number; epoch: number } {
 function readLimit(): ThinkingLimit {
   try { const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")?.thinkingLimit; return ["off", "low", "medium", "high", "xhigh"].includes(value) ? value : "high"; } catch { return "high"; }
 }
-function persistLimit(value: ThinkingLimit) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ thinkingLimit: value })); } catch { /* storage is optional */ } }
+function readVoicePreferences(): Record<string, unknown> {
+  try {
+    const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch { return {}; }
+}
+function persistVoicePreferences(patch: Record<string, unknown>) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...readVoicePreferences(), ...patch })); } catch { /* storage is optional */ }
+}
+function persistLimit(value: ThinkingLimit) { persistVoicePreferences({ thinkingLimit: value }); }
+function storedLowLatencyMode(): boolean | undefined {
+  const value = readVoicePreferences().lowLatencyMode;
+  return typeof value === "boolean" ? value : undefined;
+}
+function readLowLatencyMode() { return storedLowLatencyMode() === true; }
 
 /**
  * Turn a `getUserMedia` rejection into something the user can act on.
@@ -1603,6 +1641,7 @@ function describeVoiceApiError(error: unknown): string | null {
 }
 
 function isRuntimeOwnerConflict(error: unknown): boolean {
+  if (error instanceof VoiceSocketError) return error.code === "voice_runtime_owned_elsewhere";
   return (
     error instanceof ApiError &&
     (error.code === "voice_runtime_owned_elsewhere" ||
@@ -1610,8 +1649,10 @@ function isRuntimeOwnerConflict(error: unknown): boolean {
   );
 }
 function cleanupAudioTransport() {
+  voiceSocket?.close();
+  voiceSocket = null;
   localBargeIn?.reset('disconnect'); localBargeIn = null;
-  if(remoteAudio)remoteAudio.muted=false;
+  if(remoteAudio)remoteAudio.muted=Boolean(snapshot.conversationPolicy?.quiet || snapshot.conversationPolicy?.mode === "display");
   window.dispatchEvent(new CustomEvent('learngraph:voice-playback-gate',{detail:{muted:false,reason:'disconnect',at:performance.now()}}));
   if(localBargeTimer!==null)window.clearInterval(localBargeTimer);
   localBargeTimer=null;
@@ -1808,6 +1849,7 @@ function startBotAudioLevelMonitor(stream: MediaStream) {
  * the pipeline is never told, so no extra data-channel topic is needed.
  */
 function applyMutedToLocalStream() {
+  voiceSocket?.setMuted(snapshot.muted);
   rawMicrophoneStream?.getAudioTracks().forEach((track) => {
     track.enabled = !snapshot.muted;
   });
@@ -1862,9 +1904,31 @@ export const voiceSessionController = {
           });
       }
     }
+    if (!same) update({ lowLatencyMode: readLowLatencyMode(), lowLatencySaving: false });
     void loadVoiceCapabilities();
   },
   setThinkingLimit(value: ThinkingLimit) { persistLimit(value); update({ thinkingLimit: value }); },
+  async setLowLatencyMode(enabled: boolean) {
+    if (snapshot.lowLatencySaving) return;
+    const current = captureVoiceOwner();
+    update({ lowLatencySaving: true });
+    try {
+      if (snapshot.sessionIdRemote && snapshot.transport === "connected") {
+        await apiClient.patch(`/voice/sessions/${snapshot.sessionIdRemote}/preferences`, { low_latency_mode: enabled });
+      }
+      if (!current()) return;
+      persistVoicePreferences({ lowLatencyMode: enabled });
+      update({
+        lowLatencyMode: enabled, lowLatencySaving: false,
+        error: snapshot.error?.startsWith("低延迟模式保存失败") ? null : snapshot.error,
+      });
+    } catch (error) {
+      if (current()) update({
+        lowLatencySaving: false,
+        error: error instanceof Error ? `低延迟模式保存失败：${error.message}` : "低延迟模式保存失败",
+      });
+    }
+  },
   setMuted(value: boolean) { update({ muted: value }); applyMutedToLocalStream(); },
   /**
    * Start the tutor's audio after the browser blocked it.
@@ -1874,6 +1938,7 @@ export const voiceSessionController = {
    * and re-issuing it outside a gesture would fail exactly as it did on `ontrack`.
    */
   async resumeRemoteAudio(): Promise<boolean> {
+    if (voiceSocket && !await voiceSocket.resume()) return false;
     const audio = remoteAudio;
     const current = captureVoiceOwner();
     if (!audio) return false;
@@ -1917,9 +1982,11 @@ export const voiceSessionController = {
     };
     connectingRemoteCloser = () => closeOwnedRemote();
     let ownedPeer: RTCPeerConnection | null = null;
+    let ownedSocket: VoiceSocketTransport | null = null;
     let ownedStream: MediaStream | null = null;
     let ownedNoiseInput: VoiceNoiseInput | null = null;
     const releaseOwned = () => {
+      ownedSocket?.close();
       ownedNoiseInput?.close();
       ownedStream?.getTracks().forEach((track) => track.stop());
       if (ownedPeer) {
@@ -1957,14 +2024,15 @@ export const voiceSessionController = {
       // The endpoint is intentionally explicit: until the backend voice contract
       // is deployed, the UI reports the unavailable service instead of faking a call.
       const path = import.meta.env.VITE_VOICE_SESSION_PATH || "/voice/sessions";
+      const environmentPromise = resolveVoiceEnvironment(connectionController.signal);
       // Reconnect the existing durable voice session so its event cursor and
       // unfinished turn survive WebRTC renegotiation.  A fresh session is only
       // created for the first connection.
-      const createSession = () => apiClient.post<{ id?: string; session_id?: string; sessionId?: string; runtime_ready?: boolean; signaling_url?: string | null; reason?: string; session_epoch?: number; tasks?: Array<Record<string, unknown>>; results?: Array<Record<string, unknown>> }>(path, { session_id: snapshot.sessionId, thinking_limit: snapshot.thinkingLimit, model_id: snapshot.modelId, provider_id: snapshot.providerId, after_event_seq: snapshot.lastEventSeq, last_event_seq: snapshot.lastEventSeq }, { signal: connectionController.signal });
+      const createSession = () => apiClient.post<{ id?: string; session_id?: string; sessionId?: string; low_latency_mode?: boolean; runtime_ready?: boolean; signaling_url?: string | null; websocket_url?: string | null; reason?: string; session_epoch?: number; tasks?: Array<Record<string, unknown>>; results?: Array<Record<string, unknown>> }>(path, { session_id: snapshot.sessionId, thinking_limit: snapshot.thinkingLimit, low_latency_mode: storedLowLatencyMode(), model_id: snapshot.modelId, provider_id: snapshot.providerId, after_event_seq: snapshot.lastEventSeq, last_event_seq: snapshot.lastEventSeq, client_environment: initialVoiceEnvironment() }, { signal: connectionController.signal });
       let result;
       if (snapshot.sessionIdRemote) {
         try {
-          result = await apiClient.get<{ id?: string; session_id?: string; sessionId?: string; runtime_ready?: boolean; signaling_url?: string | null; reason?: string; session_epoch?: number; tasks?: Array<Record<string, unknown>>; results?: Array<Record<string, unknown>> }>(`/voice/sessions/${snapshot.sessionIdRemote}`);
+          result = await apiClient.get<{ id?: string; session_id?: string; sessionId?: string; low_latency_mode?: boolean; runtime_ready?: boolean; signaling_url?: string | null; websocket_url?: string | null; reason?: string; session_epoch?: number; tasks?: Array<Record<string, unknown>>; results?: Array<Record<string, unknown>> }>(`/voice/sessions/${snapshot.sessionIdRemote}`);
         } catch (error) {
           checkCurrent();
           if (!(error instanceof ApiError) || ![403, 404].includes(error.status)) throw error;
@@ -1991,7 +2059,23 @@ export const voiceSessionController = {
         return;
       }
       connectingRemoteId = remoteId;
+      if (storedLowLatencyMode() === undefined && typeof result?.low_latency_mode === "boolean") {
+        update({ lowLatencyMode: result.low_latency_mode });
+      }
+      const lowLatencyMode = Boolean(snapshot.lowLatencyMode);
+      if (remoteId && (result?.low_latency_mode !== undefined || lowLatencyMode)
+          && result?.low_latency_mode !== lowLatencyMode) {
+        await apiClient.patch(`/voice/sessions/${remoteId}/preferences`, { low_latency_mode: lowLatencyMode }, { signal: connectionController.signal });
+        checkCurrent();
+      }
       if (remoteId) persistRemoteSession(workspaceId, sessionId, remoteId);
+      const environmentSessionId = remoteId;
+      void environmentPromise.then(async (environment) => {
+        if (!current() || !environmentSessionId) return;
+        await apiClient.patch(`/voice/sessions/${environmentSessionId}/environment`, environment, { signal: connectionController.signal });
+      }).catch((error) => {
+        if (current()) console.warn("语音位置更新失败；默认天气将要求指定城市。", error instanceof Error ? error.name : "request_failed");
+      });
       if (Array.isArray(result?.tasks)) {
         taskState = mergeVoiceTaskSnapshots(taskState, result.tasks);
         syncTaskState();
@@ -2018,114 +2102,122 @@ export const voiceSessionController = {
       const offerPath = configuredOfferPath.startsWith(`${apiBase}/`)
         ? configuredOfferPath.slice(apiBase.length)
         : configuredOfferPath;
-      if (!offerPath || typeof RTCPeerConnection === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-        throw new Error("当前浏览器或内置语音运行时不支持 WebRTC。");
+      const websocketPath = result?.websocket_url?.replace("{session_id}", remoteId || "");
+      const useWebSocket = Boolean(websocketPath) && import.meta.env.VITE_VOICE_TRANSPORT !== "webrtc";
+      if (!navigator.mediaDevices?.getUserMedia || (!useWebSocket && (!offerPath || typeof RTCPeerConnection === "undefined"))) {
+        throw new Error("当前浏览器或内置语音运行时不支持实时音频连接。");
       }
-      // Deployment-wide ICE servers (STUN/TURN) from the instance administrator.
-      // Resolved before the peer connection exists; failures degrade to an empty
-      // list so a broken relay cannot stop a call that could still go direct.
-      const iceServers = await loadIceServers();
-      checkCurrent();
-      const pc = new RTCPeerConnection({ iceServers });
-      ownedPeer = pc;
-      peerConnection = pc;
+      let pc: RTCPeerConnection | null = null;
       let negotiated = false;
-      iceRestartAttempted = false;
-      const handleTransportDrop = () => {
-        if (!current() || peerConnection !== pc) return;
-        const state = pc.connectionState;
-        const iceState = pc.iceConnectionState;
-        const broken = state === "failed" || state === "disconnected" || iceState === "failed" || iceState === "disconnected";
-        const recovered = !broken && (state === "connected" || iceState === "connected" || iceState === "completed");
-        if (recovered) {
-          if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
-          iceRecoveryTimer = null;
-          if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-          iceRestartAttempted = false;
-          if (negotiated) {
-            reconnectAttempt = 0;
-            if (snapshot.transport === "reconnecting") update({ transport: "connected", state: "listening", error: null });
-            startEventPolling();
-            startTaskPolling();
-          }
-          return;
-        }
-        if (!broken) return;
-        stopEventPolling();
-        stopTaskPolling();
-        if (state === "failed" || iceState === "failed") {
-          if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
-          iceRecoveryTimer = null;
-          scheduleReconnect();
-          return;
-        }
-        // Give a transient disconnect time to recover; restartIce alone does
-        // not negotiate an offer, so always retain a bounded full-reoffer path.
-        if (iceRecoveryTimer !== null) return;
-        update({ transport: "reconnecting", error: "网络抖动，正在尝试恢复语音连接…" });
-        if (!iceRestartAttempted) {
-          iceRestartAttempted = true;
-          try { pc.restartIce(); } catch { /* bounded re-offer below */ }
-        }
-        iceRecoveryTimer = window.setTimeout(() => {
-          iceRecoveryTimer = null;
-          if (current() && peerConnection === pc) scheduleReconnect();
-        }, 5000);
-      };
-      pc.onconnectionstatechange = handleTransportDrop;
-      pc.oniceconnectionstatechange = handleTransportDrop;
-      // RTVI data channel. It must exist before the offer so the SDP carries the
-      // m-line; the backend drops every message when the client never opens one
-      // (it warns "Data channel not established within 10s"). Opening it is what
-      // turns the call from a black box into a captioned, text-drivable session:
-      // the bot broadcasts user/assistant transcripts here and accepts typed
-      // turns (`send-text`) and custom control messages.
-      const channel = pc.createDataChannel("chat");
-      dataChannel = channel;
-      channel.onopen = () => {
-        if (!current() || dataChannel !== channel) return;
-        sendRtvi({
-          type: "client-ready",
-          data: {
-            version: RTVI_VERSION,
-            about: { library: "learngraph-web", library_version: "1.0", platform: "browser" },
-          },
-        });
-      };
-      channel.onmessage = (event) => {
-        if (current() && dataChannel === channel && typeof event.data === "string") handleRtviMessage(event.data);
-      };
-      // Trickle ICE：候选地址边收集边 PATCH 给后端 SmallWebRTC handler
-      // （Pipecat 的 handle_patch_request）。必须在 setLocalDescription 之前
-      // 挂上，否则会漏掉首批候选；在拿到 offer 响应里的 pc_id 之前先缓冲，
-      // 避免 PATCH 打到尚未注册的 peer connection（后端会 404）。
-      const pendingCandidates: VoiceIceCandidate[] = [];
       let remotePcId: string | null = null;
-      const flushIceCandidates = () => {
-        if (!remotePcId || pendingCandidates.length === 0) return;
-        const candidates = pendingCandidates.splice(0, pendingCandidates.length);
-        // 失败不致命：非 trickle 路径仍可依赖 SDP 内联候选建连。
-        void apiClient
-          .patch<unknown, { pc_id: string; candidates: VoiceIceCandidate[] }>(offerPath, {
-            pc_id: remotePcId,
-            candidates,
-          })
-          .catch((error) => {
-            if (current() && isRuntimeOwnerConflict(error)) scheduleReconnect();
+      let flushIceCandidates = () => {};
+      let handleTransportDrop = () => {};
+      if (!useWebSocket) {
+        // Deployment-wide ICE servers (STUN/TURN) from the instance administrator.
+        // Resolved before the peer connection exists; failures degrade to an empty
+        // list so a broken relay cannot stop a call that could still go direct.
+        const iceServers = await loadIceServers();
+        checkCurrent();
+        pc = new RTCPeerConnection({ iceServers });
+        const rtc = pc;
+        ownedPeer = pc;
+        peerConnection = pc;
+        iceRestartAttempted = false;
+        handleTransportDrop = () => {
+          if (!current() || peerConnection !== rtc) return;
+          const state = rtc.connectionState;
+          const iceState = rtc.iceConnectionState;
+          const broken = state === "failed" || state === "disconnected" || iceState === "failed" || iceState === "disconnected";
+          const recovered = !broken && (state === "connected" || iceState === "connected" || iceState === "completed");
+          if (recovered) {
+            if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
+            iceRecoveryTimer = null;
+            if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+            iceRestartAttempted = false;
+            if (negotiated) {
+              reconnectAttempt = 0;
+              if (snapshot.transport === "reconnecting") update({ transport: "connected", state: "listening", error: null });
+              startEventPolling();
+              startTaskPolling();
+            }
+            return;
+          }
+          if (!broken) return;
+          stopEventPolling();
+          stopTaskPolling();
+          if (state === "failed" || iceState === "failed") {
+            if (iceRecoveryTimer !== null) window.clearTimeout(iceRecoveryTimer);
+            iceRecoveryTimer = null;
+            scheduleReconnect();
+            return;
+          }
+          // Give a transient disconnect time to recover; restartIce alone does
+          // not negotiate an offer, so always retain a bounded full-reoffer path.
+          if (iceRecoveryTimer !== null) return;
+          update({ transport: "reconnecting", error: "网络抖动，正在尝试恢复语音连接…" });
+          if (!iceRestartAttempted) {
+            iceRestartAttempted = true;
+            try { rtc.restartIce(); } catch { /* bounded re-offer below */ }
+          }
+          iceRecoveryTimer = window.setTimeout(() => {
+            iceRecoveryTimer = null;
+            if (current() && peerConnection === rtc) scheduleReconnect();
+          }, 5000);
+        };
+        pc.onconnectionstatechange = handleTransportDrop;
+        pc.oniceconnectionstatechange = handleTransportDrop;
+        // RTVI data channel. It must exist before the offer so the SDP carries the
+        // m-line; the backend drops every message when the client never opens one
+        // (it warns "Data channel not established within 10s"). Opening it is what
+        // turns the call from a black box into a captioned, text-drivable session:
+        // the bot broadcasts user/assistant transcripts here and accepts typed
+        // turns (`send-text`) and custom control messages.
+        const channel = pc.createDataChannel("chat");
+        dataChannel = channel;
+        channel.onopen = () => {
+          if (!current() || dataChannel !== channel) return;
+          sendRtvi({
+            type: "client-ready",
+            data: {
+              version: RTVI_VERSION,
+              about: { library: "learngraph-web", library_version: "1.0", platform: "browser" },
+            },
           });
-      };
-      pc.onicecandidate = (event) => {
-        if (!current()) return;
-        // 空 candidate 字符串是 RFC 8840 的 end-of-candidates 标记，
-        // Pipecat 侧明确支持（映射为 aiortc 的 None）。
-        pendingCandidates.push({
-          candidate: event.candidate?.candidate ?? "",
-          sdp_mid: event.candidate?.sdpMid ?? "0",
-          sdp_mline_index: event.candidate?.sdpMLineIndex ?? 0,
-        });
-        flushIceCandidates();
-      };
+        };
+        channel.onmessage = (event) => {
+          if (current() && dataChannel === channel && typeof event.data === "string") handleRtviMessage(event.data);
+        };
+        // Trickle ICE：候选地址边收集边 PATCH 给后端 SmallWebRTC handler
+        // （Pipecat 的 handle_patch_request）。必须在 setLocalDescription 之前
+        // 挂上，否则会漏掉首批候选；在拿到 offer 响应里的 pc_id 之前先缓冲，
+        // 避免 PATCH 打到尚未注册的 peer connection（后端会 404）。
+        const pendingCandidates: VoiceIceCandidate[] = [];
+        flushIceCandidates = () => {
+          if (!remotePcId || pendingCandidates.length === 0) return;
+          const candidates = pendingCandidates.splice(0, pendingCandidates.length);
+          // 失败不致命：非 trickle 路径仍可依赖 SDP 内联候选建连。
+          void apiClient
+            .patch<unknown, { pc_id: string; candidates: VoiceIceCandidate[] }>(offerPath, {
+              pc_id: remotePcId,
+              candidates,
+            })
+            .catch((error) => {
+              if (current() && isRuntimeOwnerConflict(error)) scheduleReconnect();
+            });
+        };
+        pc.onicecandidate = (event) => {
+          if (!current()) return;
+          // 空 candidate 字符串是 RFC 8840 的 end-of-candidates 标记，
+          // Pipecat 侧明确支持（映射为 aiortc 的 None）。
+          pendingCandidates.push({
+            candidate: event.candidate?.candidate ?? "",
+            sdp_mid: event.candidate?.sdpMid ?? "0",
+            sdp_mline_index: event.candidate?.sdpMLineIndex ?? 0,
+          });
+          flushIceCandidates();
+        };
+      }
       const rawStream = await navigator.mediaDevices.getUserMedia({ audio: {
         channelCount: { ideal: 1 }, sampleRate: { ideal: 48_000 },
         echoCancellation: true, noiseSuppression: true, autoGainControl: false,
@@ -2137,7 +2229,7 @@ export const voiceSessionController = {
       if(fastBargeInEnabled()){
         localBargeIn=new VoiceBargeIn((muted,reason)=>{
           if(!current())return;
-          if(remoteAudio)remoteAudio.muted=muted;
+          if(remoteAudio)remoteAudio.muted=muted || Boolean(snapshot.conversationPolicy?.quiet || snapshot.conversationPolicy?.mode === "display");
           window.dispatchEvent(new CustomEvent('learngraph:voice-playback-gate',{detail:{muted,reason,at:performance.now()}}));
         });
         localBargeTimer=window.setInterval(()=>localBargeIn?.tick(performance.now()),50);
@@ -2153,18 +2245,17 @@ export const voiceSessionController = {
       localNoiseInput = ownedNoiseInput;
       const stream = ownedNoiseInput.stream;
       localStream = stream;
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
       applyMutedToLocalStream();
       startUserAudioLevelMonitor(stream, ownedNoiseInput.audioContext);
-      pc.ontrack = (event) => {
-        if (!current() || peerConnection !== pc) return;
+      const attachRemoteStream = (remoteStream: MediaStream) => {
+        if (!current()) return;
         // Retain the element: releasing `srcObject` and pausing on teardown is
         // the only reliable way to stop the bot's audio when the PC closes.
         const audio = remoteAudio ?? new Audio();
         remoteAudio = audio;
-        audio.muted = localBargeIn?.muted ?? false;
+        audio.muted = (localBargeIn?.muted ?? false) || Boolean(snapshot.conversationPolicy?.quiet || snapshot.conversationPolicy?.mode === "display");
         audio.autoplay = true;
-        audio.srcObject = event.streams[0];
+        audio.srcObject = remoteStream;
         // Autoplay policy: a `play()` that rejects means the tutor's audio never
         // reaches the speakers, and no amount of retrying fixes it without a user
         // gesture. Surface it instead of swallowing it, and clear it when playback
@@ -2177,22 +2268,53 @@ export const voiceSessionController = {
         };
         audio.addEventListener("playing", () => markPlayback(false));
         void audio.play().then(() => markPlayback(false)).catch(() => markPlayback(true));
-        if (event.streams[0]) startBotAudioLevelMonitor(event.streams[0]);
+        startBotAudioLevelMonitor(remoteStream);
       };
-      const offer = await pc.createOffer();
-      checkCurrent();
-      await pc.setLocalDescription(offer);
-      checkCurrent();
-      const answer = await apiClient.post<{ sdp: string; type: RTCSdpType; pc_id?: string }>(offerPath, { sdp: offer.sdp, type: offer.type, request_data: { voice_session_id: remoteId, reconnecting: reconnectingExistingSession } }, { signal: connectionController.signal });
-      checkCurrent();
-      await pc.setRemoteDescription(answer);
-      checkCurrent();
-      negotiated = true;
+      if (useWebSocket && websocketPath) {
+        const socket = new VoiceSocketTransport(new AudioContext({ sampleRate: 48_000 }), {
+          url: websocketPath, token: authStore.getAccessToken() || "",
+          workspaceId, reconnecting: reconnectingExistingSession,
+          signal: connectionController.signal,
+          onMessage: (message) => { if (current()) handleRtviMessage(JSON.stringify(message)); },
+          onClose: () => {
+            if (!current()) return;
+            stopEventPolling();
+            stopTaskPolling();
+            scheduleReconnect();
+          },
+        });
+        voiceSocket = ownedSocket = socket;
+        await socket.connect();
+        checkCurrent();
+        socket.setMuted(snapshot.muted);
+        attachRemoteStream(socket.playbackStream);
+        if (!await socket.resume() && current()) update({ playbackBlocked: true });
+        await socket.startCapture(stream);
+        checkCurrent();
+        sendRtvi({
+          type: "client-ready",
+          data: { version: RTVI_VERSION, about: { library: "learngraph-web", library_version: "1.0", platform: "browser" } },
+        });
+      } else if (pc) {
+        const rtc = pc;
+        stream.getTracks().forEach((track) => rtc.addTrack(track, stream));
+        rtc.ontrack = (event) => {
+          if (current() && peerConnection === rtc && event.streams[0]) attachRemoteStream(event.streams[0]);
+        };
+        const offer = await pc.createOffer();
+        checkCurrent();
+        await pc.setLocalDescription(offer);
+        checkCurrent();
+        const answer = await apiClient.post<{ sdp: string; type: RTCSdpType; pc_id?: string }>(offerPath, { sdp: offer.sdp, type: offer.type, request_data: { voice_session_id: remoteId, reconnecting: reconnectingExistingSession } }, { signal: connectionController.signal });
+        checkCurrent();
+        await pc.setRemoteDescription(answer);
+        checkCurrent();
+        negotiated = true;
+        remotePcId = answer?.pc_id ?? null;
+        flushIceCandidates();
+      }
       connectingRemoteId = null;
       connectingRemoteCloser = null;
-      // 拿到 pc_id 后补发缓冲中的候选，并放行后续候选。
-      remotePcId = answer?.pc_id ?? null;
-      flushIceCandidates();
       if (remoteId) setVoiceSessionActive(snapshot.workspaceId, snapshot.sessionId, true);
       // A page reload cannot keep the peer connection, but the call itself is
       // still standing on the server: remember it so the reloaded page can offer
@@ -2250,6 +2372,7 @@ export const voiceSessionController = {
     }
   },
   disconnect({ preserveLatency = false }: { preserveLatency?: boolean } = {}) {
+    update({ lowLatencySaving: false });
     const remote = snapshot.sessionIdRemote ?? connectingRemoteId;
     const pendingRemote = connectingRemoteId;
     const closePendingRemote = connectingRemoteCloser;
@@ -2281,6 +2404,7 @@ export const voiceSessionController = {
     if (wasConnected) playVoiceCue(440);
   },
   async interrupt() {
+    voiceSocket?.clearPlayback(true);
     // Durable first: the interrupt must reach the worker even when this page is
     // the one that lost its data channel. The RTVI path stays as a faster copy
     // on the same pipeline (identical to an automatic barge-in).
@@ -2310,6 +2434,7 @@ export const voiceSessionController = {
   sendText(text: string, existingClientMessageId?: string): boolean {
     const content = text.trim();
     if (!content) return false;
+    voiceSocket?.clearPlayback(true);
     const clientMessageId = existingClientMessageId || createUuid();
     // Announce the idempotency key first, on the same ordered channel: the
     // worker needs it to attach to the turn `persistAcceptedTurn` is about to
@@ -2436,21 +2561,26 @@ export const voiceSessionController = {
   async acknowledgeScene(taskId: string, anchors: string[], status: "rendered" | "failed" = "rendered"): Promise<void> {
     const task = snapshot.tasks.find((item) => item.taskId === taskId);
     const remote = snapshot.sessionIdRemote;
-    if (!remote || !task?.resultId || !task.resultVersion || !snapshot.sessionEpoch) return;
+    if (!remote || !task?.resultId || !task.resultVersion || !snapshot.sessionEpoch) throw new Error("页面显示回执尚未就绪");
     const current = captureVoiceOwner();
     const receipt = {
       requirement_version: task.requirementVersion, result_version: task.resultVersion,
       session_epoch: snapshot.sessionEpoch, status, anchors,
     };
     const resultId = task.resultId;
+    const sameVersion = () => {
+      const latest = snapshot.tasks.find(item => item.taskId === taskId);
+      return current() && latest?.resultId === resultId && latest.resultVersion === receipt.result_version && latest.requirementVersion === receipt.requirement_version;
+    };
     const key = `${remote}:${resultId}`;
     // Order visibility changes after in-flight render receipts; a late HTTP
     // response must not restore a scene that has already been collapsed.
     const pending = (sceneReceipts.get(key) ?? Promise.resolve()).catch(() => {}).then(() => {
-      if (current()) return acknowledgeVoiceScene(remote, resultId, receipt);
+      if (!sameVersion()) throw new Error("页面结果已更新");
+      return acknowledgeVoiceScene(remote, resultId, receipt);
     });
     sceneReceipts.set(key, pending);
-    try { await pending; }
+    try { await pending; if (!sameVersion()) throw new Error("页面结果已更新"); }
     finally { if (sceneReceipts.get(key) === pending) sceneReceipts.delete(key); }
   },
   async setTaskAutoDelivery(taskId: string, autoDelivery: boolean): Promise<boolean> {
@@ -2496,8 +2626,15 @@ export const voiceSessionController = {
     const visual = task.visuals?.find((item) => `visual-${item.block_id}` === anchor);
     const content = findingIndex ? task.findings?.[Number(findingIndex[1])] : visual ? voiceSceneExplanation(visual) : task.summary;
     if (!content) return false;
-    voiceSessionController.upsertTask({taskId, focusAnchor: anchor});
-    return voiceSessionController.sendText(`请先用 focus_background_scene 定位任务 ${taskId} 的 ${anchor}，然后解释「${task.title}」中的这项结果，并说明依据和限制：\n${content.slice(0, 8000)}`);
+    // Focus is owned by the server's scene.focus event, after queue admission.
+    // Component playback joins the server's speech queue. It is not a user
+    // barge-in and must not call send-text(run_immediately=true).
+    const accepted = sendRtvi({ type: "client-message", data: {
+      t: "learngraph-speech-request",
+      d: { request_id: createUuid(), text: `请先用 focus_background_scene 定位任务 ${taskId} 的 ${anchor}，然后解释「${task.title}」中的这项结果，并说明依据和限制：\n${content.slice(0, 7000)}` },
+    } });
+    if (!accepted) update({ error: "语音通道尚未就绪，讲解请求未发送。" });
+    return accepted;
   },
   async approveTask(taskId: string, approved = true): Promise<boolean> {
     const remote = snapshot.sessionIdRemote;
@@ -2609,5 +2746,5 @@ export function useVoiceSession(workspaceId?: string, sessionId?: string, modelI
   const controller = useContext(VoiceSessionContext);
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   useEffect(() => { if (workspaceId && sessionId) controller.open(workspaceId, sessionId, modelId, providerId); }, [controller, sessionId, workspaceId, modelId, providerId]);
-  return useMemo(() => ({ ...state, connect: controller.connect, disconnect: controller.disconnect, interrupt: controller.interrupt, setThinkingLimit: controller.setThinkingLimit, setMuted: controller.setMuted, appendTranscript: controller.appendTranscript, upsertTask: controller.upsertTask, sendText: controller.sendText, retryText: controller.retryText, sendTurn: controller.sendTurn, startTask: controller.startTask, cancelTask: controller.cancelTask, approveTask: controller.approveTask, retryApproval: controller.retryApproval, retryPlayback: controller.retryPlayback }), [controller, state]);
+  return useMemo(() => ({ ...state, connect: controller.connect, disconnect: controller.disconnect, interrupt: controller.interrupt, setThinkingLimit: controller.setThinkingLimit, setLowLatencyMode: controller.setLowLatencyMode, setMuted: controller.setMuted, appendTranscript: controller.appendTranscript, upsertTask: controller.upsertTask, sendText: controller.sendText, retryText: controller.retryText, sendTurn: controller.sendTurn, startTask: controller.startTask, cancelTask: controller.cancelTask, approveTask: controller.approveTask, retryApproval: controller.retryApproval, retryPlayback: controller.retryPlayback }), [controller, state]);
 }

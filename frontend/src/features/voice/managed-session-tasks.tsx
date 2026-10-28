@@ -8,15 +8,18 @@ type Wire = Record<string, unknown>;
 const record = (value: unknown): Wire => value && typeof value === "object" ? value as Wire : {};
 
 /** Durable parent tasks remain visible when the audio peer lives in another client. */
-export function ManagedSessionTasks({ sessionId }: { sessionId: string }) {
+export function useManagedSessionTasks(sessionId: string | null) {
   const [tasks, setTasks] = useState<VoiceTask[]>([]);
   const [owners, setOwners] = useState<Record<string, { voice: string; epoch: number }>>({});
+  const [loadedSessionId, setLoadedSessionId] = useState<string | null>(null);
   const receipts = useRef(new Map<string, { signature: string; at: number }>());
   const pendingReceipts = useRef(new Map<string, Promise<unknown>>());
   const current = useRef({ tasks, owners });
-  current.current = { tasks, owners };
+  current.current = loadedSessionId === sessionId ? { tasks, owners } : { tasks: [], owners: {} };
   useEffect(() => {
+    if (!sessionId) return;
     const abort = new AbortController();
+    const turnCache = new Map<string, { at:number; turns:Map<string, {turn_id:string; user_text?:string; started_at?:string}> }>();
     let loading = false;
     const refresh = async () => {
       if (loading) return;
@@ -36,8 +39,21 @@ export function ManagedSessionTasks({ sessionId }: { sessionId: string }) {
           const focused = new Map(mergeVoiceScenePresentation(state, snapshot.scene_presentation).tasks.map(task => [task.taskId, task]));
           state = { ...state, tasks: state.tasks.map(task => owned.has(task.taskId) ? focused.get(task.taskId)! : task) };
           for (const task of snapshot.tasks) nextOwners[String(task.task_id ?? task.subagent_id)] = { voice, epoch: snapshot.session_epoch };
+          // Legacy voice turns may exist in the journal even when their chat
+          // message is absent. Recover their real question/time for placement.
+          let cached = turnCache.get(voice);
+          if ((!cached || state.tasks.some(task => owned.has(task.taskId) && task.triggerTurnId && !cached!.turns.has(task.triggerTurnId))) && (!cached || Date.now()-cached.at>10_000)) {
+            const transcript = await apiClient.get<{ turns?: Array<{turn_id:string; user_text?:string; started_at?:string}> }>(`/voice/sessions/${encodeURIComponent(voice)}/transcript?limit=500`, { signal: abort.signal }).catch(() => null);
+            cached = { at:Date.now(), turns:new Map((transcript?.turns ?? []).map(turn => [turn.turn_id, turn])) };
+            turnCache.set(voice,cached);
+          }
+          const turns = cached?.turns ?? new Map();
+          state = { ...state, tasks: state.tasks.map(task => {
+            const turn = owned.has(task.taskId) && task.triggerTurnId ? turns.get(task.triggerTurnId) : undefined;
+            return turn ? { ...task, triggerUserText: turn.user_text, triggerCreatedAt: turn.started_at } : task;
+          }) };
         }
-        if (!abort.signal.aborted) { setTasks(state.tasks); setOwners(nextOwners); }
+        if (!abort.signal.aborted) { setTasks(state.tasks); setOwners(nextOwners); setLoadedSessionId(sessionId); }
       } catch { /* The ordinary conversation remains usable while details retry. */ }
       finally { loading = false; }
     };
@@ -59,6 +75,11 @@ export function ManagedSessionTasks({ sessionId }: { sessionId: string }) {
     try { await request; }
     catch { if (receipts.current.get(key)?.signature === signature) receipts.current.delete(key); }
   }, []);
+  return { tasks: loadedSessionId === sessionId ? tasks : [], rendered };
+}
+
+export function ManagedSessionTasks({ sessionId }: { sessionId: string }) {
+  const { tasks, rendered } = useManagedSessionTasks(sessionId);
   if (!tasks.length) return null;
   return <VoiceTaskCanvas tasks={tasks} onRender={rendered} label="会话后台任务" />;
 }

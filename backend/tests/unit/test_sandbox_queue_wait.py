@@ -167,6 +167,27 @@ def test_queue_deadline_returns_expired_without_model_poll(context):
     assert service.wait_job(job, 2).status == "EXPIRED"
 
 
+def test_subagents_have_no_queue_deadline_including_historical_jobs(context, monkeypatch):
+    db, settings, _ = context
+    service = scheduler.SandboxSchedulerService(db, settings)
+    child = service.submit_job(workspace_id="ws", owner_user_id="actor", chat_session_id="chat",
+        kind="subagent", payload={}, deadline_seconds=1)
+    assert child.deadline_at is None
+    # Historical rows can retain an old deadline without expiring on upgrade.
+    child.deadline_at = utc_now() - timedelta(days=1)
+    command = service.submit_job(workspace_id="ws", owner_user_id="actor", chat_session_id="chat",
+        kind="agent_command", payload={})
+    command.deadline_at = utc_now() - timedelta(days=1)
+    db.commit()
+    dispatched = []
+    monkeypatch.setattr(scheduler, '_get_executor', lambda *_: SimpleNamespace(
+        submit=lambda function, job_id: dispatched.append(job_id)))
+    service.schedule_once()
+    db.refresh(child); db.refresh(command)
+    assert child.status == 'STARTING' and child.id in dispatched
+    assert command.status == 'EXPIRED' and command.id not in dispatched
+
+
 def test_foreground_tool_budget_includes_queue_but_explicit_background_stays_short(context):
     from app.services.chat import ChatService
     _, settings, _ = context

@@ -32,6 +32,7 @@ from app.services.durable_queue import (
     durable_queue_worker,
 )
 from app.services.memory_outbox_runtime import memory_outbox_scheduler
+from app.services.model_pricing_sync import model_pricing_sync_worker
 from app.services.document_learning import mark_interrupted_document_jobs
 from app.services.chat import mark_interrupted_message_streams
 from app.services.chat_durable import enqueue_interrupted_chat_resumes
@@ -67,6 +68,13 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     settings.storage_root.mkdir(parents=True, exist_ok=True)
     settings.memory_root.mkdir(parents=True, exist_ok=True)
+    # Reap expired encrypted downloads left by a process/container restart.
+    try:
+        from app.services.backup_download import prune_downloads
+        prune_downloads(settings,schedule=True)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning('Expired backup download cleanup deferred')
     init_database()
     from app.core.database import SessionLocal
     from app.services.billing import BillingService
@@ -80,6 +88,8 @@ async def lifespan(app: FastAPI):
             "\n  ".join(_profile_warnings),
         )
     ensure_demo_data()
+    from app.services.database_migration import controller as primary_migration_controller
+    primary_migration_controller(settings).recover_worker()
     mark_interrupted_document_jobs()
     mark_interrupted_message_streams()
     _prune_dead_egress_policy_snapshots()
@@ -173,9 +183,14 @@ async def lifespan(app: FastAPI):
     from app.services.provider_balance_lifecycle import balance_worker
     balance_stop = asyncio.Event()
     balance_task = asyncio.create_task(balance_worker(balance_stop))
+    pricing_stop = asyncio.Event()
+    pricing_task = asyncio.create_task(model_pricing_sync_worker(pricing_stop)) if settings.models_dev_refresh_enabled else None
     try:
         yield
     finally:
+        pricing_stop.set()
+        if pricing_task is not None:
+            await pricing_task
         balance_stop.set()
         await balance_task
         await close_embedded_runtime(app)

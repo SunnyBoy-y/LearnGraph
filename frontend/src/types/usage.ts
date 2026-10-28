@@ -41,6 +41,7 @@ export interface PriceCatalogItem {
 export interface ModelsDevStatus {
   source: string; origin: "bundled" | "network" | "network_cache" | "missing"; fetched_at: string | null;
   provider_count: number; model_count: number; priced_model_count: number;
+  auto_refresh_enabled: boolean; refresh_interval_seconds: number; next_refresh_at: string | null; stale: boolean;
 }
 export interface AlertEmailConfig {
   enabled: boolean; smtp_host: string; smtp_port: number;

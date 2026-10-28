@@ -35,6 +35,15 @@ export function isVoiceSessionActive(workspaceId: string, sessionId: string): bo
   } catch { return false; }
 }
 
+/** Only live markers; resumable calls deliberately do not become an active badge. */
+export function activeVoiceSessionIds(workspaceId: string): string[] {
+  if (typeof window === 'undefined' || !workspaceId) return [];
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(ACTIVE_STORAGE_KEY) || '[]');
+    return Array.isArray(raw) ? raw.filter((id): id is string => typeof id === 'string' && id.startsWith(`${workspaceId}:`)).map(id => id.slice(workspaceId.length + 1)) : [];
+  } catch { return []; }
+}
+
 const RESUME_STORAGE_KEY = "learngraph.voice.resumable.v1";
 
 /**

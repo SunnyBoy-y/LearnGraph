@@ -1,0 +1,62 @@
+/* Explicit opt-in preserves the existing monochrome appearance. Specificity
+   keeps older light/dark chrome rules from overriding these shared tokens. */
+:root[data-color-mode]:not([data-color-mode='mono']) {
+  --primary: var(--theme-primary);
+  --primary-foreground: var(--theme-on-primary);
+  --ring: var(--theme-primary);
+  --focus-ring: var(--theme-primary);
+  --accent: color-mix(in srgb, var(--theme-color) 9%, var(--card));
+  --accent-foreground: var(--theme-primary);
+  --sidebar: color-mix(in srgb, var(--theme-color) 4%, #fafafa);
+  --sidebar-accent: color-mix(in srgb, var(--theme-color) 10%, var(--card));
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-ring: var(--ring);
+  --lg-green: var(--theme-primary);
+  --lg-green-dark: var(--theme-primary);
+  --lg-green-soft: var(--accent);
+  --chart-1: var(--theme-primary);
+  --chart-2: color-mix(in srgb, var(--theme-primary) 75%, var(--foreground));
+  --chart-3: color-mix(in srgb, var(--theme-primary) 80%, #bd8a35);
+  --chart-4: color-mix(in srgb, var(--theme-primary) 75%, #32968e);
+  --chart-5: color-mix(in srgb, var(--theme-primary) 70%, #ae668a);
+}
+
+:root.dark[data-color-mode]:not([data-color-mode='mono']) {
+  --bg-sidebar: color-mix(in srgb, var(--theme-color) 5%, #17191c);
+  --bg-selected: color-mix(in srgb, var(--theme-color) 12%, #30343a);
+  --sidebar: var(--bg-sidebar);
+  --sidebar-accent: var(--bg-selected);
+  --accent: color-mix(in srgb, var(--theme-color) 12%, #24272b);
+}
+
+:root[data-color-mode]:not([data-color-mode='mono']) .workspace-sidebar,
+:root[data-color-mode]:not([data-color-mode='mono']) .workspace-sidebar .sidebar-nav {
+  background: var(--sidebar) !important;
+}
+:root[data-color-mode]:not([data-color-mode='mono']) :is(.sidebar-brand__mark, .brand__mark, .project-bookshelf__spine) {
+  background: var(--primary);
+  color: var(--primary-foreground);
+  box-shadow: none;
+}
+:root[data-color-mode]:not([data-color-mode='mono']) .sidebar-nav [data-nav-label] > svg {
+  color: var(--primary);
+}
+:root[data-color-mode]:not([data-color-mode='mono']) .graph-workbench-split .graph-library__spine {
+  background: var(--primary);
+}
+:root[data-color-mode]:not([data-color-mode='mono']) :is(.sidebar-user-avatar, .prompt-attachment__preview) {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+:root[data-color-mode]:not([data-color-mode='mono']) .chat-composer__submit:not(:disabled):not(.chat-composer__submit--stop),
+:root[data-color-mode]:not([data-color-mode='mono']) [data-slot='button'][data-variant='default']:not(:disabled) {
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border-color: transparent;
+}
+:root[data-color-mode]:not([data-color-mode='mono']) .chat-composer__submit:not(:disabled):not(.chat-composer__submit--stop):hover,
+:root[data-color-mode]:not([data-color-mode='mono']) [data-slot='button'][data-variant='default']:not(:disabled):hover {
+  background: color-mix(in srgb, var(--primary) 90%, var(--foreground));
+}

@@ -113,6 +113,7 @@ export type MessagePartType =
   | 'document_selection'
   | 'selection_quote'
   | 'image'
+  | 'sticker'
   | 'graph_context'
   | 'quiz'
   | 'chart'

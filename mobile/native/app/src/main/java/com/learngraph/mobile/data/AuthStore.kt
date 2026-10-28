@@ -21,6 +21,7 @@ class AuthStore(private val context: Context) {
         val TOKEN = stringPreferencesKey("lg.token")
         val WORKSPACE_ID = stringPreferencesKey("lg.workspaceId")
         val USERNAME = stringPreferencesKey("lg.username")
+        val USER_ID = stringPreferencesKey("lg.userId")
         val DISPLAY_NAME = stringPreferencesKey("lg.displayName")
         val SESSION_ID = stringPreferencesKey("lg.sessionId")
         val DEVICE_ID = stringPreferencesKey("lg.deviceId")
@@ -38,6 +39,7 @@ class AuthStore(private val context: Context) {
         val deviceId: String = "",
         val savedUsername: String = "",
         val savedPassword: String = "",
+        val userId: String? = null,
     )
 
     val state: Flow<AuthState> = context.dataStore.data.map { p ->
@@ -51,11 +53,20 @@ class AuthStore(private val context: Context) {
             deviceId = p[Keys.DEVICE_ID] ?: "",
             savedUsername = p[Keys.SAVED_USERNAME] ?: "",
             savedPassword = p[Keys.SAVED_PASSWORD] ?: "",
+            userId = p[Keys.USER_ID],
         )
     }
 
     suspend fun setBaseUrl(baseUrl: String) {
-        context.dataStore.edit { it[Keys.BASE_URL] = baseUrl }
+        context.dataStore.edit {
+            if (it[Keys.BASE_URL]?.trimEnd('/') != baseUrl.trimEnd('/')) {
+                // A bearer token and remembered password belong to one server only.
+                listOf(Keys.TOKEN, Keys.WORKSPACE_ID, Keys.USER_ID, Keys.USERNAME,
+                    Keys.DISPLAY_NAME, Keys.SESSION_ID, Keys.SAVED_USERNAME, Keys.SAVED_PASSWORD)
+                    .forEach(it::remove)
+            }
+            it[Keys.BASE_URL] = baseUrl
+        }
     }
 
     suspend fun setAuth(
@@ -65,20 +76,33 @@ class AuthStore(private val context: Context) {
         displayName: String?,
         sessionId: String?,
         deviceId: String,
+        userId: String? = null,
     ) {
         context.dataStore.edit {
             it[Keys.TOKEN] = token
-            if (workspaceId != null) it[Keys.WORKSPACE_ID] = workspaceId
-            if (username != null) it[Keys.USERNAME] = username
-            if (displayName != null) it[Keys.DISPLAY_NAME] = displayName
-            if (sessionId != null) it[Keys.SESSION_ID] = sessionId
+            fun putOrRemove(key: Preferences.Key<String>, value: String?) {
+                if (value != null) it[key] = value else it.remove(key)
+            }
+            putOrRemove(Keys.WORKSPACE_ID, workspaceId)
+            putOrRemove(Keys.USERNAME, username)
+            putOrRemove(Keys.USER_ID, userId)
+            putOrRemove(Keys.DISPLAY_NAME, displayName)
+            putOrRemove(Keys.SESSION_ID, sessionId)
             it[Keys.DEVICE_ID] = deviceId
         }
     }
 
     /** 网页版内重新登录后，把新 token 回写同步（持续免登录关键） */
     suspend fun updateToken(token: String) {
-        context.dataStore.edit { it[Keys.TOKEN] = token }
+        context.dataStore.edit {
+            if (it[Keys.TOKEN] != token) {
+                // The web page may have switched users. Its new opaque bearer does not
+                // prove that the previous user's stable ID or saved password still applies.
+                listOf(Keys.USER_ID, Keys.USERNAME, Keys.DISPLAY_NAME, Keys.SESSION_ID,
+                    Keys.SAVED_USERNAME, Keys.SAVED_PASSWORD).forEach(it::remove)
+            }
+            it[Keys.TOKEN] = token
+        }
     }
 
     /** 网页版内切换/重登工作区后，把 workspaceId 回写同步 */
@@ -106,6 +130,9 @@ class AuthStore(private val context: Context) {
             it.remove(Keys.TOKEN)
             it.remove(Keys.WORKSPACE_ID)
             it.remove(Keys.SESSION_ID)
+            it.remove(Keys.USER_ID)
+            it.remove(Keys.USERNAME)
+            it.remove(Keys.DISPLAY_NAME)
         }
     }
 

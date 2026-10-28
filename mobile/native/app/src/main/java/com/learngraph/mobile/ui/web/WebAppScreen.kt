@@ -13,6 +13,7 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -41,6 +42,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -57,6 +59,10 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.fragment.app.FragmentActivity
 import com.learngraph.mobile.LearnGraphApp
+import com.learngraph.mobile.BuildConfig
+import com.learngraph.mobile.data.NativeCacheStore
+import com.learngraph.mobile.data.NativeSidebarActivityStore
+import com.learngraph.mobile.util.UiParityDiagnostics
 import com.learngraph.mobile.data.AuthStore
 import com.learngraph.mobile.data.DownloadStatus
 import com.learngraph.mobile.data.DownloadStore
@@ -64,7 +70,9 @@ import com.learngraph.mobile.util.PermissionGate
 import com.learngraph.mobile.util.PhotoCapture
 import com.learngraph.mobile.util.WebMicPermissionBridge
 import com.learngraph.mobile.util.parseTrustedOrigin
+import com.learngraph.mobile.util.Haptics
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 /**
  * 纯网页模式（v0.8.0）：
@@ -80,15 +88,60 @@ import kotlinx.coroutines.launch
 fun WebAppScreen(
     onOpenDownloads: () -> Unit,
     onLoadFailed: () -> Unit,
+    onBackToNative: () -> Unit,
+    sessionId: String? = null,
+    initialFeature: String? = null,
+    initialAuth: AuthStore.AuthState = AuthStore.AuthState(),
+    resumeCheckEpoch: Int = 0,
 ) {
     val context = LocalContext.current
     val app = context.applicationContext as LearnGraphApp
-    val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
+    val authState by app.authStore.state.collectAsState(initial = initialAuth)
 
     val webViewRef = remember { mutableStateOf<WebView?>(null) }
     val downloadTasks by DownloadStore.tasks.collectAsState()
     val activeDownloads = downloadTasks.count { it.status == DownloadStatus.DOWNLOADING }
     val scope = rememberCoroutineScope()
+    val sidebarActivity = remember { NativeSidebarActivityStore.get(context) }
+    val activityScope = remember(authState) {
+        NativeCacheStore.scope(authState.baseUrl, authState.workspaceId, authState.userId ?: authState.username, authState.token)
+    }
+    var documentOwner by remember { mutableStateOf(UUID.randomUUID().toString()) }
+    DisposableEffect(activityScope) {
+        val ownerAtEntry = documentOwner
+        onDispose { activityScope?.let { sidebarActivity.releaseOwner(it, ownerAtEntry); sidebarActivity.releaseOwner(it, documentOwner) } }
+    }
+    LaunchedEffect(activityScope) {
+        val key = activityScope ?: return@LaunchedEffect
+        sidebarActivity.observe(key).collect {
+            val view = webViewRef.value ?: return@collect
+            val current = authState
+            if (NativeSidebarActivityStore.scope(app.api) != key || app.api.token != current.token) return@collect
+            if (NativeRendererPolicy.workspaceDestination(view.url.orEmpty(), current.baseUrl, current.workspaceId.orEmpty()) == null) return@collect
+            val token = NativeRendererPolicy.scriptJson(org.json.JSONObject.quote(current.token.orEmpty()))
+            val owner = NativeRendererPolicy.scriptJson(org.json.JSONObject.quote(documentOwner))
+            val seed = NativeRendererPolicy.scriptJson(sidebarActivity.snapshotJson(key))
+            view.evaluateJavascript("(function(){if(window.top!==window||localStorage.getItem('learngraph.access_token')!==$token||window.__lgSidebarOwner!==$owner)return;window.__lgSidebarSeed?.($seed);})()", null)
+        }
+    }
+    val hapticOwner = remember { Haptics.newOwnerToken("web") }
+    DisposableEffect(hapticOwner) { onDispose { Haptics.releaseOwner(context, hapticOwner) } }
+
+    var offlineDocumentActive by remember { mutableStateOf(false) }
+    var knownWebClientVersion by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(resumeCheckEpoch, webViewRef.value) {
+        val view = webViewRef.value ?: return@LaunchedEffect
+        val current = authState
+        val currentUrl = view.url ?: return@LaunchedEffect
+        if (!NativeRendererPolicy.shouldRevalidateOnResume(currentUrl, current.baseUrl, offlineDocumentActive)) return@LaunchedEffect
+        val response = runCatching { app.api.getWebClientVersion() }.getOrNull() ?: return@LaunchedEffect
+        val prior = knownWebClientVersion
+        val version = runCatching {
+            response.body?.let { org.json.JSONObject(it).optString("version") }
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        knownWebClientVersion = version
+        if (prior != null && prior != version) view.reload()
+    }
 
     // 麦克风授权桥：把网页的 getUserMedia 与系统运行时权限串起来。
     // 不变量 —— 只有在系统真的授予 RECORD_AUDIO 之后，才对网页放行麦克风。
@@ -140,24 +193,36 @@ fun WebAppScreen(
     // 系统返回键：优先 WebView 后退，无历史时退出应用。
     // ⚠️ 禁止在回调里调用 onBackPressedDispatcher.onBackPressed()：会重新
     // 触发本 BackHandler 回调造成无限递归（StackOverflowError 闪退，实机复现）。
+    var leavingWeb by remember { mutableStateOf(false) }
+    fun leaveWeb(destination: () -> Unit) {
+        if (leavingWeb) return
+        leavingWeb = true
+        val view = webViewRef.value
+        if (view == null) { destination(); return }
+        var finished = false
+        fun finish() { if (!finished) { finished = true; destination() } }
+        // A crashed renderer must not trap Android's Back action.
+        view.postDelayed({ finish() }, 1000)
+        val captureScript = context.assets.open("native-composer-state.js").bufferedReader().use { it.readText() }
+        view.evaluateJavascript(captureScript) { raw ->
+            runCatching {
+                val value = org.json.JSONTokener(raw).nextValue() as? String ?: return@runCatching
+                val result = org.json.JSONObject(value)
+                NativeComposerHandoff.captureReturn(context, app.api, result.optString("url"), if (result.isNull("draft")) null else result.optString("draft"), result.optJSONObject("composer"))
+            }
+            finish()
+        }
+    }
     BackHandler {
         val wv = webViewRef.value
         if (wv != null && wv.canGoBack()) {
             wv.goBack()        } else {
-            (context as? Activity)?.finish()
+            leaveWeb(onBackToNative)
         }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            // 很薄的白色顶栏：状态栏区域白底 + 2dp 白条（无任何按钮/控件）
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color.White)
-                    .windowInsetsPadding(WindowInsets.statusBars)
-                    .height(2.dp),
-            ) {}
+        Column(modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
 
             // 全屏网页（imePadding：键盘弹出时 WebView 整体抬升，输入框不被键盘遮挡；
             // navigationBarsPadding：三键导航时底部内容显示在导航键上方）
@@ -220,6 +285,41 @@ fun WebAppScreen(
                             addJavascriptInterface(
                                 NativeBridge(
                                     context = ctx,
+                                    hapticOwner = hapticOwner,
+                                    onThemeChange = { theme -> app.appearanceStore.setTheme(authState, theme) },
+                                    onThinkingChainDefaultChange = { raw ->
+                                        scope.launch {
+                                            if (raw.length > 80_000) return@launch
+                                            val value = runCatching { org.json.JSONObject(raw) }.getOrNull() ?: return@launch
+                                            val open = value.opt("open") as? Boolean ?: return@launch
+                                            val current = authState
+                                            if (app.api.token != current.token || app.api.workspaceId != current.workspaceId ||
+                                                app.api.accountId != (current.userId ?: current.username) ||
+                                                !NativeRendererPolicy.sameOrigin(app.api.baseUrl, current.baseUrl)) return@launch
+                                            if (!NativeRendererPolicy.acceptsPreferenceScope(current.baseUrl, current.token, current.workspaceId,
+                                                    value.optString("origin"), value.optString("token"), value.optString("workspaceId"))) return@launch
+                                            val page = webViewRef.value?.url ?: return@launch
+                                            if (NativeRendererPolicy.workspaceDestination(page, current.baseUrl, current.workspaceId.orEmpty()) == null) return@launch
+                                            app.appearanceStore.setThinkingChainDefaultOpen(com.learngraph.mobile.data.NativeAppearanceStore.scope(current), open)
+                                        }
+                                    },
+                                    onSidebarActivity = { raw ->
+                                        scope.launch {
+                                            if (raw.length > 16_000) return@launch
+                                            val value = runCatching { org.json.JSONObject(raw) }.getOrNull() ?: return@launch
+                                            val current = authState
+                                            val key = activityScope ?: return@launch
+                                            if (value.optString("owner") != documentOwner || NativeSidebarActivityStore.scope(app.api) != key) return@launch
+                                            if (app.api.token != current.token || app.api.workspaceId != current.workspaceId ||
+                                                app.api.accountId != (current.userId ?: current.username) ||
+                                                !NativeRendererPolicy.sameOrigin(app.api.baseUrl, current.baseUrl)) return@launch
+                                            if (!NativeRendererPolicy.acceptsPreferenceScope(current.baseUrl, current.token, current.workspaceId,
+                                                    value.optString("origin"), value.optString("token"), value.optString("workspaceId"))) return@launch
+                                            val page = webViewRef.value?.url ?: return@launch
+                                            if (NativeRendererPolicy.workspaceDestination(page, current.baseUrl, current.workspaceId.orEmpty()) == null) return@launch
+                                            sidebarActivity.applyWebEvent(key, documentOwner, raw)
+                                        }
+                                    },
                                     onClearAuth = {
                                         scope.launch { runCatching { app.authStore.clearAuth() } }
                                     },
@@ -286,6 +386,21 @@ fun WebAppScreen(
 
                             webViewClient = object : WebViewClient() {
                                 private var loadFailed = false
+                                private var offlineFallbackUrl: String? = null
+
+                                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                                    val current = authState
+                                    if (current.token != app.api.token || current.workspaceId != app.api.workspaceId ||
+                                        !NativeRendererPolicy.sameOrigin(current.baseUrl, app.api.baseUrl)) return null
+                                    val requested = request.url.toString()
+                                    return NativeWebAssets.response(
+                                        ctx,
+                                        request,
+                                        app.api.baseUrl,
+                                        current,
+                                        offlineDocument = request.isForMainFrame && requested == offlineFallbackUrl,
+                                    )
+                                }
 
                                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                                     val url = request.url
@@ -304,7 +419,36 @@ fun WebAppScreen(
                                 override fun onPageFinished(view: WebView, url: String?) {
                                     super.onPageFinished(view, url)
                                     try {
+                                        if (!offlineDocumentActive) {
+                                            NativeRendererPolicy.recordServedWebShell(url, app.api.baseUrl)
+                                        }
+                                        if (!offlineDocumentActive) {
+                                            scope.launch {
+                                                runCatching { app.api.getWebClientVersion() }.getOrNull()
+                                                    ?.body?.let { body ->
+                                                        org.json.JSONObject(body).optString("version")
+                                                            .takeIf { it.isNotBlank() }
+                                                    }?.let { knownWebClientVersion = it }
+                                            }
+                                        }
                                         syncLoginState(view)
+                                        if (url != null && NativeRendererPolicy.workspaceDestination(url, app.api.baseUrl, app.api.workspaceId.orEmpty()) != null) {
+                                            view.evaluateJavascript(ctx.assets.open("native-navigation.js").bufferedReader().use { it.readText() }, null)
+                                            activityScope?.takeIf { NativeSidebarActivityStore.scope(app.api) == it }?.let { key ->
+                                                val request = org.json.JSONObject().put("owner", documentOwner).put("origin", NativeRendererPolicy.origin(authState.baseUrl))
+                                                    .put("token", authState.token.orEmpty()).put("workspaceId", authState.workspaceId.orEmpty())
+                                                    .put("seed", org.json.JSONObject(sidebarActivity.snapshotJson(key)))
+                                                val activityScript = ctx.assets.open("native-sidebar-activity.js").bufferedReader().use { it.readText() }
+                                                val token = NativeRendererPolicy.scriptJson(org.json.JSONObject.quote(authState.token.orEmpty()))
+                                                view.evaluateJavascript("(function(){if(window.top!==window||localStorage.getItem('learngraph.access_token')!==$token)return;($activityScript)(${NativeRendererPolicy.scriptJson(request.toString())});})()", null)
+                                            }
+                                            if (BuildConfig.DEBUG) view.evaluateJavascript(ctx.assets.open("native-ui-metrics.js").bufferedReader().use { it.readText() }, null)
+                                        }
+                                        NativeComposerHandoff.pending(ctx, app.api, url)?.let { request ->
+                                            val script = ctx.assets.open("native-composer.js").bufferedReader().use { it.readText() }
+                                            val expectedToken = NativeRendererPolicy.scriptJson(org.json.JSONObject.quote(app.api.token.orEmpty()))
+                                            view.evaluateJavascript("(function(){if(window.top!==window||localStorage.getItem('learngraph.access_token')!==$expectedToken)return;$script(${NativeRendererPolicy.scriptJson(request)});})()", null)
+                                        }
                                     } catch (_: Exception) {
                                         // JS 桥/注入异常不打断页面加载
                                     }
@@ -318,7 +462,11 @@ fun WebAppScreen(
 
                                 override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
                                     super.onPageStarted(view, url, favicon)
+                                    offlineDocumentActive = url != null && url == offlineFallbackUrl
+                                    activityScope?.let { sidebarActivity.releaseOwner(it, documentOwner) }
+                                    documentOwner = UUID.randomUUID().toString()
                                     loadFailed = false
+                                    if (url != offlineFallbackUrl) offlineFallbackUrl = null
                                 }
 
                                 // 网页加载失败（服务器不可达/网络异常）→ 自动调回连接页
@@ -330,7 +478,31 @@ fun WebAppScreen(
                                     super.onReceivedError(view, request, error)
                                     if (request.isForMainFrame && !loadFailed) {
                                         loadFailed = true
-                                        onLoadFailed()
+                                        val failedUrl = request.url.toString()
+                                        val current = authState
+                                        if (error.errorCode !in setOf(
+                                                WebViewClient.ERROR_UNSUPPORTED_SCHEME,
+                                                WebViewClient.ERROR_HOST_LOOKUP,
+                                            ) &&
+                                            NativeRendererPolicy.canUseOfflineApplication(
+                                                failedUrl, app.api.baseUrl, current.workspaceId.orEmpty(),
+                                            )
+                                        ) {
+                                            offlineFallbackUrl = failedUrl
+                                            offlineDocumentActive = true
+                                            view.postDelayed({
+                                                if (offlineFallbackUrl == failedUrl && view.url == failedUrl) {
+                                                    android.widget.Toast.makeText(
+                                                        ctx,
+                                                        "服务器暂不可达，已打开离线界面",
+                                                        android.widget.Toast.LENGTH_SHORT,
+                                                    ).show()
+                                                }
+                                            }, 1_500)
+                                            view.loadUrl(failedUrl)
+                                        } else {
+                                            onLoadFailed()
+                                        }
                                     }
                                 }
 
@@ -355,10 +527,22 @@ fun WebAppScreen(
                                         )
                                     } catch (_: Exception) {
                                     }
+                                    loadFailed = true
                                     val target = view.url ?: app.api.baseUrl
+                                    val current = authState
+                                    val retryUrl = target
+                                        .replace("?__lg_offline_shell=1", "")
+                                        .replace("&__lg_offline_shell=1", "")
+                                    if (NativeRendererPolicy.canRetryPackagedApplication(
+                                            retryUrl, app.api.baseUrl, current.workspaceId.orEmpty(),
+                                        )
+                                    ) {
+                                        offlineFallbackUrl = retryUrl
+                                        offlineDocumentActive = true
+                                    }
                                     view.post {
                                         try {
-                                            view.loadUrl(target)
+                                            view.loadUrl(retryUrl)
                                         } catch (_: Exception) {
                                             onLoadFailed()
                                         }
@@ -381,6 +565,8 @@ fun WebAppScreen(
                                  * 避免旧 token 被重新注入。
                                  */
                                 private fun syncLoginState(view: WebView) {
+                                    // Keep the native host on the Web user's explicit theme, including SPA settings changes.
+                                    view.evaluateJavascript("""(function(){if(window.__lgThemeObserver)return;function sync(){LearnGraphNative.setTheme(document.documentElement.classList.contains('dark')?'dark':'light')}window.__lgThemeObserver=new MutationObserver(sync);window.__lgThemeObserver.observe(document.documentElement,{attributes:true,attributeFilter:['class']});sync();})()""", null)
                                     val nativeToken = authState.token
                                     val js = buildString {
                                         append("(function(){")
@@ -495,8 +681,33 @@ fun WebAppScreen(
                             }
 
                             webViewRef.value = this
+                            knownWebClientVersion = null
+                            settings.cacheMode = WebSettings.LOAD_DEFAULT
                             PhotoCapture.setWebView(this)
-                            loadUrl(app.api.baseUrl)
+                            val workspace = app.api.workspaceId
+                            val featureTarget = if (!workspace.isNullOrBlank() && initialFeature != null) NativeRendererPolicy.featureUrl(app.api.baseUrl, workspace, initialFeature) else null
+                            val target = if (featureTarget != null) {
+                                featureTarget
+                            } else if (!sessionId.isNullOrBlank() && !workspace.isNullOrBlank()) {
+                                Uri.parse(app.api.baseUrl).buildUpon().appendPath("w").appendPath(workspace)
+                                    .appendPath("chat").appendPath(sessionId).build().toString()
+                            } else app.api.baseUrl
+                            // Establish native identity before remote application JavaScript can run.
+                            // Both stores are required: the web auth store reads sessionStorage first.
+                            val handoff = org.json.JSONObject().apply {
+                                put("learngraph.access_token", app.api.token ?: org.json.JSONObject.NULL)
+                                put("learngraph.workspace_id", app.api.workspaceId ?: org.json.JSONObject.NULL)
+                                put("learngraph.device_id", app.api.deviceId)
+                                put("learngraph.user_id", authState.userId ?: org.json.JSONObject.NULL)
+                                put("learngraph.username", authState.username ?: org.json.JSONObject.NULL)
+                                put("learngraph.display_name", authState.displayName ?: org.json.JSONObject.NULL)
+                                put("learngraph.session_id", authState.sessionId ?: org.json.JSONObject.NULL)
+                                put("learngraph.avatar_url", org.json.JSONObject.NULL)
+                                put("learngraph.must_change_password", org.json.JSONObject.NULL)
+                            }.toString().replace("<", "\\u003c")
+                            val quotedTarget = org.json.JSONObject.quote(target).replace("<", "\\u003c")
+                            val bootstrap = """<!doctype html><meta charset="utf-8"><script>(function(){var a=$handoff;Object.keys(a).forEach(function(k){[localStorage,sessionStorage].forEach(function(s){if(a[k]===null)s.removeItem(k);else s.setItem(k,a[k]);});});location.replace($quotedTarget);})()</script>"""
+                            loadDataWithBaseURL(app.api.baseUrl, bootstrap, "text/html", "UTF-8", null)
                         }
                     },
                     update = { },
@@ -526,7 +737,7 @@ fun WebAppScreen(
                     .padding(16.dp)
                     .clip(RoundedCornerShape(999.dp))
                     .background(Color(0xEFFFFFFF))
-                    .clickable(onClick = onOpenDownloads)
+                    .clickable(onClick = { leaveWeb(onOpenDownloads) })
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -555,6 +766,10 @@ private fun requestNotifPermissionIfNeeded() {
 /** 网页 → 原生 JS bridge（Android 4.2+ 需要 @JavascriptInterface 才暴露） */
 private class NativeBridge(
     private val context: Context,
+    private val hapticOwner: String,
+    private val onThemeChange: (String) -> Unit,
+    private val onThinkingChainDefaultChange: (String) -> Unit,
+    private val onSidebarActivity: (String) -> Unit,
     private val onClearAuth: () -> Unit,
     private val onDownload: (url: String, fileName: String?) -> Unit,
     private val onSaveBase64: (dataUrl: String, fileName: String?) -> Unit,
@@ -566,6 +781,14 @@ private class NativeBridge(
     private val onTakePhoto: () -> Unit,
     private val onShortcutAction: () -> String?,
 ) {
+    @android.webkit.JavascriptInterface
+    fun setTheme(theme: String) { onThemeChange(theme) }
+    @android.webkit.JavascriptInterface
+    fun setThinkingChainDefaultOpen(payload: String) { onThinkingChainDefaultChange(payload) }
+    @android.webkit.JavascriptInterface
+    fun sidebarActivity(payload: String) { onSidebarActivity(payload) }
+    @android.webkit.JavascriptInterface
+    fun reportUiParity(payload: String) { UiParityDiagnostics.web(payload) }
     @android.webkit.JavascriptInterface
     fun clearAuth() {
         onClearAuth()
@@ -613,6 +836,9 @@ private class NativeBridge(
     @android.webkit.JavascriptInterface
     fun consumeShortcutAction(): String = onShortcutAction() ?: ""
 
+    @android.webkit.JavascriptInterface
+    fun completeComposerAction(id: String, draftTransferred: Boolean) { NativeComposerHandoff.complete(context, id, draftTransferred) }
+
     // ------------------------------------------------------------------ //
     // A 类触觉 / 提示音：网页版在渲染关键时刻触发
     // ------------------------------------------------------------------ //
@@ -620,37 +846,37 @@ private class NativeBridge(
     /** 触觉反馈（轻微震动）：intensity 0/1/2 */
     @android.webkit.JavascriptInterface
     fun haptic(intensity: Int) {
-        com.learngraph.mobile.util.Haptics.haptic(context, intensity)
+        Haptics.haptic(context, intensity, hapticOwner)
     }
 
     /** 最终回复到达轻震（思维链结束后第一帧正文） */
     @android.webkit.JavascriptInterface
     fun replyHaptic() {
-        com.learngraph.mobile.util.Haptics.replyHaptic(context)
+        Haptics.replyHaptic(context, hapticOwner)
     }
 
     /** 开始最终回答渲染期「答答答」持续震动 */
     @android.webkit.JavascriptInterface
     fun startReplyVibration() {
-        com.learngraph.mobile.util.Haptics.startReplyVibration(context)
+        Haptics.startReplyVibration(context, hapticOwner)
     }
 
     /** 结束回答渲染期持续震动 */
     @android.webkit.JavascriptInterface
     fun stopReplyVibration() {
-        com.learngraph.mobile.util.Haptics.stopReplyVibration(context)
+        Haptics.stopReplyVibration(context, hapticOwner)
     }
 
     /** agent 工具/步骤完成弱震 */
     @android.webkit.JavascriptInterface
     fun stepHaptic() {
-        com.learngraph.mobile.util.Haptics.stepHaptic(context)
+        Haptics.stepHaptic(context, hapticOwner)
     }
 
     /** 目标/掌握度达成庆祝（短-长-短） */
     @android.webkit.JavascriptInterface
     fun celebration() {
-        com.learngraph.mobile.util.Haptics.celebration(context)
+        Haptics.celebration(context, hapticOwner)
     }
 
     /** 提示音（可选，默认关） */

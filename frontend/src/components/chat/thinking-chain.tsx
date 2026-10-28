@@ -27,8 +27,8 @@ import type { MessagePart } from "@/types/sessions";
  *
  * Phases:
  * - thinking: message is streaming and the final-answer boundary has not been
- *   reached yet. Defaults OPEN during processing (user setting), so the user
- *   watches the process unfold in real time.
+ *   reached yet. Defaults collapsed during processing; the workspace setting
+ *   can opt into expanded processing, and the user can always toggle the fold.
  * - final_answer: the backend emitted `answer.started` — freeze the thinking
  *   duration and auto-collapse ONCE. Re-expanding afterwards is never undone
  *   by later deltas.
@@ -44,7 +44,7 @@ export function ThinkingChain({
   finalAnswerStarted = false,
   thinkingDurationMs,
   toolCallCount: toolCalls = 0,
-  defaultOpen = true,
+  defaultOpen = false,
   children,
   className,
 }: {
@@ -58,7 +58,7 @@ export function ThinkingChain({
   thinkingDurationMs?: number;
   /** Settled tool-call count shown in the collapsed final header. */
   toolCallCount?: number;
-  /** Processing-phase default open state (user setting; default open). */
+  /** Processing-phase default open state (user setting; default collapsed). */
   defaultOpen?: boolean;
   children: ReactNode;
   className?: string;

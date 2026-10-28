@@ -43,6 +43,7 @@ from app.providers.ports.fetch import FetchProviderPort
 from app.providers.remote.fetch import (
     FetchedDocument,
     FetchProviderError,
+    FetchRuntimeUnavailable,
     FetchProviderTimeout,
     UnsafeFetchURL,
 )
@@ -167,7 +168,10 @@ class SandboxFetchProvider:
                 "The requested URL is outside the sandbox web fetch allowlist"
             )
         spec, spec_digest = self._build_spec(target)
-        artifact = self._run_container(target, spec, spec_digest)
+        try:
+            artifact = self._run_container(target, spec, spec_digest)
+        except SandboxBackendUnavailable as exc:
+            raise FetchRuntimeUnavailable("Sandbox fetch runtime is unavailable; verify sandboxd credentials and mounts") from exc
         final_url = str(artifact["final_url"]).strip()
         if not _host_allowed(final_url, self.allowed_domains, allow_all=self.allow_all):
             raise UnsafeFetchURL(
@@ -285,9 +289,13 @@ class SandboxFetchProvider:
         exec_timeout = self._exec_timeout_seconds()
         try:
             entry = pool.acquire(timeout_seconds=exec_timeout + 10)
-        except (FetchPoolSaturated, FetchPoolUnavailable) as exc:
+        except FetchPoolUnavailable as exc:
+            raise FetchRuntimeUnavailable("Sandbox fetch runtime is unavailable; verify sandboxd and egress configuration") from exc
+        except FetchPoolSaturated as exc:
             raise FetchProviderError(str(exc)) from exc
-        except (SandboxBackendUnavailable, SandboxBackendError) as exc:
+        except SandboxBackendUnavailable as exc:
+            raise FetchRuntimeUnavailable("Sandbox fetch runtime is unavailable; verify sandboxd credentials and mounts") from exc
+        except SandboxBackendError as exc:
             raise FetchProviderError(str(exc)) from exc
         session_token = f"fetch-{new_id()}"
         input_path = f"input/{session_token}.json"
@@ -332,7 +340,9 @@ class SandboxFetchProvider:
             raise FetchProviderError(
                 "Sandbox web fetch returned a non-JSON artifact"
             ) from exc
-        except (SandboxBackendUnavailable, SandboxBackendError) as exc:
+        except SandboxBackendUnavailable as exc:
+            raise FetchRuntimeUnavailable("Sandbox fetch runtime is unavailable; verify sandboxd credentials and mounts") from exc
+        except SandboxBackendError as exc:
             raise FetchProviderError(str(exc)) from exc
         finally:
             # Per-fetch input/output files are removed from the host workspace
@@ -434,7 +444,7 @@ class SandboxFetchProvider:
         except json.JSONDecodeError as exc:
             raise FetchProviderError("Sandbox web fetch returned a non-JSON artifact") from exc
         except SandboxBackendUnavailable as exc:
-            raise FetchProviderError(str(exc)) from exc
+            raise FetchRuntimeUnavailable("Sandbox fetch runtime is unavailable; verify sandboxd credentials and mounts") from exc
         except SandboxBackendError as exc:
             raise FetchProviderError(str(exc)) from exc
         finally:

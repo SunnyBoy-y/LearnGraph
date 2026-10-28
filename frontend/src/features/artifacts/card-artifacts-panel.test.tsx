@@ -117,6 +117,25 @@ afterEach(() => {
 })
 
 describe('artifact card wall playback', () => {
+  it('uses one outer card frame and keeps the action row below the preview', async () => {
+    await renderWall([1])
+
+    const viewport = document.querySelector<HTMLElement>('[data-artifact-preview-viewport]')
+    const outerCard = viewport?.closest('article')
+
+    expect(viewport).toBeTruthy()
+    expect(viewport?.className).not.toContain('border')
+    expect(viewport?.className).not.toContain('rounded')
+    expect(outerCard?.className).toContain('border')
+    expect(outerCard).toHaveClass('p-0')
+    expect(outerCard).not.toHaveClass('p-3')
+    expect(within(outerCard as HTMLElement).getByRole('button', { name: '会话' })).toBeTruthy()
+    expect(
+      within(outerCard as HTMLElement).getByRole('button', { name: '版本与分享 卡片 1' }),
+    ).toBeTruthy()
+    expect(within(outerCard as HTMLElement).getByRole('button', { name: '删除 卡片 1' })).toBeTruthy()
+  })
+
   it('starts every card paused with a click-to-play affordance', async () => {
     await renderWall([1, 2])
 

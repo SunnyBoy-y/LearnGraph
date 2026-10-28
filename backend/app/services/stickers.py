@@ -294,7 +294,15 @@ class StickerService:
         asset = self.require_asset(sticker_id)
         if asset.id not in {entry.id for entry in self.visible_assets()}:
             raise AppError(404, "sticker_not_found", "这张表情未启用，请调整表情包开关或排序")
-        data = {"sticker_id": asset.id, "pack_id": asset.pack_id, "asset_version": asset.content_hash, "alt": asset.name + ("：" + str(asset.semantics.get("description")) if asset.semantics.get("description") else ""), "meaning": str(asset.semantics.get("description") or asset.name)[:300]}
+        semantics = clean_semantics(asset.semantics or {})
+        data = {
+            "sticker_id": asset.id, "pack_id": asset.pack_id,
+            "asset_version": asset.content_hash, "name": asset.name,
+            "alt": asset.name + ("：" + semantics["description"] if semantics["description"] else ""),
+            "meaning": (semantics["description"] or asset.name)[:300],
+            "semantics": semantics,
+            "needs_description": not bool(semantics["description"]),
+        }
         from app.services.sticker_market import catalog
         credit = next((entry for pack in catalog() if pack["source_id"] == "openmoji" for entry in pack["stickers"] if entry["sha256"] == asset.content_hash), None)
         if credit:

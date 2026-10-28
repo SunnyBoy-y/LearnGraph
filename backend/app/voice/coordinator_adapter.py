@@ -86,7 +86,11 @@ class CoordinatorDelegationPort:
     async def focus_scene(self, request: TaskControlRequest) -> Mapping[str, Any]:
         return await asyncio.to_thread(self._focus_scene_sync, request.task_id, request.instruction)
 
-    def _focus_scene_sync(self, task_id: str, anchor_id: str, *, expected_turn_id: str | None = None) -> dict[str, Any]:
+    async def show_scene(self, task_id: str, anchor_id: str) -> Mapping[str, Any]:
+        return await asyncio.to_thread(self._focus_scene_sync, task_id, anchor_id, presentation_mode="display")
+
+    def _focus_scene_sync(self, task_id: str, anchor_id: str, *, expected_turn_id: str | None = None,
+                          presentation_mode: str = "explain") -> dict[str, Any]:
         with self._coordinator() as (_coordinator, reliability, _chat, turn_id):
             if expected_turn_id is not None and turn_id != expected_turn_id:
                 return {"task_id": task_id, "status": "unavailable"}
@@ -106,8 +110,9 @@ class CoordinatorDelegationPort:
                 "task_id": task_id, "result_id": row.id, "requirement_version": row.requirement_version,
                 "result_version": row.result_version,
                 "anchor_id": anchor_id,
+                "presentation_mode": presentation_mode,
             }, turn_id=turn_id, request_id="scene-focus:" + hashlib.sha256(
-                f"{getattr(handle, 'session_epoch', 1)}:{turn_id}:{row.id}:{row.result_version}:{anchor_id}".encode()).hexdigest()[:40])
+                f"{getattr(handle, 'session_epoch', 1)}:{turn_id}:{row.id}:{row.result_version}:{anchor_id}:{presentation_mode}".encode()).hexdigest()[:40])
             rendered = anchor_id in scene["anchors"]
             return {"task_id": task_id, "status": "focused" if rendered else "requested", "anchor_id": anchor_id,
                     "instruction": "已定位到已显示组件。" if rendered else "已请求临时展开和定位，收到页面显示回执前不要声称用户已看见；可以依据结果口述。"}
@@ -140,6 +145,10 @@ class CoordinatorDelegationPort:
 
     async def ready_results(self, *, limit: int = 10) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._ready_results_sync, limit)
+
+    async def current_results(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Scene lookup and post-claim validation also need delivered results."""
+        return await asyncio.to_thread(self._ready_results_sync, limit, include_delivered=True)
 
     async def acknowledge_result(
         self,
@@ -704,7 +713,7 @@ class CoordinatorDelegationPort:
             return result.model_dump(mode="json")
 
 
-    def _ready_results_sync(self, limit: int) -> list[dict[str, Any]]:
+    def _ready_results_sync(self, limit: int, *, include_delivered: bool = False) -> list[dict[str, Any]]:
         with self._coordinator() as (
             _coordinator,
             reliability,
@@ -730,9 +739,17 @@ class CoordinatorDelegationPort:
                 limit=200,
             )
             handle = load_session(self.voice_session_id)
-            latest_turn = reliability.db.scalar(select(VoiceTurnRecord.id).where(
+            recent_turns = list(reliability.db.scalars(select(VoiceTurnRecord).where(
                 VoiceTurnRecord.voice_session_id == self.voice_session_id,
-            ).order_by(VoiceTurnRecord.created_at.desc()).limit(1))
+            ).order_by(VoiceTurnRecord.created_at.desc()).limit(32)))
+            from app.voice.turn_plan import topic_turn_ids
+            from app.voice.embedded_turn_intent import is_asr_filler, is_backchannel
+            # Keep related follow-ups in the originating topic. A new independent
+            # request fences automatic delivery without cancelling its task.
+            topic_turns = topic_turn_ids([{'turn_id': turn.id, 'user_text': turn.user_text} for turn in recent_turns if turn.user_text and
+                not is_asr_filler(turn.user_text) and not is_backchannel(turn.user_text) and
+                turn.status != 'failed'])
+            topic_id = next((turn.id for turn in reversed(recent_turns) if turn.id in topic_turns), None)
             by_task = {link.subagent_id: link for link in links}
             results: list[dict[str, Any]] = []
             for row in rows:
@@ -746,7 +763,7 @@ class CoordinatorDelegationPort:
                 )
                 manual_delivery = bool(delivery and delivery.playback_status == "claimed"
                                        and not str(delivery.idempotency_key).startswith("voice-auto:"))
-                if row.status not in {"ready", "failed", "stale"} and not manual_delivery:
+                if row.status not in {"ready", "failed", "stale"} and not manual_delivery and not (include_delivered and row.status == "delivered"):
                     continue
                 results.append(
                     {
@@ -769,7 +786,8 @@ class CoordinatorDelegationPort:
                             requirement_version=int(row.requirement_version or 1),
                             result_version=int(row.result_version or 1),
                         ),
-                        "topic_current": not getattr(link, "trigger_turn_id", None) or getattr(link, "trigger_turn_id", None) == latest_turn,
+                        "topic_current": bool(getattr(link, "trigger_turn_id", None) in topic_turns),
+                        "topic_id": topic_id,
                         "playback_status": delivery.playback_status if delivery else None,
                         "deliveries": payload.get("deliveries") or {},
                     }

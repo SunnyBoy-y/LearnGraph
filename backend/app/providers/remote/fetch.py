@@ -21,6 +21,10 @@ class FetchProviderTimeout(FetchProviderError):
     pass
 
 
+class FetchRuntimeUnavailable(FetchProviderError):
+    """Configured fetch runtime/credentials are unavailable; not a page failure."""
+
+
 class UnsafeFetchURL(FetchProviderError):
     pass
 

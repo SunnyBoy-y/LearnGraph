@@ -1,0 +1,33 @@
+.context-usage-status { width: 100%; padding-top: 3px; text-align: center; }
+.context-usage-status__trigger {
+  display: inline-flex; max-width: 100%; flex-wrap: wrap; align-items: center;
+  justify-content: center; gap: 3px 0; padding: 3px 0; border: 0; border-radius: 5px;
+  background: transparent; color: var(--muted-foreground); font: inherit;
+  font-size: 11px; line-height: 16px; font-variant-numeric: tabular-nums;
+  cursor: default; opacity: .78; transition: opacity .15s;
+}
+.context-usage-status__trigger:hover, .context-usage-status__trigger[data-state='open'] { opacity: 1; }
+.context-usage-status__trigger:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.context-usage-status__trigger > span { white-space: nowrap; padding-inline: 10px; }
+.context-usage-status__trigger > span + span { border-left: 1px solid var(--border); }
+.context-usage-detail {
+  width: 264px; max-width: calc(100vw - 24px);
+  max-height: var(--radix-popover-content-available-height); overflow-y: auto;
+  padding: 13px 16px 10px; border-radius: 18px; border: 1px solid var(--border);
+  box-shadow: 0 6px 24px color-mix(in srgb, var(--foreground) 7%, transparent);
+  font-size: 12px; line-height: 1.6;
+}
+.context-usage-detail__group + .context-usage-detail__group { margin-top: 8px; }
+.context-usage-detail__group h3 { color: var(--muted-foreground); opacity: .75; font-size: 10px; font-weight: 500; margin-bottom: 2px; }
+.context-usage-detail__group dl > div { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.context-usage-detail__group dt { color: var(--muted-foreground); }
+.context-usage-detail__group dd { color: var(--foreground); font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
+.context-usage-detail__note { margin-top: 10px; color: var(--muted-foreground); font-size: 10px; line-height: 1.5; }
+.context-usage-detail__compact { border-top: 1px solid var(--border); margin-top: 9px; padding-top: 5px; text-align: center; }
+.context-usage-detail__compact button { height: 26px; font-size: 11px; }
+.context-usage-detail__compact p { color: var(--muted-foreground); font-size: 10px; }
+.context-usage-detail__compact [role='alert'] { color: var(--destructive); }
+@media (max-width: 640px) {
+  .context-usage-status__trigger { font-size: 10px; line-height: 15px; }
+  .context-usage-status__trigger > span { padding-inline: 6px; }
+}

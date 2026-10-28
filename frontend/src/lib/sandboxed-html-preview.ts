@@ -99,13 +99,42 @@ export interface SandboxedHtmlPreviewOptions {
   subappClient?: boolean
 }
 
+/**
+ * Escaped layout whitespace must be repaired before the HTML parser sees it:
+ * otherwise it closes <head> early and foster-parents text out of tables.
+ * Keep markup, raw-text elements and literal/code content byte-for-byte intact.
+ */
+function normalizePreviewLayoutWhitespace(html: string): string {
+  const tokens = /<!--[\s\S]*?(?:-->|$)|<!\[CDATA\[[\s\S]*?(?:\]\]>|$)|<(script|style|textarea|title|xmp|iframe|noembed|noframes|noscript)(?=[\s/>])(?:[^"'<>]|"[^"]*"|'[^']*')*>[\s\S]*?(?:<\/\1\s*>|$)|<plaintext(?=[\s/>])[^>]*>[\s\S]*$|<\/?[a-z][\w:-]*(?:[^"'<>]|"[^"]*"|'[^']*')*>|<![^>]*>|[^<]+|</giu;
+  const literalElements: string[] = [];
+  return html.replace(tokens, (token: string) => {
+    if (token.startsWith("<")) {
+      const literalTag = /^<(\/?)(pre|code)(?=[\s/>])/iu.exec(token);
+      if (literalTag) {
+        const name = literalTag[2].toLowerCase();
+        if (!literalTag[1]) {
+          literalElements.push(name);
+        } else {
+          const index = literalElements.lastIndexOf(name);
+          if (index !== -1) literalElements.length = index;
+        }
+      }
+      return token;
+    }
+    if (literalElements.length || !/^(?:\s|\\[nrt])*$/u.test(token)) {
+      return token;
+    }
+    return token.replace(/\\r\\n|\\[nr]/gu, "\n").replace(/\\t/gu, "\t");
+  });
+}
+
 /** Build an opaque-origin srcDoc whose executable policy is owned by the host. */
 export function sandboxedHtmlPreviewDocument(
   html: string,
   options: SandboxedHtmlPreviewOptions = {},
 ): string {
   const parser = new DOMParser();
-  const doc = parser.parseFromString(html, "text/html");
+  const doc = parser.parseFromString(normalizePreviewLayoutWhitespace(html), "text/html");
   // Navigation / embedding / form / base markup is always stripped — the
   // sandbox never navigates the top window, never embeds third-party frames
   // and never lets the preview change the document base. External CSS links
@@ -165,5 +194,9 @@ export function sandboxedHtmlPreviewDocument(
   const clientTag = scripts && options.subappClient ? subappClientInlineTag() : "";
   let policy = options.offline ? "default-src 'none'; img-src data: blob:; media-src data: blob:; font-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" : SANDBOXED_HTML_PREVIEW_CSP;
   if (!scripts) policy = policy.replace(/script-src[^;]*/u, "script-src 'none'");
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${scripts ? PREVIEW_CONTROL_SHIM : ""}${shimTag}${clientTag}${doc.head?.innerHTML ?? ""}</head><body>${doc.body?.innerHTML ?? ""}</body></html>`;
+  const hostHead = parser.parseFromString(`<head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${scripts ? PREVIEW_CONTROL_SHIM : ""}${shimTag}${clientTag}</head>`, "text/html").head;
+  doc.head.prepend(...hostHead.childNodes);
+  // Keep the sanitized document's lang/dir/classes/body styles: throwing away
+  // these attributes loses generated backgrounds and can make text invisible.
+  return `<!doctype html>${doc.documentElement.outerHTML}`;
 }

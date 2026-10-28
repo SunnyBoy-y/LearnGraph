@@ -46,6 +46,8 @@ CONTROL_EVENT_TYPES: tuple[str, ...] = (
 # ``app.voice.schemas.VOICE_EVENT_TYPES``; validated on emit so a typo in the
 # worker fails loudly instead of writing an unreplayable row.
 VOICE_EVENT_TYPES: tuple[str, ...] = (
+    "tool.started", "tool.completed", "tool.failed", "tool.cancelled",
+    "conversation.policy",
     "scene.focus", "artifact.upsert", "task.pausing", "task.paused", "task.resumed",
     "session.created",
     "session.ready",

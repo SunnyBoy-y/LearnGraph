@@ -58,23 +58,23 @@ def test_fullwidth_comma_breaks_without_waiting_for_lookahead():
     async def run():
         return await _feed(aggregator, "你好，")
 
-    assert asyncio.run(run()) == ["你好，"]
+    assert asyncio.run(run()) == []
 
 
 def test_fullwidth_comma_and_full_stop_both_break():
-    assert _chunks(["你好，", "今天讲图。"]) == ["你好，", "今天讲图。"]
+    assert _chunks(["你好，", "今天讲图。"]) == ["你好，今天讲图。"]
 
 
 def test_halfwidth_comma_breaks_but_not_a_thousands_separator():
     """半角逗号断句，但 ``1,000`` 必须保持整块（读成 "1"+"000" 是听觉事故）。"""
     # 半角逗号切得掉；后面的 " world" 没有句末标点，要等 flush（见 flush 那条用例）。
-    assert _chunks(["hello,", " world"]) == ["hello,"]
+    assert _chunks(["hello,", " world"]) == []
     assert _chunks(["价格 1,000 元。"]) == ["价格 1,000 元。"]
 
 
 def test_comma_breaks_around_dunhao_keeps_list_together():
     """顿号连成的并列成分整体留在逗号前那一句里。"""
-    assert _chunks(["红、黄、蓝，这三色。"]) == ["红、黄、蓝，", "这三色。"]
+    assert _chunks(["红、黄、蓝，这三色。"]) == ["红、黄、蓝，这三色。"]
 
 
 def test_base_aggregator_would_not_break_on_comma():
@@ -104,7 +104,7 @@ def test_dunhao_is_not_a_break_char_at_any_layer():
 
 
 def test_fullwidth_comma_is_a_break_char():
-    assert "，" in IMMEDIATE_BREAK_CHARS
+    assert "，" not in IMMEDIATE_BREAK_CHARS
 
 
 # ------------------------------------------------------------- 非拉丁即时切 / 拉丁不变

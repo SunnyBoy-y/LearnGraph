@@ -20,6 +20,28 @@ export type SessionActivity = {
 };
 
 export type SessionActivityMap = ReadonlyMap<string, SessionActivity>;
+export type SessionActivityEvent =
+  | { kind: 'running'; sessionId: string; running: boolean }
+  | { kind: 'finished'; sessionId: string; viewing: boolean; at: number }
+  | { kind: 'touched'; sessionId: string; at: number }
+  | { kind: 'viewed'; sessionId: string };
+const eventListeners = new Set<(event: SessionActivityEvent) => void>();
+export function subscribeSessionActivityEvents(listener: (event: SessionActivityEvent) => void): () => void {
+  eventListeners.add(listener);
+  return () => { eventListeners.delete(listener); };
+}
+function emitActivityEvent(event: SessionActivityEvent) { for (const listener of eventListeners) listener(event); }
+
+/** Host hydration updates the original sidebar store without echoing stream events. */
+export function seedSessionActivity(entries: ReadonlyMap<string, SessionActivity>, preserveIds: readonly string[] = []): void {
+  const next = new Map(entries);
+  for (const id of preserveIds) {
+    const current = byId.get(id);
+    if (current) next.set(id, current); else next.delete(id);
+  }
+  byId = next;
+  emit();
+}
 
 export type SidebarSortableSession = {
   id: string;
@@ -95,6 +117,7 @@ export function markSessionRunning(sessionId: string, running: boolean): void {
   if (!sessionId || sessionId === "new") return;
   const prev = read(sessionId);
   write(sessionId, { ...prev, running });
+  emitActivityEvent({ kind: 'running', sessionId, running });
 }
 
 /**
@@ -117,6 +140,7 @@ export function markSessionGenerationFinished(
       completedAt: null,
       lastTouchedAt: Math.max(prev.lastTouchedAt, at),
     });
+    emitActivityEvent({ kind: 'finished', sessionId, viewing: true, at });
     return;
   }
   write(sessionId, {
@@ -125,6 +149,7 @@ export function markSessionGenerationFinished(
     unreadCompleted: true,
     completedAt: at,
   });
+  emitActivityEvent({ kind: 'finished', sessionId, viewing: false, at });
 }
 
 /**
@@ -143,6 +168,7 @@ export function markSessionViewed(sessionId: string): void {
     unreadCompleted: false,
     completedAt: null,
   });
+  emitActivityEvent({ kind: 'viewed', sessionId });
 }
 
 /** User sent a message — bump recency so the session sorts to the front. */
@@ -156,6 +182,7 @@ export function markSessionTouched(
     ...prev,
     lastTouchedAt: Math.max(prev.lastTouchedAt, at),
   });
+  emitActivityEvent({ kind: 'touched', sessionId, at });
 }
 
 function toEpoch(value: string | number | null | undefined): number {

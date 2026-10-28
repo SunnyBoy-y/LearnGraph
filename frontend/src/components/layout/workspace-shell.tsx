@@ -10,6 +10,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react"
 import { lazy, memo, Suspense } from "react";
+import { applyAppearance } from "@/lib/appearance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Link,
@@ -3490,12 +3491,14 @@ function TopBar({
   );
 }
 
-function ContextRail({
+export function ContextRail({
   collapsed = false,
   onSelectionExplanationChange,
+  drawerSwipe = "ignore",
 }: {
   collapsed?: boolean;
   onSelectionExplanationChange?: (open: boolean) => void;
+  drawerSwipe?: "ignore" | "allow";
 } = {}) {
   const { pathname, search } = useLocation();
   const { workspaceId = "" } = useParams();
@@ -3654,7 +3657,7 @@ function ContextRail({
       aria-hidden={collapsed || undefined}
       className="context-rail min-h-svh bg-card px-4 py-5"
       data-rail-state={collapsed ? "collapsed" : "expanded"}
-      data-drawer-swipe="ignore"
+      data-drawer-swipe={drawerSwipe}
       // Collapsed rail stays mounted for CSS slide; inert keeps it out of tab order.
       inert={collapsed || undefined}
     >
@@ -5190,15 +5193,8 @@ export function WorkspaceShell() {
     const value = settings.data?.find(
       (item) => item.key === "ui.preferences",
     )?.value;
-    if (!value || typeof value !== "object" || !("theme" in value)) return;
-    const isDark = (value as { theme?: unknown }).theme === "dark";
-    document.documentElement.classList.toggle("dark", isDark);
-    try {
-      window.localStorage.setItem("lg-theme", isDark ? "dark" : "light");
-    } catch {
-      // Tab still keeps the applied class when storage is unavailable.
-    }
-  }, [settings.data]);
+    if (settings.isSuccess) applyAppearance(value);
+  }, [settings.data, settings.isSuccess]);
   const toggleSidebar = useCallback(() => {
     setCollapsed((current) => {
       window.localStorage.setItem("lg-sidebar-collapsed", String(!current));

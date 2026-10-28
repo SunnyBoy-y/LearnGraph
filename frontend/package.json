@@ -9,6 +9,7 @@
     "code-trainer:assets": "node scripts/build-code-trainer.mjs",
     "dev": "vite",
     "build": "vite build",
+    "build:native-renderer": "node ../mobile/scripts/build-native-renderer.mjs",
     "typecheck": "tsc -b",
     "build:check": "tsc -b && npm run build",
     "lint": "oxlint",

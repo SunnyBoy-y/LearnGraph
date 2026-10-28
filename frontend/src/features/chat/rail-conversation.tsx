@@ -32,9 +32,11 @@ function railMessageParts(message: Message): MessagePart[] {
 function RailMessageContent({
   message,
   onAction,
+  thinkingChainDefaultOpen,
 }: {
   message: Message;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
+  thinkingChainDefaultOpen: boolean;
 }) {
   const parts = railMessageParts(message);
   const displaySegments = groupPartsForDisplay(parts, {
@@ -116,7 +118,7 @@ function RailMessageContent({
             <ThinkingChain
               chainParts={segment.parts}
               completedDurationSec={thinkingDurationSeconds(message.provider_trace)}
-              defaultOpen={message.status === "streaming"}
+              defaultOpen={thinkingChainDefaultOpen}
               finalAnswerStarted={Boolean(message.finalAnswerStarted)}
               messageStatus={message.status}
               startedAt={
@@ -152,9 +154,10 @@ function RailMessageContent({
 
 
 /** The rail keeps the main conversation's message primitives and reading styles. */
-export function RailConversationMessage({ message, onAction }: {
+export function RailConversationMessage({ message, onAction, thinkingChainDefaultOpen = false }: {
   message: Message;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
+  thinkingChainDefaultOpen?: boolean;
 }) {
   const user = message.role === "user";
   return (
@@ -165,7 +168,7 @@ export function RailConversationMessage({ message, onAction }: {
             <ChatStreamPartRenderer key={part.id} part={part} siblingParts={message.parts} />
           ))}
           <p className="whitespace-pre-wrap break-words">{message.content}</p>
-        </> : <RailMessageContent message={message} onAction={onAction} />}
+        </> : <RailMessageContent message={message} onAction={onAction} thinkingChainDefaultOpen={thinkingChainDefaultOpen} />}
       </MessageContent>
       {!user ? <>
         <StreamStatsBadge messageId={message.id} status={message.status} providerTrace={message.provider_trace} />

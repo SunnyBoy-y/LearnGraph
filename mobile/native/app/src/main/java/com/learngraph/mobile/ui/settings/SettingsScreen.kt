@@ -24,6 +24,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -34,13 +38,17 @@ import androidx.compose.ui.unit.dp
 import com.learngraph.mobile.LearnGraphApp
 import com.learngraph.mobile.data.AuthStore
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
  * 设置页：服务器信息 / 账号 / 关于 / 退出登录。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(onLogout: () -> Unit) {
+fun SettingsScreen(onLogout: () -> Unit, onBack: () -> Unit = {}) {
     val context = LocalContext.current
     val app = context.applicationContext as LearnGraphApp
     val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
@@ -51,6 +59,7 @@ fun SettingsScreen(onLogout: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = { Text("设置") },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回") } },
                 modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars),
             )
         },
@@ -87,9 +96,9 @@ fun SettingsScreen(onLogout: () -> Unit) {
                 elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    SettingRow("版本", "v0.13.0 原生版")
+                    SettingRow("版本", context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "-")
                     Spacer(Modifier.height(10.dp))
-                    SettingRow("说明", "原生壳 + 内嵌网页版全套功能")
+                    SettingRow("说明", "原生会话与本机缓存；复杂工具通过 Android 系统 WebView 兼容视图打开")
                 }
             }
 
@@ -98,11 +107,20 @@ fun SettingsScreen(onLogout: () -> Unit) {
             Button(
                 onClick = {
                     scope.launch {
+                        val identity = listOf(app.api.baseUrl, app.api.token, app.api.workspaceId)
                         try {
                             app.api.post("/auth/logout", "{}", auth = true, workspace = false)
                         } catch (_: Exception) {
                         }
-                        app.authStore.clearAll()
+                        withContext(NonCancellable) {
+                            if (identity == listOf(app.api.baseUrl, app.api.token, app.api.workspaceId)) {
+                                app.repository.clearCurrentAccount()
+                                android.webkit.CookieManager.getInstance().removeAllCookies(null)
+                                android.webkit.WebStorage.getInstance().deleteAllData()
+                                app.authStore.clearAuth()
+                            }
+                        }
+                        currentCoroutineContext().ensureActive()
                         onLogout()
                     }
                 },

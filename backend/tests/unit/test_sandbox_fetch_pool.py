@@ -242,6 +242,17 @@ def test_pool_reuses_one_container_across_fetches(tmp_path):
     assert backend.deleted == []  # never torn down per fetch
 
 
+def test_missing_sandboxd_credentials_is_runtime_failure(tmp_path, monkeypatch):
+    from app.providers.remote.fetch import FetchRuntimeUnavailable
+    from app.providers.remote.sandbox import SandboxBackendUnavailable
+    provider = _provider(_settings(tmp_path), FakeSandboxBackend())
+    def unavailable(*args, **kwargs):
+        raise SandboxBackendUnavailable("sandboxd token file is unreadable")
+    monkeypatch.setattr(provider._injected_backend, "probe", unavailable)
+    with pytest.raises(FetchRuntimeUnavailable, match="credentials"):
+        provider.fetch("https://example.com")
+
+
 def test_pool_supports_concurrent_fetches_without_cross_contamination(tmp_path):
     backend = FakeSandboxBackend()
     provider = _provider(_settings(tmp_path), backend)

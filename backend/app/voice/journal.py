@@ -118,6 +118,7 @@ def backoff_delay(attempt: int, *, base: float = 0.5, cap: float = 30.0) -> floa
 class _TurnState:
     turn_id: str
     user_text: str = ""
+    origin: str = "user"
     # Provider final identity (DashScope item_id/commit_id). Re-delivered
     # terminal ASR events must not append the same text a second time.
     seen_user_final_ids: set[str] = field(default_factory=set)
@@ -151,6 +152,7 @@ class _TurnState:
     playback_anchor_at: float | None = None
     audio_cursor_ms: int = 0
     llm_closed: bool = False
+    synthesis_pending: bool = False
     foreground_busy: bool = False
     foreground_status: str = "idle"
     finalized: bool = False
@@ -651,6 +653,22 @@ class VoiceTurnJournal:
 
     # -------------------------------------------------------- assistant side
 
+    async def prepare_delivery(self, request_id: str) -> str:
+        """Create an assistant-only turn without inventing a user utterance."""
+        accepted = await asyncio.to_thread(turn_api.accept_turn, self.voice_session_id, "",
+                                           client_message_id=f"voice-delivery:{request_id}", origin="delivery")
+        if not accepted.get("created"):
+            raise RuntimeError("speech delivery turn already exists")
+        return str(accepted["turn_id"])
+
+    def attach_delivery(self, turn_id: str) -> None:
+        self._begin_turn(_TurnState(turn_id=turn_id, origin="delivery"))
+
+    async def discard_delivery(self, turn_id: str) -> None:
+        await asyncio.to_thread(turn_api.finalize_turn, self.voice_session_id,
+                               turn_id=turn_id, assistant_text="", outcome=turn_api.TURN_FAILED,
+                               failure_reason="speech_admission_cancelled", memory=False)
+
     def expect_typed_turn(self, client_message_id: str, text: str = "") -> None:
         """Remember the idempotency key the client is about to type with.
 
@@ -781,6 +799,10 @@ class VoiceTurnJournal:
         """Legacy guard: speculative model text must never be published."""
         del text, turn_id
         return
+
+    def current_turn_origin(self) -> str | None:
+        """Origin of the admitted turn; historical context is not a new input."""
+        return self._turn.origin if self._turn and not self._turn.finalized else None
 
     def current_turn_id(self) -> str | None:
         """当前未 finalize 的持久 turn id，没有则 None。同步、无 IO。
@@ -1146,6 +1168,16 @@ class VoiceTurnJournal:
         )
         await self.assistant_completed()
 
+    def tts_submitted(self) -> None:
+        if self._turn is not None and not self._turn.finalized:
+            self._turn.synthesis_pending = True
+
+    async def tts_failed(self, turn_id: str | None) -> None:
+        if self._turn is not None and self._turn.turn_id == turn_id and not self._turn.finalized:
+            self._turn.synthesis_pending = False
+            await self.assistant_completed(outcome=turn_api.TURN_FAILED,
+                                           failure_reason="tts_protocol_error", memory=False)
+
     def llm_closed(self) -> None:
         """The LLM stopped producing text; schedule a finalize fallback.
 
@@ -1174,7 +1206,7 @@ class VoiceTurnJournal:
             return
         if not self._turn.llm_closed:
             return
-        if self._turn.foreground_busy:
+        if self._turn.foreground_busy or self._turn.synthesis_pending:
             return
         if self._turn.playback_observed:
             # Playback was observed, so TTS is demonstrably alive and this timer
@@ -1211,6 +1243,7 @@ class VoiceTurnJournal:
         failure_reason: str | None = None,
         degraded_reason: str | None = None,
         memory: bool | None = None,
+        silent_control: bool = False,
     ) -> None:
         """Finalize the open turn exactly once, from the text that was read aloud.
 
@@ -1231,7 +1264,7 @@ class VoiceTurnJournal:
             state.finalized = True
             self._cancel_recovery_timers()
         spoken = self._spoken_assistant_text(state)
-        if not spoken and outcome == turn_api.TURN_FINALIZED:
+        if not spoken and outcome == turn_api.TURN_FINALIZED and not silent_control:
             # Every successful assistant completion needs playback evidence.
             # This guard covers direct/legacy callers as well as grace/idle paths.
             outcome = turn_api.TURN_FAILED

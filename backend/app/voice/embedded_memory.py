@@ -33,9 +33,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
+
+from app.voice.turn_plan import filter_memory_block, plan_turn, project_request_messages
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +167,7 @@ def recall_voice_memory(
         )
         return None
 
-    block = str(block or "").strip()
+    block = filter_memory_block(str(block or "").strip(), text)
     if not block:
         return None
     return VoiceMemoryRecall(
@@ -426,6 +429,9 @@ def voice_memory_llm_service_class() -> Any:
             self._pending_memory: VoiceMemoryRecall | None = None
             self._task_session_id = task_session_id
             self._pending_tasks = ''
+            self.conversation_policy = None
+            self.journal = None
+            self._projection_query = ''
 
         @property
         def memory_bridge(self) -> VoiceMemoryBridge | None:
@@ -435,10 +441,14 @@ def voice_memory_llm_service_class() -> Any:
             # The bounded wait happens here, inside the inference task, so an
             # interruption cancels it together with the request it prepares.
             recall: VoiceMemoryRecall | None = None
+            getter = getattr(context, "get_messages", None)
+            messages = getter() if callable(getter) else []
+            user_query = last_user_text(messages)
+            self._projection_query = user_query
+            policy = self.conversation_policy
+            revision = getattr(policy, 'revision', None)
             if self._memory_bridge is not None:
                 try:
-                    getter = getattr(context, "get_messages", None)
-                    messages = getter() if callable(getter) else []
                     if answers_the_user_turn(messages):
                         recall = await self._memory_bridge.take(last_user_text(messages))
                 except Exception:
@@ -451,22 +461,42 @@ def voice_memory_llm_service_class() -> Any:
                     getter = getattr(context, "get_messages", None)
                     task_messages = getter() if callable(getter) else []
                     query = last_user_text(task_messages) if answers_the_user_turn(task_messages) else ''
-                    self._pending_tasks = await asyncio.wait_for(asyncio.to_thread(load_task_context, self._task_session_id, query), timeout=1.0)
+                    self._pending_tasks = await asyncio.wait_for(asyncio.to_thread(load_task_context, self._task_session_id, query,
+                        focus_task_ids=tuple(getattr(policy, 'focus_task_ids', ()))), timeout=1.0)
+                    if policy is not None and policy.revision == revision and self._pending_tasks:
+                        data = json.loads(self._pending_tasks.splitlines()[-1])
+                        policy.focus_task_ids = tuple(row['task_id'] for row in data)
                 except Exception:
                     self._pending_tasks = ''
             try:
+                if policy is not None and policy.revision != revision:
+                    raise asyncio.CancelledError()
                 return await super().get_chat_completions(context)
             finally:
                 self._pending_memory = None
                 self._pending_tasks = ''
+                self._projection_query = ''
 
         def build_chat_completion_params(self, params_from_context: Any) -> dict:
             params = super().build_chat_completion_params(params_from_context)
+            messages = list(params.get('messages') or [])
+            query = self._projection_query
+            origin = getattr(self.journal, 'current_turn_origin', lambda: None)()
+            if origin == 'delivery':
+                params['messages'] = [messages[0], messages[-1]] if len(messages) > 1 else messages
+            else:
+                params['messages'] = project_request_messages(messages, query)
             recall = self._pending_memory
             if recall is not None:
-                _install_memory_injection(params, recall)
+                block = filter_memory_block(recall.block, query,
+                    suppress_past_errors=bool(getattr(self.conversation_policy, 'suppress_past_errors', True)))
+                if block:
+                    _install_memory_injection(params, replace(recall, block=block))
             if self._pending_tasks:
-                params['messages'] = [*params.get('messages', []), {'role':'system', 'content':self._pending_tasks}]
+                messages = list(params['messages'])
+                index = next((i for i in range(len(messages)-1, -1, -1) if messages[i].get('role') == 'user'), len(messages))
+                messages.insert(index, {'role':'user', 'content':self._pending_tasks})
+                params['messages'] = messages
             return params
 
     _LLM_SERVICE_CLASS = VoiceMemoryLLMService

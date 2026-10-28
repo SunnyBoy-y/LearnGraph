@@ -41,7 +41,7 @@ from .events import (
     release_runtime_owner,
 )
 from .policy import clip_thinking_mode
-from .runtime import runtime_info
+from .runtime import runtime_info, websocket_runtime_url
 from .schemas import (
     RTVIEventEnvelope, VoiceSession, VoiceTaskLink, VoiceTaskStartRequest,
     VoiceTaskView,
@@ -232,7 +232,9 @@ class VoiceSessionService:
             created_at=row.created_at, updated_at=row.updated_at,
             model_id=row.model_id, provider_id=row.provider_id,
             runtime_ready=row.runtime_ready, signaling_url=row.signaling_url,
+            websocket_url=websocket_runtime_url(self.settings),
             context_snapshot=row.context_snapshot or {},
+            low_latency_mode=(row.context_snapshot or {}).get("low_latency_mode") is True,
             scene_presentation=presentation,
             tasks=[
                 VoiceTaskLink(
@@ -324,6 +326,29 @@ class VoiceSessionService:
         })
         return effective
 
+    def update_client_environment(self, voice_session_id: str, environment) -> VoiceSession:
+        from app.providers.realtime_information import ClientEnvironment
+        validated = ClientEnvironment.model_validate(environment).model_dump(mode="json")
+        self.get_session(voice_session_id, write=True)
+        row = self.db.get(VoiceSessionRecord, voice_session_id)
+        row.context_snapshot = {**(row.context_snapshot or {}), "client_environment": validated}
+        self.db.commit()
+        return self.get_session(voice_session_id)
+
+    def update_preferences(self, voice_session_id: str, *, low_latency_mode: bool) -> VoiceSession:
+        session = self.get_session(voice_session_id, write=True)
+        if session.low_latency_mode == low_latency_mode:
+            return session
+        row = self.db.get(VoiceSessionRecord, voice_session_id)
+        row.context_snapshot = {**(row.context_snapshot or {}), "low_latency_mode": low_latency_mode}
+        self.db.commit()
+        self.envelope(voice_session_id, "context.updated", {
+            "reason": "voice_preferences",
+            "low_latency_mode": low_latency_mode,
+            "applies_to": "next_turn",
+        })
+        return self.get_session(voice_session_id)
+
     def update_context_snapshot(self, voice_session_id: str, snapshot: dict[str, Any]) -> VoiceSession:
         """Persist an immutable context package for reconnects/next turns.
 
@@ -339,7 +364,12 @@ class VoiceSessionService:
         import json
         # Dataclass snapshots include ``created_at``; normalize to transport
         # safe JSON before writing the JSON column.
+        environment = (row.context_snapshot or {}).get("client_environment")
+        low_latency_mode = (row.context_snapshot or {}).get("low_latency_mode") is True
         row.context_snapshot = json.loads(json.dumps(snapshot or {}, default=str, ensure_ascii=False))
+        row.context_snapshot = {**row.context_snapshot, "low_latency_mode": low_latency_mode}
+        if environment is not None:
+            row.context_snapshot = {**row.context_snapshot, "client_environment": environment}
         row.session_epoch += 1
         self.db.commit()
         effective = self.get_session(voice_session_id)
@@ -511,7 +541,8 @@ class VoiceSessionService:
             ),
             "write_set": write_set,
             "output_contract": request.output_contract or (
-                dict(capability.output_contract) if capability else None
+                dict(capability.output_contract)
+                if capability and capability.output_contract is not None else None
             ),
             "sandbox_session_id": request.sandbox_session_id,
             "thinking_mode": mode,
@@ -562,7 +593,8 @@ class VoiceSessionService:
             ),
             write_set=write_set,
             output_contract=request.output_contract or (
-                dict(capability.output_contract) if capability else None
+                dict(capability.output_contract)
+                if capability and capability.output_contract is not None else None
             ),
             sandbox_session_id=request.sandbox_session_id,
             voice_session_id=session.id,

@@ -17,6 +17,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.TimeUnit
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+
+internal fun quickReplyBody(text: String): String = JsonObject(mapOf("content" to JsonPrimitive(text))).toString()
 
 /**
  * 通知栏快捷回复（RemoteInput）：
@@ -72,7 +76,7 @@ class QuickReplyReceiver : BroadcastReceiver() {
                 .readTimeout(10, TimeUnit.SECONDS)
                 .build()
             val url = "${auth.baseUrl.trimEnd('/')}/api/v1/sessions/$sessionId/messages/async"
-            val body = """{"content":${jsonEscape(text)}}""".toRequestBody(
+            val body = quickReplyBody(text).toRequestBody(
                 "application/json; charset=utf-8".toMediaType(),
             )
             val request = Request.Builder().url(url)
@@ -86,19 +90,6 @@ class QuickReplyReceiver : BroadcastReceiver() {
             http.newCall(request).execute().use { resp -> resp.code in 200..299 }
         } catch (_: Exception) {
             false
-        }
-    }
-
-    private fun jsonEscape(s: String): String = buildString {
-        for (c in s) {
-            when (c) {
-                '\\' -> append("\\\\")
-                '"' -> append("\\\"")
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                else -> append(c)
-            }
         }
     }
 

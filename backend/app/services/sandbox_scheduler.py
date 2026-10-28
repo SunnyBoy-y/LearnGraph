@@ -390,7 +390,7 @@ class SandboxSchedulerService:
             idempotency_key_hash=key_hash,
             queued_at=now,
             available_at=now,
-            deadline_at=now + timedelta(seconds=deadline),
+            deadline_at=None if kind == "subagent" else now + timedelta(seconds=deadline),
         )
         self.db.add(job)
         self.db.commit()
@@ -576,6 +576,7 @@ class SandboxSchedulerService:
             update(SandboxJob)
             .where(
                 SandboxJob.status == "QUEUED",
+                SandboxJob.kind != "subagent",
                 SandboxJob.deadline_at.is_not(None),
                 SandboxJob.deadline_at <= now,
             )

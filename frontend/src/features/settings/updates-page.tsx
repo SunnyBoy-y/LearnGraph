@@ -77,7 +77,7 @@ export function UpdatesPage() {
       </SettingsSection>
 
       {data?.enabled ? <>
-        <SettingsSection title="新版本" description="安装前会验证镜像、数据库兼容标记并备份 SQLite；镜像尚未发布时任务安全终止。">
+        <SettingsSection title="新版本" description="安装前会验证镜像、数据库兼容能力，并备份当前 SQLite 或 PostgreSQL 主库；迁移后更新与版本回退均保持 PostgreSQL。镜像尚未发布时任务安全终止。">
           <SettingRow title={data.latest?.version ?? '尚无正式版本'} description={data.has_update ? '发现可升级版本' : '未发现更高版本'}>
             <Button disabled={!data.has_update || busy || Boolean(data.deployment_error) || Boolean(data.check_error)} size="sm" onClick={() => data.latest && setConfirmation({ version: data.latest.version })}>
               <ArrowDownToLine className="size-3.5" />立即更新

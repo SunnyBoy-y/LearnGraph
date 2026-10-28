@@ -15,6 +15,14 @@ import {
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { ArtifactCard } from "@/types/artifacts";
 
+/**
+ * The artifact article is the card frame.  Its preview viewport must only
+ * provide sizing and clipping for the running content; giving it a second
+ * border made every artifact look like a card inside another card.
+ */
+export const artifactCardPreviewViewportClassName =
+  "artifact-card-preview-viewport relative min-h-80 max-h-[520px] min-w-0 overflow-hidden";
+
 /** Cards keep their own controls: clicks on them must not be read as "play". */
 function isCardControl(target: EventTarget | null): boolean {
   return (
@@ -61,7 +69,7 @@ export function ArtifactCardShell({
     <div className="artifact-card-item flex min-w-0 flex-col">
       <article
         aria-label={ariaLabel ?? card.title}
-        className={`flex min-w-0 flex-col rounded-xl border bg-background p-3 ${selected ? "border-ring bg-muted/40" : ""}`}
+        className={`flex min-w-0 flex-col rounded-xl border bg-background p-0 ${selected ? "border-ring bg-muted/40" : ""}`}
         onClick={(event) => {
           if (isCardControl(event.target)) return;
           onActivate(card.id);
@@ -80,7 +88,7 @@ export function ArtifactCardShell({
           version={version}
           workspaceId={workspaceId}
         />
-        <div className="mt-3 flex min-w-0 flex-wrap items-center gap-1 border-t pt-2">
+        <div className="mx-3 mt-3 flex min-w-0 flex-wrap items-center gap-1 border-t pb-3 pt-2">
           {footer}
         </div>
       </article>
@@ -165,7 +173,8 @@ export function CardInlinePreview({
 
   return (
     <div
-      className="relative mt-3 min-h-80 max-h-[520px] min-w-0 overflow-hidden rounded-xl border border-border/60 bg-muted/20"
+      className={artifactCardPreviewViewportClassName}
+      data-artifact-preview-viewport="true"
       data-preview-suspended={suspended ? "true" : "false"}
       ref={containerRef}
     >

@@ -3,9 +3,35 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const api = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn(), baseUrl: '/api/v1' }));
 const voice = vi.hoisted(() => ({ getVoiceCapabilities: vi.fn(), getVoiceIceServers: vi.fn(), getVoiceSession: vi.fn(), getVoiceTask: vi.fn(), startVoiceTask: vi.fn(), cancelVoiceTask: vi.fn(), approveVoiceTask: vi.fn(), reviseVoiceTask: vi.fn(), deliverVoiceResult: vi.fn() }));
 const noise = vi.hoisted(() => ({ createVoiceNoiseInput: vi.fn() }));
+const wss = vi.hoisted(() => ({ instances: [] as Array<{
+  options: { onMessage: (message: unknown) => void; onClose: () => void; reconnecting: boolean };
+  isOpen: boolean;
+  connect: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn>;
+  send: ReturnType<typeof vi.fn>; startCapture: ReturnType<typeof vi.fn>;
+  setMuted: ReturnType<typeof vi.fn>; clearPlayback: ReturnType<typeof vi.fn>;
+}> }));
 vi.mock('@/api/client', () => ({ apiClient: api, ApiError: class ApiError extends Error {} }));
 vi.mock('@/api/voice', () => voice);
 vi.mock('./rnnoise/input', () => ({ ...noise, idleNoiseStatus: { mode: 'idle' } }));
+vi.mock('./voice-wss', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./voice-wss')>(),
+  VoiceSocketTransport: class {
+    options;
+    isOpen = true;
+    playbackStream = {} as MediaStream;
+    connect = vi.fn().mockResolvedValue(undefined);
+    close = vi.fn(() => { this.isOpen = false; });
+    send = vi.fn().mockReturnValue(true);
+    startCapture = vi.fn().mockResolvedValue(undefined);
+    setMuted = vi.fn();
+    clearPlayback = vi.fn();
+    resume = vi.fn().mockResolvedValue(true);
+    constructor(_context: unknown, options: typeof wss.instances[number]['options']) {
+      this.options = options;
+      wss.instances.push(this);
+    }
+  },
+}));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -54,6 +80,7 @@ beforeEach(async () => {
   api.get.mockReset(); api.post.mockReset(); api.patch.mockReset(); api.delete.mockReset();
   localStorage.clear();
   Peer.instances = [];
+  wss.instances = [];
   mic = media();
   noise.createVoiceNoiseInput.mockReset();
   noise.createVoiceNoiseInput.mockImplementation(async (stream: MediaStream) => ({ stream, close: vi.fn() }));
@@ -74,6 +101,140 @@ beforeEach(async () => {
 afterEach(() => { controller?.disconnect(); vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('voice connection ownership', () => {
+  it('prefers advertised WSS without allocating a peer or fetching ICE, and keeps typed turns', async () => {
+    vi.stubGlobal('AudioContext', class { close = vi.fn().mockResolvedValue(undefined); });
+    vi.stubGlobal('Audio', class {
+      autoplay = false; srcObject: unknown = null; muted = false;
+      addEventListener = vi.fn(); play = vi.fn().mockResolvedValue(undefined);
+      pause = vi.fn(); remove = vi.fn();
+    });
+    api.post.mockImplementation(async (path: string, data: Record<string, unknown>) =>
+      path === '/voice/sessions' ? { ...remote(`remote-${data.session_id}`), websocket_url: '/api/v1/voice/sessions/{session_id}/api/audio' } : {});
+    await controller.connect(); await flush();
+    expect(Peer.instances).toHaveLength(0);
+    expect(voice.getVoiceIceServers).not.toHaveBeenCalled();
+    expect(controller.getSnapshot().transport).toBe('connected');
+    expect(wss.instances[0].startCapture).toHaveBeenCalledWith(mic.stream);
+    expect(controller.sendText('hello through WSS')).toBe(true);
+    const messages = wss.instances[0].send.mock.calls.map(([raw]) => JSON.parse(raw));
+    expect(messages.some(message => message.type === 'client-ready')).toBe(true);
+    expect(messages.some(message => message.type === 'send-text' && message.data.content === 'hello through WSS')).toBe(true);
+    wss.instances[0].options.onMessage({
+      label: 'rtvi-ai', type: 'server-message',
+      data: { event: { event_id: 'wss-ready', event_seq: 8, session_id: 'remote-A', session_epoch: 1, type: 'session.ready', payload: {} } },
+    });
+    expect(controller.getSnapshot().transport).toBe('connected');
+    controller.disconnect();
+    expect(wss.instances[0].close).toHaveBeenCalled();
+    expect(mic.track.stop).toHaveBeenCalled();
+  });
+  it.each([
+    { stored: undefined, expected: true, patches: false },
+    { stored: false, expected: false, patches: true },
+  ])('restores the server preference unless there is an explicit local value: $stored', async ({ stored, expected, patches }) => {
+    if (stored !== undefined) localStorage.setItem('learngraph.voice.preferences.v1', JSON.stringify({ lowLatencyMode: stored }));
+    localStorage.setItem('learngraph.voice.remote-sessions.v1', JSON.stringify({ 'workspace:B': 'remote-B' }));
+    api.get.mockImplementation(async (path: string) => path.includes('/events?') ? { events: [] }
+      : path.includes('/transcript?') ? { turns: [] }
+      : { ...remote(path.split('/').pop()!), low_latency_mode: true });
+    controller.open('workspace', 'B');
+    await controller.connect(); await flush();
+    expect(controller.getSnapshot().lowLatencyMode).toBe(expected);
+    expect(api.patch.mock.calls.some(([path]) => String(path).endsWith('/preferences'))).toBe(patches);
+    if (patches) expect(api.patch).toHaveBeenCalledWith('/voice/sessions/remote-B/preferences', { low_latency_mode: false }, expect.anything());
+  });
+  it('persists low latency independently of the thinking limit and sends it when connecting', async () => {
+    expect(controller.getSnapshot().lowLatencyMode).toBe(false);
+    controller.setThinkingLimit('medium');
+    await controller.setLowLatencyMode(true);
+    controller.setThinkingLimit('off');
+    expect(JSON.parse(localStorage.getItem('learngraph.voice.preferences.v1')!)).toMatchObject({
+      thinkingLimit: 'off', lowLatencyMode: true,
+    });
+    controller.open('workspace', 'B');
+    expect(controller.getSnapshot().lowLatencyMode).toBe(true);
+    await controller.connect(); await flush();
+    expect(api.post).toHaveBeenCalledWith('/voice/sessions',
+      expect.objectContaining({ session_id: 'B', low_latency_mode: true }), expect.anything());
+    await controller.setLowLatencyMode(false);
+    expect(api.patch).toHaveBeenCalledWith('/voice/sessions/remote-B/preferences', { low_latency_mode: false });
+    expect(controller.getSnapshot().lowLatencyMode).toBe(false);
+  });
+  it('keeps the old preference if the running service rejects the change', async () => {
+    await controller.connect(); await flush();
+    api.patch.mockRejectedValueOnce(new Error('offline'));
+    await controller.setLowLatencyMode(true);
+    expect(controller.getSnapshot().lowLatencyMode).toBe(false);
+    expect(controller.getSnapshot().lowLatencySaving).toBe(false);
+    expect(controller.getSnapshot().error).toContain('低延迟模式保存失败');
+    expect(JSON.parse(localStorage.getItem('learngraph.voice.preferences.v1') || '{}').lowLatencyMode).not.toBe(true);
+    await controller.setLowLatencyMode(true);
+    expect(controller.getSnapshot().lowLatencyMode).toBe(true);
+    expect(controller.getSnapshot().error).toBeNull();
+  });
+  it('does not apply an old call preference response to another conversation', async () => {
+    await controller.connect(); await flush();
+    const pending = deferred<unknown>();
+    api.patch.mockImplementationOnce(() => pending.promise);
+    const changing = controller.setLowLatencyMode(true);
+    expect(controller.getSnapshot().lowLatencySaving).toBe(true);
+    controller.open('workspace', 'B');
+    pending.resolve({});
+    await changing;
+    expect(controller.getSnapshot().sessionId).toBe('B');
+    expect(controller.getSnapshot().lowLatencyMode).toBe(false);
+    expect(controller.getSnapshot().lowLatencySaving).toBe(false);
+  });
+  it('does not leave the preference switch pending after hanging up', async () => {
+    await controller.connect(); await flush();
+    const pending = deferred<unknown>();
+    api.patch.mockImplementationOnce(() => pending.promise);
+    const changing = controller.setLowLatencyMode(true);
+    controller.disconnect();
+    expect(controller.getSnapshot().lowLatencySaving).toBe(false);
+    pending.resolve({});
+    await changing;
+    expect(controller.getSnapshot().lowLatencyMode).toBe(false);
+  });
+  it('queues a component explanation without optimistic scene focus or interrupting', async () => {
+    await controller.connect(); await flush();
+    controller.upsertTask({taskId:'task-A',title:'result',status:'ready',findings:['有据可查的结论']});
+    const peer = Peer.instances[0];
+    expect(await controller.explainTask('task-A','finding-0')).toBe(true);
+    const messages = peer.channel.send.mock.calls.map(([raw]) => JSON.parse(raw));
+    expect(messages.some(message => message.data?.t === 'learngraph-speech-request' && message.data.d.text.includes('有据可查的结论'))).toBe(true);
+    expect(messages.some(message => message.data?.t === 'learngraph-interrupt')).toBe(false);
+    expect(controller.getSnapshot().tasks[0].focusAnchor).toBeUndefined();
+  });
+  it('keeps a display-only scene open after its silent control turn ends', async () => {
+    await controller.connect(); await flush();
+    controller.upsertTask({taskId:'task-A',title:'result',status:'ready'});
+    const peer = Peer.instances[0];
+    peer.event('conversation.policy','remote-A',8,{quiet:false,background_muted:true,wait_for_scene:true,mode:'display'});
+    peer.event('scene.focus','remote-A',9,{task_id:'task-A',anchor_id:'visual-table',turn_id:'display',presentation_mode:'display'});
+    peer.event('turn.finalized','remote-A',10,{turn_id:'display',role:'assistant'});
+    expect(controller.getSnapshot().tasks[0].focusId).toBe('remote-A-9');
+    expect(controller.getSnapshot().conversationPolicy?.background_muted).toBe(true);
+    peer.event('user.started','remote-A',11,{});
+    expect(controller.getSnapshot().tasks[0].focusId).toBeUndefined();
+    peer.event('scene.focus','remote-A',12,{task_id:'task-A',anchor_id:'visual-table',turn_id:'display',presentation_mode:'display'});
+    peer.event('conversation.policy','remote-A',13,{quiet:false,background_muted:true,wait_for_scene:false,mode:'dismiss_scene'});
+    expect(controller.getSnapshot().tasks[0].focusId).toBeUndefined();
+  });
+  it('queues component explanation without a send-text interruption', async () => {
+    await controller.connect(); await flush();
+    controller.upsertTask({ taskId: 'task-A', title: '测试结果', status: 'ready', summary: '本次测试通过。' });
+    const channel = Peer.instances[0].channel;
+    channel.send.mockClear();
+    expect(await controller.explainTask('task-A', 'summary')).toBe(true);
+    const messages = channel.send.mock.calls.map(([raw]) => JSON.parse(raw));
+    const request = messages.find((message) => message.type === 'client-message' && message.data.t === 'learngraph-speech-request');
+    expect(request.data.d.request_id).toBeTruthy();
+    expect(request.data.d.text).toContain('本次测试通过。');
+    expect(messages.some((message) => message.type === 'send-text' || message.type === 'interrupt')).toBe(false);
+    expect(api.post.mock.calls.some(([url]) => String(url).includes('/turns/accept'))).toBe(false);
+  });
+
   it('ends scene focus with its playback turn and ignores a stale focus replay', async () => {
     await controller.connect(); await flush();
     controller.upsertTask({taskId:'task-A',title:'result',status:'ready'});

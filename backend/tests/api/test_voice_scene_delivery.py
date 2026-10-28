@@ -1,9 +1,73 @@
 """Exercise the real HTTP -> DB -> task inbox -> speaking-agent handoff."""
 import pytest
+import asyncio
 
 from app.core.database import SessionLocal
 from app.domain.models import VoiceSessionRecord, VoiceTaskLinkRecord, VoiceResultInboxRecord, SandboxAgentTask, SandboxAgentEvent, SandboxJob
 from app.voice.coordinator_adapter import CoordinatorDelegationPort
+
+
+def test_display_control_uses_durable_scene_and_silent_turn_without_audio_error(client, scene_call):
+    from app.voice.conversation_control import load_conversation_policy
+    from app.voice.journal import VoiceTurnJournal
+    headers, voice, _ = scene_call
+    async def run():
+        journal = VoiceTurnJournal(voice["id"])
+        await journal.user_typed("我要页面")
+        await journal._emit("conversation.policy", payload={"quiet": False, "background_muted": True,
+            "wait_for_scene": True, "mode": "display"})
+        shown = await CoordinatorDelegationPort(voice["id"]).show_scene("scene-task", "visual-comparison")
+        assert shown["status"] == "requested"
+        await journal.assistant_completed(memory=False, silent_control=True)
+        await journal.drain_persistence()
+    asyncio.run(run())
+    view = client.get(f"/api/v1/voice/sessions/{voice['id']}", headers=headers).json()
+    assert view["scene_presentation"]["presentation_mode"] == "display"
+    events = client.get(f"/api/v1/voice/sessions/{voice['id']}/events", headers=headers).json()["events"]
+    assert any(e["type"] == "turn.finalized" and e["payload"].get("outcome") == "finalized" for e in events)
+    assert not any(e["type"] == "processor.error" for e in events)
+    assert load_conversation_policy(voice["id"])["background_muted"] is True
+
+
+def test_post_claim_validation_can_read_delivered_result_and_release_it(client, scene_call):
+    _, voice, result_id = scene_call
+    port = CoordinatorDelegationPort(voice["id"])
+    async def run():
+        claim = await port.acknowledge_result("scene-task", delivery_state="delivered")
+        assert claim["created"]
+        assert await port.ready_results() == []
+        current = await port.current_results()
+        assert current[0]["result_id"] == result_id
+        assert current[0]["status"] == "delivered"
+        await port.acknowledge_result("scene-task", delivery_state="released")
+        assert (await port.ready_results())[0]["status"] == "ready"
+    asyncio.run(run())
+
+
+def test_controls_preserve_task_topic_but_a_new_question_replaces_it(client, scene_call):
+    from app.domain.models import VoiceTurnRecord
+    headers, voice, _ = scene_call
+    base = f"/api/v1/voice/sessions/{voice['id']}"
+    first = client.post(base + "/turns/accept", headers=headers,
+        json={"text": "展示你的能力", "client_message_id": "topic-demo"}).json()
+    with SessionLocal() as db:
+        from sqlalchemy import select
+        link = db.scalar(select(VoiceTaskLinkRecord).where(VoiceTaskLinkRecord.voice_session_id == voice['id']))
+        link.trigger_turn_id = first['turn_id']
+        first_turn = db.get(VoiceTurnRecord, first['turn_id'])
+        first_turn.status = 'finalized'
+        db.commit()
+    client.post(base + "/turns/accept", headers=headers,
+        json={"text": "恢复自动播报", "client_message_id": "topic-control"})
+    port = CoordinatorDelegationPort(voice['id'])
+    assert port._ready_results_sync(10)[0]['topic_current'] is True
+    with SessionLocal() as db:
+        for turn in db.query(VoiceTurnRecord).filter(VoiceTurnRecord.voice_session_id == voice['id']):
+            turn.status = 'finalized'
+        db.commit()
+    client.post(base + "/turns/accept", headers=headers,
+        json={"text": "讲一个故事", "client_message_id": "topic-story"})
+    assert port._ready_results_sync(10)[0]['topic_current'] is False
 
 
 @pytest.fixture

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnswerParts } from "@/components/chat/answer-parts";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ export function VoiceTaskScene({ task, open, onRender, onExplain }: {
   onExplain?: (taskId: string, anchor: string) => void;
 }) {
   const root = useRef<HTMLDivElement>(null);
+  const [displayState, setDisplayState] = useState<"waiting" | "visible" | "failed">("waiting");
   const activeAnchor = task.focusId ? task.focusAnchor : task.playbackStatus === "speaking"
     ? (task.visuals?.find(scene => scene.state !== "removed") ? `visual-${task.visuals.find(scene => scene.state !== "removed")!.block_id}` : "summary") : undefined;
   const childParts = useManagedAgentAnswer(task, open);
@@ -22,22 +23,52 @@ export function VoiceTaskScene({ task, open, onRender, onExplain }: {
     if (!open || !onRender || !task.resultId) return;
     const element = root.current;
     if (!element) return;
+    setDisplayState("waiting");
     let visible = typeof IntersectionObserver === "undefined";
     let pending = false;
     let disposed = false;
-    const unavailable = () => { Promise.resolve(onRender(task.taskId, [], "failed")).catch(() => {}); };
+    let visibilityRevision = 0;
+    let pendingAnchors = "";
+    let refreshAfterPending = false;
+    const unavailable = () => {
+      visibilityRevision += 1;
+      if (!disposed) setDisplayState("waiting");
+      Promise.resolve(onRender(task.taskId, [], "failed")).catch(() => {});
+    };
     const acknowledge = () => {
       if (disposed) return;
       if (!visible || document.visibilityState === "hidden") { unavailable(); return; }
-      if (pending) return;
       const anchors = [...element.querySelectorAll<HTMLElement>("[data-voice-anchor]")]
-        .filter((node) => !node.querySelector(".stream-ui__invalid") && (!node.dataset.voiceAnchor?.startsWith("visual-") || Boolean(node.querySelector("[data-ui-component]"))))
+        .filter((node) => {
+          const rect = node.getBoundingClientRect();
+          const inViewport = typeof IntersectionObserver === "undefined" || (rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth);
+          return inViewport && !node.querySelector(".stream-ui__invalid") && (!node.dataset.voiceAnchor?.startsWith("visual-") || Boolean(node.querySelector("[data-ui-component]")));
+        })
         .map((node) => node.dataset.voiceAnchor!).slice(0, 100);
-      if (!anchors.length) return;
+      if (!anchors.length) { unavailable(); return; }
+      const anchorKey = anchors.join("\n");
+      if (pending) {
+        if (anchorKey !== pendingAnchors) {
+          visibilityRevision += 1;
+          refreshAfterPending = true;
+          setDisplayState("waiting");
+        }
+        return;
+      }
       pending = true;
-      Promise.resolve(onRender(task.taskId, anchors)).catch(() => {
-        // An unconfirmed scene falls back to spoken results on the server.
-      }).finally(() => { pending = false; });
+      pendingAnchors = anchorKey;
+      const revision = ++visibilityRevision;
+      Promise.resolve(onRender(task.taskId, anchors)).then(() => {
+        if (!disposed && revision === visibilityRevision && anchors.includes(activeAnchor || "summary")) setDisplayState("visible");
+      }).catch(() => {
+        if (!disposed && revision === visibilityRevision) setDisplayState("failed");
+      }).finally(() => {
+        pending = false;
+        if (!disposed && refreshAfterPending) {
+          refreshAfterPending = false;
+          acknowledge();
+        }
+      });
     };
     const observer = typeof IntersectionObserver !== "undefined" ? new IntersectionObserver(([entry]) => {
       visible = entry.isIntersecting;
@@ -49,15 +80,19 @@ export function VoiceTaskScene({ task, open, onRender, onExplain }: {
     acknowledge();
     const timer = window.setInterval(acknowledge, 10_000);
     document.addEventListener("visibilitychange", acknowledge);
+    window.addEventListener("scroll", acknowledge, true);
+    window.addEventListener("resize", acknowledge);
     return () => {
       disposed = true;
       observer?.disconnect();
       mutations.disconnect();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", acknowledge);
+      window.removeEventListener("scroll", acknowledge, true);
+      window.removeEventListener("resize", acknowledge);
       unavailable();
     };
-  }, [open, onRender, task.taskId, task.resultId, sceneKey]);
+  }, [open, onRender, task.taskId, task.resultId, sceneKey, activeAnchor]);
 
   const lastFocused = useRef<string | undefined>(undefined);
   const childLoaded = Boolean(childParts?.length);
@@ -107,6 +142,9 @@ export function VoiceTaskScene({ task, open, onRender, onExplain }: {
   }
 
   return <div ref={root} className="space-y-3">
+    {task.presentationMode === "display" ? <p role="status" className="text-xs text-muted-foreground">
+      {displayState === "visible" ? "页面已显示，可直接操作" : displayState === "failed" ? "页面显示未确认，请重新展开" : "正在定位页面，暂不播报"}
+    </p> : null}
     {renderedParts.length ? <div data-voice-anchor="summary" data-voice-focused={isHighlighted("summary") || undefined} className={`space-y-3 transition-colors ${highlight("summary")}`}>
       <AnswerParts parts={renderedParts} renderPart={part => {
         const anchor = part.type === "ui" && part.data?.block_id ? `visual-${part.data.block_id}` : undefined;

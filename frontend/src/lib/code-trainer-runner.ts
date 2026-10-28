@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { localLanguages, normalizeLanguage } from "./code-trainer";
 import type { RunResult } from "./code-trainer";
+import { isNativeApp } from "./native-bridge";
 
 const resultSchema = z.object({
   status: z.enum(["completed", "compile_error", "runtime_error", "time_limit", "memory_limit", "output_limit", "load_error"]),
@@ -29,7 +30,10 @@ export function runnerDocument(channel: string) {
 const resourceCache = new Map<string, Promise<ArrayBuffer>>();
 function resource(name: string) {
   if (!resourceCache.has(name)) {
-    const url = `${import.meta.env.BASE_URL}code-trainer/${name}`;
+    // The APK packages renderer chunks only; large execution runtimes remain
+    // available on the connected server's normal public path, loaded on demand.
+    const base = window.LearnGraphRenderer || isNativeApp() ? "/" : import.meta.env.BASE_URL;
+    const url = `${base}code-trainer/${name}`;
     const pending = fetch(url, { credentials: "omit" }).then(response => {
       if (!response.ok) throw new Error(`运行环境资源加载失败 (${response.status})`);
       return response.arrayBuffer();

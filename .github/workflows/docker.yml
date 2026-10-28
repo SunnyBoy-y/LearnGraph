@@ -56,9 +56,17 @@ jobs:
     name: Build and smoke
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse local or shared runners before checkout
+        run: |
+          set -eu
+          [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ -z "${ACT:-}" ] \
+            || { echo "Docker smoke requires a disposable GitHub-hosted runner; checkout refused" >&2; exit 1; }
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - name: Require fresh isolated Docker daemon
+        run: python -m updater.tests.ci_docker_isolation
 
       - name: Lowercase image name
         run: echo "IMAGE_NAME=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/learngraph" >> "$GITHUB_ENV"
@@ -139,6 +147,7 @@ jobs:
         env:
           LEARNGRAPH_IMAGE: learngraph:ci
           LEARNGRAPH_ENV: development
+          COMPOSE_PROJECT_NAME: lg-ci-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           docker compose up -d --no-build
@@ -175,6 +184,19 @@ jobs:
             sleep 3
           done
           docker compose exec -T egress-proxy python -c "import socket; socket.create_connection(('127.0.0.1', 8888), timeout=4).close()"
+          # PostgreSQL provisioner shares the image, but only its dedicated
+          # service receives Docker access. Business roles must never get it.
+          for service in app egress-proxy; do
+            service_id=$(docker compose ps -q "$service")
+            if docker inspect --format '{{range .Mounts}}{{.Destination}} {{end}}' "$service_id" | grep -q '/var/run/docker.sock'; then
+              echo "business service unexpectedly has Docker access" >&2
+              exit 1
+            fi
+          done
+          # Exactly three resident roles; provisioning is an explicit profile.
+          [ "$(docker compose ps --status running --services | wc -l)" -eq 3 ]
+          ! docker compose ps --status running --services | grep -qx database-migration-agent
+          docker compose exec -T app python -m app.container_runtime health
           # The egress network must exist on the host Docker Engine and be
           # internal (dynamic sandbox containers join it by name).
           docker network inspect --format '{{.Internal}} {{.Name}}' learngraph-egress | grep -q 'true'
@@ -206,7 +228,15 @@ jobs:
     name: sandboxd control plane
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse local or shared runners before checkout
+        run: |
+          set -eu
+          [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && [ -z "${ACT:-}" ] \
+            || { echo "Docker smoke requires a disposable GitHub-hosted runner; checkout refused" >&2; exit 1; }
       - uses: actions/checkout@v6
+
+      - name: Require fresh isolated Docker daemon
+        run: python -m updater.tests.ci_docker_isolation
 
       - name: Build sandboxd image
         run: docker build -f sandboxd/Dockerfile -t sandboxd:ci .
@@ -214,14 +244,10 @@ jobs:
       - name: Build app image
         run: docker build -f Dockerfile -t learngraph:ci .
 
-      - name: App image must NOT bundle the docker SDK
+      - name: Business image must not expose a Docker endpoint
         run: |
           set -euo pipefail
-          if docker run --rm --entrypoint python learngraph:ci -c "import docker" >/dev/null 2>&1; then
-            echo "app image must NOT bundle the docker SDK (sandboxd owns Docker)" >&2
-            exit 1
-          fi
-          echo "app image has no docker SDK: ok"
+          docker run --rm --network none --read-only --entrypoint python learngraph:ci -c "import os,sys; from pathlib import Path; sys.exit('business image exposes Docker' if Path('/var/run/docker.sock').exists() or os.environ.get('DOCKER_HOST') else 0)"
 
       - name: Run sandboxd against the host socket and assert the control plane
         run: |
@@ -264,7 +290,7 @@ jobs:
             fi
             sleep 2
           done
-          docker exec sandboxd-ci python - <<'PY'
+          docker exec -i sandboxd-ci python - <<'PY'
           import json
           import urllib.request
 
@@ -284,7 +310,7 @@ jobs:
           PY
           # A non-managed network name must never be touchable through the API:
           # create without an immutable runtime image must fail closed.
-          docker exec sandboxd-ci python - <<'PY'
+          docker exec -i sandboxd-ci python - <<'PY'
           import json
           import urllib.request
           token = open("/run/secrets/token", encoding="utf-8").read().strip()

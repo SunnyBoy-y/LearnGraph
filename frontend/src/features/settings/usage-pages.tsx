@@ -192,7 +192,7 @@ function Overview({ data, onExport }: { data: UsageSummary; onExport: () => void
   return <div className="space-y-4">
     <Surface className="p-4"><SectionHeading title={data.currency + " 每日费用"} description="统计包含全部筛选记录与归档记录，日期按 UTC。" action={<Button variant="outline" onClick={onExport}>导出概览</Button>} />
       {days.length ? <div className="mt-4 h-64"><ResponsiveContainer width="100%" height="100%"><AreaChart data={days}>
-        <CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="label" /><YAxis />
+        <CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="label" /><YAxis tickFormatter={(value: number) => value.toFixed(2)} />
         <Tooltip content={({ active, payload }) => active && payload?.[0] ? <div className="rounded border bg-background p-2 text-sm">{payload[0].payload.label}<br />{nativeMoney(payload[0].payload.cost_amount, data.currency)}</div> : null} />
         <Area isAnimationActive={!reducedMotion} dataKey="chart_amount" stroke="var(--color-primary)" fill="var(--color-primary)" fillOpacity={0.12} />
       </AreaChart></ResponsiveContainer></div> : <p className="py-8 text-center text-sm text-muted-foreground">当前范围暂无已结算用量</p>}
@@ -271,9 +271,9 @@ function BudgetPanel({ scope, canManage, providers }: { scope: UsageScope; canMa
 function CatalogPanel({ scope, canManage, canRefresh, providers }: { scope: UsageScope; canManage: boolean; canRefresh: boolean; providers: Provider[] }) {
   const client = useQueryClient();
   const key = (...parts: unknown[]) => billingQueryKey(scope.workspaceId, scope.userId ?? "", scope.currency, ...parts);
-  const catalog = useQuery({ queryKey: key("catalog"), queryFn: ({ signal }) => listPriceCatalog(scope, signal) });
+  const status = useQuery({ queryKey: key("models-dev"), queryFn: ({ signal }) => getModelsDevStatus(scope, signal), refetchInterval: 60_000 });
+  const catalog = useQuery({ queryKey: key("catalog", status.data?.fetched_at), queryFn: ({ signal }) => listPriceCatalog(scope, signal) });
   const manual = useQuery({ queryKey: key("manual"), queryFn: ({ signal }) => listManualPrices(scope, signal) });
-  const status = useQuery({ queryKey: key("models-dev"), queryFn: ({ signal }) => getModelsDevStatus(scope, signal) });
   const [search, setSearch] = useState(""); const [page, setPage] = useState(0);
   const [draft, setDraft] = useState<ManualPriceUpsert | null>(null);
   const binding = useMutation({ mutationFn: (provider: Provider) => updateProvider(provider.id,
@@ -303,8 +303,12 @@ function CatalogPanel({ scope, canManage, canRefresh, providers }: { scope: Usag
       fixed_per_call: item?.native_fixed_per_call ?? "0", conditions: item?.conditions ?? {}, rates_by_unit: item?.rates_by_unit ?? {} });
   }
   return <div className="space-y-4">
-    <Surface className="space-y-3 p-4"><SectionHeading title="价格来源" description="只展示该币种的原价；按实际供应商实例、模型和计价条件匹配。" action={canRefresh ? <Button variant="outline" disabled={refresh.isPending} onClick={() => refresh.mutate()}>刷新 models.dev</Button> : null} />
-      <QuerySection query={status}>{(value) => <p className="text-sm">共享来源快照：{value.origin} · 全部币种共 {value.priced_model_count} 条价格记录 · {value.fetched_at ? stamp(value.fetched_at) : "随项目提供的快照"}</p>}</QuerySection>
+    <Surface className="space-y-3 p-4"><SectionHeading title="价格来源：models.dev" description="每日自动更新原币价格；用户手动价格始终优先，自动同步不会覆盖。" action={canRefresh ? <Button variant="outline" disabled={refresh.isPending} onClick={() => refresh.mutate()}>刷新 models.dev</Button> : null} />
+      <QuerySection query={status}>{(value) => <div className="space-y-1 text-sm">
+        <p><a href={value.source} target="_blank" rel="noreferrer" className="break-all underline">models.dev 实时价格目录</a> · 全部币种共 {value.priced_model_count} 条模型价格</p>
+        <p className="text-muted-foreground">上次成功同步：{value.origin === "bundled" || !value.fetched_at ? "尚未联网同步" : stamp(value.fetched_at)} · {value.auto_refresh_enabled ? value.stale ? "等待自动同步" : "下次更新：" + (value.next_refresh_at ? stamp(value.next_refresh_at) : "待安排") : "自动更新已关闭"}</p>
+        {value.stale ? <p className="text-amber-600">{value.origin === "network" || value.origin === "network_cache" ? "价格缓存待更新，暂时沿用最近一次成功同步的价格。" : "价格目录等待首次同步；未收录的模型可设置手动价格。"}</p> : null}
+      </div>}</QuerySection>
     </Surface>
     <Surface className="space-y-3 p-4"><SectionHeading title="供应商结算币种" description="有两种原币报价时，按供应商实际结算币种选择；已有账单保留调用时的币种。" />
       {providers.filter((provider) => provider.remote_capability).map((provider) => <div className="flex flex-wrap items-center justify-between gap-2 text-sm" key={provider.id}>
@@ -312,7 +316,7 @@ function CatalogPanel({ scope, canManage, canRefresh, providers }: { scope: Usag
         {canManage && provider.capabilities.billing_currency !== scope.currency ? <Button size="sm" variant="outline" disabled={binding.isPending} onClick={() => binding.mutate(provider)}>设置为 {scope.currency}</Button> : null}
       </div>)}
     </Surface>
-    <SectionHeading title={scope.currency + " 手动价格"} description="手动价格仅覆盖所选供应商、币种、功能和计价条件。删除按价格版本执行。" action={canManage ? <Button onClick={() => copy()}>添加手动价格</Button> : null} />
+    <SectionHeading title={scope.currency + " 手动价格"} description="手动价格仅覆盖所选供应商、币种、功能和计价条件，每日同步会保留。删除按价格版本执行。" action={canManage ? <Button onClick={() => copy()}>添加手动价格</Button> : null} />
     <QuerySection query={manual}>{(items) => <div className="grid gap-3 sm:grid-cols-2">{items.map((item) => <Surface className="min-w-0 space-y-2 p-4" key={item.id}>
       {item.provider_id === "*" ? <p className="text-sm text-amber-600">该历史价格尚未绑定供应商实例，暂不用于新调用。请编辑并选择具体供应商。</p> : null}
       <h3 className="break-all font-medium">{item.model_id}</h3><p className="break-all text-xs">{item.provider_id} / {item.feature} · v{item.version}</p>

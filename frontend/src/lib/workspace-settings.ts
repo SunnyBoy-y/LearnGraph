@@ -126,8 +126,8 @@ export function readChatDefaultResponseMode(
 export type ThinkingChainDefaultState = "open" | "collapsed";
 
 /**
- * Processing-phase default state of the thinking chain. Defaults to expanded
- * so the user watches reasoning / plan / tool steps unfold live; history
+ * Processing-phase default state of the thinking chain. Defaults to collapsed;
+ * users may explicitly opt into expanded processing. History
  * messages always load collapsed regardless of this preference.
  */
 export function readChatThinkingChainDefault(
@@ -136,10 +136,9 @@ export function readChatThinkingChainDefault(
   const value = settings?.find(
     (setting) => setting.key === CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY,
   )?.value;
-  if (!value || typeof value !== "object") return true;
+  if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
-  if (record.default_state === "collapsed") return false;
-  return true;
+  return record.default_state === "open";
 }
 
 export function readChatFeatureModelSetting(

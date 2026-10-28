@@ -86,6 +86,22 @@ jobs:
           name: android-test-results
           path: mobile/android/app/build/test-results/
           if-no-files-found: warn
+      - name: Install shared renderer dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Build shared Web message renderer
+        working-directory: mobile
+        run: npm run build:renderer
+      - name: Native Compose client unit tests and APK
+        working-directory: mobile/native
+        run: bash ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:testDebugUnitTest :app:assembleCompact --no-daemon
+      - name: Upload native test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-native-test-results
+          path: mobile/native/app/build/test-results/
+          if-no-files-found: warn
 
   frontend:
     name: Frontend

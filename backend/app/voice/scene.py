@@ -117,6 +117,6 @@ def current_scene_presentation(db: Any, session: Any) -> dict[str, Any] | None:
         if event.event_type == "turn.accepted":
             if event.turn_id != focus.turn_id:
                 return None
-        elif (not focus.turn_id or event.turn_id == focus.turn_id) and (event.payload or {}).get("role") != "user":
+        elif (focus.payload or {}).get("presentation_mode") != "display" and (not focus.turn_id or event.turn_id == focus.turn_id) and (event.payload or {}).get("role") != "user":
             return None
     return {**dict(focus.payload or {}), "id": focus.event_id, "turn_id": focus.turn_id}

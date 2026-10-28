@@ -1,8 +1,8 @@
 """Durable sub-agent executor for the unified sandbox scheduler.
 
 Runs one ``SandboxJob(kind="subagent")`` as a nested, isolated agent loop:
-independent DB session + independent model provider, budgeted rounds / wall
-time / tool calls / tokens / cost, cooperative cancellation, and a structured
+independent DB session + independent model provider, unbounded execution with
+usage tracking, cooperative cancellation, and a structured
 deliverable handoff produced by machine validation instead of model claims.
 
 Lifecycle events are emitted through an injected ``emit_event`` callback so the
@@ -11,9 +11,8 @@ stream; the executor itself never touches chat state.
 
 Status mapping (job/task):
     SUCCEEDED  — non-empty final answer, deliverables contract satisfied
-    PARTIAL    — round/tool/token/cost budget exhausted, or contract missing
+    PARTIAL    — deliverables contract missing
     FAILED     — exception / empty result
-    TIMED_OUT  — wall-clock deadline expired
     CANCELLED  — cooperative cancellation observed before finishing
     INTERRUPTED— reserved for process/lease loss recovery (not produced here)
 """
@@ -21,12 +20,13 @@ Status mapping (job/task):
 from __future__ import annotations
 
 import json
+from itertools import count
 import logging
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
-from app.core.money import amount_text, decimal_amount, sum_amounts
+from app.core.money import amount_text, sum_amounts
 from app.services.billing import BillingService
 
 logger = logging.getLogger(__name__)
@@ -433,15 +433,6 @@ def execute_subagent_job(
             )
     task_id = str(spec.get("task_id") or task.id)
     tools_allowed = spec.get("tools") if "tools" in spec else None
-    budget = spec.get("budget") if isinstance(spec.get("budget"), dict) else {}
-    max_rounds = int(budget.get("max_rounds") or settings.sandbox_subagent_max_rounds)
-    max_seconds = int(budget.get("max_seconds") or settings.sandbox_subagent_max_seconds)
-    max_tool_calls = budget.get("max_tool_calls")
-    max_tokens = int(budget.get("max_tokens") or settings.sandbox_subagent_default_max_tokens)
-    cost_limits = {currency: decimal_amount(value) for currency, value in (budget.get("max_cost_amounts") or {}).items() if currency in {"USD", "CNY"}}
-    if not cost_limits:
-        # Historical task caps were explicitly USD; retain that native cap.
-        cost_limits["USD"] = decimal_amount(budget.get("max_cost_usd") if budget.get("max_cost_usd") is not None else settings.sandbox_subagent_default_max_cost_usd)
     sandbox_session_id = spec.get("sandbox_session_id") or None
     requirement_version = max(
         1,
@@ -500,7 +491,6 @@ def execute_subagent_job(
     visual_scenes: dict[str, dict[str, Any]] = {}
 
     started = time.time()
-    deadline = started + max_seconds
     db: Any = None
     emit = emit_event or (lambda _event_type, _payload: None)
 
@@ -513,6 +503,7 @@ def execute_subagent_job(
     control_check_at = 0.0
     checkpoint = spec.get("_resume_checkpoint")
     checkpoint = checkpoint if isinstance(checkpoint, dict) and checkpoint.get("requirement_version") == requirement_version else {}
+    previous_seconds = float(checkpoint.get("active_seconds") or 0)
     completed_operations: dict[str, Any] = {}
     messages: list[Any] = []
     inflight_call_id: str | None = None
@@ -525,7 +516,7 @@ def execute_subagent_job(
             "rounds_used": rounds_used, "tool_calls_total": tool_calls_total,
             "used_tokens": used_tokens, "used_costs": dict(used_costs),
             "unknown_cost_events": unknown_cost_events,
-            "active_seconds": max_seconds - max(0, deadline - time.time()),
+            "active_seconds": previous_seconds + time.time() - started,
             "sources": actual_sources, "evidence": actual_evidence,
             "visuals": list(visual_scenes.values()),
             "completed_operations": completed_operations,
@@ -599,32 +590,6 @@ def execute_subagent_job(
         if visual_scenes:
             result["visuals"] = list(visual_scenes.values())
         return result
-
-    def _budget_outcome() -> SubagentRunOutcome | None:
-        if used_tokens >= max_tokens or any(decimal_amount(used_costs.get(currency, "0")) >= limit for currency, limit in cost_limits.items()):
-            _event("partial", {"reason": "budget_exhausted"})
-            return SubagentRunOutcome(
-                status="PARTIAL",
-                event_type="partial",
-                summary=final_text or "（子代理达到预算上限）",
-                deliverables=_result_deliverables(
-                    "partial",
-                    result_text=final_text,
-                    deliverables=None,
-                    error_class="BudgetExhausted",
-                    error_message=(
-                        f"sub-agent exceeded its budget (tokens {used_tokens}/{max_tokens}, "
-                        f"native costs {used_costs}; limits {dict((key, str(value)) for key, value in cost_limits.items())})"
-                    ),
-                ),
-                attempt_record=_attempt_record(),
-                error_class="BudgetExhausted",
-                error_message=(
-                    f"sub-agent exceeded its budget (tokens {used_tokens}/{max_tokens}, "
-                    f"native costs {used_costs}; limits {dict((key, str(value)) for key, value in cost_limits.items())})"
-                ),
-            )
-        return None
 
     def _control_state() -> tuple[bool, bool]:
         nonlocal control_check_at
@@ -964,7 +929,7 @@ def execute_subagent_job(
         )
         system_content += (
             "\n本任务允许写入的目录前缀：" + "、".join(effective_write_set)
-            + f"。本次总轮数预算为 {max_rounds}，优先完成可交付结果，不要通过试写猜测目录。"
+            + "。优先完成可交付结果，不要通过试写猜测目录。"
         )
         if "voice_publish_scene" in tool_names:
             system_content += (
@@ -998,7 +963,6 @@ def execute_subagent_job(
             actual_sources.extend(checkpoint.get("sources") or [])
             actual_evidence.extend(checkpoint.get("evidence") or [])
             visual_scenes.update({item["block_id"]: item for item in checkpoint.get("visuals") or []})
-            deadline -= float(checkpoint.get("active_seconds") or 0)
             if inflight_call_id:
                 raise UncertainToolExecution(
                     f"Tool {inflight_call_id} was dispatched without a committed result; inspect its effects before retrying"
@@ -1012,7 +976,7 @@ def execute_subagent_job(
         )
         resume_calls = _pending_tool_calls(messages)
         first_round = rounds_used if resume_calls else rounds_used + 1
-        for _round in range(first_round, max_rounds + 1):
+        for _round in count(first_round):
             cancelled, stale = _control_state()
             if stale:
                 _event("stale", {"reason": "requirement_revised"})
@@ -1051,26 +1015,6 @@ def execute_subagent_job(
             paused = _pause_outcome(messages)
             if paused is not None:
                 return paused
-            if time.time() >= deadline:
-                _event("timed_out", {"reason": "wall_clock"})
-                return SubagentRunOutcome(
-                    status="TIMED_OUT",
-                    event_type="timed_out",
-                    summary=final_text or "（子代理超时，未能给出最终答案）",
-                    deliverables=_result_deliverables(
-                        "timed_out",
-                        result_text=final_text,
-                        deliverables=None,
-                        error_class="TimeoutError",
-                        error_message=f"sub-agent exceeded its {max_seconds}s wall-time budget",
-                    ),
-                    attempt_record=_attempt_record(),
-                    error_class="TimeoutError",
-                    error_message=f"sub-agent exceeded its {max_seconds}s wall-time budget",
-                )
-            budget_outcome = _budget_outcome()
-            if budget_outcome is not None:
-                return budget_outcome
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             response_items: list[dict[str, Any]] = []
@@ -1082,17 +1026,8 @@ def execute_subagent_job(
             else:
                 billing = BillingService(db, job.workspace_id, job.owner_user_id) if db is not None else None
                 decision = billing.preflight_model_call(provider_id=model_provider.provider_id, model_id=model_provider.model_id,
-                    feature="sandbox_subagent", estimated_input_tokens=sum(_estimate_tokens(str(message.content)) for message in messages),
+                    feature="chat", estimated_input_tokens=sum(_estimate_tokens(str(message.content)) for message in messages),
                     estimated_output_tokens=2048, remote_capability=getattr(model_provider, "remote_capability", False)) if billing else None
-                if decision and decision.remote_capability and cost_limits:
-                    if decision.currency is None or (decision.currency in cost_limits and decision.projected_amount is None):
-                        billing.release_reservation(decision, reason="task_price_unknown")
-                        raise RuntimeError("Sub-agent cost budget requires a known native currency and price")
-                if decision and decision.currency in cost_limits and decision.projected_amount is not None:
-                    projected_total = decimal_amount(sum_amounts([used_costs.get(decision.currency, "0"), decision.projected_amount]))
-                    if projected_total > cost_limits[decision.currency]:
-                        billing.release_reservation(decision, reason="task_budget_blocked")
-                        raise RuntimeError("Sub-agent native " + decision.currency + " cost budget exhausted")
                 model_request_active = True
                 stream_completed = False
                 event_stream = None
@@ -1165,26 +1100,6 @@ def execute_subagent_job(
                         error_message="sub-agent returned an empty final answer",
                     )
                 break
-            if (
-                isinstance(max_tool_calls, int)
-                and tool_calls_total + sum(call.get("id") not in completed_operations for call in tool_calls) > max_tool_calls
-            ):
-                _event("partial", {"reason": "max_tool_calls"})
-                return SubagentRunOutcome(
-                    status="PARTIAL",
-                    event_type="partial",
-                    summary=final_text or "（子代理达到工具调用上限）",
-                    deliverables=_result_deliverables(
-                        "partial",
-                        result_text=final_text,
-                        deliverables=None,
-                        error_class="MaxToolCallsExhausted",
-                        error_message=f"sub-agent exceeded its {max_tool_calls}-call tool budget",
-                    ),
-                    attempt_record=_attempt_record(),
-                    error_class="MaxToolCallsExhausted",
-                    error_message=f"sub-agent exceeded its {max_tool_calls}-call tool budget",
-                )
             if not resuming_batch:
                 for index, call in enumerate(tool_calls):
                     if not call.get("id"):
@@ -1365,27 +1280,6 @@ def execute_subagent_job(
                 control_outcome = _control_outcome(final_text)
                 if control_outcome is not None:
                     return control_outcome
-            budget_outcome = _budget_outcome()
-            if budget_outcome is not None:
-                return budget_outcome
-        else:
-            final_text = final_text or "（子代理达到最大轮数，未能给出最终答案）"
-            _event("partial", {"reason": "max_rounds"})
-            return SubagentRunOutcome(
-                status="PARTIAL",
-                event_type="partial",
-                summary=final_text,
-                deliverables=_result_deliverables(
-                    "partial",
-                    result_text=final_text,
-                    deliverables=None,
-                    error_class="MaxRoundsExhausted",
-                    error_message=f"sub-agent reached its {max_rounds}-round cap",
-                ),
-                attempt_record=_attempt_record(),
-                error_class="MaxRoundsExhausted",
-                error_message=f"sub-agent reached its {max_rounds}-round cap",
-            )
         control_outcome = _control_outcome(final_text)
         if control_outcome is not None:
             return control_outcome

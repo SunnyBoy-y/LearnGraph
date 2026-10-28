@@ -61,6 +61,7 @@ services:
       SANDBOXD_STATE_PATH: /var/lib/sandboxd/state.db
       SANDBOXD_SECCOMP_DIR: /app/sandbox-profiles
       SANDBOXD_MAX_ACTIVE: "20"
+      SANDBOXD_MANAGED_DATABASE_ENABLED: "true"
     group_add:
       - ${DOCKER_GID:-998}
     volumes:

@@ -13,7 +13,8 @@ import tempfile
 import time
 import uuid
 
-from updater.agent import Agent, SERVICES, TERMINAL, UpdateError
+from updater.agent import SERVICES, TERMINAL, UpdateError
+from updater.tests.docker_isolation import IsolatedAgent, initialize_fixture, require, validate_location
 
 
 SERVER = '''import json, os, sqlite3
@@ -33,31 +34,25 @@ HTTPServer(('0.0.0.0',8000), Handler).serve_forever()
 '''
 
 
-class LocalAgent(Agent):
-    def command(self, args, timeout=60):
-        if args[0] == 'pull':
-            # Image publication is simulated with local fixture tags; all
-            # Compose/container/backup/health/rollback operations are real.
-            self.image_info(args[1])
-            return ''
-        return super().command(args, timeout)
+class LocalAgent(IsolatedAgent):
+    pass
 
 
 def wait_job(agent, job):
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         data = next(item for item in agent.state['jobs'] if item['id'] == job['id'])
-        if data['status'] in TERMINAL:
+        if data['status'] in TERMINAL and not agent.active():
             return data
         time.sleep(.25)
     raise AssertionError('Fixture update timed out')
 
 
 def main():
+    validate_location(Path(tempfile.gettempdir()) / "lg-updater-docker-preflight")
     root = Path(tempfile.mkdtemp(prefix='lg-updater-docker-')).resolve()
     image = 'learngraph-updater-fixture-' + uuid.uuid4().hex[:10]
     project = 'lg-update-test-' + uuid.uuid4().hex[:10]
-    agent = LocalAgent(root, 'LearnGraph/UpdateFixture', image, ['compose.json'], timeout=20)
     (root / 'server.py').write_text(SERVER, encoding='utf-8')
     # Reuse a local application base so acceptance does not require an external
     # registry or rebuild the product's large dependencies.
@@ -69,6 +64,10 @@ USER root
 LABEL org.opencontainers.image.version=$VERSION
 LABEL org.opencontainers.image.source=https://github.com/LearnGraph/UpdateFixture
 LABEL io.learngraph.update-compatibility=1
+# This tiny HTTP/SQLite fixture exercises the legacy updater path; it does not
+# boot the real application's native maintenance CLI. Native SQLite backup is
+# covered before migration by postgresql_roundtrip.
+LABEL io.learngraph.primary-database=sqlite-only
 ENV BROKEN=$BROKEN
 COPY server.py /fixture-server.py
 ENTRYPOINT ["python", "/fixture-server.py"]
@@ -77,7 +76,8 @@ HEALTHCHECK --interval=1s --timeout=1s --start-period=1s --retries=2 CMD python 
     config = {'name': project, 'services': {service: {'image': image + ':v1.0.0', 'volumes': ['fixture-data:/data'],
               'environment': {'LEARNGRAPH_DATABASE_URL': 'sqlite:////data/learngraph.db'}, 'restart': 'no'} for service in SERVICES},
               'volumes': {'fixture-data': {}}}
-    (root / 'compose.json').write_text(json.dumps(config), encoding='utf-8')
+    initialize_fixture(root, project, image, config)
+    agent = LocalAgent(root, 'LearnGraph/UpdateFixture', image, ['compose.json'], timeout=20)
     results = []
     try:
         for tag, broken in [('v1.0.0', '0'), ('v1.1.0', '0'), ('v1.2.0', '1')]:
@@ -112,20 +112,16 @@ HEALTHCHECK --interval=1s --timeout=1s --start-period=1s --retries=2 CMD python 
         assert restarted.state['jobs'][-1]['status'] == 'rolled_back'
         results.append('agent restart: persisted incomplete transaction restores v1.0.0')
         assert len(list(agent.private.glob('*.db'))) == 4
-        results.append('four SQLite backups copied to host and quick_check passed')
+        results.append('four SQLite backups copied to host; integrity and foreign-key checks passed')
         print(json.dumps({'passed': results, 'project': project, 'local_fixture_images': True}, ensure_ascii=False, indent=2))
     finally:
-        try:
-            agent.compose(['down', '--volumes', '--remove-orphans'], 90)
-            tags = agent.command(['image', 'ls', '--format', '{{.Repository}}:{{.Tag}}']).splitlines()
-            job_ids = {item['id'] for item in agent.state['jobs']}
-            owned = [tag for tag in tags if tag.startswith(image + ':') or any(
-                tag.startswith('learngraph-retained:' + job_id + '-') for job_id in job_ids)]
-            if owned:
-                agent.command(['image', 'rm', *owned], 90)
-        finally:
-            assert root.parent == Path(tempfile.gettempdir()).resolve() and root.name.startswith('lg-updater-docker-')
-            shutil.rmtree(root)
+        agent.compose(['down', '--volumes', '--remove-orphans'], 90)
+        owned = agent.fixture_image_tags()
+        if owned:
+            agent.command(['image', 'rm', *owned], 90)
+        # Failed cleanup retains its manifest and logs for safe recovery.
+        require(root.parent == Path(tempfile.gettempdir()).resolve() and root.name.startswith('lg-updater-docker-'), 'refuse cleanup outside temporary fixture root')
+        shutil.rmtree(root)
 
 
 if __name__ == '__main__':

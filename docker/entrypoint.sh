@@ -32,6 +32,7 @@ if [ "$(id -u)" = "0" ]; then
   exec setpriv --reuid=learngraph --regid=learngraph --init-groups -- "$0" "$@"
 fi
 
+unset _LEARNGRAPH_MASTER_KEY_FROM_FILE
 if [ "${LEARNGRAPH_SECRET_PROVIDER:-environment}" = "environment" ] && [ -z "${LEARNGRAPH_MASTER_KEY:-}" ]; then
   key_file="${DATA_ROOT}/.master-key"
   if [ ! -f "${key_file}" ]; then
@@ -41,6 +42,9 @@ if [ "${LEARNGRAPH_SECRET_PROVIDER:-environment}" = "environment" ] && [ -z "${L
   fi
   LEARNGRAPH_MASTER_KEY="$(cat "${key_file}")"
   export LEARNGRAPH_MASTER_KEY
+  # Offline recovery may restore this file and its matching encrypted route.
+  # An explicitly configured container secret must still fail on conflicts.
+  export _LEARNGRAPH_MASTER_KEY_FROM_FILE=1
 fi
 
 exec "$@"

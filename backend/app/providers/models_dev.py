@@ -4,10 +4,9 @@ from __future__ import annotations
 
 The project treats https://models.dev/api.json as the shared, vendor-neutral
 source for model defaults: context window, output limit, multimodal input
-support, reasoning availability, and native list prices.  A pruned snapshot ships
-with the repository so the catalogue works offline; an explicit network
-refresh re-downloads the live api.json, rebuilds the same index, and persists
-it under ``backend/data`` for later starts.
+support, reasoning availability, and native list prices. A bundled snapshot
+provides offline capabilities only. Prices come from the daily network refresh
+or its last successful persisted cache, never the bundled prices.
 
 Matching is intentionally by model name only ("只要模型名字对上号"): the same
 model id served through any Provider instance resolves to the same models.dev
@@ -17,9 +16,10 @@ always wins over this snapshot (merge happens in ``model_options``).
 
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -31,6 +31,7 @@ from app.providers.qwen_catalog import (
 
 
 MODELS_DEV_URL = "https://models.dev/api.json"
+REFRESH_INTERVAL_SECONDS = 24 * 60 * 60
 
 # Aggregators mirror vendor models with sometimes stale metadata; prefer the
 # canonical vendor record when the same model id appears multiple times.
@@ -74,7 +75,9 @@ _KEEP_FIELDS = (
 )
 
 _lock = threading.Lock()
+_refresh_lock = threading.Lock()
 _snapshot: dict[str, Any] | None = None
+_snapshot_cache_mtime: int | None = None
 
 
 def _bundled_path() -> Path:
@@ -84,9 +87,16 @@ def _bundled_path() -> Path:
 
 
 def _cache_path() -> Path:
-    # backend/app/providers/models_dev.py -> backend/data, matching the
-    # existing on-disk data directory used by the sqlite database.
-    return Path(__file__).resolve().parents[2] / "data" / "models_dev_snapshot.json"
+    from app.core.config import get_settings
+
+    return get_settings().storage_root.parent / "models_dev_snapshot.json"
+
+
+def _cache_mtime() -> int | None:
+    try:
+        return _cache_path().stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def _normalize(model_id: str) -> str:
@@ -159,15 +169,17 @@ def _read_snapshot_file(path: Path) -> dict[str, Any] | None:
 
 
 def _load_locked() -> dict[str, Any]:
-    global _snapshot
+    global _snapshot, _snapshot_cache_mtime
     if _snapshot is not None:
         return _snapshot
     for path, origin in ((_cache_path(), "network_cache"), (_bundled_path(), "bundled")):
+        cache_mtime = _cache_mtime()
         data = _read_snapshot_file(path)
         if data is not None:
             data.setdefault("_meta", {})
-            data["_meta"].setdefault("origin", origin)
+            data["_meta"]["origin"] = origin
             _snapshot = data
+            _snapshot_cache_mtime = cache_mtime
             return data
     _snapshot = {
         "_meta": {
@@ -183,12 +195,26 @@ def _load_locked() -> dict[str, Any]:
 
 
 def get_snapshot() -> dict[str, Any]:
+    global _snapshot, _snapshot_cache_mtime
     with _lock:
+        # Other API workers and the manual refresh endpoint share this cache.
+        mtime = _cache_mtime()
+        if _snapshot is not None and mtime is not None and mtime != _snapshot_cache_mtime:
+            cached = _read_snapshot_file(_cache_path())
+            if cached is not None:
+                cached.setdefault("_meta", {})["origin"] = "network_cache"
+                _snapshot, _snapshot_cache_mtime = cached, mtime
         return _load_locked()
 
 
 def refresh_snapshot(*, timeout_seconds: float = 45.0) -> dict[str, Any]:
     """Re-download api.json, rebuild the index, persist it, and swap it in."""
+
+    with _refresh_lock:
+        return _refresh_snapshot(timeout_seconds=timeout_seconds)
+
+
+def _refresh_snapshot(*, timeout_seconds: float) -> dict[str, Any]:
 
     response = httpx.get(
         MODELS_DEV_URL,
@@ -206,21 +232,30 @@ def refresh_snapshot(*, timeout_seconds: float = 45.0) -> dict[str, Any]:
         origin="network",
         fetched_at=datetime.now(timezone.utc).isoformat(),
     )
+    if not snapshot["models"] or not any(
+        _entries_for_record(record, key, snapshot["_meta"]["fetched_at"][:10])
+        for key, record in snapshot["pricing_records"].items()
+    ):
+        raise ValueError("models.dev returned an empty model or price catalogue")
     path = _cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    tmp.replace(path)
-    global _snapshot
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        cache_mtime = tmp.stat().st_mtime_ns
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    global _snapshot, _snapshot_cache_mtime
     with _lock:
         _snapshot = snapshot
+        _snapshot_cache_mtime = cache_mtime
     return snapshot_status()
 
 
 def snapshot_status() -> dict[str, Any]:
+    from app.core.config import get_settings
+
     snapshot = get_snapshot()
     meta = dict(snapshot.get("_meta") or {})
     models = snapshot.get("models") or {}
@@ -231,13 +266,25 @@ def snapshot_status() -> dict[str, Any]:
         and record["cost"].get("input") is not None
         and record["cost"].get("output") is not None
     )
+    next_refresh = None
+    if meta.get("origin") in {"network", "network_cache"} and meta.get("fetched_at"):
+        try:
+            fetched = datetime.fromisoformat(str(meta["fetched_at"]).replace("Z", "+00:00"))
+            fetched = fetched.replace(tzinfo=timezone.utc) if fetched.tzinfo is None else fetched.astimezone(timezone.utc)
+            next_refresh = fetched + timedelta(seconds=REFRESH_INTERVAL_SECONDS)
+        except ValueError:
+            pass
     return {
         "source": str(meta.get("source") or MODELS_DEV_URL),
         "origin": str(meta.get("origin") or "missing"),
         "fetched_at": meta.get("fetched_at"),
         "provider_count": int(meta.get("provider_count") or 0),
         "model_count": len(models),
-        "priced_model_count": priced,
+        "priced_model_count": priced if meta.get("origin") != "bundled" else 0,
+        "auto_refresh_enabled": get_settings().models_dev_refresh_enabled,
+        "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
+        "next_refresh_at": next_refresh.isoformat() if next_refresh else None,
+        "stale": next_refresh is None or datetime.now(timezone.utc) >= next_refresh,
     }
 
 
@@ -549,6 +596,8 @@ def pricing_entries() -> list[dict[str, Any]]:
     """Native tariffs, retaining every supplier instead of merging their prices."""
 
     snapshot = get_snapshot()
+    if (snapshot.get("_meta") or {}).get("origin") in {"bundled", "missing"}:
+        return []
     as_of = _snapshot_as_of()
     entries: list[dict[str, Any]] = []
     records = snapshot.get("pricing_records") or snapshot.get("models") or {}
@@ -568,6 +617,8 @@ def price_entry_for_model(model_id: str, input_tokens: int, *, provider_key: str
     aliases = {"qwen": {"alibaba", "alibaba-cn"}, "kimi": {"moonshotai"}, "zai": {"zhipuai"}, "xiaomi_mimo": {"xiaomi"}}
     key = _normalize(str(canonical.get("id") or model_id))
     snapshot = get_snapshot()
+    if (snapshot.get("_meta") or {}).get("origin") in {"bundled", "missing"}:
+        return None
     records = snapshot.get("pricing_records") or {key: canonical}
     bindings = aliases.get(provider_key, {provider_key}) if provider_key else None
     matches = []

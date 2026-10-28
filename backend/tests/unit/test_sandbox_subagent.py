@@ -168,42 +168,41 @@ class TestSubagentLoop:
         assert job.status == "failed"
         assert job.error_class == "EmptyResult"
 
-    def test_max_rounds_exhausted_is_partial_not_completed(self) -> None:
+    def test_historical_round_limit_is_ignored(self) -> None:
         spec = _spec(subagent_id="sa_rounds", max_rounds=3)
         provider = FakeProvider(
             [
                 [_tool_calls([_call("c1", "sandbox_env_info", {})]), _done()],
                 [_tool_calls([_call("c2", "sandbox_env_info", {})]), _done()],
                 [_tool_calls([_call("c3", "sandbox_env_info", {})]), _done()],
+                [_text("完成"), _done()],
             ]
         )
         sandbox = FakeSandbox()
         job = _run(SubagentJob(spec=spec), provider=provider, sandbox_service=sandbox)
-        assert job.status == "partial"
-        assert job.error_class == "MaxRoundsExhausted"
-        assert "最大轮数" in (job.result or "")
+        assert job.status == "completed"
+        assert job.rounds == 4
 
-    def test_wall_clock_timeout_is_timed_out(self) -> None:
+    def test_historical_time_limit_is_ignored(self) -> None:
         spec = _spec(subagent_id="sa_timeout", max_seconds=0)
-        provider = FakeProvider([[_tool_calls([_call("c1", "sandbox_env_info", {})]), _done()]])
+        provider = FakeProvider([[_text("完成"), _done()]])
         sandbox = FakeSandbox()
         job = _run(SubagentJob(spec=spec), provider=provider, sandbox_service=sandbox)
-        assert job.status == "timed_out"
-        assert job.error_class == "TimeoutError"
+        assert job.status == "completed"
 
-    def test_max_tool_calls_budget_is_partial(self) -> None:
+    def test_historical_tool_call_limit_is_ignored(self) -> None:
         spec = _spec(subagent_id="sa_toolbudget", max_tool_calls=2)
         provider = FakeProvider(
             [
                 [_tool_calls([_call("c1", "sandbox_env_info", {}), _call("c2", "sandbox_env_info", {})]), _done()],
                 [_tool_calls([_call("c3", "sandbox_env_info", {})]), _done()],
+                [_text("完成"), _done()],
             ]
         )
         sandbox = FakeSandbox()
         job = _run(SubagentJob(spec=spec), provider=provider, sandbox_service=sandbox)
-        assert job.status == "partial"
-        assert job.error_class == "MaxToolCallsExhausted"
-        assert job.tool_calls == 2
+        assert job.status == "completed"
+        assert job.tool_calls == 3
 
     def test_write_set_rejects_outside_paths_without_execution(self) -> None:
         spec = _spec(

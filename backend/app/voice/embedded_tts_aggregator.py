@@ -1,40 +1,4 @@
-"""TTS 侧切句：在 pipecat 的 SENTENCE 聚合器上再加"逗号也切"。
-
-## 为什么不用基类默认的 ``SimpleTextAggregator``
-
-* 它只认**句末标点**（非拉丁 ``。！？；`` 等，拉丁 ``. ! ? ; …``），**逗号一律留在
-  缓冲里**。于是一个逗号长句必须等整句（甚至等下一个句末标点）到齐才开始合成——
-  首声、字幕、账本全跟着整句一起拖后。
-* 它要求**每一个**句末标点后面再出现一个非空白字符才确认边界。那段前瞻是为拉丁句号
-  消歧设计的（``$29.`` 不是句子、``$29. Next`` 才是），中文标点并不需要，白等一个
-  token。本模块对非拉丁标点改成"标点到达即切"。
-
-## 这里定下的三条线
-
-1. **逗号也是切点**。全角 ``，`` 立即切；半角 ``,`` 也切，但排除数字千分位
-   （``1,000`` 保持整块——否则会被读成"1"+"000"，也会让字幕断在数字中间）。
-2. **非拉丁（中/日/韩等）标点即时切**，不再等前瞻字符。集合直接复用 pipecat 的
-   ``UNAMBIGUOUS_SENTENCE_ENDING_PUNCTUATION``，不自己另抄一份。
-3. **顿号 ``、`` 不切**。它是并列成分的分隔符（"红、黄、蓝"），切出来只是碎片。
-   它本来就不在 pipecat 的标点集合里，``NEVER_BREAK_CHARS`` 把这个决定写下来并由
-   测试钉住，免得以后被"顺便加上"。
-
-拉丁那一路（``. ! ? ; …`` + 千分位逗号）原样保留"前瞻 + NLTK 消歧"，只在中日韩标点上
-省掉等待：``match_endofsentence`` 的 NLTK 回退分支本来就只在"没有拉丁标点"时生效，
-两条路互不影响。
-
-## 下游影响（改颗粒度也就是改它们）
-
-一次聚合 = 一次 ``run_tts`` = 一个火山 session，同时也是官方字幕
-（``AggregatedTextFrame`` → ``bot-output{new}`` / ``TTSTextFrame`` → ``{completed}``）
-与账本 ``VoiceLedgerFrame`` 的"一句"。所以切得更细意味着字幕、转录、记忆的颗粒度
-同步变细，且每轮的 session 数变多（session 之间是串行的，见
-``embedded_volcengine_tts._enqueue_sentence``）。
-
-护栏：**纯标点不成句**。``……`` ``！！`` 这种连写若各自领一个 session，会白开一次合成、
-多出一条只有标点的字幕；这种切点只是不切，文本继续留在缓冲里，最终随下一个真切点或
-``flush()`` 一起出去，一个字都不会丢。
-"""
+"""Semantic text batching for continuous TTS; chunks never define audio boundaries."""
 
 from __future__ import annotations
 
@@ -48,9 +12,9 @@ from pipecat.utils.string import (
 from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 
-#: 标点到达即切，不需要前瞻字符：非拉丁标点 + 全角逗号。
+#: 标点到达即切，不需要前瞻字符：非拉丁句末标点。
 IMMEDIATE_BREAK_CHARS: frozenset[str] = frozenset(
-    UNAMBIGUOUS_SENTENCE_ENDING_PUNCTUATION | {"，"}
+    UNAMBIGUOUS_SENTENCE_ENDING_PUNCTUATION
 )
 
 #: 半角逗号。它要防的是数字千分位（``1,000``），所以前置字符是数字时先等一下一位。
@@ -64,12 +28,10 @@ _HAS_CONTENT = re.compile(r"\w")
 
 
 class CommaSentenceAggregator(SimpleTextAggregator):
-    """句级聚合器 + 逗号切点（顿号不切，非拉丁标点即时切）。
+    """CJK sentence endings flush immediately; commas need 24 characters.
 
-    只覆盖 ``_check_sentence_with_lookahead``：基类逐字符调用它，返回非空即为一个
-    切点。其余（``flush`` / ``reset`` / ``handle_interruption`` / 文本类型）全部沿用
-    基类——输出仍然是 ``AggregationType.SENTENCE``，所以押在"句级"上的字幕与账本路径
-    一行都不用改。
+    These chunks feed an open synthesis session. Provider subtitle timestamps
+    independently determine caption and playback ledger boundaries.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -104,7 +66,9 @@ class CommaSentenceAggregator(SimpleTextAggregator):
         if last in IMMEDIATE_BREAK_CHARS:
             return self._cut(len(self._text))
 
-        if last == HALFWIDTH_COMMA:
+        if last in {HALFWIDTH_COMMA, "，"}:
+            if len(self._text) < 24:
+                return None
             if self._text[-2:-1].isdigit():
                 # "1," 可能是千分位：等下一位再判（``1,000`` 不切；下一位若是空格或
                 # 非数字，NLTK 也确认不出句末标点，于是整块继续攒到下一个真切点）。

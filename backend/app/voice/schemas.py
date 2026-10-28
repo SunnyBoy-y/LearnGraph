@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
 
 VOICE_EVENT_TYPES = (
+    "tool.started", "tool.completed", "tool.failed", "tool.cancelled",
+    "conversation.policy",
     "scene.focus", "artifact.upsert", "task.pausing", "task.paused", "task.resumed",
     "session.created", "session.ready", "session.reconnecting", "session.closed",
     "user.started", "user.interim", "user.final", "turn.accepted", "turn.finalized",
@@ -129,6 +131,7 @@ class VoiceTaskRevisionRequest(BaseModel):
 
 
 class VoiceSession(BaseModel):
+    low_latency_mode: bool = False
     id: str
     session_id: str | None = None
     chat_session_id: str
@@ -151,10 +154,16 @@ class VoiceSession(BaseModel):
     # runtime is deployed. Clients must not treat it as an audio connection.
     runtime_ready: bool = False
     signaling_url: str | None = None
+    websocket_url: str | None = None
     model_id: str | None = None
     provider_id: str | None = None
 
+from app.providers.realtime_information import ClientEnvironment
+
+
 class VoiceSessionCreateRequest(BaseModel):
+    low_latency_mode: bool | None = Field(default=None, strict=True)
+    client_environment: ClientEnvironment | None = None
     chat_session_id: str | None = Field(default=None, min_length=1, max_length=36)
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
     max_thinking_mode: ThinkingMode = "high"
@@ -173,6 +182,10 @@ class VoiceSessionCreateRequest(BaseModel):
         if not self.chat_session_id:
             raise ValueError("chat_session_id is required")
         return self
+
+class VoiceSessionPreferencesRequest(BaseModel):
+    low_latency_mode: bool = Field(strict=True)
+
 
 class VoiceTaskStartRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=16_384)

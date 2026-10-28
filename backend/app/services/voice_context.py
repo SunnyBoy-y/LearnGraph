@@ -118,8 +118,17 @@ class VoiceContextService:
             include_history=False,
         )
         history = [
-            {"id": item.id, "role": item.role, "content": item.content,
-             "created_at": item.created_at.isoformat() if item.created_at else None}
+            {
+                "id": item.id,
+                "role": item.role,
+                "content": item.content,
+                "voice_turn_id": (
+                    item.provider_trace.get("voice_turn_id")
+                    if isinstance(getattr(item, "provider_trace", None), dict)
+                    else None
+                ),
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+            }
             for item in timeline
         ]
         context_build_id: str | None = None
@@ -158,8 +167,9 @@ class VoiceContextService:
         commit: bool = True,
         memory: bool = True,
         include_assistant: bool = True,
+        include_user: bool = True,
         assistant_status: str = "completed",
-    ) -> tuple[Message, Message | None]:
+    ) -> tuple[Message | None, Message | None]:
         """Persist one authoritative voice turn idempotently.
 
         The idempotency key is the turn id (or client message id for typed
@@ -177,7 +187,7 @@ class VoiceContextService:
         would render an empty bubble, so the absence of an answer is expressed by
         the turn status instead.
         """
-        if not str(user_text or "").strip():
+        if include_user and not str(user_text or "").strip():
             raise ValueError("voice finalized turn requires non-empty user_text")
         if not str(turn_id or "").strip():
             raise ValueError("voice finalized turn requires turn_id")
@@ -194,7 +204,7 @@ class VoiceContextService:
             trace = row.provider_trace if isinstance(row.provider_trace, dict) else {}
             if trace.get("voice_turn_id") == turn_id or trace.get("client_message_id") == key:
                 existing[row.role] = row
-        if "user" in existing and (not include_assistant or "assistant" in existing):
+        if (not include_user or "user" in existing) and (not include_assistant or "assistant" in existing):
             # Replayed finalize: the pair already exists, but a previous attempt
             # may have crashed before the memory job was enqueued.  The queue
             # deduplicates on (session, message), so re-enqueueing is safe.
@@ -205,7 +215,7 @@ class VoiceContextService:
             # and a replay of the finalize is the only place that can notice.
             if commit and "assistant" in existing:
                 self._record_message_completion(existing["assistant"])
-            return existing["user"], existing.get("assistant")
+            return existing.get("user"), existing.get("assistant")
 
         # Voice persistence bypasses the ordinary chat stream, so apply the
         # same immediate question-prefix title before the first turn is saved.
@@ -213,7 +223,7 @@ class VoiceContextService:
         apply_title_fallback = getattr(
             self.chat, "_apply_first_message_title_fallback", None
         )
-        if callable(apply_title_fallback):
+        if include_user and callable(apply_title_fallback):
             apply_title_fallback(session, user_text)
 
         # Stable ids make a retry safe even when two workers race before either
@@ -247,26 +257,27 @@ class VoiceContextService:
         )
         assistant = Message(
             id=assistant_id, workspace_id=self.chat.workspace_id,
-            session_id=session.id, parent_message_id=user.id,
+            session_id=session.id, parent_message_id=user.id if include_user else None,
             role="assistant", status=assistant_status, content=assistant_text,
             parts=[{"id": assistant_part_id, "type": "text", "status": assistant_status, "content": assistant_text}],
             provider_trace=trace,
         )
         try:
             with self.chat.db.begin_nested():
-                self.chat.db.add(user)
-                self.chat.db.flush()
-                user_version = MessageVersion(
-                    workspace_id=self.chat.workspace_id, message_id=user.id,
-                    version=1, status="completed",
-                )
-                self.chat.db.add(user_version)
-                self.chat.db.flush()
-                self.chat.db.add(MessagePartRecord(
-                    id=user_part_id, workspace_id=self.chat.workspace_id,
-                    message_version_id=user_version.id, ordinal=0,
-                    part_type="text", status="completed", content=user_text,
-                ))
+                if include_user:
+                    self.chat.db.add(user)
+                    self.chat.db.flush()
+                    user_version = MessageVersion(
+                        workspace_id=self.chat.workspace_id, message_id=user.id,
+                        version=1, status="completed",
+                    )
+                    self.chat.db.add(user_version)
+                    self.chat.db.flush()
+                    self.chat.db.add(MessagePartRecord(
+                        id=user_part_id, workspace_id=self.chat.workspace_id,
+                        message_version_id=user_version.id, ordinal=0,
+                        part_type="text", status="completed", content=user_text,
+                    ))
                 if include_assistant:
                     self.chat.db.add(assistant)
                     self.chat.db.flush()
@@ -293,16 +304,17 @@ class VoiceContextService:
                 )
             ).all()
             by_role = {row.role: row for row in rows}
-            if "user" in by_role:
+            if (include_user and "user" in by_role) or (not include_user and "assistant" in by_role):
                 if commit:
                     self.chat.db.commit()
                 if memory and "assistant" in by_role:
                     self._enqueue_memory(by_role["assistant"])
-                return by_role["user"], by_role.get("assistant")
+                return by_role.get("user"), by_role.get("assistant")
             raise
         if commit:
             self.chat.db.commit()
-            self.chat.db.refresh(user)
+            if include_user:
+                self.chat.db.refresh(user)
             if include_assistant:
                 self.chat.db.refresh(assistant)
         # Long-term memory is fed only from a finalized, committed voice turn.
@@ -315,7 +327,7 @@ class VoiceContextService:
             self._record_message_completion(
                 assistant, message_version_id=str(assistant_version.id)
             )
-        return user, (assistant if include_assistant else None)
+        return (user if include_user else None), (assistant if include_assistant else None)
 
     def _record_message_completion(
         self, assistant: Message, *, message_version_id: str | None = None

@@ -124,7 +124,7 @@ def test_permanent_errors_do_not_schedule_retry(error):
     assert provider.calls == 1
 
 
-def test_retry_keeps_consumed_token_budget():
+def test_retry_keeps_token_usage_without_enforcing_historical_budget():
     provider = RecoveryProvider([[disconnect()]])
     provider.last_usage = {"input_tokens": 1000, "output_tokens": 10}
     job = _job(_payload(budget={"max_rounds": 3, "max_seconds": 60, "max_tokens": 1000}))
@@ -132,8 +132,8 @@ def test_retry_keeps_consumed_token_budget():
     assert first.status == "RETRYING"
     assert first.deliverables["_checkpoint"]["used_tokens"] == 1010
     job.payload_json["_resume_checkpoint"] = first.deliverables["_checkpoint"]
-    next_provider = RecoveryProvider([])
+    next_provider = RecoveryProvider([[_text(_handoff_text()), _done()]])
     second = execute_subagent_job(_settings(), job, _task(), provider=next_provider, sandbox_service=FakeSandbox())
-    assert second.status == "PARTIAL"
-    assert second.error_class == "BudgetExhausted"
-    assert next_provider.calls == 0
+    assert second.status == "SUCCEEDED"
+    assert second.attempt_record["token_usage"] >= 1010
+    assert next_provider.calls == 1

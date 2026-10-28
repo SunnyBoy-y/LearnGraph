@@ -142,6 +142,20 @@ export function mergeAdjacentVoiceUserMessages(rows: readonly Message[]): Messag
         : "completed";
     result[result.length - 1] = {
       ...previous, content: text, status: row.status,
+      provider_trace: {
+        ...previous.provider_trace,
+        voice_merged_turn_ids: [...new Set([
+          ...(Array.isArray(previous.provider_trace?.voice_merged_turn_ids) ? previous.provider_trace.voice_merged_turn_ids : []),
+          previous.provider_trace?.voice_turn_id, previous.provider_trace?.turn_id,
+          ...(Array.isArray(row.provider_trace?.voice_merged_turn_ids) ? row.provider_trace.voice_merged_turn_ids : []),
+          row.provider_trace?.voice_turn_id, row.provider_trace?.turn_id,
+        ].filter((value): value is string => typeof value === "string" && Boolean(value)))],
+        voice_merged_message_ids: [...new Set([
+          ...(Array.isArray(previous.provider_trace?.voice_merged_message_ids) ? previous.provider_trace.voice_merged_message_ids : []),
+          previous.id,
+          ...(Array.isArray(row.provider_trace?.voice_merged_message_ids) ? row.provider_trace.voice_merged_message_ids : []), row.id,
+        ])],
+      },
       parts: [{
         id: previous.parts[0]?.id ?? `voice-part-${previous.id}`,
           type: "text", content: text, status: partStatus, sequence: 0,

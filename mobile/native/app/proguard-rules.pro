@@ -1,1 +1,5 @@
-# LearnGraph 原生版混淆规则（当前 release 未开启 minify，保留占位）
+# Library consumer rules preserve serialization, ML Kit and Android entry points.
+-keepattributes Signature,InnerClasses,EnclosingMethod
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}

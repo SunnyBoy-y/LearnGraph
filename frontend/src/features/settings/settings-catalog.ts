@@ -24,7 +24,7 @@ export const settingsCatalog: SettingMetadata[] = [
   entry('stickers.import', '导入私有表情包与编辑中文描述', 'conversation', '表情包', 'account', '对话与学习', '/stickers/import', 'operation'),
   entry('stickers.market', '表情市场、授权素材预览安装与 ZIP 下载', 'conversation', '表情包', 'account', '对话与学习', '/stickers/market', 'operation'),
   entry('stickers.pipeline', '视觉模型自动分析表情配字、情绪与适用场景', 'conversation', '表情包', 'account', '对话与学习', '/stickers/pipeline'),
-  entry('ui.preferences', '深色主题', 'general', '外观', 'workspace', '工作区设置', 'ui.preferences.theme'),
+  entry('ui.preferences', '显示模式与主题配色', 'general', '外观', 'workspace', '工作区设置', 'ui.preferences.theme / colorTheme / customColor'),
   ...['base_style', 'warmth', 'enthusiasm', 'headings_and_lists', 'emoji', 'verbosity'].map((key, i) =>
     entry(`response-style.${key}`, ['基础风格', '温和体贴', '热情洋溢', '标题和列表', '表情符号', '回答详细度'][i],
       'general', '回答风格', 'workspace', '个性化', `chat.response_style.${key}`, 'explicit')),

@@ -12,35 +12,48 @@ bound to the real DB, and a later test fixture's ``Base.metadata.drop_all``
 would delete every real table, including users and workspaces.
 
 This conftest loads before pytest collects any test module.  It forces a fresh,
-process-local scratch DB as the default before app code can be imported.  Tests
-which deliberately set their own temporary URL before importing app code retain
-their per-file isolation; all other tests safely use this fallback scratch DB.
-Either way, the real ``backend/data/learngraph.db`` can never be selected by the
-default test environment.
+process-local scratch DB before app code can be imported. The global app engine
+must use this exact scratch database (or memory). Dedicated integration engines
+are checked separately before connecting. Docker pytest also requires an owned
+test-worker context before creating any temporary directory.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
 import pytest
 
+if Path("/.dockerenv").is_file() and not (
+    re.fullmatch(r"lg-(?:pg-maintenance|update-test|sandboxd-test)-[0-9a-f]{10}",os.environ.get("LEARNGRAPH_TEST_DOCKER_PROJECT","")) and
+    re.fullmatch(r"[0-9a-f]{32}",os.environ.get("LEARNGRAPH_TEST_DOCKER_OWNER",""))):
+    raise pytest.UsageError("Docker test isolation: pytest requires an explicitly owned disposable worker; production container execution refused before creating files")
+_TEMP_BASE=Path(tempfile.gettempdir()).resolve()
+_REPO=Path(__file__).resolve().parents[2]
+if any(_TEMP_BASE.is_relative_to(path) for path in [Path("/data").resolve(),Path("/var/lib/docker").resolve(),_REPO/"data",_REPO/"backend/data"]):
+    raise pytest.UsageError("Docker test isolation: production data directories cannot contain pytest scratch data")
 _TEST_ROOT = Path(tempfile.mkdtemp(prefix="lg-pytest-"))
-_REAL_DB_MARKER = "learngraph.db"
 
 # Force isolation rather than setdefault: a developer's shell environment must
 # never silently redirect pytest at the production/local-user database.
 os.environ["LEARNGRAPH_DATABASE_URL"] = f"sqlite:///{(_TEST_ROOT / 'test.db').as_posix()}"
 os.environ["LEARNGRAPH_ENV"] = "test"
 os.environ["LEARNGRAPH_ENABLE_DEMO_SEED"] = "false"
+os.environ["LEARNGRAPH_MODELS_DEV_REFRESH_ENABLED"] = "false"
 os.environ["LEARNGRAPH_MEMORY_EVENT_MASTER_KEY"] = "test-memory-event-master-key"
 # Sandbox bootstrap persists sandbox-runtime.json / bootstrap-source / policy
 # files next to the storage root.  The real backend/data must never be touched
 # by tests (a bootstrap source cleanup fixture would otherwise wipe the
 # operator's persisted image-source choice).
 os.environ["LEARNGRAPH_STORAGE_ROOT"] = str(_TEST_ROOT / "storage")
+os.environ["LEARNGRAPH_MEMORY_ROOT"] = str(_TEST_ROOT / "memory")
+os.environ["LEARNGRAPH_SANDBOX_WORKSPACE_ROOT"] = str(_TEST_ROOT / "sandbox-workspaces")
+# Blank wins over a local .env and lets state_root follow each test's storage
+# root; a developer's persisted activation/restore journal must never be used.
+os.environ["LEARNGRAPH_DATABASE_MIGRATION_STATE_DIR"] = ""
 # Local .env files commonly configure LEARNGRAPH_SANDBOX_PREBUILT_IMAGE (e.g.
 # an ACR release reference).  Bootstrap mode tests assume "no prebuilt image
 # configured" and must never inherit a developer's registry reference; an
@@ -63,7 +76,12 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def _assert_engine_is_not_real_database() -> None:
-    """Reject a real-DB engine before test execution can reach ``drop_all``."""
+    """Allow only this process's scratch engine before any possible drop_all.
+
+    A denylist for learngraph.db misses PostgreSQL and custom SQLite filenames,
+    particularly when an early plugin imported the app before this conftest.
+    Dedicated PostgreSQL integration engines use their separate ownership gate.
+    """
 
     import sys
 
@@ -71,12 +89,16 @@ def _assert_engine_is_not_real_database() -> None:
     if database_module is None:
         return
 
-    engine_url = str(database_module.engine.url)
-    if _REAL_DB_MARKER in engine_url.casefold():
+    from sqlalchemy.engine import make_url
+    engine_url = make_url(database_module.engine.url)
+    safe = engine_url.get_backend_name() == "sqlite" and (
+        engine_url.database == ":memory:" or engine_url.database is not None and
+        Path(engine_url.database).resolve() == (_TEST_ROOT / "test.db").resolve())
+    if not safe:
         raise pytest.UsageError(
-            "pytest engine is bound to the REAL database "
-            f"({engine_url}). Refusing to run before any test can execute "
-            "drop_all; fix the test database configuration first."
+            "pytest application engine must use the process-local scratch SQLite. "
+            "Refusing PostgreSQL, custom/production SQLite and early-plugin bindings "
+            "before any test can execute drop_all; no database URL is disclosed."
         )
 
 

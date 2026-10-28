@@ -41,7 +41,7 @@ COPY backend/pyproject.toml backend/uv.lock ./
 # which previously left the optional voice stack (pipecat-ai) unpinned at
 # image build time.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-install-project --no-dev --extra voice --frozen
+    uv sync --no-install-project --no-dev --extra voice --extra database-migration --frozen
 
 ARG SOURCE_CACHE_BUST=dev
 RUN echo "LearnGraph backend source cache: ${SOURCE_CACHE_BUST}"
@@ -55,7 +55,9 @@ ARG UPDATE_COMPATIBILITY=1
 ARG SOURCE_REPOSITORY=https://github.com/SunnyBoy-y/LearnGraph
 LABEL org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.source=$SOURCE_REPOSITORY \
-      io.learngraph.update-compatibility=$UPDATE_COMPATIBILITY
+      io.learngraph.update-compatibility=$UPDATE_COMPATIBILITY \
+      io.learngraph.app-topology=combined-preview-v1 \
+      io.learngraph.primary-database=sqlite-postgresql-v1
 ENV LEARNGRAPH_APP_VERSION=$APP_VERSION
 COPY VERSION /app/VERSION
 RUN python -c "import os,pathlib; expected=pathlib.Path('/app/VERSION').read_text().strip(); assert os.environ['LEARNGRAPH_APP_VERSION']==expected, 'APP_VERSION must exactly match VERSION / GitHub Release tag'"
@@ -68,7 +70,12 @@ RUN if [ "$DEBIAN_MIRROR" != "deb.debian.org" ]; then \
     fi \
     && echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries \
     && apt-get update \
-    && apt-get install -y --no-install-recommends tini \
+    && apt-get install -y --no-install-recommends tini ca-certificates curl \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl --fail --retry 3 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main' > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-18 \
     && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99retries \
     && useradd --system --uid 1000 --create-home --home-dir /home/learngraph \
         --shell /usr/sbin/nologin learngraph \
@@ -109,7 +116,7 @@ USER root
 EXPOSE 8000 8001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/livez', timeout=4)"
+    CMD python -m app.container_runtime health
 
 ENTRYPOINT ["tini", "--", "learngraph-entrypoint"]
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["python", "-m", "app.container_runtime"]

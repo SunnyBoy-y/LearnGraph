@@ -13,14 +13,29 @@ android {
         applicationId = "com.learngraph.mobile"
         minSdk = 23
         targetSdk = 35
-        versionCode = 31
-        versionName = "0.16.0"
+        versionCode = 38
+        versionName = "0.18.5"
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+        create("compact") {
+            initWith(getByName("release"))
+            // Installable local build; production releases must use their own signing key.
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
+    }
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+            isUniversalApk = true
         }
     }
     compileOptions {
@@ -32,6 +47,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -47,6 +63,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.fragment:fragment-ktx:1.8.5")
+    implementation("androidx.webkit:webkit:1.12.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
@@ -62,4 +79,17 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation("junit:junit:4.13.2")
+}
+
+val verifySharedRendererAssets by tasks.registering {
+    doLast {
+        val renderer = file("src/main/assets/renderer")
+        check(renderer.resolve("native-renderer.html").isFile && renderer.resolve("native-app.html").isFile && renderer.resolve("manifest-native.json").isFile) {
+            "Build the shared renderer first: node mobile/scripts/build-native-renderer.mjs (install frontend dependencies with npm ci)."
+        }
+    }
+}
+tasks.configureEach {
+    if (name.startsWith("merge") && name.endsWith("Assets")) dependsOn(verifySharedRendererAssets)
 }

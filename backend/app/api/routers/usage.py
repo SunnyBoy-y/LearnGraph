@@ -30,7 +30,6 @@ from app.providers.models_dev import (
 from app.services import alert_email
 from app.services.billing import BillingService
 from app.services.management import UsageService
-from app.services.pricing_catalog import PRICING_CATALOG
 from app.core.errors import AppError
 
 
@@ -112,10 +111,7 @@ def clear_usage_events(
 @router.get("/price-catalog", response_model=list[PriceCatalogItem])
 def list_price_catalog(db: DB, context: CurrentWorkspace, currency: Literal["USD", "CNY"] = "USD") -> list[PriceCatalogItem]:
     del db, context
-    return [
-        PriceCatalogItem.model_validate({**item, "source": "builtin"})
-        for item in PRICING_CATALOG if item["currency"] == currency
-    ] + [PriceCatalogItem.model_validate(item) for item in pricing_entries() if item["currency"] == currency]
+    return [PriceCatalogItem.model_validate(item) for item in pricing_entries() if item["currency"] == currency]
 
 
 @router.get("/models-dev", response_model=ModelsDevSnapshotStatus)

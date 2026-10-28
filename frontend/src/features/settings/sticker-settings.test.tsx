@@ -92,7 +92,7 @@ describe('sticker integration', () => {
     const onSelect = vi.fn();
     renderWithProviders(<StickerPicker onSelect={onSelect} />);
     fireEvent.click(screen.getByRole('button', { name: '选择表情包' }));
-    fireEvent.click(await screen.findByRole('button', { name: '发送表情：坏笑猫' }));
+    fireEvent.click(await screen.findByRole('button', { name: '添加表情：坏笑猫' }));
     expect(onSelect).toHaveBeenCalledWith(sticker);
   });
 
@@ -115,7 +115,7 @@ describe('sticker integration', () => {
     expect(api.analyzeStickerPack).not.toHaveBeenCalled();
     expect(await screen.findByText('表情分析完成')).toBeInTheDocument();
     expect(onSelect).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: '发送这张表情' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加到消息' }));
     expect(onSelect).toHaveBeenCalledWith(sticker);
   });
 

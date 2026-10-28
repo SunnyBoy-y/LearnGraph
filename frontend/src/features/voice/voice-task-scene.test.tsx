@@ -1,5 +1,5 @@
 import { renderWithProviders as render } from "@/test/render";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { VoiceTaskScene } from "./voice-task-scene";
 import { emptyVoiceTaskState, mergeVoiceTaskResults, reduceVoiceTaskEvent } from "./voice-tasks";
@@ -15,6 +15,61 @@ function state() {
 }
 
 describe("shared voice task scene", () => {
+  it("refreshes per-anchor visibility when scrolling outruns a pending receipt", async () => {
+    let offscreen = false;
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    let renderCount = 0;
+    const onRender = vi.fn((_id, _anchors, status) => status === 'failed' || renderCount++ > 0 ? Promise.resolve() : pending);
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(private callback: (entries: {isIntersecting: boolean}[]) => void) {}
+      observe() { this.callback([{isIntersecting:true}]); }
+      disconnect() {}
+    });
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function(this: HTMLElement) {
+      const top = offscreen && this.dataset.voiceAnchor === 'visual-compare' ? 2000 : 10;
+      return {top,bottom:top+100,left:10,right:400,width:390,height:100,x:10,y:top,toJSON:()=>({})};
+    });
+    try {
+      const view = render(<VoiceTaskScene task={{...state().tasks[0],presentationMode:'display',focusId:'f',focusAnchor:'visual-compare'}} open onRender={onRender} />);
+      await waitFor(() => expect(onRender).toHaveBeenCalledWith('task-1',['summary','visual-compare','finding-0']));
+      offscreen = true;
+      fireEvent(window, new Event('scroll'));
+      await act(async () => { finish(); await pending; });
+      await waitFor(() => expect(onRender).toHaveBeenLastCalledWith('task-1',['summary','finding-0']));
+      expect(screen.queryByText('页面已显示，可直接操作')).not.toBeInTheDocument();
+      view.unmount();
+    } finally { rect.mockRestore(); vi.unstubAllGlobals(); }
+  });
+  it("does not confirm a display before the receipt completes, or after a hidden-page race", async () => {
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const onRender = vi.fn((_id, _anchors, status) => status === 'failed' ? Promise.resolve() : pending);
+    let visibility = 'visible';
+    const previous = Object.getOwnPropertyDescriptor(document, 'visibilityState');
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility });
+    try {
+      const task = {...state().tasks[0],presentationMode:'display' as const,focusId:'f',focusAnchor:'visual-compare'};
+      const view = render(<VoiceTaskScene task={task} open onRender={onRender} />);
+      await waitFor(() => expect(onRender).toHaveBeenCalled());
+      expect(screen.queryByText('页面已显示，可直接操作')).not.toBeInTheDocument();
+      visibility = 'hidden';
+      fireEvent(document, new Event('visibilitychange'));
+      await act(async () => { finish(); await pending; });
+      expect(onRender).toHaveBeenLastCalledWith('task-1', [], 'failed');
+      expect(screen.queryByText('页面已显示，可直接操作')).not.toBeInTheDocument();
+      view.unmount();
+    } finally {
+      if (previous) Object.defineProperty(document, 'visibilityState', previous);
+      else Reflect.deleteProperty(document, 'visibilityState');
+    }
+  });
+  it("shows a receipt failure instead of claiming that the page was displayed", async () => {
+    const onRender = vi.fn().mockRejectedValue(new Error('offline'));
+    render(<VoiceTaskScene task={{...state().tasks[0],presentationMode:'display'}} open onRender={onRender} />);
+    await screen.findByText('页面显示未确认，请重新展开');
+    expect(screen.queryByText('页面已显示，可直接操作')).not.toBeInTheDocument();
+  });
   it("scrolls to and highlights the component until presentation ends", async () => {
     const old = Object.getOwnPropertyDescriptor(HTMLElement.prototype,"scrollIntoView");
     const scroll = vi.fn();
@@ -39,15 +94,11 @@ describe("shared voice task scene", () => {
     expect(finalized.tasks[0].visuals![0].state).toBe("completed");
     expect(mergeVoiceTaskResults(finalized,result({...complete,state:"streaming"})).tasks[0].visuals![0].state).toBe("completed");
   });
-  it("sends the selected finding through the real voice controller and focuses the same anchor", async () => {
+  it("does not pretend a disconnected explanation was accepted or focused", async () => {
     voiceSessionController.open("scene-workspace", `scene-${crypto.randomUUID()}`);
     voiceSessionController.upsertTask(state().tasks[0]);
-    const send = vi.spyOn(voiceSessionController, "sendText").mockReturnValue(true);
-    try {
-      expect(await voiceSessionController.explainTask("task-1", "finding-0")).toBe(true);
-      expect(send).toHaveBeenCalledWith(expect.stringContaining("First finding"));
-      expect(voiceSessionController.getSnapshot().tasks[0].focusAnchor).toBe("finding-0");
-    } finally { send.mockRestore(); }
+    expect(await voiceSessionController.explainTask("task-1", "finding-0")).toBe(false);
+    expect(voiceSessionController.getSnapshot().tasks[0].focusAnchor).toBeUndefined();
   });
   it("acknowledges mounted anchors, renders a real table, and routes a conclusion click", async () => {
     const onRender = vi.fn(), onExplain = vi.fn();

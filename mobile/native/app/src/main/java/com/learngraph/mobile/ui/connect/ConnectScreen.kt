@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -96,6 +98,7 @@ fun ConnectScreen(onConnected: () -> Unit) {
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 28.dp),
     ) {
         Spacer(Modifier.height(48.dp))
@@ -174,10 +177,18 @@ fun ConnectScreen(onConnected: () -> Unit) {
                 }
                 loading = true
                 error = null
-                app.api.baseUrl = normalized
                 scope.launch {
                     try {
-                        app.api.get("/deployment/profile", auth = false, workspace = false)
+                        val probe = com.learngraph.mobile.data.ApiClient(kotlinx.serialization.json.Json { ignoreUnknownKeys = true })
+                        probe.baseUrl = normalized
+                        probe.get("/deployment/profile", auth = false, workspace = false)
+                        if (normalized != authState.baseUrl) {
+                            app.authStore.clearAuth()
+                            app.api.token = null
+                            app.api.workspaceId = null
+                            app.api.accountId = null
+                        }
+                        app.api.baseUrl = normalized
                         app.authStore.setBaseUrl(normalized)
                         onConnected()
                     } catch (e: Exception) {

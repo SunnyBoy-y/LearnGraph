@@ -24,6 +24,10 @@ SERVICES = ("app", "preview", "egress-proxy")
 TERMINAL = {"succeeded", "failed", "rolled_back", "rollback_failed"}
 VERSION = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?$")
 COMPAT_LABEL = "io.learngraph.update-compatibility"
+DATABASE_LABEL = "io.learngraph.primary-database"
+DATABASE_CAPABILITY = "sqlite-postgresql-v1"
+TOPOLOGY_LABEL = "io.learngraph.app-topology"
+COMBINED_TOPOLOGY = "combined-preview-v1"
 
 
 def version(value: str) -> tuple[int, ...]:
@@ -50,6 +54,31 @@ class UpdateError(Exception):
     def __init__(self, message: str, status: int = 409):
         super().__init__(message)
         self.status = status
+
+
+# Older SQLite images cannot import newer maintenance modules. These checks
+# must also stay active when the container sets PYTHONOPTIMIZE.
+LEGACY_SQLITE_GUARD = '''import os,json,sqlite3
+from pathlib import Path
+root=Path(os.environ.get('LEARNGRAPH_DATABASE_MIGRATION_STATE_DIR') or '/data/database-migration')
+if (root/'active.json').exists():
+    raise RuntimeError('PostgreSQL activation forbids the legacy SQLite updater')
+job=json.loads((root/'job.json').read_text()) if (root/'job.json').exists() else {}
+if job and job.get('state') not in ('CANCELLED','COMPLETED'):
+    raise RuntimeError('Database migration is in progress')
+url=os.environ.get('LEARNGRAPH_DATABASE_URL','sqlite:////data/learngraph.db')
+if not url.startswith('sqlite:///'):
+    raise RuntimeError('Only SQLite is supported')
+src=sqlite3.connect(Path(url[10:]).resolve().as_uri()+'?mode=ro',uri=True)
+try:
+    fenced=src.execute("SELECT 1 FROM sqlite_master WHERE name='_lg_database_fence'").fetchone()
+    row=src.execute('SELECT sealed FROM _lg_database_fence WHERE singleton=1').fetchone() if fenced else None
+    if row and row[0]:
+        raise RuntimeError('Sealed SQLite cannot be used as the primary database')
+except BaseException:
+    src.close()
+    raise
+'''
 
 
 class Agent:
@@ -92,8 +121,14 @@ class Agent:
     def save(self) -> None:
         atomic_json(self.state_file, self.state)
 
+    def command_environment(self) -> dict[str, str]:
+        return os.environ.copy()
+
+    def command_failed(self, result) -> None:
+        pass  # Production diagnostics must not enter public job records.
+
     def command(self, args: list[str], timeout: int = 60) -> str:
-        environment = os.environ.copy()
+        environment = self.command_environment()
         version_file = self.root / "VERSION"
         if version_file.exists():
             environment["LEARNGRAPH_APP_VERSION"] = version_file.read_text(encoding="utf-8").strip()
@@ -104,6 +139,7 @@ class Agent:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise UpdateError("Docker 命令不可用或超时，请检查更新器宿主机日志", 503) from exc
         if result.returncode:
+            self.command_failed(result)
             # Docker diagnostics can contain environment values. Do not return
             # stderr to the browser or persist it in a public job record.
             raise UpdateError(f"Docker {args[0]} 执行失败，请在宿主机检查 Docker/镜像权限", 503)
@@ -115,9 +151,18 @@ class Agent:
             files += ["-f", str(self.override)]
         return self.command(["compose", *files, *args], timeout)
 
+    def services(self) -> tuple[str, ...]:
+        # Discover the operator's base topology, never resurrect a service
+        # merely because an old image-selection override still mentions it.
+        files = [part for file in self.compose_files for part in ("-f", file)]
+        declared = set(self.command(["compose", *files, "config", "--services"]).splitlines())
+        if not {"app", "egress-proxy"} <= declared:
+            raise UpdateError("Compose 必须声明 app 和 egress-proxy")
+        return tuple(service for service in SERVICES if service in declared)
+
     def containers(self) -> dict[str, dict]:
         result = {}
-        for service in SERVICES:
+        for service in self.services():
             ids = self.compose(["ps", "--all", "--quiet", service]).splitlines()
             if len(ids) != 1:
                 raise UpdateError(f"{service} 必须恰好有一个容器；不支持多副本或尚未启动的栈")
@@ -198,7 +243,7 @@ class Agent:
                 self.save()
 
     def active(self) -> bool:
-        return any(job["status"] not in TERMINAL for job in self.state["jobs"])
+        return any(job["status"] not in TERMINAL or job.get("maintenance_reserved", False) for job in self.state["jobs"])
 
     def set_policy(self, enabled: bool) -> dict:
         with self.lock:
@@ -239,7 +284,7 @@ class Agent:
             self.save()
 
     def write_images(self, images: dict[str, str]) -> None:
-        atomic_json(self.override, {"services": {service: {"image": images[service]} for service in SERVICES}})
+        atomic_json(self.override, {"services": {service: {"image": image} for service, image in images.items()}})
 
     def pin(self, images: dict[str, str], job_id: str) -> dict[str, str]:
         pins = {}
@@ -255,7 +300,7 @@ class Agent:
     def verify_configuration(self, containers: dict[str, dict]) -> None:
         # A shell-only env override or an omitted hardening file must not
         # silently change volumes, credentials or ports during an update.
-        hashes = dict(line.split() for line in self.compose(["config", "--hash", ",".join(SERVICES)]).splitlines())
+        hashes = dict(line.split() for line in self.compose(["config", "--hash", ",".join(containers)]).splitlines())
         for service, container in containers.items():
             labels = container["Config"].get("Labels", {})
             directory = labels.get("com.docker.compose.project.working_dir", "")
@@ -272,16 +317,76 @@ class Agent:
             raise UpdateError("镜像缺少一致的数据库兼容标记；请先部署支持更新器的基线版本")
         return next(iter(values))
 
+    def maintenance(self, container: str, operation: str, *args) -> dict:
+        output = self.command(["exec", container, "learngraph-entrypoint", "python", "-m", "app.services.database_maintenance", operation, *args], self.backup_timeout)
+        try:
+            return json.loads(output)
+        except (ValueError, TypeError) as exc:
+            raise UpdateError("数据库维护工具未返回有效结果", 503) from exc
+
+    def database_status(self, container: dict) -> dict:
+        capability = (container["Config"].get("Labels") or {}).get(DATABASE_LABEL)
+        if capability == DATABASE_CAPABILITY:
+            return self.maintenance(container["Id"], "status")
+        # Older SQLite releases remain updatable. Never infer SQLite from the
+        # bootstrap environment when a PostgreSQL activation manifest exists.
+        self.command(["exec", container["Id"], "python", "-c",
+            LEGACY_SQLITE_GUARD + "\nsrc.close()\n"])
+        return {"engine": "sqlite", "capability": None}
+
+    def verify_database(self, job: dict) -> None:
+        expected = job.get("database", {})
+        if expected.get("engine") == "postgresql":
+            current = self.database_status(self.containers()["app"])
+            if any(current.get(key) != expected.get(key) for key in ("engine", "activation_id", "identity")):
+                raise UpdateError("更新后的主数据库身份发生变化；禁止回退 SQLite 或连接其他数据库")
+
+    def release_maintenance(self, job: dict) -> None:
+        if job.get("maintenance_reserved"):
+            app = self.containers()["app"]
+            self.maintenance(app["Id"], "release", "--owner", job["id"])
+            job["maintenance_reserved"] = False
+            job.pop("maintenance_cleanup_required", None)
+            self.save()
+
     def backup(self, job: dict, container: str) -> None:
+        if job.get("database", {}).get("capability") == DATABASE_CAPABILITY:
+            import hashlib
+            remote = f"/data/.backup-work/learngraph-update-{job['id']}.zip"
+            dest = self.private / (job["id"] + ".zip")
+            verified = False
+            try:
+                info = self.maintenance(container, "backup", "--owner", job["id"], "--output", remote)
+                self.command(["cp", f"{container}:{remote}", str(dest)], self.backup_timeout)
+                dest.chmod(0o600)
+                digest = hashlib.sha256()
+                with dest.open("rb") as handle:
+                    while block := handle.read(1024 * 1024):
+                        digest.update(block)
+                if digest.hexdigest() != info["sha256"] or dest.stat().st_size != info["bytes"]:
+                    raise UpdateError("宿主机数据库备份与容器内校验结果不一致")
+                verified = True
+                job["backup"] = {"file": dest.name, "bytes": info["bytes"], "sha256": info["sha256"], "engine": info["engine"]}
+                self.save()
+            finally:
+                if not verified:
+                    dest.unlink(missing_ok=True)
+                with contextlib.suppress(UpdateError):
+                    self.command(["exec", container, "python", "-c", f"from pathlib import Path; Path({remote!r}).unlink(missing_ok=True)"])
+            return
         remote = f"/tmp/learngraph-update-{job['id']}.db"
-        script = (
-            "import os, sqlite3; "
-            "url=os.environ.get('LEARNGRAPH_DATABASE_URL','sqlite:////data/learngraph.db'); "
-            "assert url.startswith('sqlite:///'), 'Only SQLite is supported'; "
-            "src=sqlite3.connect('file:'+url[10:]+'?mode=ro',uri=True); "
-            f"dst=sqlite3.connect({remote!r}); src.backup(dst); "
-            "assert dst.execute('PRAGMA quick_check').fetchone()[0]=='ok'; dst.close(); src.close()"
-        )
+        script = LEGACY_SQLITE_GUARD + f'''
+try:
+    dst=sqlite3.connect({remote!r})
+    try:
+        src.backup(dst)
+        if dst.execute('PRAGMA integrity_check').fetchall()!=[('ok',)] or dst.execute('PRAGMA foreign_key_check').fetchone():
+            raise RuntimeError('SQLite backup integrity validation failed')
+    finally:
+        dst.close()
+finally:
+    src.close()
+'''
         self.command(["exec", container, "python", "-c", script], self.backup_timeout)
         try:
             dest = self.private / (job["id"] + ".db")
@@ -294,23 +399,26 @@ class Agent:
     def replace(self, images: dict[str, str]) -> None:
         # No pull, build, dependency recreation, volume deletion, or image prune.
         # Exact local image IDs make rollback independent of mutable remote tags.
+        if set(images) != set(self.services()):
+            raise UpdateError("目标部署拓扑与当前 Compose 不一致，禁止跨拓扑自动回退")
         self.write_images(images)
         self.compose(["up", "-d", "--no-deps", "--no-build", "--pull", "never",
-                      "--wait", "--wait-timeout", str(self.timeout), *SERVICES], self.timeout + 90)
+                      "--wait", "--wait-timeout", str(self.timeout), *images], self.timeout + 90)
         actual = self.containers()
-        for service in SERVICES:
+        for service in images:
             if actual[service]["Image"] != images[service]:
                 raise UpdateError(f"{service} 镜像与目标不一致")
             if actual[service]["State"].get("Health", {}).get("Status") != "healthy":
                 raise UpdateError(f"{service} 未通过容器健康检查")
         # App's Compose probe is liveness only. Require DB readiness as well.
         self.command(["exec", actual["app"]["Id"], "python", "-c",
-                      "import json,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health',timeout=10)); assert r['status']=='ok'"], 20)
+                      "import json,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health',timeout=10));\nif r.get('status')!='ok': raise RuntimeError('Database readiness failed')"], 20)
 
     def restore(self, job: dict) -> None:
         self.phase(job, "rolling_back", "正在恢复更新前的镜像，不恢复数据库快照")
         try:
             self.replace(job["previous_images"])
+            self.verify_database(job)
             self.phase(job, "rolled_back", "更新失败，已恢复原版本并通过健康检查")
         except Exception:
             self.phase(job, "rollback_failed", "回滚失败，需要管理员在宿主机检查；备份和原镜像已保留")
@@ -321,6 +429,9 @@ class Agent:
             self.phase(job, "preparing", "检查当前容器与镜像")
             containers = self.containers()
             self.verify_configuration(containers)
+            database = self.database_status(containers["app"])
+            job["database"] = database
+            self.save()
             previous = {service: item["Image"] for service, item in containers.items()}
             compatibility = self.compatibility(previous)
             old_version = containers["app"]["Config"].get("Labels", {}).get("org.opencontainers.image.version", "unknown")
@@ -339,20 +450,29 @@ class Agent:
                     raise UpdateError("镜像版本标签与 Release 不匹配")
                 if labels.get("org.opencontainers.image.source", "").casefold().rstrip("/") != f"https://github.com/{self.repository}".casefold():
                     raise UpdateError("镜像来源与配置的 GitHub 仓库不匹配")
-                images = {service: info["Id"] for service in SERVICES}
+                images = {service: info["Id"] for service in containers}
+            if "preview" not in containers and (self.image_info(images["app"])["Config"].get("Labels") or {}).get(TOPOLOGY_LABEL) != COMBINED_TOPOLOGY:
+                raise UpdateError("目标镜像不支持合并预览拓扑，禁止更新或回退到独立预览版本")
             if self.compatibility(images) != compatibility:
                 raise UpdateError("数据库兼容标记不同，禁止自动升级/回退；请使用人工备份迁移流程")
+            if database["engine"] == "postgresql" and any((self.image_info(image)["Config"].get("Labels") or {}).get(DATABASE_LABEL) != DATABASE_CAPABILITY for image in images.values()):
+                raise UpdateError("目标镜像不支持 PostgreSQL 单向主库，禁止升级或版本回退到 SQLite 版本")
             if images == previous:
                 raise UpdateError("目标镜像已经运行")
             pins = self.pin(previous, job["id"])
             self.pin(images, job["id"] + "-target")
-            self.phase(job, "backing_up", "正在创建 SQLite 一致性备份", previous_images=previous,
+            if database.get("capability") == DATABASE_CAPABILITY:
+                job["maintenance_reserved"] = True
+                self.save()
+                self.maintenance(containers["app"]["Id"], "reserve", "--owner", job["id"])
+            self.phase(job, "backing_up", "正在创建并验证主数据库一致性备份", previous_images=previous,
                        target_images=images, previous_version=old_version, retained_tags=pins)
             self.backup(job, containers["app"]["Id"])
             self.verify_configuration(self.containers())
             # Journal BEFORE changing the override or replacing any container.
-            self.phase(job, "applying", "正在替换应用、预览和代理容器，连接将短暂中断")
+            self.phase(job, "applying", "正在替换应用（含预览）和出网代理，连接将短暂中断")
             self.replace(images)
+            self.verify_database(job)
             self.phase(job, "succeeded", "版本切换完成，容器与数据库健康检查通过")
         except Exception as exc:
             message = str(exc) if isinstance(exc, (UpdateError, ValueError)) else "更新器发生内部错误"
@@ -365,10 +485,17 @@ class Agent:
                 self.restore(job)
             else:
                 self.phase(job, "failed", message)
+        finally:
+            try:
+                self.release_maintenance(job)
+            except UpdateError:
+                self.phase(job, job["status"], job["message"], maintenance_cleanup_required=True)
 
     def recover(self) -> None:
         for job in self.state["jobs"]:
             if job["status"] in TERMINAL:
+                with contextlib.suppress(UpdateError):
+                    self.release_maintenance(job)
                 continue
             if job["status"] in {"applying", "rolling_back"} and job.get("previous_images"):
                 if job["kind"] == "update":
@@ -376,6 +503,8 @@ class Agent:
                 self.restore(job)
             else:
                 self.phase(job, "failed", "更新器重启中断了切换前的任务；运行中的容器未修改")
+            with contextlib.suppress(UpdateError):
+                self.release_maintenance(job)
 
     def poll(self, stop: threading.Event, interval: int) -> None:
         while not stop.is_set():
@@ -497,7 +626,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="Container must reach this address; restrict with host firewall")
     parser.add_argument("--port", type=int, default=34116)
     parser.add_argument("--interval", type=int, default=3600)
-    parser.add_argument("--backup-timeout", type=int, default=900, help="SQLite backup/verification/copy timeout in seconds")
+    parser.add_argument("--backup-timeout", type=int, default=900, help="Primary database backup/verification/copy timeout in seconds")
     parser.add_argument("--init-only", action="store_true", help="Create the service token without starting or changing containers")
     args = parser.parse_args()
     if args.interval < 300:

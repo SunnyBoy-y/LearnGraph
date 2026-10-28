@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import queue
@@ -25,7 +26,8 @@ from fastapi import (
     WebSocket,
     status,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB, WorkspaceContext
@@ -493,19 +495,62 @@ def graph_change_service(db: DB, context: CurrentWorkspace) -> GraphChangeSetSer
     )
 
 
+def _conditional_timeline_response(
+    request: Request,
+    context: WorkspaceContext,
+    payload: list[SessionView] | MessageListPageView,
+) -> Response:
+    """Revalidate the authorized, serialized representation in its own scope.
+
+    Call only after resource authorization and payload construction. Including
+    identity, workspace and the requested page prevents validators being reused
+    across accounts or timeline windows, even when their JSON happens to match.
+    Hash the actual response bytes so historical edits and deletions invalidate
+    the cache without relying on timestamps or message counts.
+    """
+    response = JSONResponse(content=jsonable_encoder(payload))
+    scope = json.dumps(
+        [
+            context.principal.tenant_id,
+            context.principal.user_id,
+            context.workspace_id,
+            request.url.path,
+            request.url.query,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(scope + b"\n" + response.body).hexdigest()
+    etag = f'"{digest}"'
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "private, no-cache",
+        "Vary": "Authorization, X-Workspace-ID",
+    }
+    # If-None-Match uses weak comparison for GET, including a list of validators.
+    validators = request.headers.get("if-none-match", "").split(",")
+    if any(value.strip().removeprefix("W/") in {"*", etag} for value in validators):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    response.headers.update(headers)
+    return response
+
+
 @router.get("", response_model=list[SessionView])
-def list_sessions(db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[SessionView]:
+def list_sessions(
+    request: Request, db: DB, context: CurrentWorkspace, settings: AppSettings,
+) -> Response:
     authz = AuthorizationService(db, context.principal)
     items = service(db, context, settings).list_sessions()
     # B1-4: batch authorization instead of per-item can_access_resource.
     accessible = authz.filter_accessible_ids(
         context.workspace, "session", [item.id for item in items], "read"
     )
-    return [
+    payload = [
         SessionView.model_validate(item)
         for item in items
         if item.id in accessible
     ]
+    return _conditional_timeline_response(request, context, payload)
 
 
 @router.post("", response_model=SessionView, status_code=status.HTTP_201_CREATED)
@@ -1161,13 +1206,14 @@ def undo_graph_change_set(
 @router.get("/{session_id}/messages", response_model=MessageListPageView)
 def list_messages(
     session_id: str,
+    request: Request,
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
     limit: Annotated[int | None, Query(ge=1, le=200)] = None,
     before_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     compact: bool = True,
-) -> MessageListPageView:
+) -> Response:
     """Return the session timeline, optionally windowed and compact.
 
     - Default: full timeline with lossless text and compact nested tool/citation metadata.
@@ -1177,7 +1223,7 @@ def list_messages(
     ``GET /messages/{message_id}``.
     """
 
-    return MessageListPageView.model_validate(
+    payload = MessageListPageView.model_validate(
         service(db, context, settings).list_messages_page(
             session_id,
             limit=limit,
@@ -1185,6 +1231,7 @@ def list_messages(
             compact=compact,
         )
     )
+    return _conditional_timeline_response(request, context, payload)
 
 
 @router.get("/{session_id}/context-usage", response_model=SessionContextUsageView)

@@ -8,6 +8,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -53,6 +56,8 @@ fun RegisterScreen(onRegistered: () -> Unit, onBack: () -> Unit) {
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 28.dp),
     ) {
         Spacer(Modifier.height(48.dp))
@@ -149,6 +154,7 @@ fun RegisterScreen(onRegistered: () -> Unit, onBack: () -> Unit) {
                                     app.api.token = reg.accessToken
                                     app.api.workspaceId = workspace
                                     app.api.deviceId = deviceId
+                                    app.api.accountId = reg.userId ?: reg.username ?: username
                                     app.authStore.setAuth(
                                         token = reg.accessToken,
                                         workspaceId = workspace,
@@ -156,6 +162,7 @@ fun RegisterScreen(onRegistered: () -> Unit, onBack: () -> Unit) {
                                         displayName = reg.displayName,
                                         sessionId = reg.sessionId,
                                         deviceId = deviceId,
+                                        userId = reg.userId,
                                     )
                                     onRegistered()
                                 }

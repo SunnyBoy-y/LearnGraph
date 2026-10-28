@@ -1,0 +1,45 @@
+/* Native owns the outer scroll and spacing; the shared renderer owns content. */
+html.native-renderer-host, html.native-renderer-host body, .native-renderer-host #root {
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  margin: 0;
+  background: transparent;
+}
+html.native-renderer-host body { overflow: hidden; }
+/* workspace-main--chat normally owns the whole viewport. Embedded messages must
+   shrink after a streamed answer or a fold; using 100dvh here creates a height
+   feedback loop with the native measured container and leaves large blank gaps. */
+html.native-renderer-host .native-renderer-message {
+  display: flow-root !important; height: auto !important; max-height: none !important;
+  grid-template-rows: none !important; overflow: visible !important;
+  width: 100%; min-width: 0; min-height: 0 !important; padding: 0 0 1px;
+}
+html.native-renderer-host .native-renderer-message .chat-canvas-page {
+  display: flow-root !important; height: auto !important; min-height: 0 !important;
+  max-height: none !important; padding: 0; border: 0; overflow: visible !important; background: transparent;
+}
+.native-renderer-message .is-assistant { display: block; margin: 0; padding: 0; }
+.native-renderer-message [data-message-content], .native-renderer-message .message-answer-segment {
+  width: 100% !important; max-width: none !important; margin: 0 !important; min-width: 0;
+}
+.native-renderer-message .message-answer-segment > :last-child { margin-bottom: 0; }
+.native-renderer-preview-controls, .native-renderer-preview-action { max-width: 760px; margin: 20px auto; padding: 16px; }
+.native-renderer-preview-controls { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+html.native-renderer-host:not(.is-native-app) body { overflow: auto; background: var(--background); }
+html.native-renderer-host:not(.is-native-app) .native-renderer-message { max-width: 760px; margin: 0 auto; padding: 16px; }
+.native-renderer-preview-action { border: 1px solid var(--border); border-radius: 12px; font-size: 12px; }
+.native-renderer-preview-action pre { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 12px; }
+html.native-renderer-host[data-renderer-surface="graph"],
+html.native-renderer-host[data-renderer-surface="graph"] body,
+html.native-renderer-host[data-renderer-surface="graph"] #root { width: 100%; height: 100dvh; overflow: hidden; }
+.native-renderer-graph { width: 100%; height: 100dvh; min-height: 0; overflow: hidden; }
+html.native-renderer-host .native-renderer-graph .context-rail {
+  position: static !important; display: flex !important; inset: auto !important;
+  width: 100% !important; max-width: none !important; height: 100dvh !important; max-height: 100dvh !important;
+  min-height: 0 !important; transform: none !important; opacity: 1 !important; visibility: visible !important;
+  pointer-events: auto !important; border-radius: 0 !important; margin: 0 !important;
+}
+.native-renderer-graph .chat-graph-rail { height: 100% !important; min-height: 0; }
+.native-renderer-graph-empty { padding: 28px 20px; color: var(--muted-foreground); font-size: 13px; line-height: 1.7; }
+.native-renderer-graph-empty p { margin-top: 12px; }

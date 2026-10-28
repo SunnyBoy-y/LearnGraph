@@ -175,6 +175,7 @@ export class ApiClient {
     path: string,
     options: ApiRequestOptions,
     body?: RequestBody,
+    allowNotModified = false,
   ): Promise<Response> {
     const url = appendQuery(joinUrl(this.baseUrl, path), options.query)
     const headers = new Headers(options.headers)
@@ -210,7 +211,7 @@ export class ApiClient {
           body: requestBody,
           signal: options.signal,
         })
-        if (response.ok) return response
+        if (response.ok || (allowNotModified && response.status === 304)) return response
 
         if (retryable && backoff !== null && RETRYABLE_STATUSES.has(response.status)) {
           await delayWithAbort(backoff, options.signal)
@@ -278,6 +279,15 @@ export class ApiClient {
     return this.request<TResponse>('GET', path, options)
   }
 
+  /** A 304 is useful only with the caller's same-scope cached body. */
+  async getConditional<TResponse>(path: string, etag?: string | null, options: ApiRequestOptions = {}): Promise<{ notModified: boolean; etag: string | null; data?: TResponse }> {
+    const headers = new Headers(options.headers)
+    if (etag) headers.set('If-None-Match', etag)
+    const response = await this.fetchResponse('GET', path, { ...options, headers }, undefined, true)
+    return { notModified: response.status === 304, etag: response.headers.get('ETag'),
+      ...(response.status === 304 ? {} : { data: await readResponseBody(response) as TResponse }) }
+  }
+
   async getBlob(path: string, options: ApiRequestOptions = {}, maxBytes?: number): Promise<Blob> {
     const response = await this.fetchResponse('GET', path, options)
     if (maxBytes === undefined) return response.blob()
@@ -307,6 +317,11 @@ export class ApiClient {
   async postBlob<TBody>(path: string, body: TBody, options: ApiRequestOptions = {}): Promise<Blob> {
     const response = await this.fetchResponse('POST', path, options, { value: body, kind: 'json' })
     return response.blob()
+  }
+
+  /** Authenticated downloads whose caller consumes the response as a stream. */
+  async postDownload<TBody>(path: string, body: TBody, options: ApiRequestOptions = {}): Promise<Response> {
+    return this.fetchResponse('POST', path, options, { value: body, kind: 'json' })
   }
 
   /** Read a bounded range, refusing servers that silently return the entire file. */

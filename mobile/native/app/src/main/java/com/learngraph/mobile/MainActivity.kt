@@ -15,10 +15,14 @@ import androidx.fragment.app.FragmentActivity
 import com.learngraph.mobile.notify.ReplyNotifier
 import com.learngraph.mobile.ui.navigation.AppNav
 import com.learngraph.mobile.ui.theme.LearnGraphTheme
+import com.learngraph.mobile.ui.components.WebMotionConfig
+import com.learngraph.mobile.ui.components.installWebCssMotionClock
 import com.learngraph.mobile.util.PermissionGate
 import com.learngraph.mobile.util.PhotoCapture
 import com.learngraph.mobile.util.ShortcutActions
 import java.util.concurrent.Executors
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * LearnGraph 原生版入口。
@@ -66,6 +70,7 @@ class MainActivity : FragmentActivity() {
             }
         }
         enableEdgeToEdge()
+        installWebCssMotionClock()
 
         val shortcut = intent?.getStringExtra("lg.shortcut")
         if (shortcut == ShortcutActions.ACTION_CONNECT) {
@@ -74,7 +79,7 @@ class MainActivity : FragmentActivity() {
             requestNotifPermissionIfNeeded()
             setContent {
                 LearnGraphTheme {
-                    AppNav(startAtConnect = true)
+                    WebMotionConfig { AppNav(startAtConnect = true) }
                 }
             }
             return
@@ -93,7 +98,7 @@ class MainActivity : FragmentActivity() {
         requestNotifPermissionIfNeeded()
         setContent {
             LearnGraphTheme {
-                AppNav()
+                WebMotionConfig { AppNav() }
             }
         }
     }
@@ -160,12 +165,17 @@ class MainActivity : FragmentActivity() {
     companion object {
         const val PREFS = "lg_mobile"
         const val KEY_BIOMETRIC = "biometric_enabled"
+        private val _navigationEpoch = MutableStateFlow(0)
+        val navigationEpoch = _navigationEpoch.asStateFlow()
+        private val _foregroundEpoch = MutableStateFlow(0)
+        val foregroundEpoch = _foregroundEpoch.asStateFlow()
     }
 
     private fun prefs() = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     override fun onResume() {
         super.onResume()
+        if (_foregroundEpoch.value > 0 || !ReplyNotifier.appInForeground) _foregroundEpoch.value += 1
         // 把权限申请路由切回本页（内嵌浏览器可能刚在本页之上跑过）
         PermissionGate.activate(this)
         ReplyNotifier.setForeground(true)
@@ -190,6 +200,7 @@ class MainActivity : FragmentActivity() {
                 ShortcutActions.ingestOpenSession(this, sessionId)
             }
         }
+        _navigationEpoch.value += 1
     }
 
     /**

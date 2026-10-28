@@ -172,6 +172,8 @@ def test_tool_workflow_real_docker(tmp_path, monkeypatch, pooled):
             live_model = os.environ.get("LEARNGRAPH_TEST_TOOL_WORKFLOW_LIVE_MODEL_CONTAINER")
             live_metrics = None
             if live_model and not pooled:
+                from docker_test_safety import owned_container
+                live_model = owned_container(live_model)["Id"]
                 import subprocess
                 from dataclasses import asdict
                 from app.providers.ports.model import ProviderChatMessage

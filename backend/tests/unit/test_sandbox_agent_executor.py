@@ -139,12 +139,13 @@ class TestExecutor:
         types = [t for t, _ in events]
         assert "started" in types and "succeeded" in types
 
-    def test_rounds_exhausted_is_partial(self) -> None:
+    def test_historical_round_budget_does_not_stop_execution(self) -> None:
         provider = FakeProvider(
             [
                 [_tool_calls([_call("c1", "sandbox_env_info", {})]), _done()],
                 [_tool_calls([_call("c2", "sandbox_env_info", {})]), _done()],
                 [_tool_calls([_call("c3", "sandbox_env_info", {})]), _done()],
+                [_text(_handoff_text()), _done()],
             ]
         )
         sandbox = FakeSandbox()
@@ -155,8 +156,8 @@ class TestExecutor:
             provider=provider,
             sandbox_service=sandbox,
         )
-        assert outcome.status == "PARTIAL"
-        assert outcome.error_class == "MaxRoundsExhausted"
+        assert outcome.status == "SUCCEEDED"
+        assert provider.calls == 4
 
     def test_empty_answer_fails(self) -> None:
         provider = FakeProvider([[_done()]])
@@ -201,11 +202,12 @@ class TestExecutor:
         )
         assert sandbox.calls[0][1]["sandbox_session_id"] == "sb_pinned"
 
-    def test_token_budget_exhausted_is_partial(self) -> None:
+    def test_historical_token_budget_does_not_stop_execution(self) -> None:
         provider = FakeProvider(
             [
                 [_tool_calls([_call("c1", "sandbox_env_info", {})]), _done()],
                 [_tool_calls([_call("c2", "sandbox_env_info", {})]), _done()],
+                [_text(_handoff_text()), _done()],
             ],
             usage={"input_tokens": 100_000, "output_tokens": 100_000},
         )
@@ -217,8 +219,8 @@ class TestExecutor:
             provider=provider,
             sandbox_service=sandbox,
         )
-        assert outcome.status == "PARTIAL"
-        assert outcome.error_class == "BudgetExhausted"
+        assert outcome.status == "SUCCEEDED"
+        assert outcome.attempt_record["token_usage"] > 50_000
 
     def test_cancel_returns_cancelled(self) -> None:
         provider = FakeProvider([[_tool_calls([_call("c1", "sandbox_env_info", {})]), _done()]])

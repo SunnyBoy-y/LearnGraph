@@ -228,13 +228,12 @@ def test_manual_price_overrides_existing_auto_price_and_matches_region(client, r
 
 
 @pytest.mark.parametrize("currencies", [("USD",), ("USD", "CNY")])
-def test_models_dev_native_currency_is_not_overwritten_by_regional_fallback(client, register_user, monkeypatch, currencies):
+def test_models_dev_native_currency_is_selected_without_conversion(client, register_user, monkeypatch, currencies):
     from app.services import billing as module
     _, workspace, provider = setup_native(register_user)
     def tariff(currency, source):
         return dict(currency=currency, provider_key="native-vendor", model_id="catalog-model", catalog_id=source+currency,
             native_input_per_million="0.25", native_output_per_million="0", conditions={}, source=source, source_url="https://models.dev")
-    monkeypatch.setattr(module, "PRICING_CATALOG", [tariff("CNY", "official_catalog")])
     monkeypatch.setattr(module, "price_entry_for_model", lambda *args, currency=None, **kwargs: tariff(currency, "models_dev") if currency in currencies else None)
     with SessionLocal() as db:
         config = db.get(ProviderConfig, provider)
@@ -257,6 +256,76 @@ def test_models_dev_native_currency_is_not_overwritten_by_regional_fallback(clie
             assert decision.currency == "USD"
         assert decision.projected_amount == "0.25" and decision.source.startswith("models_dev")
         billing.record_usage(decision, input_tokens=1000000, output_tokens=0, attempt=1)
+
+
+def test_network_price_updates_new_calls_and_keeps_manual_prices_and_history(client, register_user, auth_headers, monkeypatch, tmp_path):
+    import httpx
+    from app.providers import models_dev
+
+    token, workspace, provider = setup_native(register_user)
+    monkeypatch.setattr(models_dev, "_cache_path", lambda: tmp_path / "models-dev.json")
+    monkeypatch.setattr(models_dev, "_snapshot", None)
+    price = "1"
+    tiered = True
+
+    def response(*args, **kwargs):
+        return httpx.Response(200, json={"openai": {"models": {
+            "synced": {"id": "synced", "cost": {"input": price, "output": "0", "tiers": [
+                {"tier": {"type": "context", "size": 1000000}, "input": "99", "output": "0"},
+            ] if tiered else []}},
+        }}}, request=httpx.Request("GET", models_dev.MODELS_DEV_URL))
+
+    monkeypatch.setattr(models_dev.httpx, "get", response)
+    models_dev.refresh_snapshot()
+    with SessionLocal() as db:
+        provider_config = db.get(ProviderConfig, provider)
+        provider_config.capabilities = {"pricing_provider_key": "openai", "billing_currency": "USD"}
+        db.commit()
+        billing = BillingService(db, workspace, "test")
+        kwargs = dict(provider_id=provider, model_id="synced", feature="chat",
+            estimated_input_tokens=1000000, estimated_output_tokens=0, remote_capability=True, reserve=False)
+        first = billing.preflight_model_call(**kwargs)
+        assert first.projected_amount == "1"
+        history = billing.record_usage(first, input_tokens=1000000, output_tokens=0, attempt=1)
+        assert billing.preflight_model_call(**kwargs).price_version_id == first.price_version_id
+
+        price = "2"
+        tiered = False
+        models_dev.refresh_snapshot()
+        second = billing.preflight_model_call(**kwargs)
+        assert second.projected_amount == "2" and second.price_version_id != first.price_version_id
+        assert billing.preflight_model_call(**kwargs).price_version_id == second.price_version_id
+        db.refresh(history)
+        assert history.cost_amount == "1" and history.price_version_id == first.price_version_id
+
+        manual = billing.upsert_manual_price(provider_id=provider, model_id="synced", currency="USD",
+            input_per_million="0.123456789", output_per_million="0")
+        price = "3"
+        models_dev.refresh_snapshot()
+        final = billing.preflight_model_call(**kwargs)
+        assert final.projected_amount == "0.123456789" and final.price_version_id == manual["id"]
+        assert billing.list_manual_prices("USD")[0]["input_per_million"] == "0.123456789"
+
+    catalog = client.get("/api/v1/usage/price-catalog?currency=USD", headers=auth_headers(token, workspace)).json()
+    assert len(catalog) == 1 and catalog[0]["source"] == "models_dev"
+    assert catalog[0]["native_input_per_million"] == "3"
+
+
+def test_missing_models_dev_price_never_reuses_an_old_automatic_tariff(client, register_user, monkeypatch):
+    from app.services import billing as module
+
+    _, workspace, provider = setup_native(register_user)
+    monkeypatch.setattr(module, "price_entry_for_model", lambda *args, **kwargs: None)
+    with SessionLocal() as db:
+        config = db.get(ProviderConfig, provider)
+        config.capabilities = {"pricing_provider_key": "openai", "billing_currency": "USD"}
+        db.commit()
+        billing = BillingService(db, workspace, "test")
+        billing.create_price(provider_id=provider, model_id="removed", currency="USD",
+            input_per_million="99", output_per_million="99", source="official_catalog")
+        result = billing.preflight_model_call(provider_id=provider, model_id="removed", feature="chat",
+            estimated_input_tokens=1000000, estimated_output_tokens=0, remote_capability=True, reserve=False)
+        assert result.projected_amount is None and result.price_version_id is None
 
 
 def test_native_search_requests_share_the_same_budget_and_ledger(client, register_user):

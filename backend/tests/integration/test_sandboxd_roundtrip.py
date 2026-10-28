@@ -2,14 +2,15 @@
 
 Requires:
 - a running sandboxd with Docker Engine access
-- LEARNGRAPH_TEST_SANDBOXD_URL / _TOKEN / _ADMIN_TOKEN set, or the local
-  dev defaults under backend/data/.sandboxd (matches scripts/dev.mjs layout)
+- explicitly owned disposable Docker daemon, endpoint and credential paths
 
 Run:
   cd backend
   uv run --locked --extra test pytest tests/integration/test_sandboxd_roundtrip.py -q
 
-The suite is skipped unless the daemon is reachable. Every sandbox created is
+The suite is skipped unless explicitly enabled. No endpoint is probed during
+collection. Docker ownership is required before reading tokens or connecting.
+Every sandbox created is
 deleted in ``finally`` and the suite asserts no managed container/volume is
 left behind.
 """
@@ -24,15 +25,15 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-_SANDBOXD_URL = os.environ.get("LEARNGRAPH_TEST_SANDBOXD_URL", "http://127.0.0.1:18090")
-_DEPLOYMENT_ID = os.environ.get("LEARNGRAPH_TEST_SANDBOXD_DEPLOYMENT_ID", "dev-local")
+_SANDBOXD_URL = os.environ.get("LEARNGRAPH_TEST_SANDBOXD_URL", "")
+_DEPLOYMENT_ID = os.environ.get("LEARNGRAPH_TEST_SANDBOXD_DEPLOYMENT_ID", "")
 _TOKEN_FILE = os.environ.get(
     "LEARNGRAPH_TEST_SANDBOXD_TOKEN_FILE",
-    str(Path(__file__).resolve().parents[2] / "data" / ".sandboxd" / "sandboxd-token"),
+    "",
 )
 _ADMIN_TOKEN_FILE = os.environ.get(
     "LEARNGRAPH_TEST_SANDBOXD_ADMIN_TOKEN_FILE",
-    str(Path(__file__).resolve().parents[2] / "data" / ".sandboxd" / "sandboxd-admin-token"),
+    "",
 )
 # A local pinned test runner image. Bootstrap can install it via the admin API;
 # point LEARNGRAPH_TEST_SANDBOXD_IMAGE at any local image with runner-abi=1.
@@ -43,10 +44,16 @@ _IMAGE = os.environ.get(
 
 
 def _token(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8").strip()
+    from docker_test_safety import credential_path
+    return credential_path(path).read_text(encoding="utf-8").strip()
 
 
 def _client():
+    if os.environ.get("LEARNGRAPH_TEST_SANDBOXD_DOCKER") != "1":
+        pytest.skip("requires explicit owned disposable sandboxd Docker fixture")
+    from docker_test_safety import endpoint, require
+    endpoint(_SANDBOXD_URL, "LEARNGRAPH_TEST_SANDBOXD_CONTAINER")
+    require(_DEPLOYMENT_ID.startswith("lg-test-") and len(_DEPLOYMENT_ID) >= 20, "private sandboxd test deployment required")
     from app.providers.remote.sandboxd_client import (
         SandboxdClient,
         SandboxdProtocolError,
@@ -66,15 +73,6 @@ def _client():
     )
 
 
-def _daemon_available() -> bool:
-    try:
-        client, _ = _client()
-        client.get_ready()
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _ensure_runtime(client, runtime_kind: str = "python-node") -> None:
     try:
         runtimes = client.list_runtimes()
@@ -85,7 +83,6 @@ def _ensure_runtime(client, runtime_kind: str = "python-node") -> None:
     client.install_runtime(runtime_kind, _IMAGE)
 
 
-@pytest.mark.skipif(not _daemon_available(), reason="sandboxd is not reachable")
 @pytest.mark.parametrize("runtime_kind", ["python-node", "python-node-browser"])
 def test_sandboxd_roundtrip_create_write_exec_read_stop_resume_delete(runtime_kind):
     from app.providers.remote.sandboxd_client import SandboxdProtocolError
@@ -190,7 +187,6 @@ def test_sandboxd_roundtrip_create_write_exec_read_stop_resume_delete(runtime_ki
                     raise
 
 
-@pytest.mark.skipif(not _daemon_available(), reason="sandboxd is not reachable")
 def test_sandboxd_fail_closed_and_owner_scope():
     client, errors = _client()
     session_id = f"it-fail-{uuid.uuid4().hex[:10]}"

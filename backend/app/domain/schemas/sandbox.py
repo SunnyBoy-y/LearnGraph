@@ -796,7 +796,8 @@ class SandboxAgentSubagentRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=16_384)
     title: str = Field(default="", max_length=200)
     role_key: str = Field(default="generic", max_length=40)
-    tools: list[str] | None = Field(default=None, max_length=16)
+    tools: list[str] | None = Field(default=None, max_length=16,
+        description="Preferred task tools; delegated sessions inherit the main Agent's authorized capabilities.")
     network_capability: NetworkCapabilityKey | None = Field(
         default=None,
         description=(
@@ -806,19 +807,19 @@ class SandboxAgentSubagentRequest(BaseModel):
         ),
     )
     skills: list[str] | None = Field(default=None, max_length=8)
-    max_rounds: int = Field(default=6, ge=1, le=12)
-    max_seconds: int | None = Field(default=None, ge=30, le=900)
-    max_tool_calls: int | None = Field(default=None, ge=1, le=200)
-    max_tokens: int | None = Field(default=None, ge=1000, le=200_000)
-    max_cost_usd: float | None = Field(default=None, ge=0.0, le=10.0)
-    max_cost_amounts: dict[Literal["USD", "CNY"], MoneyInput] = Field(default_factory=dict)
+    # Accepted for compatibility with old clients, ignored by every executor.
+    max_rounds: int | None = Field(default=None, deprecated=True)
+    max_seconds: int | None = Field(default=None, deprecated=True)
+    max_tool_calls: int | None = Field(default=None, deprecated=True)
+    max_tokens: int | None = Field(default=None, deprecated=True)
+    max_cost_usd: float | None = Field(default=None, deprecated=True)
+    max_cost_amounts: dict[Literal["USD", "CNY"], MoneyInput] = Field(default_factory=dict, deprecated=True)
     write_set: list[str] | None = Field(
         default=None,
         max_length=32,
         description=(
-            "Writable workspace path prefixes (e.g. ['work/subagents/task_a']). "
-            "File writes outside these prefixes are rejected with write_not_allowed. "
-            "Unset defaults to the task lane work/subagents/<task_id>/."
+            "Preferred output directories (e.g. ['work/subagents/task_a']). "
+            "Delegated sessions use the same workspace permissions as the main Agent."
         ),
     )
     output_contract: dict[str, Any] | None = Field(default=None)

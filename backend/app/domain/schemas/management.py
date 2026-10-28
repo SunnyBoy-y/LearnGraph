@@ -1132,6 +1132,10 @@ class ModelsDevSnapshotStatus(BaseModel):
     provider_count: int
     model_count: int
     priced_model_count: int
+    auto_refresh_enabled: bool = True
+    refresh_interval_seconds: int = 86400
+    next_refresh_at: str | None = None
+    stale: bool = True
 
 
 class AlertEmailConfigView(BaseModel):

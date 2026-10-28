@@ -475,6 +475,7 @@ def _run_bot_without_a_live_pipeline(monkeypatch):
 
     import app.voice.embedded_bot as bot_mod
     import app.voice.events as voice_events
+    monkeypatch.setattr(bot_mod, "load_conversation_policy", lambda _session: {})
     from app.voice.embedded_context import VoiceContextState
     from app.voice.journal import VoiceTurnJournal
 
@@ -557,6 +558,7 @@ def _run_bot_without_a_live_pipeline(monkeypatch):
     monkeypatch.setattr(bot_mod, "WorkerRunner", _FakeRunner)
     monkeypatch.setattr(bot_mod, "VoiceContextAdapter", _StubContextAdapter)
     monkeypatch.setattr(bot_mod, "load_session_row", lambda _session_id: None)
+    monkeypatch.setattr(bot_mod, "load_conversation_policy", lambda _session_id: None)
     # Provider 解析要读库，而本测试不碰库；桩成空配置，服务对象本身仍是真的。
     monkeypatch.setattr(
         bot_mod, "_resolve_voice_provider_config", lambda _session_id: _EmptyProviders()

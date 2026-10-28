@@ -1,7 +1,7 @@
 """Delegation is a durable ordinary ChatSession, not a second Agent loop.
 
 ChatService owns model invocation, tools, messages, parts, billing and approvals.
-This adapter only narrows delegation and checkpoints safe execution boundaries.
+This adapter prevents recursive delegation and checkpoints safe execution boundaries.
 """
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import copy
 import json
 import time
 from dataclasses import asdict
-from datetime import timedelta, timezone
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -18,7 +17,7 @@ from sqlalchemy import select, update
 from app.core.errors import AppError
 from app.domain.models import ChatSession, Message, SandboxAgentTask, SandboxJob, utc_now
 from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
-from app.services.agent_execution_profiles import resolve_agent_execution_profile, network_capability_allows_tool, clamp_network_capability
+from app.services.agent_execution_profiles import resolve_agent_execution_profile
 
 
 def ensure_child_session(db, task, job) -> ChatSession:
@@ -33,10 +32,14 @@ def ensure_child_session(db, task, job) -> ChatSession:
         child = ChatSession(id=child_id, workspace_id=task.workspace_id,
             parent_session_id=parent.id, session_kind='agent', title=task.title,
             project_id=parent.project_id, goal_id=parent.goal_id, graph_id=parent.graph_id,
-            memory_enabled=False, writeback_policy='manual_only',
+            memory_enabled=parent.memory_enabled, writeback_policy=parent.writeback_policy,
             context_capsule={'managed_agent': {'task_id': task.id, 'owner_user_id': task.owner_user_id,
                 'controller': 'agent'}})
         db.add(child)
+    # Older children used a restricted memory policy. Inherit the parent policy
+    # for existing delegations too, without recreating messages or checkpoints.
+    child.memory_enabled = parent.memory_enabled
+    child.writeback_policy = parent.writeback_policy
     spec['agent_session_id'] = child_id
     task.spec_json = spec
     db.commit()
@@ -64,6 +67,10 @@ def bind_chat_session(service, session_id):
         return
     if task.owner_user_id != service.actor_id:
         raise AppError(403, 'agent_session_forbidden', 'Delegated conversation belongs to another user')
+    parent = service.db.get(ChatSession, task.chat_session_id)
+    if parent and (child.memory_enabled != parent.memory_enabled or child.writeback_policy != parent.writeback_policy):
+        child.memory_enabled, child.writeback_policy = parent.memory_enabled, parent.writeback_policy
+        service.db.commit()
     control = getattr(service, '_managed_control', None)
     if control is None:
         binding = (child.context_capsule or {})['managed_agent']
@@ -99,9 +106,8 @@ class SessionControl:
         self.spec = dict(task.spec_json or {})
         self.payload = dict(job.payload_json or {})
         self.version = int(self.payload.get('requirement_version') or 1)
-        self.profile = resolve_agent_execution_profile(task.role_key, tools=self.payload.get('tools'))
-        self.network = clamp_network_capability(self.profile.network_capability,
-            (self.payload.get('network_policy') or {}).get('mode'))
+        # Role selects reasoning and delivery behavior, not a narrower permission set.
+        self.profile = resolve_agent_execution_profile(task.role_key, tools=None)
         raw = self.payload.get('_resume_checkpoint') or {}
         self.state = copy.deepcopy(raw) if raw.get('requirement_version') == self.version else {}
         # Legacy checkpoints preserve their messages too; no completed operation is replayed.
@@ -113,10 +119,8 @@ class SessionControl:
         self.state.setdefault('used_costs', {})
         self.state.setdefault('active_seconds', 0)
         self.state['requirement_version'] = self.version
-        self.budget = self.payload.get('budget') or {}
-        self.cost_limits = dict(self.budget.get('max_cost_amounts') or {})
-        if not self.cost_limits and self.budget.get('max_cost_usd') is not None:
-            self.cost_limits = {'USD': self.budget['max_cost_usd']}
+        # Delegated execution is unbounded, including historical checkpoints.
+        # Keep usage counters for reporting, never as execution stop conditions.
         self.started = time.monotonic()
         self.previous_seconds = self.state['active_seconds']
         self.first_model = True
@@ -126,22 +130,6 @@ class SessionControl:
         self.scenes = {s['block_id']: s for s in self.state.get('visuals', [])}
         self.evidence = list(self.state.get('evidence', []))
         self.sources = list(self.state.get('sources', []))
-        self.voice = self.spec.get('origin') == 'voice' or bool((self.spec.get('input_snapshot') or {}).get('voice_session_id'))
-
-    @property
-    def allowed(self):
-        names = set(self.profile.requested_tools())
-        # The structured UI tool is the ordinary Agent renderer, scoped to this child message.
-        if self.voice and self.profile.role.value in {'tool', 'research'}:
-            names.add('ui_stream')
-        parent = self.db.get(ChatSession, self.task.chat_session_id)
-        inherited = (parent.context_capsule or {}).get('managed_agent') if parent else None
-        if inherited:
-            ancestor = self.db.get(SandboxAgentTask, inherited['task_id'])
-            ancestor_spec = ancestor.spec_json or {}
-            granted = resolve_agent_execution_profile(ancestor.role_key, tools=ancestor_spec.get('tool_profile'))
-            names.intersection_update(granted.requested_tools())
-        return {name for name in names if network_capability_allows_tool(self.network, name)}
 
     def persist(self):
         self.state.update(active_seconds=self.previous_seconds + time.monotonic()-self.started,
@@ -162,13 +150,9 @@ class SessionControl:
             self.halted = 'PAUSED'
         elif int(spec.get('current_requirement_version') or self.version) != self.version:
             self.halted = 'CANCELLED'
-        elif self.previous_seconds+time.monotonic()-self.started >= int(self.budget.get('max_seconds') or 600):
-            self.halted = 'TIMED_OUT'
-        elif self.state['used_tokens'] >= int(self.budget.get('max_tokens') or 100000):
-            self.halted = 'PARTIAL'
         if self.halted:
             self.persist()
-            raise SessionStopped('Delegated token budget exhausted' if self.halted == 'PARTIAL' else self.halted)
+            raise SessionStopped(self.halted)
 
     def prompt(self):
         snapshot = copy.deepcopy(self.spec.get('input_snapshot') or {})
@@ -178,6 +162,7 @@ class SessionControl:
             # system prompt consumed most of the delegated token budget each round.
             context.pop('prompt_block', None)
         return ('这是父 Agent 委派的任务。请直接完成任务，工具、授权、消息和产物使用普通 Agent 流程。'
+            '你继承主 Agent 的工具权限，但不得再创建子 Agent。API 费用受工作区统一预算约束，没有单任务预算。'
             '不要输出隐藏思维链。只有工具成功并有实际产物才可宣称完成。'
             '用户要求表格、图表、时间线时，使用 ui_stream 挂载真实结构化页面，必须含 rows/items/nodes 数据。'
             '例如 mount 表格时数据放入 upsert.rows，每行 {id,label,values}；props.columns 对应 values 的键。'
@@ -238,26 +223,15 @@ class DelegatedProvider:
         c.state['messages'] = [asdict(item) for item in messages]
         # The initial ordinary user message already carries c.prompt(). Do not
         # add another system copy of the complete delegation/context payload.
-        if c.state['rounds_used'] >= int(c.budget.get('max_rounds') or 16):
-            c.halted = 'PARTIAL'
-            raise SessionStopped('Model round budget exhausted')
         c.persist()
         text, reasoning, calls, items, completed = '', '', [], [], False
         quote = None
-        if c.cost_limits:
+        if getattr(self.provider, 'remote_capability', False):
             from app.services.billing import BillingService
-            from app.core.money import decimal_amount
             billing = BillingService(c.db, c.job.workspace_id, c.job.owner_user_id)
             quote = billing.preflight_model_call(provider_id=self.provider.provider_id, model_id=self.provider.model_id,
                 feature='chat', estimated_input_tokens=sum(len(str(item.content))//3+1 for item in messages),
                 estimated_output_tokens=2048, remote_capability=self.provider.remote_capability, reserve=False)
-            if quote.currency is None or quote.projected_amount is None:
-                c.halted = 'PARTIAL'
-                raise SessionStopped('Delegated cost budget requires a known native price')
-            if quote.currency in c.cost_limits and (decimal_amount(c.state['used_costs'].get(quote.currency, '0'))+
-                    decimal_amount(quote.projected_amount) > decimal_amount(c.cost_limits[quote.currency])):
-                c.halted = 'PARTIAL'
-                raise SessionStopped('Delegated native currency budget exhausted')
         try:
             stream = self.provider.stream_chat(messages, **options)
             try:
@@ -300,7 +274,7 @@ class DelegatedProvider:
 
 
 class DelegatedRuntime:
-    """Only narrows a normal AgentToolRuntime. Actual dispatch remains ordinary."""
+    """Use the ordinary authorized runtime, excluding recursive delegation."""
     def __init__(self, runtime, control):
         self.runtime, self.control = runtime, control
 
@@ -309,22 +283,19 @@ class DelegatedRuntime:
 
     def definitions(self, **options):
         if not options.get('agent_mode_enabled', True): return []
-        return self.runtime.definitions_for_tools(tool_names=self.control.allowed,
-            web_search_enabled=True, memory_enabled=False, capability_families={'builtin_extension'})
+        return self.runtime.definitions(**options, excluded_tool_names={'sandbox_subagent'})
 
     def stream_chat(self, provider, messages, **options):
         # Reuse the normal streamed-file-write transport and its cleanup semantics.
         yield from self.runtime.stream_chat(provider, messages, **options)
 
     def execute(self, call, **context):
-        from app.services.sandbox_agent_executor import _extract_tool_call, _write_allowed
+        from app.services.sandbox_agent_executor import _extract_tool_call
         c = self.control
         c.check(force=True)
         call_id, name, arguments = _extract_tool_call(call)
-        if name not in c.allowed:
-            raise AppError(403, 'delegated_tool_denied', 'Tool is outside the delegated scope')
-        if not _write_allowed(tuple(c.payload.get('write_set') or [f'work/subagents/{c.task.id}']), name, arguments):
-            raise AppError(403, 'delegated_write_denied', 'Path is outside the delegated write scope')
+        if name == 'sandbox_subagent':
+            raise AppError(403, 'nested_subagent_forbidden', 'Delegated agents cannot create further agents')
         signature = json.dumps({'name': name, 'arguments': arguments}, sort_keys=True, ensure_ascii=False)
         previous = c.state['completed_operations'].get(call_id)
         if previous:
@@ -333,9 +304,6 @@ class DelegatedRuntime:
             c.state['messages'].append(asdict(ProviderChatMessage(role='tool', tool_call_id=call_id, content=previous['result'])))
             c.persist()
             return previous['result'], previous.get('meta', {}), previous.get('sources', [])
-        if c.state['tool_calls_total'] >= int(c.budget.get('max_tool_calls') or 200):
-            c.halted = 'PARTIAL'
-            raise SessionStopped('Tool budget exhausted')
         c.state['inflight_call_id'] = call_id
         c.persist()
         c.emit('tool_started', {'tool_name': name, 'ordinal': c.state['tool_calls_total']+1})
@@ -369,11 +337,19 @@ def execute_managed_session(settings, job, task, *, emit_event, save_checkpoint)
         if not AuthorizationService(db, context.principal).can_access_resource(context.workspace, 'session', task.chat_session_id, 'write'):
             raise AppError(403, 'agent_parent_access_revoked', 'Delegating user no longer has access to the parent conversation')
         control = SessionControl(db, task, job, save_checkpoint, emit_event)
+        parent_turn = db.scalar(select(Message).where(Message.session_id == task.chat_session_id,
+            Message.role == 'assistant').order_by(Message.created_at.desc()).limit(1))
+        parent_trace = (parent_turn.provider_trace or {}) if parent_turn else {}
+        search_route = parent_trace.get('search_route')
+        if search_route not in {'disabled', 'model_native', 'external', 'local', 'auto'}:
+            search_route = None
         from app.services.agent_execution_profiles import fallback_thinking_modes
         requested = (job.payload_json or {}).get('thinking_mode')
         for thinking in fallback_thinking_modes(requested, default=control.profile.default_thinking_mode):
             chat = build_chat_service(db, workspace_context=context, settings=settings,
-                thinking_mode=thinking, agent_mode=True)
+                thinking_mode=thinking, agent_mode=True,
+                provider_id=parent_trace.get('provider_id'), model_id=parent_trace.get('model_id'),
+                search_route=search_route)
             if getattr(chat.model_provider, 'available', True): break
         chat._managed_control = control
         bind_chat_session(chat, child.id)
@@ -385,8 +361,10 @@ def execute_managed_session(settings, job, task, *, emit_event, save_checkpoint)
         error = None
         try:
             prompt = control.prompt()
+            web_search = bool(parent_trace.get('web_search', getattr(chat.search_provider, 'available', False)))
             for delivery_attempt in range(2):
-                for frame in chat.create_stream(child.id, MessageCreateRequest(content=prompt, agent_mode=True)):
+                for frame in chat.create_stream(child.id, MessageCreateRequest(content=prompt, agent_mode=True,
+                        web_search=web_search, search_route=search_route or ('auto' if web_search else 'disabled'))):
                     # Process details remain ordinary persisted message parts/SSE.
                     for line in frame.splitlines():
                         if line.startswith('data:'):

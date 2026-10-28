@@ -24,6 +24,7 @@ export interface NativeShareInboxItem {
 
 interface LearnGraphNativeBridge {
   clearAuth?: () => void
+  setThinkingChainDefaultOpen?: (payload: string) => void
   download?: (url: string, fileName?: string) => void
   saveBase64?: (dataUrl: string, fileName?: string) => void
   getInboxItems?: () => string
@@ -57,6 +58,17 @@ function nativeBridge(): LearnGraphNativeBridge | null {
 /** APK 内运行（bridge 存在） */
 export function isNativeApp(): boolean {
   return Boolean(nativeBridge())
+}
+
+/** Only a successful setting save in the still-current authenticated scope calls this bridge. */
+export function notifyNativeThinkingChainDefaultSaved(scope: { accessToken: string; workspaceId: string }, open: boolean): void {
+  const bridge = nativeBridge()
+  if (!bridge?.setThinkingChainDefaultOpen) return
+  try {
+    bridge.setThinkingChainDefaultOpen(JSON.stringify({ origin: window.location.origin, token: scope.accessToken, workspaceId: scope.workspaceId, open }))
+  } catch {
+    // The persisted server setting remains authoritative on older APKs or a detached WebView.
+  }
 }
 
 // ------------------------------------------------------------------ //

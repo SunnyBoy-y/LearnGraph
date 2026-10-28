@@ -69,6 +69,27 @@ def _post_finalize(client, headers, voice_id: str, turn_id: str, text: str) -> d
 
 # ------------------------------------------------------- durability / replay
 
+def test_client_environment_is_owned_validated_and_survives_context_refresh(client, register_user, auth_headers):
+    token, ws, *_ = register_user("voice_environment")
+    headers = auth_headers(token, ws)
+    chat_id = _make_chat_session(client, headers)
+    environment = {"timezone": "Asia/Shanghai", "location_status": "available", "location": {"city": "Paris", "latitude": 48.86, "longitude": 2.35, "timezone": "Europe/Paris", "source": "client_ip"}}
+    response = client.post("/api/v1/voice/sessions", headers=headers, json={"chat_session_id": chat_id, "client_environment": environment})
+    assert response.status_code == 200, response.text
+    voice = response.json()
+    assert voice["context_snapshot"]["client_environment"]["location"]["city"] == "Paris"
+    # Ordinary session reconnect refreshes chat context without erasing location.
+    refreshed = _create_voice_session(client, headers, chat_id)
+    assert refreshed["context_snapshot"]["client_environment"] == voice["context_snapshot"]["client_environment"]
+    path = f"/api/v1/voice/sessions/{voice['id']}/environment"
+    assert client.patch(path, headers=headers, json={"timezone": "invalid/zone"}).status_code == 422
+    other_token, other_ws, *_ = register_user("voice_environment_other")
+    assert client.patch(path, headers=auth_headers(other_token, other_ws), json={"timezone": "UTC"}).status_code in (403, 404)
+    updated = client.patch(path, headers=headers, json={"timezone": "UTC", "location_status": "unavailable"})
+    assert updated.status_code == 200
+    assert updated.json()["session_epoch"] == refreshed["session_epoch"]
+    assert updated.json()["context_snapshot"]["client_environment"]["location"] is None
+
 
 def test_voice_events_are_monotonic_and_replayable_across_workers(client, register_user, auth_headers):
     token, ws, _u, _p = register_user("voice_evt")
@@ -1626,3 +1647,22 @@ def test_transcript_also_returns_the_turn_that_is_still_running(client, register
     assert len(turns) == 1, "落定后不能既算进行中又算已落定"
     assert turns[0]["status"] == "finalized"
     assert turns[0]["assistant_text"] == "答完了"
+
+
+def test_background_delivery_persists_only_assistant_without_fake_user(client, register_user, auth_headers):
+    from app.voice.turns import accept_turn, finalize_turn
+    from sqlalchemy import select
+    token, ws, _, _ = register_user("voice_delivery")
+    headers = auth_headers(token, ws)
+    chat = _make_chat_session(client, headers)
+    voice = _create_voice_session(client, headers, chat)["id"]
+    accepted = accept_turn(voice, "", client_message_id="voice-delivery:speech-1", origin="delivery")
+    assert accepted["created"]
+    for _ in range(2):
+        result = finalize_turn(voice, accepted["turn_id"], "后台结果已经完成。", memory=False)
+        assert result["persisted"]
+    with SessionLocal() as db:
+        messages = list(db.scalars(select(Message).where(Message.session_id == chat)))
+        assert [(message.role, message.content) for message in messages] == [("assistant", "后台结果已经完成。")]
+        assert not list(db.scalars(select(VoiceEventRecord).where(VoiceEventRecord.voice_session_id == voice,
+                                                                  VoiceEventRecord.event_type == "user.final")))

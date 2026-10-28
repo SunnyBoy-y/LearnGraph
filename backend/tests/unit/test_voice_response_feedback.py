@@ -31,6 +31,34 @@ def tools(*ids):
     return FunctionCallsStartedFrame([FunctionCallFromLLM("delegate_tool_task", id, {}, None) for id in ids])
 
 
+def test_search_progress_waits_then_names_the_actual_query():
+    async def run():
+        feedback, journal, frames = setup_feedback(delay=.02)
+        await feedback.process_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
+        await feedback.process_frame(FunctionCallsStartedFrame([
+            FunctionCallFromLLM("search_web", "weather", {"query": "北京天气"}, None)
+        ]), FrameDirection.DOWNSTREAM)
+        await feedback.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+        assert not [frame for frame in frames if isinstance(frame, TextFrame)]
+        await asyncio.sleep(.04)
+        assert [frame.text for frame in frames if isinstance(frame, TextFrame)] == ["我正在查询北京天气。"]
+        await feedback.cleanup()
+    asyncio.run(run())
+
+
+def test_submitted_tts_cannot_be_failed_by_the_old_llm_grace_timer():
+    async def run():
+        journal = VoiceTurnJournal("offline")
+        journal._turn = _TurnState(turn_id="tts-in-flight", llm_closed=True)
+        journal.assistant_completed = AsyncMock()
+        journal.tts_submitted()
+        await journal._fallback_finalize()
+        journal.assistant_completed.assert_not_awaited()
+        await journal.tts_failed("tts-in-flight")
+        journal.assistant_completed.assert_awaited_once()
+    asyncio.run(run())
+
+
 def test_slow_inference_gets_one_short_cue_before_its_answer():
     async def run():
         feedback, journal, frames = setup_feedback()
@@ -38,7 +66,7 @@ def test_slow_inference_gets_one_short_cue_before_its_answer():
         await asyncio.sleep(.02)
         await feedback.process_frame(TextFrame("答案是十四。"), FrameDirection.DOWNSTREAM)
         await feedback.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
-        assert [f.text for f in frames if isinstance(f, TextFrame)] == ["嗯，让我想一想。", "答案是十四。"]
+        assert [f.text for f in frames if isinstance(f, TextFrame)] == ["让我思考一下。", "答案是十四。"]
         assert frames[1].metadata["voice_acknowledgement"]
         assert journal.activities == [("turn-1", "thinking"), ("turn-1", "idle")]
         await feedback.cleanup()
@@ -69,7 +97,7 @@ def test_parallel_tools_and_followup_rounds_do_not_repeat_the_cue_or_hide_work()
         await feedback.process_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
         await feedback.process_frame(TextFrame("任务已受理。"), FrameDirection.DOWNSTREAM)
         await feedback.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
-        assert [f.text for f in frames if isinstance(f, TextFrame)] == ["嗯，我看看。", "任务已受理。"]
+        assert [f.text for f in frames if isinstance(f, TextFrame)] == ["任务已受理。"]
         assert journal.activities[-1] == ("turn-1", "idle")
         await feedback.cleanup()
     asyncio.run(run())

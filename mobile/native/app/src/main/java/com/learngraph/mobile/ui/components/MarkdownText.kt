@@ -1,6 +1,7 @@
 package com.learngraph.mobile.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -13,6 +14,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -47,7 +50,17 @@ fun MarkdownText(
     val titleColor = baseColor ?: MaterialTheme.colorScheme.onSurface
 
     Column(modifier = modifier) {
-        blocks.forEach { block ->
+        blocks.forEachIndexed { index, block ->
+            if (index > 0) {
+                val previous = blocks[index - 1]
+                val gap = when {
+                    block is Block.Line && block.kind in listOf(LineKind.H1, LineKind.H2, LineKind.H3) -> 24.dp
+                    previous is Block.Line && previous.kind in listOf(LineKind.H1, LineKind.H2, LineKind.H3) -> 10.dp
+                    block is Block.Line && previous is Block.Line && block.kind == LineKind.LIST && previous.kind == LineKind.LIST -> 6.dp
+                    else -> 14.4.dp
+                }
+                Spacer(Modifier.height(gap))
+            }
             when (block) {
                 is Block.Code -> {
                     Text(
@@ -57,10 +70,11 @@ fun MarkdownText(
                         color = codeColor,
                         modifier = Modifier
                             .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
                             .background(codeBg)
+                            .horizontalScroll(rememberScrollState())
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                     )
-                    Spacer(Modifier.height(6.dp))
                 }
                 is Block.Line -> renderLine(block, onLinkClick, titleColor, baseColor)
             }
@@ -91,30 +105,44 @@ private fun splitBlocks(markdown: String): List<Block> {
             i++ // 跳过闭合 ```
             out.add(Block.Code(buf.toString()))
         } else {
-            val trimmed = line
+            if (line.isBlank()) { i++; continue }
+            val trimmed = line.trimStart()
             val kind = when {
                 trimmed.startsWith("### ") -> LineKind.H3
                 trimmed.startsWith("## ") -> LineKind.H2
                 trimmed.startsWith("# ") -> LineKind.H1
                 trimmed.startsWith("> ") -> LineKind.QUOTE
-                trimmed.startsWith("- ") || trimmed.startsWith("* ") -> LineKind.LIST
+                trimmed.startsWith("- ") || trimmed.startsWith("* ") || trimmed.matches(Regex("^\\d+[.)]\\s+.*")) -> LineKind.LIST
                 trimmed.startsWith("|") -> LineKind.TABLE
                 else -> LineKind.NORMAL
             }
-            val text = when (kind) {
+            var text = when (kind) {
                 LineKind.H1 -> trimmed.removePrefix("# ")
                 LineKind.H2 -> trimmed.removePrefix("## ")
                 LineKind.H3 -> trimmed.removePrefix("### ")
                 LineKind.QUOTE -> trimmed.removePrefix("> ")
-                LineKind.LIST -> "• ${trimmed.removePrefix("- ").removePrefix("* ")}"
+                LineKind.LIST -> if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) "• ${trimmed.drop(2)}" else trimmed
                 else -> trimmed
             }
-            if (text.isBlank() && kind == LineKind.NORMAL) {
-                out.add(Block.Line("", LineKind.NORMAL))
-            } else {
-                out.add(Block.Line(text, kind))
-            }
             i++
+            // One Text per Markdown paragraph: source soft breaks must not
+            // become unrelated Compose rows with artificial gaps.
+            if (kind == LineKind.NORMAL || kind == LineKind.TABLE || kind == LineKind.QUOTE) {
+                while (i < lines.size && lines[i].isNotBlank()) {
+                    val next = lines[i].trimStart()
+                    val belongs = when (kind) {
+                        LineKind.TABLE -> next.startsWith("|")
+                        LineKind.QUOTE -> next.startsWith("> ")
+                        else -> !next.startsWith("```") && !next.startsWith("# ") && !next.startsWith("## ") && !next.startsWith("### ") && !next.startsWith("> ") && !next.startsWith("- ") && !next.startsWith("* ") && !next.startsWith("|") && !next.matches(Regex("^\\d+[.)]\\s+.*"))
+                    }
+                    if (!belongs) break
+                    val addition = if (kind == LineKind.QUOTE) next.removePrefix("> ") else lines[i]
+                    val separator = if (kind != LineKind.NORMAL || text.endsWith("  ")) "\n" else " "
+                    text = text.trimEnd() + separator + addition
+                    i++
+                }
+            }
+            out.add(Block.Line(text, kind))
         }
     }
     return out
@@ -132,24 +160,23 @@ private fun renderLine(
         return
     }
     val style = when (block.kind) {
-        LineKind.H1 -> MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold, color = titleColor)
-        LineKind.H2 -> MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, color = titleColor)
-        LineKind.H3 -> MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold, color = titleColor)
-        LineKind.QUOTE -> MaterialTheme.typography.bodyMedium.copy(
-            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+        LineKind.H1 -> MaterialTheme.typography.titleLarge.copy(fontSize = 22.sp, lineHeight = 30.8.sp, fontWeight = FontWeight.Bold, color = titleColor)
+        LineKind.H2 -> MaterialTheme.typography.titleMedium.copy(fontSize = 18.sp, lineHeight = 26.1.sp, fontWeight = FontWeight.Bold, color = titleColor)
+        LineKind.H3 -> MaterialTheme.typography.titleSmall.copy(fontSize = 16.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold, color = titleColor)
+        LineKind.QUOTE -> MaterialTheme.typography.bodyLarge.copy(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        LineKind.LIST -> MaterialTheme.typography.bodyMedium
-        LineKind.TABLE -> MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
-        LineKind.NORMAL -> MaterialTheme.typography.bodyMedium
+        LineKind.LIST -> MaterialTheme.typography.bodyLarge.copy(fontSize = 16.sp, lineHeight = 28.8.sp)
+        LineKind.TABLE -> MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace, fontSize = 14.sp, lineHeight = 22.4.sp)
+        LineKind.NORMAL -> MaterialTheme.typography.bodyLarge.copy(fontSize = 16.sp, lineHeight = 28.8.sp)
     }
     val textColor = baseColor ?: style.color
     val linkColor = MaterialTheme.colorScheme.primary
-    val annotated = remember(block.text) { buildInline(block.text, style.toSpanStyle().copy(color = textColor), linkColor, onLinkClick) }
+    val annotated = remember(block.text, style, textColor, linkColor, onLinkClick) { buildInline(block.text, style.toSpanStyle().copy(color = textColor), linkColor, onLinkClick) }
     Text(
         text = annotated,
         style = style.copy(color = textColor),
-        modifier = Modifier.padding(top = if (block.kind == LineKind.H1 || block.kind == LineKind.H2) 4.dp else 0.dp),
+        modifier = if (block.kind == LineKind.QUOTE) Modifier.padding(start = 16.dp) else Modifier,
     )
 }
 

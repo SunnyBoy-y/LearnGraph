@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.frontend_static import install_frontend_static
+from app.frontend_static import install_frontend_static, web_client_fingerprint
 
 
 def _write_dist(root: Path) -> Path:
@@ -17,7 +17,7 @@ def _write_dist(root: Path) -> Path:
     assets.mkdir(parents=True)
     (dist / "index.html").write_text("<!doctype html><title>LearnGraph</title>", encoding="utf-8")
     (dist / "favicon.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
-    (assets / "app.js").write_text("console.log('ok')", encoding="utf-8")
+    (assets / "app-AbCd1234.js").write_text("console.log('ok')", encoding="utf-8")
     return dist
 
 
@@ -49,6 +49,7 @@ def test_spa_serves_index_assets_and_reserves_api(tmp_path: Path) -> None:
     assert home.status_code == 200
     assert "LearnGraph" in home.text
     assert home.headers.get("cache-control") == "no-cache"
+    assert home.headers.get("etag") == f'"{web_client_fingerprint(dist / "index.html")}"'
 
     deep = client.get("/w/demo/home")
     assert deep.status_code == 200
@@ -58,13 +59,41 @@ def test_spa_serves_index_assets_and_reserves_api(tmp_path: Path) -> None:
     assert icon.status_code == 200
     assert "svg" in icon.headers.get("content-type", "")
 
-    asset = client.get("/assets/app.js")
+    asset = client.get("/assets/app-AbCd1234.js")
     assert asset.status_code == 200
     assert "console.log" in asset.text
+    assert asset.headers.get("cache-control") == "public, max-age=31536000, immutable"
 
     assert client.get("/api/v1/health").json() == {"status": "ok"}
     assert client.get("/api/v1/missing").status_code == 404
     assert client.get("/docs").status_code == 404
+
+
+def test_web_client_version_revalidates_without_a_full_shell_download(tmp_path: Path) -> None:
+    dist = _write_dist(tmp_path)
+    app = FastAPI()
+    install_frontend_static(app, dist)
+    client = TestClient(app)
+
+    first = client.get("/api/v1/web-client/version")
+    assert first.status_code == 200
+    assert first.json() == {"version": web_client_fingerprint(dist / "index.html")}
+    assert first.headers.get("cache-control") == "no-cache"
+
+    unchanged = client.get(
+        "/api/v1/web-client/version",
+        headers={"If-None-Match": first.headers["etag"]},
+    )
+    assert unchanged.status_code == 304
+    assert unchanged.content == b""
+
+    (dist / "index.html").write_text("<!doctype html><title>LearnGraph v2</title>", encoding="utf-8")
+    changed = client.get(
+        "/api/v1/web-client/version",
+        headers={"If-None-Match": first.headers["etag"]},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["version"] != first.json()["version"]
 
 
 def test_spa_rejects_path_escape(tmp_path: Path) -> None:

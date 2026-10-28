@@ -7,16 +7,19 @@
  */
 
 import { useEffect, useRef } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
 
 import { useAuth } from '@/features/auth/auth-context-value'
 import { consumeShortcutAction } from '@/lib/native-bridge'
+import { useNativeSidebarActivityContract } from '@/lib/native-sidebar-activity-contract'
 
 export function NativeActions() {
   const { workspaceId = '' } = useParams()
   const { workspaceId: activeWorkspaceId } = useAuth()
   const navigate = useNavigate()
   const wid = workspaceId || activeWorkspaceId
+  const location = useLocation()
+  useNativeSidebarActivityContract(wid, location.pathname)
   const consumedRef = useRef(false)
 
   useEffect(() => {

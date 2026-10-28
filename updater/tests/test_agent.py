@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
+import os
 from pathlib import Path
 import tempfile
+import sqlite3
+import subprocess
+import sys
 import threading
 import unittest
+from contextlib import closing
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import ThreadingHTTPServer
 
-from updater.agent import Agent, COMPAT_LABEL, SERVICES, UpdateError, handler, process_lock, version
+from updater.agent import Agent, COMPAT_LABEL, DATABASE_LABEL, DATABASE_CAPABILITY, LEGACY_SQLITE_GUARD, SERVICES, TOPOLOGY_LABEL, COMBINED_TOPOLOGY, UpdateError, handler, process_lock, version
 
 
 class FakeAgent(Agent):
@@ -22,13 +28,17 @@ class FakeAgent(Agent):
         self.break_target = False
         self.break_rollback = False
         self.target_compatibility = "1"
+        self.target_topology = COMBINED_TOPOLOGY
         self.break_backup = False
         self.state["releases"] = [{"version": "v1.1.0"}]
+
+    def services(self):
+        return SERVICES
 
     def containers(self):
         return {name: {"Id": name, "Image": self.running, "Config": {"Labels": {
             "org.opencontainers.image.version": "v1.0.0" if self.running == "old" else "v1.1.0",
-        }}} for name in SERVICES}
+        }}} for name in self.services()}
 
     def current(self):
         return {"version": "v1.0.0" if self.running == "old" else "v1.1.0", "image": self.running, "compatibility": "1"}
@@ -39,6 +49,7 @@ class FakeAgent(Agent):
     def image_info(self, image):
         return {"Id": "new" if ":v1.1.0" in image else image, "Config": {"Labels": {
             COMPAT_LABEL: self.target_compatibility if image != "old" else "1",
+            TOPOLOGY_LABEL: self.target_topology,
             "org.opencontainers.image.version": "v1.1.0",
             "org.opencontainers.image.source": "https://github.com/SunnyBoy-y/LearnGraph",
         }}}
@@ -66,6 +77,22 @@ class FakeAgent(Agent):
 
 
 class AgentTests(unittest.TestCase):
+    def test_legacy_checks_reject_activation_and_sealed_source_under_optimization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "test.db"
+            with closing(sqlite3.connect(database)) as db:
+                db.execute("CREATE TABLE _lg_database_fence(singleton INTEGER PRIMARY KEY,sealed INTEGER)")
+                db.execute("INSERT INTO _lg_database_fence VALUES(1,1)")
+                db.commit()
+            env = {**os.environ, "LEARNGRAPH_DATABASE_URL":"sqlite:///"+database.as_posix(), "LEARNGRAPH_DATABASE_MIGRATION_STATE_DIR":str(root)}
+            for activated in [False, True]:
+                if activated: (root / "active.json").write_text("{}")
+                result = subprocess.run([sys.executable,"-O","-c",LEGACY_SQLITE_GUARD + "\nsrc.close()"],env=env,capture_output=True,text=True)
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn("RuntimeError",result.stderr)
+                self.assertIn("activation" if activated else "Sealed SQLite",result.stderr)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -121,6 +148,33 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(self.agent.running, "old")
         self.assertFalse(self.agent.override.exists())
 
+    def test_native_copy_checksum_failure_cleans_remote_artifact(self):
+        job = {"id":"a"*24,"database":{"engine":"postgresql","capability":DATABASE_CAPABILITY}}
+        info = {"sha256":hashlib.sha256(b"expected").hexdigest(),"bytes":8,"engine":"postgresql"}
+        operations = []
+        def command(args, timeout=60):
+            operations.append(args)
+            if args[0] == "cp": Path(args[2]).write_bytes(b"damaged!")
+            return ""
+        with patch.object(self.agent,"maintenance",return_value=info), patch.object(self.agent,"command",side_effect=command):
+            with self.assertRaisesRegex(UpdateError,"校验结果不一致"):
+                Agent.backup(self.agent,job,"owned-app")
+        self.assertTrue(any(op[0]=="exec" and "unlink" in op[-1] for op in operations))
+        self.assertNotIn("backup",job)
+
+    def test_cleanup_failure_blocks_new_jobs_and_restart_retries_it(self):
+        def maintenance(container, operation, *args):
+            if operation == "release": raise UpdateError("injected release failure")
+            return {}
+        with patch.object(self.agent,"database_status",return_value={"engine":"sqlite","capability":DATABASE_CAPABILITY}), patch.object(self.agent,"maintenance",side_effect=maintenance):
+            job = self.submit_sync(target="v1.1.0")
+        self.assertEqual(job["status"],"succeeded")
+        self.assertTrue(job["maintenance_cleanup_required"] and self.agent.active())
+        with self.assertRaises(UpdateError): self.agent.submit(target="v1.1.0",request_id="another-request-123")
+        with patch.object(self.agent,"maintenance",return_value={}): self.agent.recover()
+        self.assertFalse(self.agent.active())
+        self.assertNotIn("maintenance_cleanup_required",job)
+
     def test_unpublished_or_injected_targets_are_rejected(self):
         for target in ["v9.0.0", "ghcr.io/evil/app:latest", "--help", "../v1"]:
             with self.assertRaises(UpdateError):
@@ -149,6 +203,36 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(self.agent.state["auto_install"])
         self.assertEqual([op[0] for op in self.agent.operations].count("backup"), 1)
         self.assertFalse(any(op[0] == "pull" for op in self.agent.operations))
+
+    def test_postgresql_rejects_a_target_without_database_capability(self):
+        database = {"engine": "postgresql", "activation_id": "one-way", "identity": "same-server", "capability": DATABASE_CAPABILITY}
+        with patch.object(self.agent, "database_status", return_value=database):
+            job = self.submit_sync(target="v1.1.0")
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("禁止", job["error"])
+        self.assertFalse(any(op[0] == "replace" for op in self.agent.operations))
+
+    def test_completed_job_reservation_must_be_released_before_next_update(self):
+        job = self.submit_sync(target="v1.1.0")
+        job["maintenance_reserved"] = True
+        with self.assertRaisesRegex(UpdateError, "已有更新任务"):
+            self.agent.submit(target="v1.1.0", request_id="different-request-id")
+        job["maintenance_reserved"] = False
+        self.assertFalse(self.agent.active())
+
+    def test_postgresql_route_change_rolls_back_images_and_preserves_database(self):
+        database = {"engine": "postgresql", "activation_id": "one-way", "identity": "same-server", "capability": DATABASE_CAPABILITY}
+        image_info = self.agent.image_info
+        def capable(image):
+            result = image_info(image)
+            result["Config"]["Labels"][DATABASE_LABEL] = DATABASE_CAPABILITY
+            return result
+        with patch.object(self.agent, "image_info", side_effect=capable), patch.object(self.agent, "maintenance", return_value={}), patch.object(self.agent, "database_status", side_effect=[database, {"engine": "sqlite"}, database]):
+            job = self.submit_sync(target="v1.1.0")
+        self.assertEqual(job["status"], "rolled_back")
+        self.assertEqual(self.agent.running, "old")
+        self.assertFalse(job["maintenance_reserved"])
+        self.assertEqual([op[0] for op in self.agent.operations].count("backup"), 1)
 
     def test_restart_recovers_journal_written_before_container_mutation(self):
         original = self.submit_sync(target="v1.1.0")
@@ -198,6 +282,42 @@ class AgentTests(unittest.TestCase):
         with patch.object(self.agent, "compose", return_value="app changed\npreview original\negress-proxy original"):
             with self.assertRaisesRegex(UpdateError, "Compose"):
                 Agent.verify_configuration(self.agent, containers)
+
+    def test_topology_discovery_excludes_stale_image_override(self):
+        self.agent.override.write_text(json.dumps({"services": {"preview": {"image": "old"}}}))
+        with patch.object(self.agent, "command", return_value="app\negress-proxy\nsandboxd") as command:
+            self.assertEqual(Agent.services(self.agent), ("app", "egress-proxy"))
+        self.assertNotIn(str(self.agent.override), command.call_args.args[0])
+
+    def test_combined_topology_updates_without_recreating_preview(self):
+        with patch.object(self.agent, "services", return_value=("app", "egress-proxy")), \
+             patch.object(self.agent, "containers", return_value={
+                 name: {"Image": "new", "Id": name, "State": {"Health": {"Status": "healthy"}}}
+                 for name in ("app", "egress-proxy")
+             }), patch.object(self.agent, "compose") as compose:
+            Agent.replace(self.agent, {"app": "new", "egress-proxy": "new"})
+        self.assertNotIn("preview", compose.call_args.args[0])
+        self.assertEqual(set(json.loads(self.agent.override.read_text())["services"]), {"app", "egress-proxy"})
+
+    def test_cross_topology_rollback_is_rejected_before_override_write(self):
+        with patch.object(self.agent, "services", return_value=("app", "egress-proxy")):
+            with self.assertRaisesRegex(UpdateError, "拓扑"):
+                Agent.replace(self.agent, dict.fromkeys(SERVICES, "old"))
+        self.assertFalse(self.agent.override.exists())
+
+    def test_combined_upgrade_requires_capable_image_before_backup(self):
+        self.agent.target_topology = None
+        with patch.object(self.agent, "services", return_value=("app", "egress-proxy")):
+            job = self.submit_sync(target="v1.1.0")
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("合并预览", job["error"])
+        self.assertNotIn(["backup"], self.agent.operations)
+
+    def test_combined_upgrade_pins_only_two_business_roles(self):
+        with patch.object(self.agent, "services", return_value=("app", "egress-proxy")):
+            job = self.submit_sync(target="v1.1.0")
+        self.assertEqual(job["status"], "succeeded")
+        self.assertEqual(set(job["target_images"]), {"app", "egress-proxy"})
 
     def test_missing_local_running_image_is_reported_before_upgrade(self):
         with patch.object(self.agent, 'compose', return_value='container-id'), \

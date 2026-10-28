@@ -14,7 +14,6 @@ from app.core.errors import AppError
 from app.core.money import amount_text, currency_code, decimal_amount, exact_money, sum_amounts
 from app.domain.models import BudgetAlert, BudgetPolicy, PriceVersion, ProviderConfig, UsageEvent, Workspace, utc_now
 from app.providers.models_dev import price_entry_for_model
-from app.services.pricing_catalog import PRICING_CATALOG
 from app.repositories.audit import AuditRepository
 from app.repositories.domain import BudgetAlertRepository, BudgetPolicyRepository, PriceVersionRepository, UsageRepository
 
@@ -256,9 +255,9 @@ class BillingService:
         # They can produce usage, but no vendor/currency is inferred from their
         # name. Unknown pricing is still blocked by any matching hard budget.
         price = self._active_price(provider_id, model_id, feature, current, max(0, estimated_input_tokens)) if configured else None
-        if price is None and configured:
+        if configured and (price is None or price.source != MANUAL_PRICE_SOURCE):
             price = self._seed_default_catalog_price(provider_id=provider_id, model_id=model_id, feature=feature,
-                                                      now=current, input_tokens=max(0, estimated_input_tokens))
+                now=current, input_tokens=max(0, estimated_input_tokens), existing=price)
         declared = (configured.capabilities or {}).get("billing_currency") if configured else None
         native_currency = price.currency if price else (currency_code(declared) if declared else None)
         quote = BillingQuote(provider_id, model_id, feature, True, native_currency,
@@ -548,6 +547,12 @@ class BillingService:
             candidates = [price for price in candidates if price.currency == currency_code(declared_currency)]
         if not candidates:
             return None
+        manual = [price for price in candidates if price.source == MANUAL_PRICE_SOURCE]
+        if not manual:
+            # Auto prices are revalidated against the current snapshot below.
+            # An obsolete, more specific tier must not outrank its replacement.
+            return max(candidates, key=lambda price: (self._as_utc(price.effective_at), price.version))
+        candidates = manual
         def rank(price: PriceVersion) -> tuple[int, ...]:
             binding = price.conditions or {}
             specificity = sum(binding.get(key) is not None for key in ("region", "endpoint", "billing_tier", "min_input_tokens", "max_input_tokens"))
@@ -584,35 +589,40 @@ class BillingService:
             if self._provider_catalog_key(provider) == provider_key.strip().casefold()]
 
     def _seed_default_catalog_price(self, *, provider_id: str, model_id: str, feature: str,
-                                   now: datetime, input_tokens: int) -> PriceVersion | None:
+                                   now: datetime, input_tokens: int, existing: PriceVersion | None = None) -> PriceVersion | None:
         provider = self._require_provider(provider_id)
         vendor = self._provider_catalog_key(provider)
         if vendor is None:
             return None
         declared_currency = (provider.capabilities or {}).get("billing_currency")
-        builtin = [item for item in PRICING_CATALOG if item["provider_key"] == vendor and item["model_id"] == model_id
-                   and self._conditions_match(item.get("conditions") or {}, input_tokens, provider)
-                   and (not declared_currency or item["currency"] == currency_code(declared_currency))]
         native_currencies = [currency_code(declared_currency)] if declared_currency else ["USD", "CNY"]
         network_choices = [entry for currency in native_currencies
             if (entry := price_entry_for_model(model_id, input_tokens, provider_key=vendor, currency=currency))
             and self._conditions_match(entry.get("conditions") or {}, input_tokens, provider)]
-        choices = network_choices or builtin
+        choices = network_choices
         if len({entry["currency"] for entry in choices}) > 1:
             raise AppError(409, "pricing_currency_ambiguous", "Select the provider's native billing currency before execution")
-        # Read models.dev prices in their published currency. Official tariffs
-        # are a native fallback, never a reason to reinterpret a USD record.
         item = choices[-1] if choices else None
         if item is None:
             return None
+        source = f"models_dev:{item.get('source_url') or 'https://models.dev/api.json'}"
+        conditions = {**(item.get("conditions") or {}), "catalog_id": item["catalog_id"], "catalog_provider_key": vendor,
+            "catalog_as_of": item.get("as_of"), "catalog_source_url": item.get("source_url"), "native_schema": 2}
+        amounts = {
+            "input_per_million": amount_text(item["native_input_per_million"]),
+            "output_per_million": amount_text(item["native_output_per_million"]),
+            "cached_input_per_million": amount_text(item["native_cached_input_per_million"]) if item.get("native_cached_input_per_million") is not None else None,
+            "cache_write_per_million": amount_text(item["native_cache_write_per_million"]) if item.get("native_cache_write_per_million") is not None else None,
+            "fixed_per_call": amount_text(item.get("native_fixed_per_call", "0")),
+        }
+        units = {key: amount_text(value) for key, value in (item.get("rates_by_unit") or {}).items()}
+        if (existing is not None and existing.source == source and existing.currency == item["currency"]
+            and existing.model_id == model_id and existing.feature == feature
+            and existing.conditions == conditions and (existing.rates_by_unit or {}) == units
+            and all(getattr(existing, key) == value for key, value in amounts.items())):
+            return existing
         return self.create_price(provider_id=provider_id, model_id=model_id, feature=feature, currency=item["currency"],
-            input_per_million=item["native_input_per_million"], output_per_million=item["native_output_per_million"],
-            cached_input_per_million=item.get("native_cached_input_per_million"),
-            cache_write_per_million=item.get("native_cache_write_per_million"), fixed_per_call=item.get("native_fixed_per_call", "0"),
-            rates_by_unit=item.get("rates_by_unit"), effective_at=now, commit=False,
-            source=f"{item.get('source') or 'official_catalog'}:{item.get('source_url') or 'unknown'}",
-            conditions={**(item.get("conditions") or {}), "catalog_id": item["catalog_id"], "catalog_provider_key": vendor,
-                "catalog_as_of": item.get("as_of"), "catalog_source_url": item.get("source_url")})
+            **amounts, rates_by_unit=units, effective_at=now, commit=False, source=source, conditions=conditions)
 
     @staticmethod
     def _conditions_match(conditions: dict[str, Any], input_tokens: int, provider: ProviderConfig | None = None) -> bool:

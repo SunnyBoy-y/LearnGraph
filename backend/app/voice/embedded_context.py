@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
+from uuid import NAMESPACE_URL, uuid5
 
 from app.voice.events import load_session
 from app.voice.turns import list_turns
@@ -74,11 +75,31 @@ class VoiceContextAdapter:
                 }
             )
 
-        self._append_history(messages, snapshot.get("history"))
+        history_messages = self._append_history(messages, snapshot.get("history"))
         turns = self._turn_loader(self.voice_session_id, limit=self.max_messages)
+        # Snapshot and voice journal can overlap. Match durable identities;
+        # repeated words in a different turn are never an identity.
+        history = snapshot.get("history") or []
+        historical = list(history) if isinstance(history, list) else []
+        seen_turns: set[str] = set()
         for turn in turns:
+            turn_id = str(turn.get("turn_id") or "")
+            if turn_id and turn_id in seen_turns:
+                continue
+            if turn_id:
+                seen_turns.add(turn_id)
             user_text = str(turn.get("user_text") or "").strip()
             assistant_text = str(turn.get("assistant_text") or "").strip()
+            key = str(turn.get("client_message_id") or turn_id)
+            identities = {str(uuid5(NAMESPACE_URL, f"voice:{handle.workspace_id}:{handle.chat_session_id}:{key}:{role}"))
+                          for role in ("user", "assistant")} if key and getattr(handle, "workspace_id", None) and getattr(handle, "chat_session_id", None) else set()
+            overlapping = {str(item.get("id")) for item in historical if isinstance(item, Mapping) and (
+                item.get("voice_turn_id") == turn_id and turn_id or str(item.get("id")) in identities)}
+            # Latest journal projection wins for the same record (e.g. an
+            # interrupted answer shortened after the chat snapshot was taken).
+            if overlapping:
+                replaced = [history_messages[key] for key in overlapping if key in history_messages]
+                messages[:] = [message for message in messages if not any(message is old for old in replaced)]
             if user_text:
                 messages.append({"role": "user", "content": user_text})
             if assistant_text:
@@ -108,29 +129,32 @@ class VoiceContextAdapter:
         return [{"role": "system", "content": self.system_instruction}]
 
     @staticmethod
-    def _append_history(messages: list[dict[str, str]], history: Any) -> None:
+    def _append_history(messages: list[dict[str, str]], history: Any) -> dict[str, dict[str, str]]:
+        identities: dict[str, dict[str, str]] = {}
         if not isinstance(history, Iterable) or isinstance(history, (str, bytes, Mapping)):
-            return
+            return identities
         for item in history:
             if not isinstance(item, Mapping):
                 continue
             role = str(item.get("role") or "").strip()
             content = str(item.get("content") or "").strip()
             if role in {"system", "user", "assistant"} and content:
-                messages.append({"role": role, "content": content})
+                message = {"role": role, "content": content}
+                identity = str(item.get("id") or "")
+                if identity:
+                    old = identities.get(identity)
+                    messages[:] = [existing for existing in messages if existing is not old]
+                    identities[identity] = message
+                messages.append(message)
+        return identities
 
 
 def _bounded_unique(
     messages: list[dict[str, str]], max_messages: int
 ) -> list[dict[str, str]]:
-    deduped: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for message in messages:
-        key = (message["role"], message["content"])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(message)
+    # Kept for compatibility with callers. Identity deduplication happens at
+    # the source boundary above, not by user/assistant text equality.
+    deduped = list(messages)
 
     if len(deduped) <= max_messages:
         return deduped

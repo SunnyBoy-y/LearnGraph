@@ -226,6 +226,9 @@ def install_embedded_runtime(app: Any) -> bool:
         await handler.handle_patch_request(parsed_request)
         return {"status": "success"}
 
+    from app.voice.websocket_runtime import install_websocket_runtime
+
+    install_websocket_runtime(app)
     app.state.learn_graph_voice_runtime = handler
     return True
 

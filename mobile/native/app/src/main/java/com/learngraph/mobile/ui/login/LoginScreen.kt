@@ -10,6 +10,9 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -43,7 +46,7 @@ import java.util.UUID
  * 未注册账号可跳转注册页（服务器开启注册时）。
  */
 @Composable
-fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
+fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit, onChangeServer: () -> Unit = {}) {
     val app = LocalContext.current.applicationContext as LearnGraphApp
     val scope = rememberCoroutineScope()
     val authState by app.authStore.state.collectAsState(initial = AuthStore.AuthState())
@@ -70,6 +73,8 @@ fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 28.dp),
     ) {
         Spacer(Modifier.height(72.dp))
@@ -150,6 +155,7 @@ fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
                             app.api.token = login.accessToken
                             app.api.workspaceId = workspace
                             app.api.deviceId = deviceId
+                            app.api.accountId = login.userId ?: login.username ?: username
                             app.authStore.setAuth(
                                 token = login.accessToken,
                                 workspaceId = workspace,
@@ -157,6 +163,7 @@ fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
                                 displayName = login.displayName,
                                 sessionId = login.sessionId,
                                 deviceId = deviceId,
+                                userId = login.userId,
                             )
                             // 记忆前已询问（勾选）：同意才保存，取消勾选则清除
                             if (rememberMe) {
@@ -189,6 +196,9 @@ fun LoginScreen(onLoggedIn: () -> Unit, onRegister: () -> Unit) {
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("没有账号？注册新账号")
+        }
+        androidx.compose.material3.TextButton(onClick = onChangeServer, modifier = Modifier.fillMaxWidth()) {
+            Text("切换服务器")
         }
     }
 }

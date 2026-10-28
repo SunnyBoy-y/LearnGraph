@@ -5,7 +5,7 @@ import { ManagedSessionTasks } from "./managed-session-tasks";
 
 const api=vi.hoisted(() => ({ get:vi.fn(), post:vi.fn(), ack:vi.fn() }));
 vi.mock("@/api/client",()=>({apiClient:api}));
-vi.mock("@/api/auth-store",()=>({authStore:{getWorkspaceId:()=>"ws"}}));
+vi.mock("@/api/auth-store",()=>({authStore:{getWorkspaceId:()=>"ws",getSession:()=>null}}));
 vi.mock("@/api/voice",()=>({acknowledgeVoiceScene:api.ack}));
 
 it("reopens durable task output and acknowledges only the actual rendered scene",async()=>{

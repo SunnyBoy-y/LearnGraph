@@ -325,7 +325,8 @@ class VoiceAgentCoordinator:
         request_text = str(objective or prompt or "").strip()
         if not request_text:
             raise AppError(422, "voice_agent_prompt_required", "Delegation requires a non-empty objective")
-        profile = resolve_agent_execution_profile(role_key, tools=list(tools) if tools is not None else None)
+        profile = resolve_agent_execution_profile(role_key, tools=list(tools) if tools is not None else None,
+            inherit_permissions=True)
         requested_thinking = str(thinking_mode or profile.default_thinking_mode).strip().casefold()
         normalized_tools = _tools_value(profile)
         capability_tools = list(profile.tools)

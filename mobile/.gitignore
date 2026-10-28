@@ -22,9 +22,11 @@ android/capacitor-cordova-android-plugins/build/
 
 # 原生版（mobile/native/）构建产物
 native/.gradle/
+native/.kotlin/
 native/build/
 native/app/build/
 native/local.properties
+native/app/src/main/assets/renderer/
 
 # IDE
 .idea/

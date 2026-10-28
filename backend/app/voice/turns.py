@@ -100,6 +100,7 @@ def accept_turn(
     request_id: str | None = None,
     payload: dict[str, Any] | None = None,
     phase: str = PHASE_AUTHORITATIVE,
+    origin: str = "user",
 ) -> dict[str, Any]:
     """Open (or return) the durable turn for one user utterance.
 
@@ -107,6 +108,11 @@ def accept_turn(
     a genuine accept from a replayed one and skip duplicate side effects.
     """
     text = str(user_text or "").strip()
+    if origin not in {"user", "delivery"}:
+        raise ValueError("unknown voice turn origin")
+    delivery = origin == "delivery"
+    if delivery and text:
+        raise ValueError("assistant delivery cannot contain a user utterance")
     session = load_session(voice_session_id)
     if session is None:
         raise VoiceSessionMissing(voice_session_id)
@@ -129,6 +135,7 @@ def accept_turn(
                     "turn_id": existing.id,
                     "replayed": True,
                     **(payload or {}),
+            "origin": origin,
                 },
                 turn_id=existing.id,
                 request_id=f"turn.accepted:{existing.id}",
@@ -136,7 +143,7 @@ def accept_turn(
             )
             return {**turn_to_dict(existing), "created": False}
 
-        if not text:
+        if not text and not delivery:
             raise ValueError("a voice turn requires non-empty user_text")
         turn = VoiceTurnRecord(
             id=turn_id or f"turn_{uuid4().hex[:24]}",
@@ -160,14 +167,15 @@ def accept_turn(
     # ``turn.accepted`` (what the system committed to answering) are separate
     # events on purpose: the client promotes a caption to authoritative on
     # ``turn.accepted`` and can still show a corrected ``user.final``.
-    emit_event(
-        voice_session_id,
-        "user.final",
-        payload={"text": text, "client_message_id": client_message_id},
-        turn_id=snapshot["turn_id"],
-        request_id=request_id or f"user.final:{snapshot['turn_id']}",
-        phase=phase,
-    )
+    if not delivery:
+        emit_event(
+            voice_session_id,
+            "user.final",
+            payload={"text": text, "client_message_id": client_message_id},
+            turn_id=snapshot["turn_id"],
+            request_id=request_id or f"user.final:{snapshot['turn_id']}",
+            phase=phase,
+        )
     sink = VoiceEventSink(voice_session_id)
     sink.emit(
         "turn.accepted",
@@ -175,6 +183,7 @@ def accept_turn(
             "client_message_id": client_message_id,
             "turn_id": snapshot["turn_id"],
             **(payload or {}),
+            "origin": origin,
         },
         turn_id=snapshot["turn_id"],
         request_id=f"turn.accepted:{snapshot['turn_id']}",
@@ -414,7 +423,7 @@ def list_turns(
     limit: int = 50,
     include_open: bool = False,
 ) -> list[dict[str, Any]]:
-    """Authoritative transcript, oldest first.
+    """Recent authoritative transcript window, in chronological order.
 
     Includes every settled status, not just ``finalized``: a failed or
     interrupted turn still holds the user's question, and hiding it here is what
@@ -428,17 +437,26 @@ def list_turns(
     pipeline's own finalize both settle it), and long-term memory still only
     ever takes finalized turns, so exposing it cannot leak an unfinished answer.
     """
+    bounded_limit = max(1, int(limit))
     with SessionLocal() as db:
+        # The context adapter asks for a bounded *recent* window. Applying the
+        # limit before ordering newest-first used to return the oldest N turns,
+        # so reconnects beyond the window silently rebuilt the Tutor context
+        # without the latest conversation. Fetch newest-first, then restore
+        # chronological order for prompt construction and transcript rendering.
         rows = db.scalars(
             select(VoiceTurnRecord)
             .where(
                 VoiceTurnRecord.voice_session_id == voice_session_id,
                 VoiceTurnRecord.status.in_(TERMINAL_TURN_STATUSES),
             )
-            .order_by(VoiceTurnRecord.finalized_at.asc(), VoiceTurnRecord.created_at.asc())
-            .limit(int(limit))
+            .order_by(
+                VoiceTurnRecord.finalized_at.desc(),
+                VoiceTurnRecord.created_at.desc(),
+            )
+            .limit(bounded_limit)
         ).all()
-        settled = [turn_to_dict(row) for row in rows]
+        settled = [turn_to_dict(row) for row in reversed(rows)]
         if not include_open:
             return settled
         open_rows = db.scalars(
@@ -576,9 +594,11 @@ def persist_turn_messages(
     """
 
     user_text = str(turn.get("user_text") or "").strip()
-    if not user_text:
-        return False
+    # Only explicit server-side delivery admission accepts an empty user_text.
+    delivery = not user_text
     assistant_text = str(turn.get("assistant_text") or "")
+    if delivery and not assistant_text.strip():
+        return True  # cancelled before playback; no empty message to persist
     # A failed turn has no answer to write. Persisting an empty assistant message
     # would render an empty bubble; the failure is carried by the turn status and
     # the ``turn.finalized`` payload instead, so the client can offer a retry.
@@ -612,6 +632,7 @@ def persist_turn_messages(
                     commit=True,
                     memory=memory,
                     include_assistant=include_assistant,
+                    include_user=not delivery,
                     assistant_status="completed" if include_assistant else "failed",
                 )
             return True

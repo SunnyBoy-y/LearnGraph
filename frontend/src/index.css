@@ -2,6 +2,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+@import "./styles/themes.css";
 
 @custom-variant dark (&:is(.dark *));
 @source "../node_modules/streamdown/dist/*.js";
@@ -135,7 +136,7 @@
   --reading-heading-color: #202020;
   --reading-strong-weight: 650;
   --reading-heading-weight: 700;
-  --reading-max-width: 800px;
+  --reading-max-width: 760px;
   /* 聊天统一内容列宽：正文与输入框共用，禁止各自独立 max-width */
   --chat-content-width: 800px;
   /* 底部 Composer 动态高度（ResizeObserver 写入）；默认值避免首帧跳动 */
@@ -2465,17 +2466,17 @@ body.is-resizing .workspace-resizer {
 }
 .is-assistant [data-message-content] .message-answer-segment h1 {
   margin: 36px 0 16px;
-  font-size: 22px;
+  font-size: 26px;
   line-height: 1.4;
 }
 .is-assistant [data-message-content] .message-answer-segment h2 {
   margin: 32px 0 12px;
-  font-size: 18px;
+  font-size: 21px;
   line-height: 1.45;
 }
 .is-assistant [data-message-content] .message-answer-segment h3 {
   margin: 28px 0 10px;
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 650;
   line-height: 1.5;
 }
@@ -3563,6 +3564,12 @@ body.is-resizing .workspace-resizer {
 }
 
 .magic-card { display: grid; gap: 10px; overflow: hidden; }
+.artifact-card-preview-viewport > .magic-card {
+  min-height: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
 .magic-card__heading { display: flex; align-items: flex-start; gap: 8px; }
 .magic-card__heading > div { display: grid; min-width: 0; flex: 1; gap: 2px; }
 .magic-card__heading strong { font-size: 12px; }
@@ -7044,15 +7051,14 @@ html[data-drawer-open] [data-slot="sheet-content"] {
   transform-origin: center;
   will-change: opacity, transform;
 }
+/* This small status indicator keeps communicating active generation even when
+   decorative page motion is reduced. Override the global 0.001ms/one-shot rule
+   only here; preserve the original meteor geometry, timing and stagger. */
 @media (prefers-reduced-motion: reduce) {
-  .message-stream-stats__meteor-trail {
-    animation: none;
-    opacity: .35;
-    transform: rotate(-28deg) translateX(0);
-  }
+  .message-stream-stats__meteor-trail,
   .message-stream-stats__loading-icon {
-    animation: none;
-    opacity: .8;
+    animation-duration: 1.55s !important;
+    animation-iteration-count: infinite !important;
   }
 }
 .message-stream-stats__item {
@@ -7318,21 +7324,34 @@ html[data-drawer-open] [data-slot="sheet-content"] {
    =========================================================================== */
 
 /* Keep the textarea mounted during a hold so pointer capture survives. */
-.chat-composer-anchor.is-dictating .chat-composer [data-slot='input-group'] > * { opacity: 0; }
+.chat-composer-anchor.is-dictating .chat-composer [data-slot='input-group'] {
+  display: block;
+  min-height: 112px;
+  padding: 0 0 64px;
+  border-radius: 24px;
+}
 .chat-composer-anchor.is-dictating .chat-composer__start,
 .chat-composer-anchor.is-dictating .chat-composer__end,
-.chat-composer-anchor.is-dictating .chat-composer__resize { visibility: hidden; }
-.chat-composer-anchor.is-dictating .chat-composer__textarea { touch-action: none; user-select: none; }
+.chat-composer-anchor.is-dictating .chat-composer__resize { position: absolute; visibility: hidden; }
+.chat-composer-anchor.is-dictating .chat-composer__textarea {
+  width: 100%;
+  min-height: 48px !important;
+  padding: 14px 44px 8px !important;
+  touch-action: none;
+  user-select: none;
+}
+.chat-composer-anchor.is-dictating .chat-composer__textarea::placeholder { color: transparent; }
 .chat-voice-bar {
   position: absolute;
-  inset: 0;
+  inset: auto 0 16px;
   z-index: 30;
   display: flex;
   align-items: center;
   gap: 12px;
   width: 100%;
-  min-height: 64px;
-  padding: 8px 10px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0 10px;
   border: 0;
   border-radius: 0;
   background: transparent;

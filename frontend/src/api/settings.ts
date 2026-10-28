@@ -7,22 +7,37 @@ import type {
 } from "@/types/settings";
 
 import { apiClient, type ApiRequestOptions } from "./client";
+import { authStore } from "./auth-store";
+import { notifyNativeThinkingChainDefaultSaved } from "@/lib/native-bridge";
+import { CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY, readChatThinkingChainDefault } from "@/lib/workspace-settings";
 
 export function listSettings(options?: ApiRequestOptions): Promise<WorkspaceSetting[]> {
   return apiClient.get<WorkspaceSetting[]>("/settings", options);
 }
 
-export function updateSetting(
+export async function updateSetting(
   key: string,
   value: unknown,
   options?: ApiRequestOptions,
 ): Promise<WorkspaceSetting> {
   const payload: SettingUpdateRequest = { value };
-  return apiClient.put<WorkspaceSetting, SettingUpdateRequest>(
+  const requestedAs = authStore.getSession();
+  const setting = await apiClient.put<WorkspaceSetting, SettingUpdateRequest>(
     `/settings/${encodeURIComponent(key)}`,
     payload,
     options,
   );
+  const current = authStore.getSession();
+  if (key === CHAT_THINKING_CHAIN_DEFAULT_SETTING_KEY && setting.key === key && requestedAs && current &&
+      requestedAs.accessToken === current.accessToken && requestedAs.workspaceId === current.workspaceId &&
+      options?.auth !== false && options?.workspace !== false) {
+    const headers = new Headers(options?.headers);
+    if ((!headers.has('Authorization') || headers.get('Authorization') === `Bearer ${requestedAs.accessToken}`) &&
+        (!headers.has('X-Workspace-ID') || headers.get('X-Workspace-ID') === requestedAs.workspaceId)) {
+      notifyNativeThinkingChainDefaultSaved(requestedAs, readChatThinkingChainDefault([setting]));
+    }
+  }
+  return setting;
 }
 
 export async function getResearchPolicy(): Promise<ResearchPolicy> {

@@ -43,6 +43,7 @@ from app.providers.ports.search import SearchProviderPort
 from app.providers.remote.search import SearchProviderError, SearchProviderTimeout
 from app.providers.remote.fetch import (
     FetchProviderError,
+    FetchRuntimeUnavailable,
     FetchProviderTimeout,
     UnsafeFetchURL,
     require_public_http_url,
@@ -207,6 +208,7 @@ class AgentToolRuntime:
         memory_enabled: bool = True,
         capability_families: set[str] | None = None,
         activated_capabilities: set[str] | None = None,
+        excluded_tool_names: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         if not agent_mode_enabled:
             return []
@@ -275,6 +277,9 @@ class AgentToolRuntime:
         # Qwen companion with .fetch) makes it available even when "联网" is
         # off, since fetching a single authorized URL is not a blanket
         # web-search action and the URL is always SSRF/allow-list gated.
+        if web_search_enabled:
+            from app.providers.realtime_information import information_tool_definitions
+            definitions.extend(information_tool_definitions())
         if web_search_enabled and self._search_available:
             definitions.extend(self._web_tool_definitions())
         if web_search_enabled and self._image_search_available:
@@ -296,7 +301,8 @@ class AgentToolRuntime:
             definitions.extend(self._memory_tool_definitions())
         from app.services.runtime_tool_catalog import compact_definitions
 
-        definitions = list({d["function"]["name"]: d for d in definitions}.values())
+        definitions = list({d["function"]["name"]: d for d in definitions
+                            if d["function"]["name"] not in (excluded_tool_names or set())}.values())
         definitions, catalog = compact_definitions(
             definitions, management_names={d["function"]["name"] for d in management},
             active_ids=effective_activated or set(), active_families=effective_families or set(),
@@ -3164,6 +3170,7 @@ class AgentToolRuntime:
         source_message_id: str | None = None,
         model_supports_image_input: bool = False,
         disclosed_tool_names: set[str] | None = None,
+        information_context: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         self._result_session_id = chat_session_id
         # P1: never carry a write transaction across the tool-call boundary.
@@ -3269,7 +3276,13 @@ class AgentToolRuntime:
                 "propose_memory_draft",
             }:
                 return self._execute_memory_tool(name, arguments, chat_session_id=chat_session_id)
+            if name in {"get_weather", "get_news"}:
+                from app.providers.realtime_information import execute_information_tool
+                result = execute_information_tool(name, arguments, information_context)
+                return self._success(result, {"provider": result["provider"]}, result["sources"])
             if name == "get_current_time":
+                if not arguments.get("timezone") and information_context and information_context.get("timezone"):
+                    arguments = {**arguments, "timezone": information_context["timezone"]}
                 result = self._get_current_time(arguments)
                 return self._success(
                     result,
@@ -7627,6 +7640,8 @@ class AgentToolRuntime:
                     "fetch_url_blocked",
                     "The fetched page is outside the authorized public domains",
                 ) from exc
+            except FetchRuntimeUnavailable as exc:
+                raise AppError(503, "fetch_runtime_unavailable", "网页抓取运行时不可用，请检查 sandboxd 凭据和共享挂载。") from exc
             except FetchProviderTimeout:
                 document = None
             except FetchProviderError:

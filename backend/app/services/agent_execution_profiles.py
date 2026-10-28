@@ -329,13 +329,16 @@ def resolve_agent_execution_profile(
     role_key: str | None,
     *,
     tools: list[str] | tuple[str, ...] | None,
+    inherit_permissions: bool = False,
 ) -> AgentExecutionProfile:
     """Resolve the durable execution policy for one sub-agent task.
 
     ``tools=None`` selects the role default, ``tools=[]`` selects no tools, and
     any non-empty list is a strict allow-list.  ReasonAgent always resolves to
     no tools; accepting a non-empty list there would silently turn a pure
-    reasoning request into a tool-enabled task.
+    reasoning request into a tool-enabled task. Managed delegations pass
+    ``inherit_permissions=True``: roles describe task preferences, while the
+    ordinary authorized runtime decides which tools are available.
     """
     role = normalize_agent_role(role_key)
     if tools is None:
@@ -349,7 +352,7 @@ def resolve_agent_execution_profile(
         selected = _normalize_tool_names(tools)
 
     allowed = _ROLE_ALLOWED_TOOLS[role]
-    if allowed is not None:
+    if allowed is not None and not inherit_permissions:
         invalid = [name for name in selected if name not in allowed]
         if invalid:
             raise AgentProfileError(

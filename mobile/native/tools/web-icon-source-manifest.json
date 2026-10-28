@@ -1,0 +1,217 @@
+{
+  "version": "1.24.0",
+  "icons": {
+    "Menu": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/menu.mjs",
+      "sha256": "22058a0be242807ef841fe55ec829f08b5b3f9c9e06d5e152b1a1a49a3605766"
+    },
+    "Network": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/network.mjs",
+      "sha256": "5872c18757f0d2b59573489a6210e863805011f1b69b0f8f930351d40e9bf27b"
+    },
+    "Sliders": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/sliders-horizontal.mjs",
+      "sha256": "cc5106678b38ea8452e269d780d29f7ac70d5e6b8d86f0842ef115499256ae2f"
+    },
+    "Microphone": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/mic.mjs",
+      "sha256": "35de70450ad73cf1df4f1ba40216d4b462861c0e0e6a436257286e6128b25c56"
+    },
+    "ArrowUp": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/arrow-up.mjs",
+      "sha256": "e3232d6606c12574a686b78b89799e24f322a3c07fbcc3c4ffb3cd06772a297d"
+    },
+    "Expand": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/maximize-2.mjs",
+      "sha256": "7e113af4b466c42290e781ccd23dc5017a93a316347fe1e6d75cd99e63d0f30b"
+    },
+    "Collapse": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/minimize-2.mjs",
+      "sha256": "6a85773684563e49c1b43abf7aad8ac7095a658e9e9d49853c4b080dabbea193"
+    },
+    "Target": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/target.mjs",
+      "sha256": "a63516af0ce47e0d1d75810558ff47c269e6b64158d9f7ec3c8e247f5074e506"
+    },
+    "Globe": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/globe.mjs",
+      "sha256": "8db2f8aa76c061fbae1c5930012e3d638fbae8fcafdf139ef960690bda5e07df"
+    },
+    "Chevron": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/chevron-down.mjs",
+      "sha256": "58b0dfaafdcebe29c043ac8d11968ceeb21da88ab5d6aca03277fc17ef648412"
+    },
+    "Edit": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/pencil.mjs",
+      "sha256": "518fbc184127830133957f988544f3c24e64137175434072e372b60477809a5c"
+    },
+    "Copy": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/copy.mjs",
+      "sha256": "b1adfa9a86981da669afdb3e18ea14338a6c8e70482598ceade39fa11903f287"
+    },
+    "More": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/ellipsis.mjs",
+      "sha256": "9e0584b7d4ae26d937449ed3c12dc1eb9fec627d99c3da9aff1872085e062a7d"
+    },
+    "Plus": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/plus.mjs",
+      "sha256": "92c4286e30b400254394bcedb913d61ff03ab79c1f8add10e3721d3cd998a058"
+    },
+    "Close": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/x.mjs",
+      "sha256": "a99c30d2c806d31da714fbdccc789ccd44989e8ccd8964db87899ee0c433077e"
+    },
+    "Search": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/search.mjs",
+      "sha256": "d5fcbc5293568a805c259b717b63d34f65950fd8842bbb3c8e2352e116c0f98c"
+    },
+    "Folder": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/folder.mjs",
+      "sha256": "277d91070c7004cb96effd5c18c3b8687245e473c3345df76c28179d0377dd90"
+    },
+    "FolderPlus": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/folder-plus.mjs",
+      "sha256": "fdc9c53b83562a3f933affa7152f8526b26a22795abcf18ac74284455c675981"
+    },
+    "Trash": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/trash-2.mjs",
+      "sha256": "e4200b965c88a77100d615cc07aa30092b01f7149059bca3b17ac3dcc7bf9c21"
+    },
+    "Download": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/download.mjs",
+      "sha256": "6393cdc4edb87d85ae1bdc3cb5e6eaa889947292d231090442702f09a16ee877"
+    },
+    "Settings": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/settings.mjs",
+      "sha256": "3c9ed9aef32e724362f4af8b35cfcfd638114062c32e1c608f63d6dd2047029e"
+    },
+    "ListChecks": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/list-checks.mjs",
+      "sha256": "10be9e7a0954787b1ad3cf0f47c04fb0865f8794d268ad90a61d71cab459aca8"
+    },
+    "ChevronLeft": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/chevron-left.mjs",
+      "sha256": "df6140a362dab67e025a098523a1d5e9dbb8a17a68778c386f23ea8285103add"
+    },
+    "ChevronRight": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/chevron-right.mjs",
+      "sha256": "0ffa1c6fe9ad05d32ab66fcd746dd5ab4f6f4319a9d7e320b92e03e42b1045b7"
+    },
+    "ArrowDown": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/arrow-down.mjs",
+      "sha256": "85df4c22a2ff87f3831cb9ed71020e059477e80a707371727a829d2b2c4551cf"
+    },
+    "LoaderCircle": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/loader-circle.mjs",
+      "sha256": "92b4f6c7004b04f493ec65ddc04966b8e399fe0784410e602aabbef6fc18eb99"
+    },
+    "RefreshCcw": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/refresh-ccw.mjs",
+      "sha256": "3bb594fff8fa0a544a61d2f0d1fbadca2d549ab97465dd4aab4ac0d5b02d967c"
+    },
+    "MessageSquareText": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/message-square-text.mjs",
+      "sha256": "2df088f03504e02ecf6d4df59aae64b9ba28a9a8cadc5baffefcfab4072b31f5"
+    },
+    "Files": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/files.mjs",
+      "sha256": "f147ffe47e81c50104d702d1674b511d887dd32772cc2cb608d1e5a93545310e"
+    },
+    "Package": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/package.mjs",
+      "sha256": "7de01ed8f16163109f4825af0b6e802f5da1e5d387f72b1ce771387619746865"
+    },
+    "Brain": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/brain.mjs",
+      "sha256": "dacd2a6855b302e1eb5c1bbeec4775c5c861a2e3a5bbee1c8cfa2280fbb60bc1"
+    },
+    "GraduationCap": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/graduation-cap.mjs",
+      "sha256": "7d5334026b7ea5c4ddf5becd6b4dbd7793083c5c532fd6607362365c4e6d3aff"
+    },
+    "CalendarDays": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/calendar-days.mjs",
+      "sha256": "b03fccab43f2569b82143bd15db958c0b2c73be10bd521a5cf9289bbb4445633"
+    },
+    "Zap": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/zap.mjs",
+      "sha256": "4e643dd2d4e9373c8a447cc0a94de729e42dce7306bc73f1126b8c81d307308b"
+    },
+    "Check": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/check.mjs",
+      "sha256": "ba636adabb8e8e159400bb6d97323760ab0cd294a52d723f218192dcdb625449"
+    },
+    "CheckCheck": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/check-check.mjs",
+      "sha256": "6bd830c8b60bd236e7f2b6ceee0d93c89be1e9009f4f2560231d3ae8a78a8a9e"
+    },
+    "CornerDownRight": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/corner-down-right.mjs",
+      "sha256": "078d1681776ee58a92573f91a810344596edcd5043a465db4e5097d2e9afb28c"
+    },
+    "Clock": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/clock.mjs",
+      "sha256": "aa56e44ba5e775180e07a8d4790b1cc22fe9648b2507c2d70a5f42f18b346746"
+    },
+    "ExternalLink": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/external-link.mjs",
+      "sha256": "5f82189fa104b773e288b1d11c91cd8b6653effd94ccf4723b71d41f942281b6"
+    },
+    "Paperclip": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/paperclip.mjs",
+      "sha256": "7d227ea832f76d330a0b8840930c018edc2b678866c3cf0263b8b1e2c16c184a"
+    },
+    "Archive": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/archive.mjs",
+      "sha256": "40d3ae50fdb2d5c240f2260df27d1f82db52fe4143058b9d0c89b2173ae3aa7b"
+    },
+    "LogOut": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/log-out.mjs",
+      "sha256": "394d3223f72ef1e128f20334a6109ad30f0c03fd1771284f595d2a5f290c9775"
+    },
+    "Server": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/server.mjs",
+      "sha256": "a3a0157c4a81f6f86296933fb334866fd324b0dd05c8c5d55c20d5f2ba7eb3f4"
+    },
+    "Pin": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/pin.mjs",
+      "sha256": "ce85b5f804a312c39389189995c434faa0ac84173b16229081836d7993b38a09"
+    },
+    "Share2": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/share-2.mjs",
+      "sha256": "79c8af6493af01308ba6729790dde83d8495bfc8205578f3093632b666394691"
+    },
+    "FolderOpen": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/folder-open.mjs",
+      "sha256": "b4f3558a085da5dcc3dca2e83e57b1798ad64dd661e83bad0a691151b632dcfd"
+    },
+    "GitBranch": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/git-branch.mjs",
+      "sha256": "716fdc10bb4f91b44823b5e9d77f999bb8b3936f1a8f68d27993001523a3bda8"
+    },
+    "Link": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/link-2.mjs",
+      "sha256": "a4e63fec3ad858ac7934fe5131b8caf0befe8cb2e0e3207165f14603850b4649"
+    },
+    "FileText": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/file-text.mjs",
+      "sha256": "a3fd5dc198856cdb106f8650e3beacbac3a6e9e1b339f1f215117a8cd34e8d0d"
+    },
+    "MessageCircle": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/message-circle.mjs",
+      "sha256": "4efb6ba05ad8fee673d63b1fa51adef13765e433235c27b48ce8fadbdc64040b"
+    },
+    "ArrowUpRight": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/arrow-up-right.mjs",
+      "sha256": "d86838f1b6f1fa2bfb3136f62647b7ba446b3fc2ab6c0c0c34f025aa59c2339e"
+    },
+    "Camera": {
+      "source": "frontend/node_modules/lucide-react/dist/esm/icons/camera.mjs",
+      "sha256": "a70d168c3aa63f82476ea44093ca3d7bb0540ab306e03486f47bd3528eea9095"
+    },
+    "Wave": {
+      "source": "frontend/src/features/voice/voice-orb.tsx:VOICE_WAVE_BARS",
+      "sha256": "682f37cff6c6412f40e47c669ac93f5a5d7b9ae066662b02140e1478a0a2c763"
+    }
+  }
+}

@@ -47,9 +47,16 @@ export function SidebarVersion({ isSystemAdmin }: { isSystemAdmin: boolean }) {
       </PopoverTrigger>
       <PopoverContent align="start" sideOffset={10} className="sidebar-version-panel" aria-label="版本与更新">
         <div className="sidebar-version-panel__header"><span>当前版本</span>
-          {data?.enabled ? <button type="button" aria-label="检查更新" title="检查更新" disabled={busy || check.isPending} onClick={() => check.mutate()}>
-            <RefreshCw className={check.isPending ? 'animate-spin' : undefined} size={15} />
-          </button> : null}
+          <div className="sidebar-version-panel__actions">
+            {data?.enabled ? <button type="button" aria-label="检查更新" title="检查更新" disabled={busy || check.isPending} onClick={() => check.mutate()}>
+              <RefreshCw className={check.isPending ? 'animate-spin' : undefined} size={15} />
+            </button> : null}
+            <a href="https://github.com/SunnyBoy-y/LearnGraph" target="_blank" rel="noopener noreferrer" aria-label="访问 GitHub" title="访问 GitHub">
+              <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-2.91-.88-2.91-3.09 0-.66.23-1.2.61-1.62-.06-.15-.27-.77.06-1.6 0 0 .61-.19 2.01.75a5.6 5.6 0 0 1 1.5-.2c.51 0 1.02.07 1.5.2 1.4-.95 2.01-.75 2.01-.75.33.83.12 1.45.06 1.6.38.42.61.96.61 1.62 0 2.22-1.14 2.89-2.92 3.09.29.25.55.74.55 1.5 0 1.07-.01 1.94-.01 2.21 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+              </svg>
+            </a>
+          </div>
         </div>
         <div className="sidebar-version-panel__identity">
           <strong>{version}</strong>

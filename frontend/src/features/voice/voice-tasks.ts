@@ -68,6 +68,10 @@ export interface VoiceTaskArtifact {
 
 export interface VoiceTask {
   taskId: string;
+  triggerTurnId?: string;
+  parentMessageId?: string;
+  triggerUserText?: string;
+  triggerCreatedAt?: string;
   agentSessionId?: string;
   linkId?: string;
   resultId?: string;
@@ -76,6 +80,7 @@ export interface VoiceTask {
   focusAnchor?: string;
   focusId?: string;
   focusTurnId?: string;
+  presentationMode?: "display" | "explain";
   findings?: string[];
   visuals?: UISnapshot[];
   speechId?: string;
@@ -822,12 +827,22 @@ function normalizeTask(
 
   return {
     taskId,
-    agentSessionId: firstString(recordOrEmpty(raw.spec_json).agent_session_id, raw.agent_session_id, payload.agent_session_id) ?? existing?.agentSessionId,
+    triggerTurnId: firstString(raw.trigger_turn_id, raw.triggerTurnId, payload.trigger_turn_id,
+      recordOrEmpty(recordOrEmpty(raw.spec_json).association).turn_id,
+      recordOrEmpty(recordOrEmpty(raw.spec_json).input_snapshot).turn_id,
+      ["task.accepted", "created"].includes(eventType) ? payload.turn_id ?? raw.turn_id : undefined) ?? existing?.triggerTurnId,
+    parentMessageId: firstString(raw.parent_message_id, raw.parentMessageId,
+      recordOrEmpty(recordOrEmpty(raw.spec_json).association).parent_message_id,
+      recordOrEmpty(recordOrEmpty(raw.spec_json).input_snapshot).parent_message_id) ?? existing?.parentMessageId,
+    triggerUserText: firstString(raw.triggerUserText) ?? existing?.triggerUserText,
+    triggerCreatedAt: firstString(raw.triggerCreatedAt, raw.created_at, payload.created_at) ?? existing?.triggerCreatedAt,
+    agentSessionId: firstString(raw.agentSessionId, recordOrEmpty(raw.spec_json).agent_session_id, raw.agent_session_id, payload.agent_session_id) ?? existing?.agentSessionId,
     resultVersion: firstNumber(raw.result_version, raw.resultVersion, payload.result_version) ?? previousResult?.resultVersion,
     autoDelivery: booleanValue(raw.auto_delivery ?? raw.autoDelivery ?? payload.auto_delivery) ?? existing?.autoDelivery ?? true,
-    focusAnchor: firstString(raw.focusAnchor, payload.focusAnchor, eventType === "scene.focus" ? payload.anchor_id : undefined) ?? previousResult?.focusAnchor,
+    focusAnchor: firstString(raw.focusAnchor, payload.focusAnchor, eventType === "scene.focus" ? raw.anchor_id ?? payload.anchor_id : undefined) ?? previousResult?.focusAnchor,
     focusId: eventType === "scene.focus" ? firstString(raw.event_id, raw.id) : previousResult?.focusId,
     focusTurnId: eventType === "scene.focus" ? firstString(raw.turn_id, payload.turn_id) : previousResult?.focusTurnId,
+    presentationMode: eventType === "scene.focus" ? ((raw.presentation_mode ?? payload.presentation_mode) === "display" ? "display" : "explain") : previousResult?.presentationMode,
     findings: findings.length ? findings : previousResult?.findings ?? [],
     visuals: [...visuals.values()].slice(0, 8),
     linkId:
@@ -1052,7 +1067,8 @@ export function mergeVoiceScenePresentation(state: VoiceTaskState, value: unknow
     const matches = presentation.task_id === task.taskId && presentation.requirement_version === task.requirementVersion
       && (!presentation.result_version || presentation.result_version === task.resultVersion);
     return { ...task, focusAnchor: matches ? firstString(presentation.anchor_id) : undefined,
-      focusId: matches ? firstString(presentation.id) : undefined, focusTurnId: matches ? firstString(presentation.turn_id) : undefined };
+      focusId: matches ? firstString(presentation.id) : undefined, focusTurnId: matches ? firstString(presentation.turn_id) : undefined,
+      presentationMode: matches ? (presentation.presentation_mode === "display" ? "display" : "explain") : undefined };
   }) };
 }
 

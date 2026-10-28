@@ -822,28 +822,20 @@ class SandboxToolkitMixin:
         return result
 
     def _subagent_budget_payload(self, payload: Any) -> dict[str, Any]:
-        return {
-            "max_rounds": min(payload.max_rounds, self.settings.sandbox_subagent_max_rounds),
-            "max_seconds": payload.max_seconds or self.settings.sandbox_subagent_max_seconds,
-            "max_tool_calls": payload.max_tool_calls,
-            "max_tokens": payload.max_tokens or self.settings.sandbox_subagent_default_max_tokens,
-            "max_cost_amounts": getattr(payload, "max_cost_amounts", {}),
-            "max_cost_usd": (
-                payload.max_cost_usd
-                if payload.max_cost_usd is not None
-                else self.settings.sandbox_subagent_default_max_cost_usd
-            ),
-        }
+        # Legacy clients can still send budget fields; all delegations are unbounded.
+        return {}
 
     def toolkit_subagent(self, payload: SandboxAgentSubagentRequest) -> dict[str, Any]:
         if not self.settings.sandbox_subagent_enabled:
             raise AppError(503, "sandbox_subagent_disabled", "Sandbox sub-agents are disabled by configuration")
-        self._require_chat_session(payload.chat_session_id)
+        parent = self._require_chat_session(payload.chat_session_id)
+        if parent.session_kind == "agent" or (parent.context_capsule or {}).get("managed_agent"):
+            raise AppError(403, "nested_subagent_forbidden", "Delegated agents cannot create further agents")
         from app.domain.models import SandboxAgentTask
         from app.services.sandbox_scheduler import SandboxSchedulerService, append_agent_event
 
         try:
-            profile = resolve_agent_execution_profile(payload.role_key, tools=payload.tools)
+            profile = resolve_agent_execution_profile(payload.role_key, tools=payload.tools, inherit_permissions=True)
         except AgentProfileError as exc:
             raise AppError(422, "invalid_agent_profile", str(exc)) from exc
         effective_network = clamp_network_capability(
@@ -1112,7 +1104,7 @@ class SandboxToolkitMixin:
         if spec.get("voice_pause_requested"):
             spec = {key: value for key, value in spec.items() if key not in {"voice_pause_requested", "voice_pause_requested_at"}}
             task.spec_json = spec
-        budget = spec.get("budget") or {}
+        budget = {}
         prompt = payload.prompt_override or spec.get("objective") or ""
         attempt_no = len(task.attempts_json or []) + 2
         from app.domain.models import SandboxJob

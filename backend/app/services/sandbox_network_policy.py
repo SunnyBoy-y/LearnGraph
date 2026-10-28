@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import threading
+from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -30,6 +31,19 @@ from typing import Any, Callable, Iterable
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Windows readers can deny an atomic replace while another fetch is opening
+# the same policy. Serialize the short in-process read/derive/replace section;
+# network and container work remain concurrent. RLock permits refresh -> store.
+_fetch_policy_io_lock = threading.RLock()
+
+
+def _synchronized_fetch_policy(operation):
+    @wraps(operation)
+    def synchronized(*args, **kwargs):
+        with _fetch_policy_io_lock:
+            return operation(*args, **kwargs)
+    return synchronized
 
 HOSTNAME_MAX_LENGTH = 253
 LABEL_MAX_LENGTH = 63
@@ -664,6 +678,7 @@ def derive_egress_policy_for_fetch(
     return validate_egress_policy(data, now=now)
 
 
+@_synchronized_fetch_policy
 def store_workspace_fetch_policy_file(policy_dir: str | Path, policy: EgressPolicy) -> Path:
     """Atomically persist the derived fetch policy to its own workspace file."""
     directory = Path(policy_dir)
@@ -685,6 +700,7 @@ def store_workspace_fetch_policy_file(policy_dir: str | Path, policy: EgressPoli
     return policy_path
 
 
+@_synchronized_fetch_policy
 def refresh_workspace_fetch_policy_file(
     policy_dir: str | Path,
     workspace_id: str,
@@ -864,6 +880,7 @@ def derive_egress_policy_for_agent(
     return validate_egress_policy(data, now=now)
 
 
+@_synchronized_fetch_policy
 def load_workspace_fetch_policy_file(
     policy_dir: str | Path,
     workspace_id: str,

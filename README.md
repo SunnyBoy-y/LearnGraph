@@ -144,7 +144,11 @@ docker compose up -d --build
 | 子应用 Preview | `http://127.0.0.1:18001` | 独立 origin，浏览器 iframe 按 capability token 加载 |
 | Health | `http://127.0.0.1:18000/api/v1/health` | |
 
-Compose 栈**开箱即含沙箱执行能力**：内置 `sandboxd` 控制面（唯一挂载 Docker socket 的组件）+ 审批制出网（`egress-proxy`），沙箱默认断网、出网逐请求重授权并审计，无需额外部署。
+Compose 默认只启动 **3 个常驻容器**：`app`（主站与只读预览双进程，分别映射 18000/18001）、`sandboxd`、`egress-proxy`。主站与预览仍为不同 origin，双向子应用协议不变；任一进程退出会停止其同伴并使容器失败，由 Docker 重启。
+
+Compose 栈**开箱即含沙箱执行能力**：内置 `sandboxd` 控制面 + 审批制出网（`egress-proxy`），沙箱默认断网、出网逐请求重授权并审计，无需额外部署。主站与代理不挂载 Docker socket。
+
+数据库迁移代理不再常驻，也不阻塞主站启动。系统管理员在设置页完成预检、密码确认并点击迁移后，后台通过 `sandboxd` 的独立管理通道自动创建或启动固定代理；PostgreSQL 准备就绪后立即停止代理。代理采用 `restart: "no"`，后台每 15 秒续租，应用异常中断且租约过期时由 `sandboxd` 自动回收。已创建的 PostgreSQL 独立运行，不受停止代理影响；使用外部 PostgreSQL 无需代理。主站不接触 Docker socket，也不能指定任意镜像、命令或宿主挂载。旧部署与手动排障步骤见 [容器拓扑迁移](docs/container-topology.md)。
 
 <details>
 <summary><strong>Docker 运维细节（自定义端口 / 升级备份 / 公网访问 / 加固…）</strong></summary>
@@ -153,7 +157,7 @@ Compose 栈**开箱即含沙箱执行能力**：内置 `sandboxd` 控制面（�
 
 - 首次启动自动生成仓库根目录 `.env`（模板来自 `.env.example`，全部为注释掉的默认值；文件已存在时**绝不覆盖**）。
 - 未设置 `LEARNGRAPH_MASTER_KEY` 时，入口脚本生成一把主密钥保存在数据卷，页面保存的 Provider Secret 重启后仍可解密。
-- 所有持久化数据（SQLite 库、上传文件、主密钥、egress 策略与审计）都在数据卷 `learngraph_learngraph-data`（容器内 `/data`），与镜像/容器完全解耦。**升级镜像、重建容器都不会丢数据**；⚠️ 只有 `docker compose down -v` 会永久删除数据卷。
+- 默认 SQLite 库、上传文件、主密钥、迁移状态、egress 策略与审计在数据卷 `learngraph_learngraph-data`（容器内 `/data`），与镜像/容器解耦。管理员迁移后 PostgreSQL 使用独立数据库卷；需要同时保留该卷和 `/data`。升级镜像不删除这些卷；`docker compose down -v` 或手动删除数据库卷会丢失数据。
 
 **自定义端口与 LAN 暴露**
 
@@ -185,11 +189,13 @@ powershell -ExecutionPolicy Bypass -File scripts/install-docker-env-hook.ps1
 
 ```bash
 ./scripts/docker-update.sh --check                      # 检查当前版本与栈状态（只读）
-./scripts/docker-update.sh ghcr.io/<owner>/learngraph:v1.2.0   # 备份 → 拉新镜像 → 替换 → 健康检查 → 失败自动回滚
-./scripts/docker-update.sh --backup-only                # 只做数据备份（可入定时任务）
+LEARNGRAPH_EXPECTED_PROJECT=learngraph ./scripts/docker-update.sh ghcr.io/<owner>/learngraph:v1.2.0   # 备份 → 拉新镜像 → 替换 → 健康检查 → 失败自动回滚
+LEARNGRAPH_EXPECTED_PROJECT=learngraph ./scripts/docker-update.sh --backup-only                # 只做数据备份（可入定时任务）
 ```
 
-升级脚本保证：升级前对 SQLite 做在线备份（WAL 安全、业务不停）+ 数据卷整体打包 + sandboxd 状态卷备份；新容器通过健康检查才算成功，失败自动回滚旧镜像；备份保留最近 10 份（`BACKUP_KEEP` 可调），输出到 `backups/`（⚠️ 备份含主密钥，等同敏感数据，请妥善保管）。升级前先执行 `--check` 并手动跑一次 `--backup-only` 验证备份可用。
+`LEARNGRAPH_EXPECTED_PROJECT` 必须填写实际 Compose 项目名。写操作会固定该项目，核对容器工作目录和数据卷归属；缺少或不匹配时在业务入口执行前拒绝。`--check` 保持只读且不要求该参数。Docker 验收脚本另需隔离清单与资源所有权标签，不接受未标记的旧测试栈或正式项目。
+
+升级脚本保证：升级前对实际主业务库做一致性备份（SQLite 或 PostgreSQL）+ 数据卷整体打包 + 当前栈 sandboxd 状态卷备份；新容器通过健康检查才算成功，失败自动回滚旧镜像，保持当前数据库及升级后数据。PostgreSQL 目标镜像必须声明兼容能力，禁止切回 SQLite。备份保留最近 10 份（`BACKUP_KEEP` 可调），输出到 `backups/`（⚠️ 备份含恢复密钥，等同敏感数据，请妥善保管）。升级前先执行 `--check` 并手动跑一次 `--backup-only` 验证备份可用。
 
 **加固形态（可选，仅 Linux）**
 
@@ -209,7 +215,7 @@ docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
 默认全部数据落在 Docker 命名卷 `learngraph-data`（Docker 管理，`docker volume ls` 可见；Linux 上物理路径约在 `/var/lib/docker/volumes/learngraph_learngraph-data/_data`），不在项目目录里。备份/升级用一键脚本：
 
 ```bash
-./scripts/docker-update.sh --backup-only   # 打包 SQLite + 数据卷 + sandboxd 状态卷，输出到 backups/
+LEARNGRAPH_EXPECTED_PROJECT=learngraph ./scripts/docker-update.sh --backup-only   # 当前主库（SQLite/PostgreSQL）+ 数据卷 + 当前栈 sandboxd 状态卷
 ```
 
 如需数据落在宿主机指定目录（NFS / 外部备份 / 迁移服务器），在首次 `up` 前设置（仅 Linux 宿主）：
@@ -405,7 +411,7 @@ Sandbox Control Plane
 └─ capability / approval / audit
 ```
 
-SQLite(WAL) 是当前 MVP 的规范业务事实源。SSE 负责传输，Session、Message、MessageVersion、MessagePart、流事件和记忆事件仍会持久化（支持断线恢复、重放与审计）。前端统一访问 LearnGraph 后端，由服务端完成认证、工作区授权、Provider 调用和事实写入。
+新安装默认以 SQLite(WAL) 保存业务事实；仅系统管理员可发起主业务库到 PostgreSQL 的单向迁移，成功后全部主业务读写使用 PostgreSQL，禁止回退 SQLite。SSE 负责传输，Session、Message、MessageVersion、MessagePart、流事件和记忆事件仍会持久化（支持断线恢复、重放与审计）。前端统一访问 LearnGraph 后端，由服务端完成认证、工作区授权、Provider 调用和事实写入。
 
 <details>
 <summary><strong>查看仓库结构</strong></summary>
@@ -428,12 +434,12 @@ LearnGraph/
 │     └─ domain/         模型与 Schema（含记忆事件模型）
 ├─ sandboxd/             沙箱控制面守护进程（唯一接触 Docker Engine 的组件）
 ├─ mobile/
-│  ├─ native/            Android 原生客户端（Kotlin / Jetpack Compose / GeckoView）
+│  ├─ native/            Android 原生客户端（Kotlin / Compose、本地缓存、系统 WebView 兼容）
 │  └─ android/           早期 Capacitor Android 实现
 ├─ docs/                 可公开部署的开发者 HTML 文档（GitHub Pages）
 ├─ scripts/              跨平台启动、检查与运维脚本
 ├─ Dockerfile            应用镜像（前端生产构建 + FastAPI）
-├─ docker-compose.yml    自托管编排（app/preview/egress-proxy/sandboxd）
+├─ docker-compose.yml    自托管编排（app 含 preview / egress-proxy / sandboxd；迁移代理按需）
 └─ .github/assets/       README 公共素材
 ```
 
@@ -507,7 +513,9 @@ LearnGraph/
 后端在 `backend` 执行 `uv run --locked --extra test --extra voice pytest tests -q -m "not integration"`；
 sandboxd 在 `sandboxd` 执行 `uv run --locked --extra test pytest tests -q`。
 GitHub Actions 在 Pull Request、推送到 `main` 或手动触发时执行上述三组测试，并上传 JUnit 报告；
-Android 单元测试在独立任务中通过 `:app:testDebugUnitTest` 执行（需 Java 21 和 Android SDK，本地先在 `mobile` 构建并执行 `npm run cap:sync`）。
+Android 任务同时验证早期 Capacitor 壳与 `mobile/native` 原生客户端；原生版需 Java 21 和 Android SDK 35，
+在 `mobile` 执行 `npm run test:native` 和 `npm run apk:compact`，无需构建或同步网页壳。
+原生迁移范围、缓存行为和安装包说明见 [Android 客户端说明](mobile/native/README.md)。
 后端的 `voice` 依赖用于离线语音管线测试，无需真实云端 Provider 凭据。
 真实 Docker 往返测试也已入库，需配置隔离的 sandboxd 服务后单独执行
 `uv run --locked --extra test --extra voice pytest tests/integration/test_sandboxd_roundtrip.py -q`。
@@ -569,9 +577,9 @@ Dockerfile 都会拒绝版本不匹配的构建。`npm` / Python 包使用的 `0
 镜像发布完成后可在网页手动重试。自动安装默认关闭，失败版本不会反复自动安装；
 手动回退会关闭自动安装，避免下次检查立即升回去。
 
-更新器同步切换 `app`、`preview`、`egress-proxy`，不替换 `sandboxd` 或沙箱 runner，
+更新器按实际拓扑同步切换 `app`（含预览）和 `egress-proxy`；兼容旧部署中独立的 `preview`。不替换 `sandboxd`、按需迁移代理或沙箱 runner，
 也不自动更新 Compose/宿主机脚本；需要改变这些部署协议的版本应采用人工迁移。
-切换前保留旧/新镜像的本地标签及不可变 image ID，在线备份 SQLite 并校验，
+切换前保留旧/新镜像的本地标签及不可变 image ID，备份实际 SQLite/PostgreSQL 主库并校验，
 切换后验证全部容器健康状态与数据库就绪接口。失败时恢复原镜像；更新器若在
 切换中重启，也会依据落盘任务恢复原部署。回滚失败会明确显示「需要人工处理」。
 
@@ -579,9 +587,9 @@ Dockerfile 都会拒绝版本不匹配的构建。`npm` / Python 包使用的 `0
 `io.learngraph.update-compatibility` 标签相同才允许在线切换/回退；不兼容的
 数据库、部署配置、sandboxd 协议变更必须增加此代号，并走人工迁移流程。
 此标记是发布契约，不会自动证明数据库兼容。更新器不自动还原数据库，
-以免丢弃更新后的数据；备份位于 `data/updater/private/<任务ID>.db`。
+以免丢弃更新后的数据；新更新器的数据库备份位于 `data/updater/private/<任务ID>.zip`，旧 SQLite 基线为 `.db`。
 数据库备份、校验与拷贝默认各允许 900 秒，大库可通过 `--backup-timeout` 调整。
-这是数据库备份，不包含附件/主密钥的全量灾备；请另行备份整个数据卷。
+这是宿主私有数据库备份，包含敏感恢复材料；附件仍需备份整个数据卷。用户可在设置中下载加密全站备份，SQLite 与 PostgreSQL 均支持，详见 [全站备份与恢复](backend/SITE_BACKUP.md)。PostgreSQL 更新及版本回退还要求镜像声明 `io.learngraph.primary-database=sqlite-postgresql-v1`，并在更新/回滚后验证主库身份，禁止回退 SQLite。
 
 当前镜像选择持久化为根目录的 `docker-compose.update.json`，普通重启和
 `npm run docker -- ...` 会保持该选择。直接使用 Docker Compose 时必须追加该文件：
@@ -591,7 +599,7 @@ docker compose -f docker-compose.yml -f docker-compose.updater.yml -f docker-com
 ```
 
 首次更新前该文件尚不存在，无需追加。不要使用旧的 `scripts/docker-update.sh`
-与网页更新器同时更新；两者不共享事务锁。任务、备份和镜像暂不自动清理，管理员
+与网页更新器同时更新；新流程使用共享数据库维护互锁，未完成操作需要先恢复或结束。任务、备份和镜像暂不自动清理，管理员
 可按实际磁盘预算清理已不再需要回退的历史；删除保留镜像后对应回退将安全失败。
 手动操作 Compose 同样应避开网页更新任务。
 

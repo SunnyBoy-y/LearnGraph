@@ -14,6 +14,7 @@ F02/F04/F05 的共同根因就在这里：适配器自己数一套序号、账�
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from pipecat.processors.frame_processor import FrameDirection
@@ -79,6 +80,7 @@ class _FakeWS:
         ]
 
     async def recv(self) -> bytes:
+        await asyncio.sleep(0)
         if not self._messages:
             raise RuntimeError("upstream closed")
         return self._messages.pop(0)
@@ -92,6 +94,11 @@ def _stub_upstream(service: VolcengineTTSService) -> None:
         ws = service._ws
         if event == EventType.StartSession and hasattr(ws, "bind"):
             ws.bind(str(session_id))
+        if event == EventType.TaskRequest:
+            ws._messages.insert(-1, Message(type=MsgType.FullServerResponse, flag=MsgTypeFlagBits.WithEvent,
+                event=EventType.TTSSubtitle, session_id=session_id,
+                payload=json.dumps({"text": payload["req_params"]["text"], "words": [{"startTime": 0,
+                    "endTime": ws._audio_bytes / 2 / SAMPLE_RATE}]}).encode()).marshal())
 
     async def _noop(*args: Any, **kwargs: Any) -> None:
         return None

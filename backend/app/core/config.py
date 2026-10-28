@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -82,7 +83,7 @@ DEFAULT_SANDBOX_PREBUILT_IMAGE = (
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", str(Path(os.environ["LEARNGRAPH_DATA_ROOT"]) / "restored.env")) if os.environ.get("LEARNGRAPH_DATA_ROOT") else ".env",
         env_prefix="LEARNGRAPH_",
         case_sensitive=False,
         extra="ignore",
@@ -175,6 +176,13 @@ class Settings(BaseSettings):
 
     env: str = "development"
     database_url: str = "sqlite:///./data/learngraph.db"
+    # Empty preserves the existing SQLite installation layout. Merely setting
+    # these fields never starts a database, backup, copy or activation.
+    database_migration_state_dir: str = ""
+    database_migration_agent_url: str = ""
+    database_migration_agent_token_file: str = ""
+    database_migration_agent_auto_start: bool = False
+    database_migration_cutover_wait_seconds: float = Field(default=0.75, ge=0.05, le=5)
     # SQLite write-lock busy wait (milliseconds). Feeds both the pysqlite
     # ``timeout`` and the per-connection PRAGMA busy_timeout. 2s is a fast-fail
     # budget: normal multi-stream contention resolves in well under a second
@@ -323,7 +331,7 @@ class Settings(BaseSettings):
     # Per-workspace aggregate storage budget enforced on upload. Set to 0 to
     # disable quota enforcement (not recommended on shared deployments).
     workspace_storage_quota_bytes: int = 10 * 1024 * 1024 * 1024
-    max_backup_bytes: int = 1024 * 1024 * 1024
+    max_backup_bytes: int = Field(default=16 * 1024 * 1024 * 1024, gt=0)
     # Document parsing reads the whole file into memory; this per-file cap for
     # the text-index pipeline (independent from max_upload_bytes) keeps typical
     # learning decks and media-heavy PPTX (100-200 MB) indexable.
@@ -369,6 +377,7 @@ class Settings(BaseSettings):
     mastery_message_threshold: int = 8
     mastery_idle_seconds: int = 300
     mastery_embedded_scheduler_enabled: bool = True
+    models_dev_refresh_enabled: bool = True
     mastery_scheduler_interval_seconds: int = 60
     mastery_job_lease_seconds: int = 300
     mastery_job_max_attempts: int = 3
@@ -378,7 +387,8 @@ class Settings(BaseSettings):
     # proposes MemoryDrafts through the per-workspace enhancement settings.
     memory_extraction_scheduler_enabled: bool = True
     memory_extraction_interval_seconds: int = 120
-    memory_extraction_idle_seconds: int = 180
+    memory_extraction_idle_seconds: int = 900
+    memory_extraction_min_user_turns: int = 10
     memory_extraction_sessions_per_sweep: int = 3
     # Event-sourced memory architecture rollout. Architecture flags are deployment
     # controls, never ordinary workspace settings editable by agents.
@@ -575,6 +585,7 @@ class Settings(BaseSettings):
     sandbox_patch_max_bytes: int = 2_000_000
     sandbox_notebook_enabled: bool = True
     sandbox_subagent_enabled: bool = True
+    # Deprecated compatibility settings; delegated tasks have no individual caps.
     sandbox_subagent_max_rounds: int = 6
     sandbox_subagent_max_seconds: int = 300
     # Per-chat cap on concurrently active sub-agents (queued + running).
@@ -583,7 +594,7 @@ class Settings(BaseSettings):
     sandbox_subagent_max_concurrent_chat: int = 10
 
     # ── Sub-agent v2 (durable tasks via the unified scheduler) ───────────
-    sandbox_subagent_queue_deadline_seconds: int = 900
+    sandbox_subagent_queue_deadline_seconds: int = 900  # deprecated; subagents do not expire in the queue
     sandbox_subagent_max_concurrent_user: int = 10
     sandbox_subagent_max_concurrent_workspace: int = 10
     sandbox_subagent_max_concurrent_chat: int = 10
@@ -593,8 +604,7 @@ class Settings(BaseSettings):
     sandbox_subagent_reserved_parent_ratio: float = 0.2
     sandbox_subagent_events_enabled: bool = True
     sandbox_subagent_wait_max_ms: int = 60_000
-    # Budget fallbacks when the pricing catalog has no entry for the model:
-    # max tokens (input+output) per sub-agent run and a USD cost cap.
+    # Deprecated compatibility settings. API calls use shared BillingService policies.
     sandbox_subagent_default_max_tokens: int = 60_000
     sandbox_subagent_default_max_cost_usd: float = 0.15
     # Sandbox workspace UID/GID pairing for cross-identity writer safety.
@@ -827,6 +837,7 @@ class Settings(BaseSettings):
     # lease, so a reconnect on another instance can take over safely.
     voice_runtime_owner_lease_seconds: float = 20.0
     voice_runtime_owner_heartbeat_seconds: float = 5.0
+    voice_wss_enabled: bool = True
     # LLM-stage retry budget. Only a generation that produced *no* text is
     # retried (see ``VoiceTurnJournal.llm_failed``), which keeps the retry
     # idempotent: there is no partial answer to duplicate and the voice pipeline

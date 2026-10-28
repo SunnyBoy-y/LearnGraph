@@ -441,23 +441,12 @@ function HostBridgeHint({ status }: { status?: HostBridgeStatus }) {
   // 直连）；源码模式或无关 provider 不打扰。
   if (!status?.has_local_loopback_providers) return null;
   if (status.host_access_mode === "direct") {
-    const ready = status.host_gateway_reachable === true;
-    const title = ready
-      ? "可信桌面直连已启用：本机模型服务可正常使用"
-      : "可信桌面直连已启用，但宿主机网关不可达";
+    if (status.host_gateway_reachable === true) return null;
     return (
-      <div
-        className={
-          ready
-            ? "mx-5 mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800"
-            : "mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"
-        }
-      >
-        <p className="font-medium">{title}</p>
+      <div className="mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+        <p className="font-medium">可信桌面直连已启用，但宿主机网关不可达</p>
         <p className="mt-1 whitespace-pre-line text-xs leading-relaxed">
-          {ready
-            ? "本机服务（Ollama、LM Studio、本地 HTTP MCP 等）经 host.docker.internal:同端口 直接访问，无需启动 Host Service Bridge。"
-            : status.guidance}
+          {status.guidance}
         </p>
       </div>
     );
@@ -1110,26 +1099,8 @@ function ProvidersPageForm() {
                         </div>
                       </div></div><div className="shrink-0"><div className="flex flex-col items-start gap-1">
                         <StatePill
-                          label={providerStatusLabel(
-                            provider.status,
-                            provider.enabled,
-                          )}
-                          status={
-                            provider.enabled
-                              ? provider.status
-                              : provider.status === "healthy" ||
-                                  provider.status === "healthy_local"
-                                ? "degraded"
-                                : provider.status
-                          }
+                          status={provider.enabled ? "enabled" : "disabled"}
                         />
-                        {!provider.enabled ? (
-                          <p className="text-[10px] text-amber-700 dark:text-amber-300">
-                            {provider.status === "probe_failed"
-                              ? "自动健康探测未通过，接口保持停用"
-                              : "接口当前停用"}
-                          </p>
-                        ) : null}
                         {customBalanceLast ? (
                           <p
                             className={`text-[10px] ${
@@ -3692,7 +3663,7 @@ function normalizeLoadedCapabilities(
   const contextLimit =
     Number.isFinite(rawLimit) && rawLimit >= 8_000
       ? Math.min(rawLimit, contextWindow)
-      : 204_000;
+      : Math.min(204_000, contextWindow);
   return {
     ...capabilities,
     context_window_tokens: contextWindow,
@@ -3777,23 +3748,6 @@ function searchRouteLabel(route: SearchRoute) {
     case "local":
       return "仅外挂";
   }
-}
-
-/** Probe health is independent of workspace enablement. */
-function providerStatusLabel(status: string, enabled: boolean): string {
-  if (!enabled) {
-    if (status === "healthy" || status === "healthy_local") {
-      return "探测通过 · 未启用";
-    }
-    if (status === "configured_disabled") return "已配置 · 未启用";
-    if (status === "unconfigured") return "未配置";
-    if (status === "disabled") return "已停用";
-    return `未启用 · ${status}`;
-  }
-  if (status === "enabled_unverified") return "已启用 · 未探测";
-  if (status === "healthy") return "健康 · 已启用";
-  if (status === "healthy_local") return "本地健康 · 已启用";
-  return status;
 }
 
 function ModelCapabilitiesDialog({
@@ -4377,7 +4331,14 @@ function capabilityContextError(capabilities: ProviderModelCapabilities): string
 function capabilitiesForSave(
   capabilities: ProviderModelCapabilities,
 ): ProviderModelCapabilities {
-  return capabilities;
+  return {
+    ...capabilities,
+    // Bound the legacy limit by the final value, never an unfinished input.
+    context_limit_tokens: Math.min(
+      capabilities.context_limit_tokens,
+      capabilities.context_window_tokens,
+    ),
+  };
 }
 
 function CapabilityFormFields({
@@ -4442,7 +4403,6 @@ function CapabilityFormFields({
                 setCapabilities((current) => ({
                   ...current,
                   context_window_tokens: value,
-                  context_limit_tokens: Math.min(current.context_limit_tokens, value),
                   context_window_source: "user_declared",
                   context_window_confidence: "confirmed",
                 }));

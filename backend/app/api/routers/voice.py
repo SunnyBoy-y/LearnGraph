@@ -4,6 +4,7 @@ from fastapi import APIRouter, Header, Query
 from typing import Literal
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
+from app.providers.realtime_information import ClientEnvironment
 from app.voice.schemas import (
     VoiceEventResponse, VoiceSession, VoiceSessionCreateRequest, VoiceTaskStartRequest,
     VoiceTaskView, VoiceEventReplayResponse,
@@ -11,10 +12,11 @@ from app.voice.schemas import (
     VoiceTaskCancelRequest, VoiceTaskRevisionRequest,
     VoiceTaskApprovalRequest,
     VoiceTaskDeliveryPolicyRequest,
+    VoiceSessionPreferencesRequest,
 )
 from app.voice.scene import SceneReceipt
 from app.voice.service import VoiceSessionService
-from app.voice.runtime import runtime_info
+from app.voice.runtime import runtime_info, websocket_runtime_url
 from app.voice.availability import inspect_voice_capabilities, inspect_voice_provider_status
 
 router = APIRouter(prefix="/voice", tags=["voice"])
@@ -27,6 +29,7 @@ def voice_capabilities(settings: AppSettings, db: DB, context: CurrentWorkspace)
     return {
         "runtime_ready": info.ready,
         "signaling_url": info.signaling_url,
+        "websocket_url": websocket_runtime_url(settings),
         "reason": info.reason,
         "transcription_model": "qwen3-asr-flash-realtime",
         "tts_provider": "huoshan_bidirectional_streaming",
@@ -58,7 +61,22 @@ def create_voice_session(payload: VoiceSessionCreateRequest, db: DB, context: Cu
         session = service.update_context_snapshot(session.id, snapshot.to_dict())
     except Exception:
         pass
+    if payload.client_environment is not None:
+        session = service.update_client_environment(session.id, payload.client_environment)
+    if payload.low_latency_mode is not None:
+        session = service.update_preferences(session.id, low_latency_mode=payload.low_latency_mode)
     return session
+
+@router.patch("/sessions/{voice_session_id}/preferences", response_model=VoiceSession)
+def update_voice_preferences(voice_session_id: str, payload: VoiceSessionPreferencesRequest,
+                             db: DB, context: CurrentWorkspace, settings: AppSettings):
+    return svc(db, context, settings).update_preferences(
+        voice_session_id, low_latency_mode=payload.low_latency_mode,
+    )
+
+@router.patch("/sessions/{voice_session_id}/environment", response_model=VoiceSession)
+def update_voice_environment(voice_session_id: str, payload: ClientEnvironment, db: DB, context: CurrentWorkspace, settings: AppSettings):
+    return svc(db, context, settings).update_client_environment(voice_session_id, payload)
 
 @router.get("/sessions/{voice_session_id}", response_model=VoiceSession)
 def get_voice_session(voice_session_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings):

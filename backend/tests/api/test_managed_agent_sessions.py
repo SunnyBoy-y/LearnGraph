@@ -276,3 +276,156 @@ def test_resume_reconciles_user_committed_ui_newer_than_worker_checkpoint(client
         completed=execute_managed_session(get_settings(),job,task,emit_event=lambda *_args:None,save_checkpoint=checkpoints.append)
         assert completed.status=='SUCCEEDED',completed
         assert completed.deliverables['visuals'][0]['rows'][1]['values']['value']==88
+
+
+@pytest.mark.parametrize('takeover', [False, True])
+def test_all_delegations_ignore_old_task_budgets_but_keep_usage(client, register_user, auth_headers, monkeypatch, takeover):
+    import app.services.chat as chat_module
+    # Cross the ordinary stream ceiling as well as all historical task caps.
+    monkeypatch.setattr(chat_module, 'MAX_PROVIDER_STREAM_ATTEMPTS', 2)
+    monkeypatch.setattr(chat_module, 'MAX_AGENT_TOOL_ROUNDS', 1)
+    headers, task_id, job_id, provider = setup_task(client, register_user, auth_headers, monkeypatch)
+    provider.last_usage = {'input_tokens': 100, 'output_tokens': 10}
+    def tool_rounds(messages, **options):
+        provider.calls += 1
+        if provider.calls <= 3:
+            yield ProviderStreamEvent('tool_calls', tool_calls=[{'id': f'clock-{provider.calls}', 'function': {
+                'name': 'get_current_time', 'arguments': '{}'}}])
+            yield ProviderStreamEvent('completed', finish_reason='tool_calls')
+        else:
+            yield ProviderStreamEvent('text_delta', content='已完成')
+            yield ProviderStreamEvent('completed', finish_reason='stop')
+    provider.stream_chat = tool_rounds
+    with SessionLocal() as db:
+        task, job = db.get(SandboxAgentTask, task_id), db.get(SandboxJob, job_id)
+        task.status = job.status = 'QUEUED'
+        job.payload_json = {**job.payload_json, 'tools': [], 'budget': {
+            'max_tokens': 1, 'max_rounds': 1, 'max_tool_calls': 1, 'max_seconds': 1,
+            'max_cost_usd': 0, 'max_cost_amounts': {'USD': '0', 'CNY': '0'}},
+            '_resume_checkpoint': {'requirement_version': 1, 'used_tokens': 1_000_000,
+                'rounds_used': 1000, 'tool_calls_total': 1000, 'active_seconds': 10000,
+                'used_costs': {'USD': '100', 'CNY': '200'}}}
+        db.commit()
+        if takeover:
+            child_id = control_child_session(db, get_settings(), task, 'takeover')['agent_session_id']
+            response = client.post(f'/api/v1/sessions/{child_id}/messages/stream', headers=headers,
+                json={'content': '继续', 'agent_mode': True})
+            assert response.status_code == 200 and 'message.completed' in response.text, response.text[-1000:]
+            db.refresh(job)
+            checkpoint = job.payload_json['_resume_checkpoint']
+        else:
+            from app.services import chat_service_factory as factory
+            original_build = factory.build_chat_service
+            inherited_options = []
+            def build_with_parent(*args, **options):
+                inherited_options.append(options)
+                return original_build(*args, **options)
+            monkeypatch.setattr(factory, 'build_chat_service', build_with_parent)
+            db.add(Message(workspace_id=task.workspace_id, session_id=task.chat_session_id,
+                role='assistant', content='委派任务', status='completed', provider_trace={
+                    'provider_id': provider.provider_id, 'model_id': provider.model_id,
+                    'search_route': 'disabled', 'web_search': False}))
+            db.commit()
+            checkpoints = []
+            outcome = execute_managed_session(get_settings(), job, task,
+                emit_event=lambda *_args: None, save_checkpoint=checkpoints.append)
+            assert outcome.status == 'SUCCEEDED', outcome
+            assert inherited_options[0]['provider_id'] == provider.provider_id
+            assert inherited_options[0]['model_id'] == provider.model_id
+            assert inherited_options[0]['search_route'] == 'disabled'
+            checkpoint = checkpoints[-1]
+        assert provider.calls == 4
+        assert checkpoint['rounds_used'] == 1004
+        assert checkpoint['tool_calls_total'] == 1003
+        assert checkpoint['used_tokens'] > 1_000_000
+
+
+@pytest.mark.parametrize('currency', ['USD', 'CNY'])
+@pytest.mark.parametrize('feature', ['*', 'chat'])
+def test_parent_and_sibling_agents_share_the_configured_api_budget(client, register_user, auth_headers, monkeypatch, currency, feature):
+    from decimal import Decimal
+    from uuid import uuid4
+    from app.domain.models import ProviderConfig
+    from app.services.billing import BillingService
+    headers, task_id, job_id, provider = setup_task(client, register_user, auth_headers, monkeypatch)
+    provider.provider_id = str(uuid4())
+    provider.last_usage = {'input_tokens': 5, 'output_tokens': 5}
+    with SessionLocal() as db:
+        task, job = db.get(SandboxAgentTask, task_id), db.get(SandboxJob, job_id)
+        db.add(ProviderConfig(id=provider.provider_id, workspace_id=task.workspace_id,
+            display_name='shared-budget', provider_type='openai_compatible',
+            base_url='https://unknown.example', capabilities={'billing_currency': currency},
+            remote_capability=True, enabled=True))
+        db.commit()
+        billing = BillingService(db, task.workspace_id, task.owner_user_id)
+        billing.create_price(provider_id=provider.provider_id, model_id=provider.model_id,
+            currency=currency, input_per_million='0', output_per_million='0', fixed_per_call='0.1')
+        billing.create_budget_policy(name='shared API budget', currency=currency, hard_limit='0.25', feature=feature)
+        # The main Agent has already spent 0.1 from the same budget.
+        quote = billing.preflight_model_call(provider_id=provider.provider_id, model_id=provider.model_id,
+            feature='chat', estimated_input_tokens=5, estimated_output_tokens=5, remote_capability=True)
+        billing.record_usage(quote, input_tokens=5, output_tokens=5, attempt=1)
+        task.status = job.status = 'QUEUED'
+        db.commit()
+        child_id = control_child_session(db, get_settings(), task, 'takeover')['agent_session_id']
+        response = client.post(f'/api/v1/sessions/{child_id}/messages/stream', headers=headers,
+            json={'content': '完成任务', 'agent_mode': True})
+        assert response.status_code == 200 and 'message.completed' in response.text, response.text[-1000:]
+        assert provider.calls == 1
+        # A different delegated task must not get a separate API allowance.
+        sibling = SandboxAgentTask(workspace_id=task.workspace_id, owner_user_id=task.owner_user_id,
+            chat_session_id=task.chat_session_id, task_id='sibling-task', role_key='reason', status='QUEUED', spec_json={})
+        db.add(sibling); db.flush()
+        sibling_job = SandboxJob(workspace_id=task.workspace_id, owner_user_id=task.owner_user_id,
+            chat_session_id=task.chat_session_id, kind='subagent', status='QUEUED', payload_json={'prompt': '继续任务'})
+        db.add(sibling_job); db.flush(); sibling.latest_job_id = sibling_job.id; db.commit()
+        sibling_id = control_child_session(db, get_settings(), sibling, 'takeover')['agent_session_id']
+        blocked = client.post(f'/api/v1/sessions/{sibling_id}/messages/stream', headers=headers,
+            json={'content': '继续任务', 'agent_mode': True})
+        assert blocked.status_code == 200 and 'event: message.failed' in blocked.text, blocked.text
+        assert '"code": "budget_hard_limit_exceeded"' in blocked.text
+        assert 'event: message.completed' not in blocked.text
+        assert provider.calls == 1
+        status = billing.budget_statuses(currency=currency)[0]
+        assert Decimal(status['spent_amount']) == Decimal('0.2')
+
+
+def test_child_inherits_normal_runtime_and_cannot_delegate_again(client, register_user, auth_headers, monkeypatch):
+    from app.core.errors import AppError
+    from app.domain.schemas.sandbox import SandboxAgentSubagentRequest
+    from app.services.chat_service_factory import build_agent_tool_runtime, build_background_workspace_context
+    from app.services.managed_agent_session import DelegatedRuntime, SessionControl, ensure_child_session
+    _, task_id, job_id, _ = setup_task(client, register_user, auth_headers, monkeypatch)
+    with SessionLocal() as db:
+        task, job = db.get(SandboxAgentTask, task_id), db.get(SandboxJob, job_id)
+        parent = db.get(ChatSession, task.chat_session_id)
+        parent.memory_enabled = True
+        db.commit()
+        child = ensure_child_session(db, task, job)
+        assert child.memory_enabled == parent.memory_enabled
+        assert child.writeback_policy == parent.writeback_policy
+        context = build_background_workspace_context(db, workspace_id=task.workspace_id, actor_id=task.owner_user_id)
+        runtime = build_agent_tool_runtime(db, context, get_settings())
+        control = SessionControl(db, task, job, lambda _: None, lambda *_: None)
+        delegated = DelegatedRuntime(runtime, control)
+        options = dict(agent_mode_enabled=True, web_search_enabled=True, memory_enabled=True,
+            capability_families={'runtime', 'builtin_extension'})
+        parent_names = {d['function']['name'] for d in runtime.definitions(**options)}
+        child_names = {d['function']['name'] for d in delegated.definitions(**options)}
+        assert 'sandbox_subagent' in parent_names
+        assert child_names == parent_names - {'sandbox_subagent'}
+        assert all(d['function_name'] != 'sandbox_subagent' for d in runtime.extensions.runtime_tool_descriptors)
+        with pytest.raises(AppError, match='cannot create further agents'):
+            delegated.execute({'id': 'nested', 'function': {'name': 'sandbox_subagent', 'arguments': '{"prompt":"nested"}'}},
+                chat_session_id=child.id, allowed_domains=[])
+        # Also reject a direct service/API call, not only model tool disclosure.
+        with pytest.raises(AppError, match='cannot create further agents'):
+            runtime.sandbox.toolkit_subagent(SandboxAgentSubagentRequest(chat_session_id=child.id, prompt='nested'))
+        created = runtime.sandbox.toolkit_subagent(SandboxAgentSubagentRequest(
+            chat_session_id=parent.id, prompt='新委派', role_key='reason', tools=['sandbox_write_file'],
+            max_rounds=1, max_seconds=1,
+            max_tool_calls=1, max_tokens=1, max_cost_usd=0, max_cost_amounts={'CNY': '0'}))
+        new_task = db.scalar(select(SandboxAgentTask).where(SandboxAgentTask.task_id == created['task_id']))
+        new_job = db.get(SandboxJob, new_task.latest_job_id)
+        assert new_task.spec_json['budget'] == new_job.payload_json['budget'] == {}
+        assert new_job.deadline_at is None

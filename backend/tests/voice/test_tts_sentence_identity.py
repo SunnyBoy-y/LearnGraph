@@ -212,10 +212,10 @@ def test_acknowledgement_and_answer_contexts_share_one_turn_audio_cursor():
         await service._close_turn_context(None, None)
         assert service._audio_cursor_ms == 500
         starts = []
-        async def synthesize(text, context_id, **kwargs):
+        async def synthesize(queue, context_id, **kwargs):
             starts.append(service._audio_cursor_ms)
             service._audio_cursor_ms += 100
-        service._synthesize_sentence = synthesize
+        service._synthesize_stream = synthesize
         service.create_task = asyncio.create_task
         service._enqueue_sentence("答案。", "answer-context")
         await service._session_chain
@@ -295,6 +295,7 @@ def _one_sentence_packets(audio_bytes: int = 4800) -> Callable[[str], list[bytes
     def _build(session_id: str) -> list[bytes]:
         return [
             _audio_packet(session_id, audio_bytes=audio_bytes),
+            _server_event(session_id, EventType.TTSSubtitle, {"text": "第一句。", "words": [{"word": "第一句。", "startTime": 0, "endTime": audio_bytes / 2 / SAMPLE_RATE}]}),
             _server_event(session_id, EventType.SessionFinished, {"status_code": 20000000}),
         ]
 
@@ -303,6 +304,80 @@ def _one_sentence_packets(audio_bytes: int = 4800) -> Callable[[str], list[bytes
 
 def _audio_ms(service: VolcengineTTSService, audio_bytes: int) -> int:
     return int(audio_bytes / 2 / service.sample_rate * 1000)
+
+
+def test_three_text_chunks_share_one_provider_session_and_align_independent_subtitles():
+    async def run():
+        service = _build_service(journal=_FakeJournal(), generation=3)
+        await service.create_audio_context(CONTEXT_ID)
+        service.create_task = asyncio.create_task
+        events, texts = [], []
+        packets = asyncio.Queue()
+        class WS:
+            async def recv(self): return await packets.get()
+        service._ws = WS()
+        _stub_upstream(service)
+        async def send(event, session_id="", payload=None):
+            events.append((event, session_id))
+            if event == EventType.TaskRequest:
+                texts.append(payload["req_params"]["text"])
+            if event == EventType.FinishSession:
+                # The provider is free to combine input chunks into subtitles.
+                packets.put_nowait(_audio_packet(session_id, audio_bytes=9600))
+                packets.put_nowait(_server_event(session_id, EventType.TTSSubtitle, {
+                    "text": "".join(texts), "words": [{"startTime": 0, "endTime": .2}]}))
+                packets.put_nowait(_server_event(session_id, EventType.SessionFinished, {}))
+        service._send_event = send
+        for text in ["先讲原理，", "再看实例。", "最后总结。"]:
+            service._enqueue_sentence(text, CONTEXT_ID)
+        service._stream_inputs[CONTEXT_ID].put_nowait(None)
+        await service._session_chain
+        assert [event for event, _ in events].count(EventType.StartSession) == 1
+        assert [event for event, _ in events].count(EventType.TaskRequest) == 3
+        assert [event for event, _ in events].count(EventType.FinishSession) == 1
+        assert len({sid for _, sid in events}) == 1
+        frames = _drained_frames(service)
+        assert [frame.text for frame in _ledger_frames(frames) if frame.kind == "start"] == ["先讲原理，再看实例。最后总结。"]
+        assert sum(len(frame.audio) for frame in frames if isinstance(frame, TTSAudioRawFrame)) == 9600
+        await service.cleanup()
+    asyncio.run(run())
+
+
+def test_final_context_waits_for_the_current_foreground_state_at_audio_drain():
+    async def run():
+        journal = _FakeJournal()
+        journal.busy = True
+        journal.foreground_busy = lambda: journal.busy
+        service = _build_service(journal=journal, generation=3)
+        await service.create_audio_context(CONTEXT_ID)
+        release = asyncio.Event()
+        chain = asyncio.create_task(release.wait())
+        service._session_chain = chain
+        closing = asyncio.create_task(service._close_turn_context(CONTEXT_ID, chain))
+        journal.busy = False
+        release.set()
+        await closing
+        ends = [f for f in _drained_frames(service) if isinstance(f, VoiceLedgerFrame) and f.kind == 'turn-end']
+        assert len(ends) == 1 and ends[0].turn_final
+        await service.cleanup()
+    asyncio.run(run())
+
+
+def test_an_older_context_cannot_finalize_a_later_queued_synthesis():
+    async def run():
+        journal = _FakeJournal()
+        journal.foreground_busy = lambda: False
+        service = _build_service(journal=journal, generation=3)
+        await service.create_audio_context(CONTEXT_ID)
+        old = asyncio.create_task(asyncio.sleep(0))
+        latest = asyncio.create_task(asyncio.sleep(0))
+        service._session_chain = latest
+        await service._close_turn_context(CONTEXT_ID, old)
+        ends = [f for f in _drained_frames(service) if isinstance(f, VoiceLedgerFrame) and f.kind == 'turn-end']
+        assert len(ends) == 1 and not ends[0].turn_final
+        await latest
+        await service.cleanup()
+    asyncio.run(run())
 
 
 # --------------------------------------------------------- 句首账本帧的载荷
@@ -556,12 +631,9 @@ def test_end_frame_is_only_enqueued_when_the_sentence_completed():
                 ),
             ]
 
-        frames = await _run_one_sentence(service, "半句话", packets=_packets)
-        await _release(frames, journal)
-
-        assert [frame.kind for frame in _ledger_frames(frames)] == ["start"]
+        with pytest.raises(RuntimeError, match="TTS provider error"):
+            await _run_one_sentence(service, "半句话", packets=_packets)
         assert journal.ended == []
-        assert journal.errors, "合成失败必须留下一条阶段错误"
 
     asyncio.run(_run())
 
@@ -588,7 +660,7 @@ def test_interrupted_sentence_enqueues_no_end_frame():
             await task
 
         frames = _drained_frames(service)
-        assert [frame.kind for frame in _ledger_frames(frames)] == ["start"]
+        assert _ledger_frames(frames) == []  # no aligned subtitle before interruption
         assert journal.ended == []
 
     asyncio.run(_run())

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 
 def _voice_session(client, register_user, auth_headers):
     token, workspace_id, *_ = register_user(f"voice_caps_{uuid4().hex[:8]}")
@@ -63,3 +65,27 @@ def test_write_capability_starts_without_interactive_approval(
     pending = started.json()
     assert pending["status"] == "queued"
     assert pending["approval_status"] == "none"
+
+
+@pytest.mark.parametrize("output_contract", [None, {"required": ["short_answer"]}])
+def test_reasoning_capability_accepts_optional_output_contract(
+    client, register_user, auth_headers, output_contract
+):
+    headers, voice_id = _voice_session(client, register_user, auth_headers)
+    body = {
+        "prompt": "Explain why binary search halves the candidate range.",
+        "capability_id": "reasoning",
+        "thinking_mode": "off",
+        "idempotency_key": "reasoning-optional-contract",
+    }
+    if output_contract is not None:
+        body["output_contract"] = output_contract
+    path = f"/api/v1/voice/sessions/{voice_id}/tasks"
+    response = client.post(path, headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    task = response.json()
+    assert task["status"] == "queued"
+    assert task["approval_status"] == "none"
+    repeated = client.post(path, headers=headers, json=body)
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["subagent_id"] == task["subagent_id"]
