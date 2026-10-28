@@ -21,7 +21,7 @@ import { ImageLightbox } from "@/components/chat/image-lightbox";
 import { relativeHtmlResources } from "@/lib/sandboxed-html-preview";
 import { SandboxedHtmlFrame } from "./sandboxed-html-frame";
 import { useDocumentText } from "./use-document-text";
-import { MessageResponse } from "@/components/ai-elements/message";
+import { LazyStreamdown } from "@/components/ai-elements/lazy-streamdown";
 import { readDocumentBytes, readDocumentText } from "@/lib/document-text";
 import { delimitedTextSeparator } from "@/lib/file-preview";
 import { PREVIEW_RANGE_BYTES, type SeekableFile } from "@/lib/seekable-file";
@@ -1164,7 +1164,7 @@ export function TextDocumentViewer({
         </div>
       ) : null}
       {markdown && mode === "preview" ? (
-        <div className="p-6"><MessageResponse isAnimating={false}>{text}</MessageResponse></div>
+        <div className="p-6"><LazyStreamdown>{text}</LazyStreamdown></div>
       ) : (
         <pre className="m-0 max-h-[calc(100svh-12rem)] overflow-auto bg-muted/20 p-4 text-xs leading-5">
           <code>{text}</code>
