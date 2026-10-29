@@ -70,9 +70,9 @@ def select_task_rows(rows: list[dict], query: str, focus_task_ids: tuple[str, ..
 
 def load_task_context(voice_session_id: str, user_query: str = '', *, focus_task_ids: tuple[str, ...] = ()) -> str:
     query = plan_turn(user_query)
-    if not query.request_text or small_talk(query.request_text) or switches_topic(query.request_text) or query.verbatim is not None:
+    if user_query and (not query.request_text or small_talk(query.request_text) or switches_topic(query.request_text) or query.verbatim is not None):
         return ''
-    if not refers_to_task(query.request_text) and not follows_topic(query.request_text) and not focus_task_ids:
+    if user_query and not refers_to_task(query.request_text) and not follows_topic(query.request_text) and not focus_task_ids:
         return ''
     handle = load_session(voice_session_id)
     if handle is None:
@@ -100,7 +100,7 @@ def load_task_context(voice_session_id: str, user_query: str = '', *, focus_task
                     summary=result.summary or '', session_epoch=handle.session_epoch,
                     requirement_version=result.requirement_version, result_version=result.result_version))
             rows.append(item)
-    rows = select_task_rows(rows, user_query, focus_task_ids)
+    rows = rows[:6] if not user_query else select_task_rows(rows, user_query, focus_task_ids)
     if not rows:
         return ''
     target = requested_scene(rows, user_query)

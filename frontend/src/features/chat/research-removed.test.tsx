@@ -19,11 +19,13 @@ describe("removed research controls", () => {
   it("keeps chat functions available without research actions", async () => {
     const user = userEvent.setup();
     renderWithProviders(
-      <TooltipProvider>
-        <Routes>
-          <Route path="/w/:workspaceId/chat/:sessionId" element={<ChatCanvasPage />} />
-        </Routes>
-      </TooltipProvider>,
+      <AuthContext.Provider value={{ workspaceId: "test-workspace" } as AuthContextValue}>
+        <TooltipProvider>
+          <Routes>
+            <Route path="/w/:workspaceId/chat/:sessionId" element={<ChatCanvasPage />} />
+          </Routes>
+        </TooltipProvider>
+      </AuthContext.Provider>,
       { initialEntries: ["/w/test-workspace/chat/new"] },
     );
     await screen.findByRole("heading", { name: "从一个问题开始" });

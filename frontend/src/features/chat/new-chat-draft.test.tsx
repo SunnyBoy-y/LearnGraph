@@ -197,7 +197,7 @@ describe("first message draft promotion", () => {
       if (path === "/settings") return [{
         key: "chat.default_response_mode", value: { response_mode: "fast" },
       }];
-      if (path === "/sessions/first-session/messages") {
+      if (path.startsWith("/sessions/first-session/messages") && !path.includes("/durable-")) {
         if (holdHistory) { heldHistoryStarted = true; return delayedHistory.promise; }
         return { items: [], total_count: 0, has_more_before: false };
       }

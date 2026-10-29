@@ -1,10 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { Streamdown } from "streamdown";
+import { cjk } from "@streamdown/cjk";
+import { code } from "@streamdown/code";
+import { createMathPlugin } from "@streamdown/math";
 
-// Keep the Markdown renderer lazy. Mermaid loads separately, only for diagram
-// fences; vite.config.ts keeps its cyclic dependency graph in a single chunk.
-type StreamdownLike = (props: Record<string, unknown>) => ReactNode;
+// Mermaid remains lazy because it is only needed for diagram fences.
 type StreamdownModule = {
-  Streamdown: StreamdownLike;
+  Streamdown: typeof Streamdown;
   plugins: Record<string, unknown>;
 };
 
@@ -33,24 +35,15 @@ export function createPlainCodeHighlighter() {
   };
 }
 
-function loadStreamdown(mode: CodeHighlightMode): Promise<StreamdownModule> {
-  const codePlugin =
-    mode === "plain"
-      ? Promise.resolve(createPlainCodeHighlighter())
-      : import("@streamdown/code").then((m) => m.code);
-  return Promise.all([
-    import("streamdown"),
-    import("@streamdown/cjk"),
-    codePlugin,
-    import("@streamdown/math"),
-  ]).then(([streamdown, cjk, code, math]) => ({
-    Streamdown: streamdown.Streamdown as StreamdownLike,
+function loadStreamdown(_mode: CodeHighlightMode): Promise<StreamdownModule> {
+  return Promise.resolve({
+    Streamdown,
     plugins: {
-      cjk: cjk.cjk,
+      cjk,
       code,
-      math: math.createMathPlugin({ singleDollarTextMath: true }),
+      math: createMathPlugin({ singleDollarTextMath: true }),
     },
-  }));
+  });
 }
 
 let shikiCached: Promise<StreamdownModule> | undefined;
@@ -114,7 +107,7 @@ export function LazyStreamdown({
   const { Streamdown, plugins } = module;
   return (
     <Streamdown {...props} plugins={diagramPlugin ? { ...plugins, mermaid: diagramPlugin } : plugins}>
-      {children}
+      {typeof children === "string" ? children : ""}
     </Streamdown>
   );
 }

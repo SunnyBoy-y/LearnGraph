@@ -2,7 +2,7 @@ import "@/test/pdfjs-polyfills";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { listSessionMessages, listSessions } from "@/api";
+import { listSessionMessages, listSessions, listSettings } from "@/api";
 import { listProviders, discoverProviderModels } from "@/api/providers";
 import { renderWithProviders } from "@/test/render";
 import type { Session } from "@/types/sessions";
@@ -12,7 +12,7 @@ import { SideConversationRail } from "./right-rail-panels";
 vi.mock("@/api", () => ({
   listSessions: vi.fn(), listSessionMessages: vi.fn(), createSession: vi.fn(),
   cancelSessionMessage: vi.fn(), streamSessionMessage: vi.fn(),
-  downloadFile: vi.fn(), listSessionFiles: vi.fn(),
+  downloadFile: vi.fn(), listSessionFiles: vi.fn(), listSettings: vi.fn(),
 }));
 
 vi.mock("@/api/providers", () => ({ listProviders: vi.fn(), discoverProviderModels: vi.fn() }));
@@ -30,6 +30,7 @@ beforeEach(() => {
   vi.mocked(discoverProviderModels).mockResolvedValue({ provider_id: "none", status: "ok", models: [] });
   vi.mocked(listSessions).mockResolvedValue([session("main-1", "算法学习"), session("side-1", "二分查找")]);
   vi.mocked(listSessionMessages).mockResolvedValue([]);
+  vi.mocked(listSettings).mockResolvedValue([]);
 });
 
 describe("side conversation picker", () => {
