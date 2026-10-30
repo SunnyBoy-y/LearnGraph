@@ -64,10 +64,10 @@ def test_voice_worker_publishes_incremental_scenes_and_rejects_old_revisions():
     assert outcome.deliverables["visuals"][0]["revision"] == 1
 
 
-def test_budget_exhaustion_keeps_already_published_scene():
+def test_round_budget_is_not_an_execution_cap():
     outcome, events = run_scene_worker(max_rounds=1)
-    assert outcome.status == "PARTIAL"
-    assert outcome.deliverables["visuals"][0]["revision"] == 0
+    assert outcome.status == "SUCCEEDED"
+    assert outcome.deliverables["visuals"][0]["revision"] == 1
     assert any(kind == "artifact.upsert" for kind, _ in events)
 
 
@@ -82,8 +82,8 @@ def test_pause_resume_reuses_completed_tools_and_preserves_budget():
     assert resumed.status == "SUCCEEDED"
     assert [payload["snapshot"]["revision"] for kind, payload in events if kind == "artifact.upsert"] == [1]
     assert resumed.attempt_record["tool_calls"] == 3
-    exhausted, _ = run_scene_worker(max_rounds=1, checkpoint=checkpoint)
-    assert exhausted.status == "PARTIAL"
+    resumed_with_round_metadata, _ = run_scene_worker(max_rounds=1, checkpoint=checkpoint)
+    assert resumed_with_round_metadata.status == "SUCCEEDED"
 
 
 def test_resume_does_not_repeat_an_already_executed_file_write():

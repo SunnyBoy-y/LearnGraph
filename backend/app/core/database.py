@@ -308,10 +308,8 @@ class _CrossThreadRLock:
                 # This thread's hold was force-cleared by a watchdog reset;
                 # there is nothing left to release and no imbalance to count.
                 return
-            if self._tls.count > 1:
+            if self._tls.count > 0:
                 self._tls.count -= 1
-                return
-            self._tls.count = 0
             if self._held <= 0:
                 # Over-release: count imbalance (double release or release after
                 # a watchdog reset already cleared global state). This must

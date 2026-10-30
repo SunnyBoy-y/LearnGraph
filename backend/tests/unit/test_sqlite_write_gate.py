@@ -119,6 +119,18 @@ def test_gate_released_after_commit(engine) -> None:
     assert acquired, "gate still held after commit"
 
 
+def test_reentrant_gate_releases_every_hold(engine) -> None:
+    """Nested connections in one worker must not leave the global gate held."""
+    assert _SQLITE_WRITE_LOCK.acquire(blocking=True, timeout=5)
+    assert _SQLITE_WRITE_LOCK.acquire(blocking=True, timeout=5)
+    _SQLITE_WRITE_LOCK.release()
+    _SQLITE_WRITE_LOCK.release()
+    acquired = _SQLITE_WRITE_LOCK.acquire(blocking=False)
+    if acquired:
+        _SQLITE_WRITE_LOCK.release()
+    assert acquired, "reentrant gate release leaked a global hold"
+
+
 def test_reads_are_not_gated(engine) -> None:
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     with factory() as db:

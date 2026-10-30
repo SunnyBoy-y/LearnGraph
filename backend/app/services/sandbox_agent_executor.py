@@ -663,12 +663,6 @@ def execute_subagent_job(
             )
         return None
 
-    final_text = ""
-    used_tokens = 0
-    used_costs: dict[str, str] = {}
-    unknown_cost_events = 0
-    tool_calls_total = 0
-    rounds_used = 0
     try:
         if profile_error is not None:
             return SubagentRunOutcome(

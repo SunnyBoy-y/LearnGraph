@@ -24,6 +24,12 @@ PUBLIC_PREFIXES = (
 
 PUBLIC_OPERATIONS = {("GET", "/api/v1/version")}
 
+# This single-use browser download is authenticated by an HttpOnly cookie
+# coupled to an unguessable path ticket.  An anonymous request for a made-up
+# ticket intentionally returns 404 to avoid revealing whether a ticket exists;
+# it cannot exercise the bearer-token 401 invariant below.
+SCOPED_TICKET_OPERATIONS = {("GET", "/api/v1/migrations/backup/browser/{ticket}")}
+
 
 def _iter_operations(client):
     spec = client.get("/openapi.json").json()
@@ -70,7 +76,11 @@ def test_openapi_all_endpoints_reject_anonymous(client):
     failures = []
     checked = 0
     for path, method, _op in _iter_operations(client):
-        if path.startswith(PUBLIC_PREFIXES) or (method, path) in PUBLIC_OPERATIONS:
+        if (
+            path.startswith(PUBLIC_PREFIXES)
+            or (method, path) in PUBLIC_OPERATIONS
+            or (method, path) in SCOPED_TICKET_OPERATIONS
+        ):
             continue
         # Media streams authenticate with a scoped ticket, rather than the
         # Authorization header. Supply an invalid ticket to exercise auth;
