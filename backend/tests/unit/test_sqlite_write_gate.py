@@ -131,6 +131,38 @@ def test_reentrant_gate_releases_every_hold(engine) -> None:
     assert acquired, "reentrant gate release leaked a global hold"
 
 
+def test_reentrant_gate_does_not_release_for_waiters(engine) -> None:
+    """A nested hold must keep the process-wide mutex held for other threads."""
+    assert _SQLITE_WRITE_LOCK.acquire(blocking=True, timeout=5)
+    assert _SQLITE_WRITE_LOCK.acquire(blocking=True, timeout=5)
+    result: list[bool] = []
+
+    def probe() -> None:
+        acquired = _SQLITE_WRITE_LOCK.acquire(blocking=False)
+        result.append(acquired)
+        if acquired:
+            _SQLITE_WRITE_LOCK.release()
+
+    first = threading.Thread(target=probe)
+    first.start()
+    first.join(timeout=5)
+    assert result == [False]
+
+    _SQLITE_WRITE_LOCK.release()
+    result.clear()
+    second = threading.Thread(target=probe)
+    second.start()
+    second.join(timeout=5)
+    assert result == [False]
+
+    _SQLITE_WRITE_LOCK.release()
+    result.clear()
+    third = threading.Thread(target=probe)
+    third.start()
+    third.join(timeout=5)
+    assert result == [True]
+
+
 def test_reads_are_not_gated(engine) -> None:
     factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     with factory() as db:
