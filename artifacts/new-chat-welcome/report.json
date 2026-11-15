@@ -1,0 +1,1131 @@
+{
+  "pass": true,
+  "base": "http://127.0.0.1:15173",
+  "checks": [
+    "initial server-generated recommendations / POST body / no new-home stats",
+    "local pool rotation / cooldown reuse / preserved draft / reload / no session creation",
+    "desktop light layout",
+    "desktop light mono computed neutral sidebar palette",
+    "recent create appears on hover / section titles are semibold",
+    "desktop batch menu / select all / preview / cancel / deselect / exit",
+    "desktop dark layout",
+    "desktop dark mono computed neutral sidebar palette",
+    "long draft layout",
+    "collapsed long draft layout",
+    "mobile layout",
+    "small-mobile layout",
+    "mobile light mono computed neutral sidebar palette",
+    "mobile batch menu / select all / preview / cancel / deselect / exit",
+    "project draft layout",
+    "recent create clears project context and opens an ungrouped draft",
+    "existing empty session layout",
+    "started conversation mobile layout",
+    "project payload / empty-session stats hidden / goal layout retained / one click = one create + one send / normal-conversation stats retained",
+    "generation failure / toast retry succeeds / no session creation",
+    "empty generation result shows no static template",
+    "no provider = no generation request and no static template"
+  ],
+  "layouts": [
+    {
+      "label": "desktop light",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 551.15625,
+          "y": 304,
+          "right": 780.828125,
+          "bottom": 355,
+          "width": 229.671875,
+          "height": 51
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 300,
+          "y": 430,
+          "right": 1032,
+          "bottom": 492,
+          "width": 732,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 300,
+          "y": 516,
+          "right": 1032,
+          "bottom": 696,
+          "width": 732,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 556,
+          "right": 1020,
+          "bottom": 600,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 604,
+          "right": 1020,
+          "bottom": 648,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 652,
+          "right": 1020,
+          "bottom": 696,
+          "width": 708,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "desktop dark",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 553.65625,
+          "y": 304,
+          "right": 783.328125,
+          "bottom": 355,
+          "width": 229.671875,
+          "height": 51
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 300,
+          "y": 430,
+          "right": 1037,
+          "bottom": 492,
+          "width": 737,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 300,
+          "y": 516,
+          "right": 1037,
+          "bottom": 696,
+          "width": 737,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 556,
+          "right": 1025,
+          "bottom": 600,
+          "width": 713,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 604,
+          "right": 1025,
+          "bottom": 648,
+          "width": 713,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 652,
+          "right": 1025,
+          "bottom": 696,
+          "width": 713,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "long draft",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 551.15625,
+          "y": 229,
+          "right": 780.828125,
+          "bottom": 280,
+          "width": 229.671875,
+          "height": 51
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 300,
+          "y": 355,
+          "right": 1032,
+          "bottom": 567,
+          "width": 732,
+          "height": 212
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 300,
+          "y": 591,
+          "right": 1032,
+          "bottom": 771,
+          "width": 732,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 631,
+          "right": 1020,
+          "bottom": 675,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 679,
+          "right": 1020,
+          "bottom": 723,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 727,
+          "right": 1020,
+          "bottom": 771,
+          "width": 708,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "collapsed long draft",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 551.15625,
+          "y": 229,
+          "right": 780.828125,
+          "bottom": 280,
+          "width": 229.671875,
+          "height": 51
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 300,
+          "y": 355,
+          "right": 1032,
+          "bottom": 567,
+          "width": 732,
+          "height": 212
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 300,
+          "y": 591,
+          "right": 1032,
+          "bottom": 771,
+          "width": 732,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 631,
+          "right": 1020,
+          "bottom": 675,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 679,
+          "right": 1020,
+          "bottom": 723,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 727,
+          "right": 1020,
+          "bottom": 771,
+          "width": 708,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 359,
+          "bottom": 403,
+          "width": 343,
+          "height": 379
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 708,
+          "right": 359,
+          "bottom": 824,
+          "width": 343,
+          "height": 116
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 427,
+          "right": 359,
+          "bottom": 633,
+          "width": 343,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 475,
+          "right": 359,
+          "bottom": 537,
+          "width": 343,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 541,
+          "right": 359,
+          "bottom": 585,
+          "width": 343,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 589,
+          "right": 359,
+          "bottom": 633,
+          "width": 343,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "small-mobile",
+      "width": 320,
+      "height": 640,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 640,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 289,
+          "bottom": 171,
+          "width": 273,
+          "height": 147
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 512,
+          "right": 289,
+          "bottom": 620,
+          "width": 273,
+          "height": 108
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 195,
+          "right": 289,
+          "bottom": 437,
+          "width": 273,
+          "height": 242
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 243,
+          "right": 289,
+          "bottom": 305,
+          "width": 273,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 309,
+          "right": 289,
+          "bottom": 371,
+          "width": 273,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 375,
+          "right": 289,
+          "bottom": 437,
+          "width": 273,
+          "height": 62
+        }
+      ]
+    },
+    {
+      "label": "project draft",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 551.15625,
+          "y": 304,
+          "right": 780.828125,
+          "bottom": 355,
+          "width": 229.671875,
+          "height": 51
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 300,
+          "y": 430,
+          "right": 1032,
+          "bottom": 492,
+          "width": 732,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 300,
+          "y": 516,
+          "right": 1032,
+          "bottom": 696,
+          "width": 732,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 556,
+          "right": 1020,
+          "bottom": 600,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 604,
+          "right": 1020,
+          "bottom": 648,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 652,
+          "right": 1020,
+          "bottom": 696,
+          "width": 708,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "existing empty session",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 551.15625,
+          "y": 304,
+          "right": 780.828125,
+          "bottom": 355,
+          "width": 229.671875,
+          "height": 51
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 300,
+          "y": 430,
+          "right": 1032,
+          "bottom": 492,
+          "width": 732,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 300,
+          "y": 516,
+          "right": 1032,
+          "bottom": 696,
+          "width": 732,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 556,
+          "right": 1020,
+          "bottom": 600,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 604,
+          "right": 1020,
+          "bottom": 648,
+          "width": 708,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 312,
+          "y": 652,
+          "right": 1020,
+          "bottom": 696,
+          "width": 708,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "started conversation mobile",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "chat-composer-anchor",
+          "x": 12,
+          "y": 655,
+          "right": 378,
+          "bottom": 771,
+          "width": 366,
+          "height": 116
+        }
+      ]
+    }
+  ],
+  "colors": [
+    {
+      "label": "desktop light mono",
+      "dark": false,
+      "colorMode": "mono",
+      "entries": [
+        {
+          "label": "新对话",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "图谱",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "资料",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "产物",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "定时任务",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        }
+      ],
+      "brand": {
+        "color": "oklch(0.17 0.008 165)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "mark": {
+        "color": "rgb(255, 255, 255)",
+        "background": "rgb(25, 25, 25)",
+        "shadow": "none"
+      },
+      "more": {
+        "color": "oklch(0.17 0.008 165)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "moreIcon": {
+        "color": "rgb(115, 115, 115)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "project": {
+        "color": "oklch(0.52 0.01 150)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "projectHeader": {
+        "color": "oklch(0.52 0.01 150)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "folder": {
+        "color": "oklch(0.52 0.01 150)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "session": {
+        "color": "oklch(0.17 0.008 165)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      }
+    },
+    {
+      "label": "desktop dark mono",
+      "dark": true,
+      "colorMode": "mono",
+      "entries": [
+        {
+          "label": "新对话",
+          "text": "rgb(180, 180, 180)",
+          "icon": "rgb(180, 180, 180)"
+        },
+        {
+          "label": "图谱",
+          "text": "rgb(180, 180, 180)",
+          "icon": "rgb(180, 180, 180)"
+        },
+        {
+          "label": "资料",
+          "text": "rgb(180, 180, 180)",
+          "icon": "rgb(180, 180, 180)"
+        },
+        {
+          "label": "产物",
+          "text": "rgb(180, 180, 180)",
+          "icon": "rgb(180, 180, 180)"
+        },
+        {
+          "label": "定时任务",
+          "text": "rgb(180, 180, 180)",
+          "icon": "rgb(180, 180, 180)"
+        }
+      ],
+      "brand": {
+        "color": "rgb(232, 232, 232)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "mark": {
+        "color": "rgb(255, 255, 255)",
+        "background": "rgb(25, 25, 25)",
+        "shadow": "none"
+      },
+      "more": {
+        "color": "rgb(180, 180, 180)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "moreIcon": {
+        "color": "rgb(180, 180, 180)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "project": {
+        "color": "rgb(180, 180, 180)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "projectHeader": {
+        "color": "rgb(180, 180, 180)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "folder": {
+        "color": "rgb(180, 180, 180)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "session": {
+        "color": "rgb(180, 180, 180)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      }
+    },
+    {
+      "label": "mobile light mono",
+      "dark": false,
+      "colorMode": "mono",
+      "entries": [
+        {
+          "label": "新对话",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "图谱",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "资料",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "产物",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        },
+        {
+          "label": "定时任务",
+          "text": "oklch(0.17 0.008 165)",
+          "icon": "rgb(115, 115, 115)"
+        }
+      ],
+      "brand": {
+        "color": "oklch(0.17 0.008 165)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "mark": {
+        "color": "rgb(255, 255, 255)",
+        "background": "rgb(25, 25, 25)",
+        "shadow": "none"
+      },
+      "more": {
+        "color": "oklch(0.17 0.008 165)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "moreIcon": {
+        "color": "rgb(115, 115, 115)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "project": {
+        "color": "oklch(0.52 0.01 150)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "projectHeader": {
+        "color": "oklch(0.52 0.01 150)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "folder": {
+        "color": "oklch(0.52 0.01 150)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      },
+      "session": {
+        "color": "oklch(0.17 0.008 165)",
+        "background": "rgba(0, 0, 0, 0)",
+        "shadow": "none"
+      }
+    }
+  ],
+  "requests": [
+    {
+      "scenario": "main",
+      "opening": [
+        {
+          "index": 1,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 2,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 3,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 4,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 5,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": "qa-project",
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 6,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 7,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 8,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        }
+      ],
+      "writes": [
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/batch-delete-impact",
+          "body": {
+            "session_ids": [
+              "qa-recent"
+            ]
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/batch-delete-impact",
+          "body": {
+            "session_ids": [
+              "qa-recent"
+            ]
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": "qa-project",
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions",
+          "body": {
+            "memory_enabled": true,
+            "title": "新会话",
+            "project_id": null,
+            "goal_id": null,
+            "graph_id": null,
+            "current_node_id": null
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/qa-started/messages/stream",
+          "body": {
+            "content": "结合上次的网络笔记，TCP 为什么需要三次握手？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [],
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "failure and retry",
+      "opening": [
+        {
+          "index": 1,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 503
+        },
+        {
+          "index": 2,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        }
+      ],
+      "writes": [
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "no memories",
+      "opening": [
+        {
+          "index": 1,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        }
+      ],
+      "writes": [
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "no provider",
+      "opening": [],
+      "writes": []
+    }
+  ],
+  "screenshots": [
+    "artifacts/new-chat-welcome/desktop.png",
+    "artifacts/new-chat-welcome/desktop-dark.png",
+    "artifacts/new-chat-welcome/mobile.png",
+    "artifacts/new-chat-welcome/small-mobile.png",
+    "artifacts/new-chat-welcome/sidebar-mobile.png"
+  ],
+  "scenarios": [
+    {
+      "name": "main",
+      "pageErrors": [],
+      "consoleErrors": [],
+      "externalRequests": [],
+      "unknownMockedReads": [
+        "/voice/capabilities",
+        "/graphs",
+        "/version",
+        "/sandbox/agent-tasks",
+        "/sessions/qa-started/messages/qa-answer/versions"
+      ]
+    },
+    {
+      "name": "failure and retry",
+      "pageErrors": [],
+      "consoleErrors": [
+        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)"
+      ],
+      "externalRequests": [],
+      "unknownMockedReads": [
+        "/voice/capabilities",
+        "/graphs"
+      ]
+    },
+    {
+      "name": "no memories",
+      "pageErrors": [],
+      "consoleErrors": [],
+      "externalRequests": [],
+      "unknownMockedReads": [
+        "/voice/capabilities",
+        "/graphs"
+      ]
+    },
+    {
+      "name": "no provider",
+      "pageErrors": [],
+      "consoleErrors": [],
+      "externalRequests": [],
+      "unknownMockedReads": [
+        "/voice/capabilities",
+        "/graphs"
+      ]
+    }
+  ]
+}

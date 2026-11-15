@@ -148,6 +148,9 @@ services:
       dockerfile: Dockerfile
       args:
         APP_VERSION: ${LEARNGRAPH_APP_VERSION:-v0.5}
+        # Full references allow explicit registry access if a host mirror returns 401.
+        NODE_IMAGE: ${LEARNGRAPH_NODE_IMAGE:-node:22-bookworm-slim}
+        PYTHON_IMAGE: ${LEARNGRAPH_PYTHON_IMAGE:-python:3.12-slim-bookworm}
         # 国内构建若 deb.debian.org (Fastly) 偶发 502，可在根 .env 设
         # LEARNGRAPH_DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn 切换镜像源。
         DEBIAN_MIRROR: ${LEARNGRAPH_DEBIAN_MIRROR:-deb.debian.org}
@@ -275,6 +278,7 @@ services:
       context: .
       dockerfile: sandboxd/Dockerfile
       args:
+        PYTHON_IMAGE: ${LEARNGRAPH_PYTHON_IMAGE:-python:3.12-slim-bookworm}
         DEBIAN_MIRROR: ${LEARNGRAPH_DEBIAN_MIRROR:-deb.debian.org}
     environment:
       SANDBOXD_LISTEN_HOST: "0.0.0.0"

@@ -1,0 +1,55 @@
+接口定案（后端已实现，前端可立即接入）
+
+POST /api/v1/sessions/opening-prompts
+前端 apiClient path: '/sessions/opening-prompts'
+实际 prefix: api_router=/api/v1，chat.router=/sessions；新静态 POST 已注册在 /{session_id}/suggested-prompts 前。
+认证：沿用登录 Bearer token 和 X-Workspace-ID；无需 session_id。
+
+请求：
+{ "provider_id"?: string|null, "model_id"?: string|null, "project_id"?: string|null, "count"?: integer }
+count 默认3，范围1..9，只接受整数；不接受任何额外字段（memory/context 注入返回422）。
+模型选择：显式 provider_id/model_id 优先；均未传时读取 chat.suggested_prompts_model，再回退 workspace chat 功能默认模型。复用 provider factory，thinking_mode=off、prefer_fast=true、search_route=disabled，不使用 Agent/搜索/真实记忆供应商调用。
+
+200 响应：
+{
+  "prompts": [{ "id": "<uuid>", "content": "<AI生成的问题>" }],
+  "metadata": {
+    "memory_used": true,
+    "memory_count": 2,
+    "project_count": 1,
+    "read_mode": "events",
+    "cached": false,
+    "request_id": "<uuid>",
+    "provider_id": "<resolved provider>",
+    "model_id": "<resolved model>"
+  }
+}
+上述数值仅说明字段形状，不是生产结果。每次有数据的POST均真实执行一次新的AI生成（独立request_id写入模型提示），无固定缓存、无固定问题fallback。
+无任何可用记忆/可访问项目时：200 {"prompts":[],"metadata":{"memory_used":false,"memory_count":0,"project_count":0,"read_mode":"events","cached":false,"reason":"no_authorized_context"}}，不触发模型调用。
+
+权限与数据边界：
+- 服务端从真实工作区/当前用户读取；筛选tenant/workspace/subject_user、owner_only/shared、项目/目标/节点/会话/文件ACL。
+- 尊重 memory.shared_policy 的 workspace_enabled、workspace_recall_enabled；owner_only 不向非owner开放。
+- events read mode只用事件搜索投影，不回退legacy；投影有canonical行时复核最新revision和生命周期，拒绝过时/已删除投影。
+- legacy模式读取实际revision；不通过purge/补revision等有副作用的读取服务。
+- 过滤过期/未来生效/归档/撤回/禁止召回/child_agent_denied/不可信来源/未核实偏好/会话专用与task专用记忆；复用memory_safety和memory_usage，不从任务经历推断偏好。
+- 没记忆时仅用真实可访问项目标题与状态；所有数据都不存在则返回空，不编造用户背景。
+- 远程调用后重新核实ACL/记忆策略/源内容；有变更拒绝旧结果（409）。
+- 不创建session、message、suggested_prompt_batch、memory event/trace/batch；保留正常计费preflight和UsageEvent记录。
+
+错误响应（标准AppError）：
+{"error":{"code":"...","message":"...","details":{}}}
+401 未认证；404 not_found（project不存在/无权）；422 请求校验。
+503 model_provider_unavailable / remote_model_required（不会用demo模板兜底）。
+502 opening_prompt_invalid_response（问题不足/重复/无有效结果）或 opening_prompt_generation_failed。
+504 opening_prompt_provider_timeout。
+409 opening_prompt_context_changed（调用期间上下文/策略变化，请刷新）。
+沿用计费预检本身的错误（如预算或价格限制），不暴露供应商原始异常中的凭据。
+
+实现文件：
+backend/app/api/routers/chat.py（仅补import和新路由，保留既有未提交改动）
+backend/app/domain/schemas/opening_prompts.py（新增）
+backend/app/services/opening_prompts.py（新增）
+backend/tests/unit/test_opening_prompts.py（新增，含FastAPI TestClient接口测试）
+
+最终测试：107 passed（新增开场推荐51项，含FastAPI接口/认证/刷新/权限与适用性/owner_only/shared/events/失败无模板/计费无会话测试；既有suggested-prompts门禁+memory_usage回归56项）。命令：cd backend && uv run --no-sync pytest tests/unit/test_opening_prompts.py tests/api/test_suggested_prompts_anchor_gate.py tests/memory/test_memory_usage.py -q --disable-warnings --maxfail=3。git diff --check 通过（仅提示已有chat.py CRLF/LF规范化警告）。所有模型均本地stub，无真实付费模型调用，无schema migration，无restore/reset/commit。SQLite测试通过；查询使用通用SQLAlchemy，无SQLite特有语句，未连接真实PostgreSQL。

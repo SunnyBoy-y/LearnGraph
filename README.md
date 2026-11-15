@@ -172,6 +172,17 @@ docker compose up -d --build
 
 默认只绑定 `127.0.0.1` 且使用高位端口（18000/18001）以避免与常用开发端口冲突。
 
+**基础镜像拉取失败（`401 Unauthorized`）**
+
+如果构建在 `load metadata for ... node/python` 处失败，且错误 URL 指向 `docker.m.daocloud.io`，说明失败发生在宿主机配置的 Docker Hub 镜像代理。可在根目录 `.env` 中设置完整基础镜像地址，显式使用代理仓库路径：
+
+```dotenv
+LEARNGRAPH_NODE_IMAGE=m.daocloud.io/docker.io/library/node:22-bookworm-slim
+LEARNGRAPH_PYTHON_IMAGE=m.daocloud.io/docker.io/library/python:3.12-slim-bookworm
+```
+
+然后重新执行 `docker compose up -d --build`。Python 地址同时用于 `app` 和 `sandboxd` 的构建与运行阶段；这两个配置只影响构建，不会传入应用容器环境。其他网络环境可换成自己可访问的完整镜像地址，保留对应的 Node 22 / Python 3.12 与 Debian bookworm 版本；删除覆盖即可恢复默认 Docker Hub 地址。`LEARNGRAPH_DEBIAN_MIRROR` 只控制容器内的 apt 源，不影响 `FROM` 镜像拉取。
+
 **原生 `docker compose` 命令自动生成 `.env`（可选）**
 
 想让原生命令也自动生成 `.env`，装一次 shell 级 hook（幂等，且只对 LearnGraph 项目生效）：

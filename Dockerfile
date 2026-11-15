@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1.7
+# Use Docker's bundled BuildKit frontend; no external syntax image is required.
+# This avoids a bootstrap pull through registry mirrors before the build starts.
 # LearnGraph application image: Vite production build + FastAPI.
 #
 # The sandbox runner (backend/sandbox/Dockerfile) stays a separate image.
@@ -8,7 +9,12 @@
 # ghcr.io 重新解析 tag，网络抖动会以 `Head .../manifests/0.12: EOF` 失败；
 # digest 引用优先命中 BuildKit 本地内容库，无需 registry 往返）。
 
-FROM node:22-bookworm-slim AS frontend
+# Defaults remain Docker Hub; Compose can override the complete image references
+# when the host's transparent registry mirror fails authentication.
+ARG NODE_IMAGE=node:22-bookworm-slim
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+
+FROM ${NODE_IMAGE} AS frontend
 
 WORKDIR /frontend
 
@@ -23,7 +29,7 @@ ARG SOURCE_CACHE_BUST=dev
 RUN echo "LearnGraph source cache: ${SOURCE_CACHE_BUST}"
 RUN npm run build
 
-FROM python:3.12-slim-bookworm AS backend
+FROM ${PYTHON_IMAGE} AS backend
 
 COPY --from=ghcr.io/astral-sh/uv:0.12@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /bin/uv
 
@@ -48,7 +54,7 @@ RUN echo "LearnGraph backend source cache: ${SOURCE_CACHE_BUST}"
 COPY backend/app ./app
 COPY backend/sandbox ./sandbox
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 
 ARG APP_VERSION=v0.5
 ARG UPDATE_COMPATIBILITY=1

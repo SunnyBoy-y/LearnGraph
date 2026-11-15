@@ -1,0 +1,1064 @@
+{
+  "pass": true,
+  "browser": "installed Microsoft Edge / Playwright headless",
+  "base": "http://127.0.0.1:15173",
+  "apiIsolation": "all /api/ fulfilled locally; unexpected mutations blocked; external HTTP/WS blocked",
+  "scenarios": [
+    {
+      "name": "desktop-create-double-click-slow-create",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pass": true,
+      "checks": [
+        "real right-rail graph card click: preview only; no writes, creation, SSE, route or source binding change",
+        "slow creation held behind gate: double click creates exactly once",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus",
+        "back/forward switches existing sessions, restores node-a/node-b bindings and does not send again"
+      ],
+      "counts": {
+        "creates": 1,
+        "streams": 1,
+        "folders": 1,
+        "readiness": 0
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions",
+          "body": {
+            "memory_enabled": true,
+            "title": "新会话",
+            "goal_id": "goal",
+            "graph_id": "study-graph",
+            "current_node_id": "node-b",
+            "project_id": "study-project"
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-destination/messages/stream",
+          "body": {
+            "content": "什么是 待学知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-b"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-b&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/study-destination/messages?limit=50&compact=false",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/sessions/study-destination/messages/study-destination-user-1",
+        "/sessions/study-destination/messages/study-destination-answer-1",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph",
+        "/auth/me",
+        "/voice/capabilities",
+        "/workspaces",
+        "/sessions/study-destination",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sessions/study-source",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/graphs/study-graph/nodes/node-b/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "desktop-reuse-different-route",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pass": true,
+      "checks": [
+        "real right-rail graph card click: preview only; no writes, creation, SSE, route or source binding change",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus",
+        "back/forward switches existing sessions, restores node-a/node-b bindings and does not send again"
+      ],
+      "counts": {
+        "creates": 0,
+        "streams": 1,
+        "folders": 1,
+        "readiness": 0
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-destination/messages/stream",
+          "body": {
+            "content": "什么是 待学知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-b"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-b&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-destination",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/voice/capabilities",
+        "/sessions/study-destination/messages?limit=50&compact=false",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/sessions/study-destination/messages/study-destination-user-1",
+        "/sessions/study-destination/messages/study-destination-answer-1",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph",
+        "/auth/me",
+        "/voice/capabilities",
+        "/workspaces",
+        "/sessions/study-destination",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sessions/study-source",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/graphs/study-graph/nodes/node-b/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "desktop-reuse-same-route",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pass": true,
+      "checks": [
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus"
+      ],
+      "counts": {
+        "creates": 0,
+        "streams": 1,
+        "folders": 1,
+        "readiness": 0
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-source/messages/stream",
+          "body": {
+            "content": "什么是 当前知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-a"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-a&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/sessions/study-source/messages/study-source-user-1",
+        "/sessions/study-source/messages/study-source-answer-1",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph",
+        "/auth/me",
+        "/voice/capabilities",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/workspaces",
+        "/sessions/study-source",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "desktop-slow-sandbox-second-click",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pass": true,
+      "checks": [
+        "second explicit click during sandbox preflight: one eventual auto-submitted SSE",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus"
+      ],
+      "counts": {
+        "creates": 0,
+        "streams": 1,
+        "folders": 2,
+        "readiness": 3
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-source/messages/stream",
+          "body": {
+            "content": "什么是 当前知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-a"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": true,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sandbox/agent/readiness",
+        "/auth/me",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model&agent_mode=true",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-a&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/sandbox/agent/readiness",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-a&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sandbox/bootstrap/status",
+        "/sessions/study-source/messages/study-source-user-1",
+        "/sessions/study-source/messages/study-source-answer-1",
+        "/sandbox/agent/readiness",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model&agent_mode=true",
+        "/graphs/study-graph",
+        "/voice/capabilities",
+        "/auth/me",
+        "/workspaces",
+        "/sessions/study-source",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "desktop-create-failure-explicit-retry",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pass": true,
+      "checks": [
+        "real right-rail graph card click: preview only; no writes, creation, SSE, route or source binding change",
+        "failed creation response creates no record/sends nothing; releases navigation lock for explicit retry",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus"
+      ],
+      "counts": {
+        "creates": 2,
+        "streams": 1,
+        "folders": 2,
+        "readiness": 0
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions",
+          "body": {
+            "memory_enabled": true,
+            "title": "新会话",
+            "goal_id": "goal",
+            "graph_id": "study-graph",
+            "current_node_id": "node-b",
+            "project_id": "study-project"
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions",
+          "body": {
+            "memory_enabled": true,
+            "title": "新会话",
+            "goal_id": "goal",
+            "graph_id": "study-graph",
+            "current_node_id": "node-b",
+            "project_id": "study-project"
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-destination/messages/stream",
+          "body": {
+            "content": "什么是 待学知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-b"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-b&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-b&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/voice/capabilities",
+        "/sessions/study-destination/messages?limit=50&compact=false",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/sessions/study-destination/messages/study-destination-user-1",
+        "/sessions/study-destination/messages/study-destination-answer-1",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph",
+        "/voice/capabilities",
+        "/auth/me",
+        "/workspaces",
+        "/sessions/study-destination",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/graphs/study-graph/nodes/node-b/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [
+        "Failed to load resource: the server responded with a status of 503 (Service Unavailable)"
+      ],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "desktop-stream-failure-explicit-retry",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "pass": true,
+      "checks": [
+        "failed SSE stays consumed; explicit retry sends once without creating",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus"
+      ],
+      "counts": {
+        "creates": 0,
+        "streams": 2,
+        "folders": 2,
+        "readiness": 0
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-source/messages/stream",
+          "body": {
+            "content": "什么是 当前知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-a"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-source/messages/stream",
+          "body": {
+            "content": "什么是 当前知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-a"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-a&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/voice/capabilities",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/auth/me",
+        "/workspaces",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-a&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source",
+        "/sessions/study-source/messages/study-source-user-2",
+        "/sessions/study-source/messages/study-source-answer-2",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph",
+        "/voice/capabilities",
+        "/auth/me",
+        "/workspaces",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "mobile-create-double-click-slow-create",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "pass": true,
+      "checks": [
+        "real right-rail graph card click: preview only; no writes, creation, SSE, route or source binding change",
+        "slow creation held behind gate: double click creates exactly once",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus",
+        "back/forward switches existing sessions, restores node-a/node-b bindings and does not send again"
+      ],
+      "counts": {
+        "creates": 1,
+        "streams": 1,
+        "folders": 1,
+        "readiness": 0
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions",
+          "body": {
+            "memory_enabled": true,
+            "title": "新会话",
+            "goal_id": "goal",
+            "graph_id": "study-graph",
+            "current_node_id": "node-b",
+            "project_id": "study-project"
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-destination/messages/stream",
+          "body": {
+            "content": "什么是 待学知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-b"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/version",
+        "/sessions/page?ungrouped=true&roots_only=true&limit=20",
+        "/sessions/page?project_id=study-project&roots_only=true&limit=20",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-b&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/study-destination/messages?limit=50&compact=false",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/sessions/study-destination/messages/study-destination-user-1",
+        "/sessions/study-destination/messages/study-destination-answer-1",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph",
+        "/voice/capabilities",
+        "/auth/me",
+        "/workspaces",
+        "/sessions/page?ungrouped=true&roots_only=true&limit=20",
+        "/sessions/page?project_id=study-project&roots_only=true&limit=20",
+        "/sessions/study-destination",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50",
+        "/sessions/study-source",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/version",
+        "/graphs/study-graph/nodes/node-b/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "mobile-reuse-different-route",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "pass": true,
+      "checks": [
+        "real right-rail graph card click: preview only; no writes, creation, SSE, route or source binding change",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus"
+      ],
+      "counts": {
+        "creates": 0,
+        "streams": 1,
+        "folders": 1,
+        "readiness": 0
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-destination/messages/stream",
+          "body": {
+            "content": "什么是 待学知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-b"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/version",
+        "/sessions/page?project_id=study-project&roots_only=true&limit=20",
+        "/sessions/page?ungrouped=true&roots_only=true&limit=20",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-b&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-destination",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/voice/capabilities",
+        "/sessions/study-destination/messages?limit=50&compact=false",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20",
+        "/sandbox/agent-tasks?chat_session_id=study-destination&limit=50",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/sessions/study-destination/messages/study-destination-user-1",
+        "/sessions/study-destination/messages/study-destination-answer-1",
+        "/graphs/study-graph/nodes/node-b/questions",
+        "/sessions/study-destination/context-usage?provider_id=study-provider&model_id=study-model",
+        "/graphs/study-graph",
+        "/auth/me",
+        "/voice/capabilities",
+        "/workspaces",
+        "/sessions/page?project_id=study-project&roots_only=true&limit=20",
+        "/sessions/page?ungrouped=true&roots_only=true&limit=20",
+        "/sessions/study-destination",
+        "/sessions/page?parent_session_id=study-destination&roots_only=false&include_archived=true&limit=20"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/version",
+        "/graphs/study-graph/nodes/node-b/questions"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    },
+    {
+      "name": "mobile-slow-sandbox-second-click",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "pass": true,
+      "checks": [
+        "second explicit click during sandbox preflight: one eventual auto-submitted SSE",
+        "correct persisted graph/node/project binding; correct destination; prompt and node_ids; completed AI reply visible; route intent consumed; no duplicate on refocus"
+      ],
+      "counts": {
+        "creates": 0,
+        "streams": 1,
+        "folders": 2,
+        "readiness": 3
+      },
+      "requests": [
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/graphs/study-graph/learning-folder",
+          "body": null
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/study-source/messages/stream",
+          "body": {
+            "content": "什么是 当前知识点？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [
+              "node-a"
+            ],
+            "provider_id": "study-provider",
+            "model_id": "study-model",
+            "thinking_mode": "off",
+            "agent_mode": true,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ],
+      "reads": [
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/auth/me",
+        "/workspaces",
+        "/projects?include_archived=true",
+        "/sessions/study-source",
+        "/settings",
+        "/voice/capabilities",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/graphs",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sessions/study-source",
+        "/settings",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/providers",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sandbox/agent/readiness",
+        "/auth/me",
+        "/voice/capabilities",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/providers/study-provider/models",
+        "/graphs/study-graph",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model&agent_mode=true",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/version",
+        "/sessions/page?project_id=study-project&roots_only=true&limit=20",
+        "/sessions/page?ungrouped=true&roots_only=true&limit=20",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-a&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source",
+        "/sessions/study-source/messages?limit=50&compact=false",
+        "/sandbox/agent/readiness",
+        "/sessions/page?project_id=study-project&graph_id=study-graph&node_id=node-a&session_kind=main&roots_only=false&pinned_first=false&limit=20",
+        "/sessions/study-source",
+        "/sandbox/agent-tasks?chat_session_id=study-source&limit=50",
+        "/sandbox/bootstrap/status",
+        "/sessions/study-source/messages/study-source-user-1",
+        "/sessions/study-source/messages/study-source-answer-1",
+        "/sandbox/agent/readiness",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/sessions/study-source/context-usage?provider_id=study-provider&model_id=study-model&agent_mode=true",
+        "/graphs/study-graph",
+        "/auth/me",
+        "/voice/capabilities",
+        "/workspaces",
+        "/sessions/study-source",
+        "/sessions/page?parent_session_id=study-source&roots_only=false&include_archived=true&limit=20",
+        "/sessions/page?project_id=study-project&roots_only=true&limit=20",
+        "/sessions/page?ungrouped=true&roots_only=true&limit=20"
+      ],
+      "unknownReads": [
+        "/voice/capabilities",
+        "/sandbox/agent-tasks",
+        "/graphs/study-graph/nodes/node-a/questions",
+        "/version"
+      ],
+      "pageErrors": [],
+      "consoleErrors": [],
+      "external": [],
+      "unexpectedWrites": []
+    }
+  ],
+  "screenshots": [
+    "artifacts/node-study/desktop-preview.png",
+    "artifacts/node-study/desktop-completed.png",
+    "artifacts/node-study/mobile-preview.png",
+    "artifacts/node-study/mobile-bound-destination.png",
+    "artifacts/node-study/mobile-completed-ai-visible.png"
+  ]
+}

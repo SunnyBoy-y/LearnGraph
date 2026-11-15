@@ -251,9 +251,11 @@ backend/sandbox/.spec-test.json
 
 # Local frontend previews, demonstrations, probes, and their recorded data.
 # Production components and maintained tests remain versioned.
-/frontend/src/dev/
+/frontend/src/dev/*
+!/frontend/src/dev/fluent-emoji-preview.tsx
 /frontend/src/previews/
 /frontend/*-preview.html
+!/frontend/fluent-emoji-preview.html
 /frontend/code-trainer.html
 /frontend/memory-deletion.html
 /frontend/stream-ui.html

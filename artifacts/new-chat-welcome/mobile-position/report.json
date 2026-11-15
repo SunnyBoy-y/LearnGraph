@@ -1,0 +1,929 @@
+{
+  "pass": true,
+  "base": "http://127.0.0.1:15173",
+  "checks": [
+    "320x640 layout",
+    "390x844 layout",
+    "768x1024 layout",
+    "1024x768 layout",
+    "1025x900 layout",
+    "1440x1000 layout",
+    "mobile refreshed draft layout",
+    "mobile multiline draft layout",
+    "mobile collapsed draft layout",
+    "mobile new?project=qa-project layout",
+    "mobile qa-empty layout",
+    "mobile dark layout",
+    "mobile started conversation layout",
+    "desktop started conversation layout",
+    "mobile ordering / breakpoint boundaries / refresh / stable input / multiline draft / expand / project and empty routes / dark theme / goal mode / send"
+  ],
+  "layouts": [
+    {
+      "label": "320x640",
+      "width": 320,
+      "height": 640,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 641,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 289,
+          "bottom": 164,
+          "width": 273,
+          "height": 140
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 505,
+          "right": 289,
+          "bottom": 621,
+          "width": 273,
+          "height": 116
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 188,
+          "right": 289,
+          "bottom": 430,
+          "width": 273,
+          "height": 242
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 236,
+          "right": 289,
+          "bottom": 298,
+          "width": 273,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 302,
+          "right": 289,
+          "bottom": 364,
+          "width": 273,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 368,
+          "right": 289,
+          "bottom": 430,
+          "width": 273,
+          "height": 62
+        }
+      ]
+    },
+    {
+      "label": "390x844",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 359,
+          "bottom": 403,
+          "width": 343,
+          "height": 379
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 708,
+          "right": 359,
+          "bottom": 824,
+          "width": 343,
+          "height": 116
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 427,
+          "right": 359,
+          "bottom": 633,
+          "width": 343,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 475,
+          "right": 359,
+          "bottom": 537,
+          "width": 343,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 541,
+          "right": 359,
+          "bottom": 585,
+          "width": 343,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 589,
+          "right": 359,
+          "bottom": 633,
+          "width": 343,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "768x1024",
+      "width": 768,
+      "height": 1024,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1024,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 737,
+          "bottom": 606,
+          "width": 721,
+          "height": 582
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 893,
+          "right": 737,
+          "bottom": 1004,
+          "width": 721,
+          "height": 111
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 630,
+          "right": 737,
+          "bottom": 818,
+          "width": 721,
+          "height": 188
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 678,
+          "right": 737,
+          "bottom": 722,
+          "width": 721,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 726,
+          "right": 737,
+          "bottom": 770,
+          "width": 721,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 774,
+          "right": 737,
+          "bottom": 818,
+          "width": 721,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "1024x768",
+      "width": 1024,
+      "height": 768,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 768,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 993,
+          "bottom": 353,
+          "width": 977,
+          "height": 329
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 640,
+          "right": 993,
+          "bottom": 748,
+          "width": 977,
+          "height": 108
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 377,
+          "right": 993,
+          "bottom": 565,
+          "width": 977,
+          "height": 188
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 425,
+          "right": 993,
+          "bottom": 469,
+          "width": 977,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 473,
+          "right": 993,
+          "bottom": 517,
+          "width": 977,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 521,
+          "right": 993,
+          "bottom": 565,
+          "width": 977,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "1025x900",
+      "width": 1025,
+      "height": 900,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 900,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 442.171875,
+          "y": 330,
+          "right": 617.8125,
+          "bottom": 369,
+          "width": 175.640625,
+          "height": 39
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 150,
+          "y": 444,
+          "right": 910,
+          "bottom": 506,
+          "width": 760,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 150,
+          "y": 530,
+          "right": 910,
+          "bottom": 710,
+          "width": 760,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 162,
+          "y": 570,
+          "right": 898,
+          "bottom": 614,
+          "width": 736,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 162,
+          "y": 618,
+          "right": 898,
+          "bottom": 662,
+          "width": 736,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 162,
+          "y": 666,
+          "right": 898,
+          "bottom": 710,
+          "width": 736,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "1440x1000",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 442.15625,
+          "y": 374,
+          "right": 671.828125,
+          "bottom": 425,
+          "width": 229.671875,
+          "height": 51
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 177,
+          "y": 500,
+          "right": 937,
+          "bottom": 562,
+          "width": 760,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 177,
+          "y": 586,
+          "right": 937,
+          "bottom": 766,
+          "width": 760,
+          "height": 180
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 189,
+          "y": 626,
+          "right": 925,
+          "bottom": 670,
+          "width": 736,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 189,
+          "y": 674,
+          "right": 925,
+          "bottom": 718,
+          "width": 736,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 189,
+          "y": 722,
+          "right": 925,
+          "bottom": 766,
+          "width": 736,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile refreshed draft",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 359,
+          "bottom": 403,
+          "width": 343,
+          "height": 379
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 708,
+          "right": 359,
+          "bottom": 824,
+          "width": 343,
+          "height": 116
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 427,
+          "right": 359,
+          "bottom": 633,
+          "width": 343,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 475,
+          "right": 359,
+          "bottom": 537,
+          "width": 343,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 541,
+          "right": 359,
+          "bottom": 585,
+          "width": 343,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 589,
+          "right": 359,
+          "bottom": 633,
+          "width": 343,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile multiline draft",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 359,
+          "bottom": 323,
+          "width": 343,
+          "height": 299
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 628,
+          "right": 359,
+          "bottom": 824,
+          "width": 343,
+          "height": 196
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 347,
+          "right": 359,
+          "bottom": 553,
+          "width": 343,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 395,
+          "right": 359,
+          "bottom": 457,
+          "width": 343,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 461,
+          "right": 359,
+          "bottom": 505,
+          "width": 343,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 509,
+          "right": 359,
+          "bottom": 553,
+          "width": 343,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile collapsed draft",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 359,
+          "bottom": 323,
+          "width": 343,
+          "height": 299
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 628,
+          "right": 359,
+          "bottom": 824,
+          "width": 343,
+          "height": 196
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 347,
+          "right": 359,
+          "bottom": 553,
+          "width": 343,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 395,
+          "right": 359,
+          "bottom": 457,
+          "width": 343,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 461,
+          "right": 359,
+          "bottom": 505,
+          "width": 343,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 509,
+          "right": 359,
+          "bottom": 553,
+          "width": 343,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile new?project=qa-project",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 359,
+          "bottom": 411,
+          "width": 343,
+          "height": 387
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 716,
+          "right": 359,
+          "bottom": 824,
+          "width": 343,
+          "height": 108
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 435,
+          "right": 359,
+          "bottom": 641,
+          "width": 343,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 483,
+          "right": 359,
+          "bottom": 545,
+          "width": 343,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 549,
+          "right": 359,
+          "bottom": 593,
+          "width": 343,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 597,
+          "right": 359,
+          "bottom": 641,
+          "width": 343,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile qa-empty",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 359,
+          "bottom": 411,
+          "width": 343,
+          "height": 387
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 716,
+          "right": 359,
+          "bottom": 824,
+          "width": 343,
+          "height": 108
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 435,
+          "right": 359,
+          "bottom": 641,
+          "width": 343,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 483,
+          "right": 359,
+          "bottom": 545,
+          "width": 343,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 549,
+          "right": 359,
+          "bottom": 593,
+          "width": 343,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 597,
+          "right": 359,
+          "bottom": 641,
+          "width": 343,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile dark",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "new-chat-heading",
+          "x": 16,
+          "y": 24,
+          "right": 364,
+          "bottom": 411,
+          "width": 348,
+          "height": 387
+        },
+        {
+          "element": "chat-composer-anchor",
+          "x": 16,
+          "y": 716,
+          "right": 364,
+          "bottom": 824,
+          "width": 348,
+          "height": 108
+        },
+        {
+          "element": "new-chat-suggestions",
+          "x": 16,
+          "y": 435,
+          "right": 364,
+          "bottom": 641,
+          "width": 348,
+          "height": 206
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 483,
+          "right": 364,
+          "bottom": 545,
+          "width": 348,
+          "height": 62
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 549,
+          "right": 364,
+          "bottom": 593,
+          "width": 348,
+          "height": 44
+        },
+        {
+          "element": "new-chat-suggestions__prompt",
+          "x": 16,
+          "y": 597,
+          "right": 364,
+          "bottom": 641,
+          "width": 348,
+          "height": 44
+        }
+      ]
+    },
+    {
+      "label": "mobile started conversation",
+      "width": 390,
+      "height": 844,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 844,
+      "elements": [
+        {
+          "element": "chat-composer-anchor",
+          "x": 12,
+          "y": 708,
+          "right": 378,
+          "bottom": 816,
+          "width": 366,
+          "height": 108
+        }
+      ]
+    },
+    {
+      "label": "desktop started conversation",
+      "width": 1440,
+      "height": 1000,
+      "overflow": 0,
+      "pageOverflow": 0,
+      "scrollBottom": 1000,
+      "elements": [
+        {
+          "element": "chat-composer-anchor",
+          "x": 164.5,
+          "y": 903,
+          "right": 964.5,
+          "bottom": 957,
+          "width": 800,
+          "height": 54
+        }
+      ]
+    }
+  ],
+  "colors": [],
+  "requests": [
+    {
+      "scenario": "mobile welcome layout",
+      "opening": [
+        {
+          "index": 1,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          },
+          "status": 200
+        },
+        {
+          "index": 2,
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": "qa-project",
+            "count": 3
+          },
+          "status": 200
+        }
+      ],
+      "writes": [
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": null,
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/opening-prompts",
+          "body": {
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "project_id": "qa-project",
+            "count": 3
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions",
+          "body": {
+            "memory_enabled": true,
+            "title": "新会话",
+            "project_id": null,
+            "goal_id": null,
+            "graph_id": null,
+            "current_node_id": null
+          }
+        },
+        {
+          "method": "POST",
+          "endpoint": "/sessions/qa-started/messages/stream",
+          "body": {
+            "content": "结合上次的网络笔记，TCP 为什么需要三次握手？",
+            "generation_mode": "text",
+            "image_size": "auto",
+            "source_file_ids": [],
+            "file_ids": [],
+            "node_ids": [],
+            "provider_id": "qa-provider",
+            "model_id": "qa-model",
+            "thinking_mode": "off",
+            "agent_mode": false,
+            "goal_mode": false,
+            "search_route": "disabled",
+            "web_search": false,
+            "graph_action": "none"
+          }
+        }
+      ]
+    }
+  ],
+  "screenshots": [
+    "artifacts/new-chat-welcome/mobile-position/mobile-layout-desktop.png",
+    "artifacts/new-chat-welcome/mobile-position/mobile-layout-phone.png"
+  ],
+  "scenarios": [
+    {
+      "name": "mobile welcome layout",
+      "pageErrors": [],
+      "consoleErrors": [],
+      "externalRequests": [],
+      "unknownMockedReads": [
+        "/voice/capabilities",
+        "/graphs",
+        "/version",
+        "/sandbox/agent-tasks"
+      ]
+    }
+  ]
+}

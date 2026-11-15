@@ -1,0 +1,350 @@
+{
+  "cases": [
+    {
+      "name": "light-actionable",
+      "width": 380,
+      "height": 137.59375,
+      "x": 1036,
+      "top": 72,
+      "right": 24,
+      "bottom": 790.40625,
+      "closeWidth": 32,
+      "closeHeight": 32,
+      "closeInside": true,
+      "background": "oklch(1 0 0)",
+      "color": "oklch(0.17 0.008 165)",
+      "transition": "0.2s, 0.2s",
+      "theme": "light",
+      "horizontalOverflow": false,
+      "ancestors": [
+        {
+          "tag": "OL",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "SECTION",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "DIV",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "BODY",
+          "overflow": "hidden",
+          "contain": "none"
+        },
+        {
+          "tag": "HTML",
+          "overflow": "visible",
+          "contain": "none"
+        }
+      ],
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      }
+    },
+    {
+      "name": "light-hover",
+      "width": 380,
+      "height": 137.59375,
+      "x": 1036,
+      "top": 72,
+      "right": 24,
+      "bottom": 790.40625,
+      "closeWidth": 32,
+      "closeHeight": 32,
+      "closeInside": true,
+      "background": "oklch(1 0 0)",
+      "color": "oklch(0.17 0.008 165)",
+      "transition": "0.2s, 0.2s",
+      "theme": "light",
+      "horizontalOverflow": false,
+      "ancestors": [
+        {
+          "tag": "OL",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "SECTION",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "DIV",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "BODY",
+          "overflow": "hidden",
+          "contain": "none"
+        },
+        {
+          "tag": "HTML",
+          "overflow": "visible",
+          "contain": "none"
+        }
+      ],
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      }
+    },
+    {
+      "name": "keyboard-alt-t-escape-restore-focus",
+      "passed": true
+    },
+    {
+      "name": "duplicate-five-times",
+      "visible": 1
+    },
+    {
+      "name": "fifo-queue-real-close",
+      "initial": [
+        "后台任务 2 已完成",
+        "后台任务 1 已完成"
+      ],
+      "next": [
+        "后台任务 3 已完成",
+        "后台任务 1 已完成"
+      ]
+    },
+    {
+      "name": "expanded-two-notices",
+      "width": 380,
+      "height": 53,
+      "x": 1036,
+      "top": 72,
+      "right": 24,
+      "bottom": 875,
+      "closeWidth": 32,
+      "closeHeight": 32,
+      "closeInside": true,
+      "background": "oklch(1 0 0)",
+      "color": "oklch(0.17 0.008 165)",
+      "transition": "0.2s, 0.2s",
+      "theme": "light",
+      "horizontalOverflow": false,
+      "ancestors": [
+        {
+          "tag": "OL",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "SECTION",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "DIV",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "BODY",
+          "overflow": "hidden",
+          "contain": "none"
+        },
+        {
+          "tag": "HTML",
+          "overflow": "visible",
+          "contain": "none"
+        }
+      ],
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      }
+    },
+    {
+      "name": "action-releases-queue",
+      "passed": true
+    },
+    {
+      "name": "dark-long-chinese",
+      "width": 380,
+      "height": 118.390625,
+      "x": 1036,
+      "top": 72,
+      "right": 24,
+      "bottom": 809.609375,
+      "closeWidth": 32,
+      "closeHeight": 32,
+      "closeInside": true,
+      "background": "rgb(28, 31, 35)",
+      "color": "rgb(232, 235, 238)",
+      "transition": "0.2s, 0.2s",
+      "theme": "dark",
+      "horizontalOverflow": false,
+      "ancestors": [
+        {
+          "tag": "OL",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "SECTION",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "DIV",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "BODY",
+          "overflow": "hidden",
+          "contain": "none"
+        },
+        {
+          "tag": "HTML",
+          "overflow": "visible",
+          "contain": "none"
+        }
+      ],
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      }
+    },
+    {
+      "name": "system-reduced-motion",
+      "passed": true
+    },
+    {
+      "name": "200-percent-equivalent-css-viewport",
+      "width": 380,
+      "height": 118.390625,
+      "x": 316,
+      "top": 72,
+      "right": 24,
+      "bottom": 309.609375,
+      "closeWidth": 32,
+      "closeHeight": 32,
+      "closeInside": true,
+      "background": "rgb(28, 31, 35)",
+      "color": "rgb(232, 235, 238)",
+      "transition": "0.2s, 0.2s",
+      "theme": "dark",
+      "horizontalOverflow": false,
+      "ancestors": [
+        {
+          "tag": "OL",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "SECTION",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "DIV",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "BODY",
+          "overflow": "auto",
+          "contain": "none"
+        },
+        {
+          "tag": "HTML",
+          "overflow": "visible",
+          "contain": "none"
+        }
+      ],
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      }
+    },
+    {
+      "name": "narrow-390",
+      "width": 358,
+      "height": 139.1875,
+      "x": 16,
+      "top": 16,
+      "right": 16,
+      "bottom": 688.8125,
+      "closeWidth": 32,
+      "closeHeight": 32,
+      "closeInside": true,
+      "background": "rgb(28, 31, 35)",
+      "color": "rgb(232, 235, 238)",
+      "transition": "0.2s, 0.2s",
+      "theme": "dark",
+      "horizontalOverflow": false,
+      "ancestors": [
+        {
+          "tag": "OL",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "SECTION",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "DIV",
+          "overflow": "visible",
+          "contain": "none"
+        },
+        {
+          "tag": "BODY",
+          "overflow": "auto",
+          "contain": "none"
+        },
+        {
+          "tag": "HTML",
+          "overflow": "visible",
+          "contain": "none"
+        }
+      ],
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      }
+    },
+    {
+      "name": "offline-persistent-online-clears",
+      "passed": true
+    },
+    {
+      "name": "hover-and-keyboard-focus-pause",
+      "passed": true
+    },
+    {
+      "name": "copy-local-2500ms-no-toast",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "C:\\Users\\13600\\Desktop\\66\\LearnGraph\\docs\\notification-light.png",
+    "C:\\Users\\13600\\Desktop\\66\\LearnGraph\\docs\\notification-dark.png",
+    "C:\\Users\\13600\\Desktop\\66\\LearnGraph\\docs\\notification-narrow.png"
+  ],
+  "pageErrors": [],
+  "passed": true
+}

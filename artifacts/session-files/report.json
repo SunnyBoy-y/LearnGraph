@@ -1,0 +1,19 @@
+{
+  "checks": [
+    "desktop-light: folders, nested preview, full height, close, focus restoration, refresh, long names, Escape, workspace-only files, download, session switch, neighboring tab, empty and recovery",
+    "desktop-dark: folders, nested preview, full height, close, focus restoration, refresh, long names, Escape, workspace-only files, download, session switch, neighboring tab, empty and recovery",
+    "mobile-light: folders, nested preview, full height, close, focus restoration, refresh, long names, Escape, workspace-only files, download, session switch, neighboring tab, empty and recovery",
+    "mobile-dark: folders, nested preview, full height, close, focus restoration, refresh, long names, Escape, workspace-only files, download, session switch, neighboring tab, empty and recovery"
+  ],
+  "errors": [],
+  "screenshots": [
+    "artifacts/session-files/desktop-light-directory.png",
+    "artifacts/session-files/desktop-light-preview.png",
+    "artifacts/session-files/desktop-dark-directory.png",
+    "artifacts/session-files/desktop-dark-preview.png",
+    "artifacts/session-files/mobile-light-directory.png",
+    "artifacts/session-files/mobile-light-preview.png",
+    "artifacts/session-files/mobile-dark-directory.png",
+    "artifacts/session-files/mobile-dark-preview.png"
+  ]
+}

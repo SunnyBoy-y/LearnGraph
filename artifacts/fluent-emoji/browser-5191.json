@@ -1,0 +1,20 @@
+{
+  "url": "http://127.0.0.1:5191/fluent-emoji-preview.html",
+  "checks": [
+    "actual message renderer: Markdown, Stream UI document, headings, standalone, rails, metric and timeline",
+    "all visible local WebP assets decode, no external image requests, legacy Lucide still renders",
+    "unusual upstream filenames and attribution files are served in the deployment",
+    "streaming replay preserves tab selection and simulation input state",
+    "desktop/mobile (1440px/390px), light/dark: no overflow and bounded square icons",
+    "failed image requests fall back to readable Unicode without broken images",
+    "shared rich-response/editorial/genui/timeline/input preview routes render without runtime errors"
+  ],
+  "errors": [],
+  "images": 23,
+  "screenshots": [
+    "5191-light-1440.png",
+    "5191-light-390.png",
+    "5191-dark-1440.png",
+    "5191-dark-390.png"
+  ]
+}

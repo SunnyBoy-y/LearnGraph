@@ -13,6 +13,20 @@ and are not official descriptions from the upstream projects.
 - Pinned revision: `1ffb34c752ecf5d402f04cfb4b392c77f57c54bc`.
 - Files: `reaction-*.png` and `market-*.png`.
 
+### Answer and Stream UI icon assets
+
+- Microsoft Fluent Emoji 3D artwork, distributed as WebP by LobeHub through
+  `@lobehub/fluent-emoji-3d`, pinned to version `1.1.0` in the frontend lockfile.
+- Copyright (c) Microsoft Corporation; Copyright (c) 2023 LobeHub. MIT license.
+- Unicode Emoji 15.1 names/sequences: Copyright © 1991-2026 Unicode, Inc.;
+  Unicode License V3. The generated index records its source and SHA-256.
+- Full notices: `frontend/licenses/fluent-emoji.txt`, also shipped with the
+  images at `fluent-emoji/1.1.0/LICENSE.txt` in web and native renderer builds.
+- Source distribution: https://github.com/lobehub/fluent-emoji
+- Metadata: https://unicode.org/Public/emoji/15.1/emoji-test.txt
+- These are separate from the sticker marketplace assets. Images are served
+  locally on demand; no third-party image host is contacted while rendering.
+
 ## Google Noto Emoji image assets
 
 - Copyright 2013 Google, Inc. All Rights Reserved.

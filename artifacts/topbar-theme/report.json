@@ -1,0 +1,77 @@
+{
+  "cases": [
+    {
+      "name": "mobile schedules",
+      "passed": true
+    },
+    {
+      "name": "mobile home",
+      "passed": true
+    },
+    {
+      "name": "mobile chat/new",
+      "passed": true
+    },
+    {
+      "name": "mobile graphs",
+      "passed": true
+    },
+    {
+      "name": "mobile capabilities",
+      "passed": true
+    },
+    {
+      "name": "mobile learn/joint",
+      "passed": true
+    },
+    {
+      "name": "mobile sources",
+      "passed": true
+    },
+    {
+      "name": "mobile evidence/review",
+      "passed": true
+    },
+    {
+      "name": "mobile practice",
+      "passed": true
+    },
+    {
+      "name": "mobile memory",
+      "passed": true
+    },
+    {
+      "name": "mobile artifacts",
+      "passed": true
+    },
+    {
+      "name": "hover-focus-navigation-tools",
+      "passed": true
+    },
+    {
+      "name": "desktop layout and tools unchanged",
+      "passed": true
+    },
+    {
+      "name": "native wide dark",
+      "passed": true
+    },
+    {
+      "name": "native mobile dark",
+      "passed": true
+    },
+    {
+      "name": "light-to-dark switch",
+      "passed": true
+    },
+    {
+      "name": "colored dark theme",
+      "passed": true
+    }
+  ],
+  "errors": [],
+  "screenshots": [
+    "C:\\Users\\13600\\Desktop\\66\\LearnGraph\\artifacts\\topbar-theme\\mobile-dark.png"
+  ],
+  "passed": true
+}

@@ -1,0 +1,18 @@
+{
+  "scenario": "desktop-reuse-same-route",
+  "viewport": {"width": 1440, "height": 1000},
+  "action": "Real Edge locator.dblclick({delay:70}) on 继续学习; instant mocked completed SSE response",
+  "expectedStreamCount": 1,
+  "actualStreamCount": 2,
+  "createdSessions": 0,
+  "learningFolderCalls": 2,
+  "duplicateEndpoint": "/sessions/study-source/messages/stream",
+  "duplicatePayload": {"content":"什么是 当前知识点？","node_ids":["node-a"],"provider_id":"study-provider","model_id":"study-model"},
+  "pageErrors": [],
+  "consoleErrors": [],
+  "externalRequests": [],
+  "screenshot": "artifacts/node-study/desktop-reuse-same-route-FAILED.png",
+  "reportedImmediately": true,
+  "businessFilesChangedByQa": false,
+  "parentFix": "CTA filters native click detail > 1; rerun pending"
+}
