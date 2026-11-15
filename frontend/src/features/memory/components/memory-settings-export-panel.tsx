@@ -1,7 +1,7 @@
 import { currentWorkspaceQueryKey } from '@/lib/query-keys';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, RefreshCw, ShieldCheck } from 'lucide-react';
-import { toast } from 'sonner';
+import { toast } from '@/lib/notifications';
 import { exportMemoryEventManifest, getMemoryArchitectureStatus, getMemoryEnhancement, replayValidateMemory } from '@/api';
 import { ErrorState, LoadingState, SectionHeading, Surface, } from '@/components/shared/page-elements';
 import { Badge } from '@/components/ui/badge';

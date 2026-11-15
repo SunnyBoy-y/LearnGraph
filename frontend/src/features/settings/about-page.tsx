@@ -1,6 +1,6 @@
 import { useState, type ComponentType } from "react";
 import { BookOpen, Bug, Check, Copy, ExternalLink, Scale } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   PageFrame,

@@ -185,9 +185,15 @@ async def lifespan(app: FastAPI):
     balance_task = asyncio.create_task(balance_worker(balance_stop))
     pricing_stop = asyncio.Event()
     pricing_task = asyncio.create_task(model_pricing_sync_worker(pricing_stop)) if settings.models_dev_refresh_enabled else None
+    from app.services.scheduled_tasks import scheduled_task_worker
+    schedules_stop = asyncio.Event()
+    schedules_task = asyncio.create_task(scheduled_task_worker(schedules_stop, settings)) if settings.scheduled_tasks_enabled else None
     try:
         yield
     finally:
+        schedules_stop.set()
+        if schedules_task is not None:
+            await schedules_task
         pricing_stop.set()
         if pricing_task is not None:
             await pricing_task

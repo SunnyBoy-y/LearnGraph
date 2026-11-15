@@ -28,7 +28,7 @@ import {
   Trash2,
   WalletCards,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { AnimatePresence, motion } from "motion/react";
 import { useReducedMotionPreference } from "@/lib/motion-preferences";
 
@@ -77,7 +77,6 @@ import {
   ErrorState,
   LoadingState,
   PageFrame,
-  PageIntro,
   SectionHeading,
   StatePill,
   Surface,
@@ -181,7 +180,7 @@ import {
 } from "./speech-provider-config";
 import { ResidentAsrSection } from "./resident-asr-section";
 import { Textarea } from "@/components/ui/textarea";
-import { isRealtimeTranscriptionModel } from "@/lib/model-choices";
+import { isRealtimeTranscriptionModel, thinkingLabels } from "@/lib/model-choices";
 
 function providerDefaultModelId(provider: Provider): string {
   const capabilities = provider.capabilities;
@@ -821,8 +820,7 @@ function ProvidersPageForm() {
   });
   return (
     <PageFrame>
-      <PageIntro
-        actions={
+      <div className="flex justify-end">
           <div className="flex flex-wrap gap-2">
             <ProviderDialog
               busy={create.isPending}
@@ -846,11 +844,7 @@ function ProvidersPageForm() {
             />
             <ImportProviderPopover />
           </div>
-        }
-        description="配置模型、搜索、抓取与记忆服务。"
-        eyebrow="Provider gateway"
-        title="服务连接"
-      />
+      </div>
       <HostBridgeHint status={hostBridge.data} />
       {roleFilter === "transcription" ? (
         <ResidentAsrSection
@@ -3620,6 +3614,7 @@ const reasoningModes: Exclude<ThinkingMode, "off">[] = [
   "medium",
   "high",
   "xhigh",
+  "max",
 ];
 const searchRoutes: SearchRoute[] = [
   "auto",
@@ -3691,11 +3686,10 @@ function normalizeLoadedCapabilities(
 
 function emptyModelCapabilities(): ProviderModelCapabilities {
   return {
-    // New LLM connections default to reasoning on; unsupported models can be
-    // narrowed in their individual override.
-    reasoning_efforts: ["low", "medium", "high", "xhigh"],
-    thinking_mapping: { low: "low", medium: "medium", high: "high", xhigh: "xhigh" },
-    default_thinking_mode: "medium",
+    // Unknown capabilities are explicitly opt-in, including the new max tier.
+    reasoning_efforts: [],
+    thinking_mapping: { off: null },
+    default_thinking_mode: "off",
     reasoning_parameter: "reasoning_effort",
     thinking_required: false,
     hosted_web_search: false,
@@ -4333,6 +4327,8 @@ function capabilitiesForSave(
 ): ProviderModelCapabilities {
   return {
     ...capabilities,
+    // Confirming a saved form is an explicit choice, including filled defaults.
+    capability_source: "user_declared",
     // Bound the legacy limit by the final value, never an unfinished input.
     context_limit_tokens: Math.min(
       capabilities.context_limit_tokens,
@@ -4492,7 +4488,7 @@ function CapabilityFormFields({
                       toggleReasoningEffort(effort, checked === true)
                     }
                   />
-                  <Label htmlFor={inputId}>支持 {effort}</Label>
+                  <Label htmlFor={inputId}>支持 {thinkingLabels[effort]}（{effort}）</Label>
                 </div>
                 <Input
                   className="mt-3 h-8 font-mono text-xs"
@@ -4774,6 +4770,7 @@ export function ModelOverrideDialog({
   provider: Provider;
 }) {
   const [edited, setEdited] = useState(false);
+  const [validationMessage, setValidationMessage] = useState("");
   useSettingsDirty(`model-parameters-${provider.id}-${modelId}`, edited);
   const queryClient = useQueryClient();
   const providerWorkspaceId = String(currentWorkspaceQueryKey()[1]);
@@ -4839,33 +4836,35 @@ export function ModelOverrideDialog({
       );
       void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
       onSaved(snapshot);
-      toast.success("模型配置已保存");
+      toast.success("模型配置已保存", { scope: `${providerWorkspaceId}:${provider.id}:${modelId}`, context: modelId });
       onClose();
     },
-    onError: (error) => toast.error(error.message),
+    // The dialog keeps the failed configuration and its retry button visible.
   });
 
   const terminalError = capabilitiesQuery.isError && !snapshotMissing;
 
   function submit(event: FormEvent) {
     event.preventDefault();
+    if (save.isPending) return;
+    setValidationMessage("");
     if (
       capabilities.default_thinking_mode !== "off" &&
       !capabilities.reasoning_efforts.includes(capabilities.default_thinking_mode)
     ) {
-      toast.error("默认思考模式必须已列入支持的推理强度");
+      setValidationMessage("默认思考模式必须已列入支持的推理强度");
       return;
     }
     if (
       capabilities.default_search_route === "model_native" &&
       !capabilities.hosted_web_search
     ) {
-      toast.error("模型原生联网需要先确认托管网页搜索能力");
+      setValidationMessage("模型原生联网需要先确认托管网页搜索能力");
       return;
     }
     const contextError = capabilityContextError(capabilities);
     if (contextError) {
-      toast.error(contextError);
+      setValidationMessage(contextError);
       return;
     }
     save.mutate();
@@ -4907,11 +4906,12 @@ export function ModelOverrideDialog({
                   capabilities={capabilities}
                   idPrefix={`model-${provider.id}-${modelId}`}
                   providerType={provider.provider_type}
-                  setCapabilities={(next) => { setEdited(true); setCapabilities(next); }}
+                  setCapabilities={(next) => { setValidationMessage(""); save.reset(); setEdited(true); setCapabilities(next); }}
                 />
+                {validationMessage ? <p role="status" className="text-sm text-muted-foreground">{validationMessage}</p> : null}
                 {save.isError ? (
                   <p className="text-sm text-destructive" role="alert">
-                    {save.error.message}
+                    未能保存配置：{save.error.message}
                   </p>
                 ) : null}
               </div>
@@ -4943,7 +4943,7 @@ export function ModelOverrideDialog({
               }
               type="submit"
             >
-              {save.isPending ? "保存中…" : "保存该模型配置"}
+              {save.isPending ? "保存中…" : save.isError ? "重试保存" : "保存该模型配置"}
             </Button>
           </DialogFooter>
         </form>

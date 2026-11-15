@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 import { Ban, Image as ImageIcon, PenTool, Sparkles } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   cancelAIGraphCover,

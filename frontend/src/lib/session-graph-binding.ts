@@ -1,6 +1,7 @@
 import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
-import { getGraph, listGraphs, listSessions, updateSession } from "@/api";
+import { toast } from '@/lib/notifications';
+import { getGraph, listGraphs, updateSession } from "@/api";
+import { sessionDetailKey, updateSessionCaches, useSessionDetail } from "@/lib/session-queries";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { GraphSummary } from "@/types/graphs";
 import type { Session, SessionUpdateRequest } from "@/types/sessions";
@@ -26,10 +27,10 @@ export function publishLearningNodeContext(context: LearningNodeContext) {
 /** The menu and rail share persisted state and a per-session mutation lock. */
 export function useSessionGraphBinding(workspaceId: string, sessionId?: string) {
   const queryClient = useQueryClient();
-  const sessionsKey = workspaceQueryKey(workspaceId, "sessions");
+  const sessionsKey = sessionDetailKey(workspaceId, sessionId ?? "new");
   const mutationKey = workspaceQueryKey(workspaceId, "session-graph-binding", sessionId ?? "new");
-  const sessions = useQuery({ queryKey: sessionsKey, queryFn: listSessions, staleTime: 30_000 });
-  const session = sessions.data?.find((item) => item.id === sessionId);
+  const sessionQuery = useSessionDetail(workspaceId, sessionId);
+  const session = sessionQuery.data;
   const graphs = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graphs"), queryFn: listGraphs, staleTime: 30_000,
   });
@@ -50,14 +51,12 @@ export function useSessionGraphBinding(workspaceId: string, sessionId?: string) 
     onMutate: () => queryClient.cancelQueries({ queryKey: sessionsKey }),
     mutationFn: (payload: SessionUpdateRequest) => updateSession(sessionId!, payload),
     onSuccess: (updated) => {
-      queryClient.setQueryData<Session[]>(sessionsKey, (current) =>
-        current?.map((item) => item.id === updated.id ? updated : item),
-      );
+      updateSessionCaches(queryClient, workspaceId, updated);
     },
   });
 
   function latestSession() {
-    return queryClient.getQueryData<Session[]>(sessionsKey)?.find((item) => item.id === sessionId);
+    return queryClient.getQueryData<Session>(sessionsKey);
   }
 
   async function commit(payload: SessionUpdateRequest, success: string) {

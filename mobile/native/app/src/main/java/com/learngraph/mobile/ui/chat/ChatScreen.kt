@@ -531,13 +531,13 @@ private fun NativeRetryDialog(
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("响应模式", modifier = Modifier.weight(1f), fontSize = 13.sp, lineHeight = 19.5.sp)
-                TextButton(onClick = { selected = selected.copy(responseMode = "fast", thinkingMode = "off") }) { Text("极速", fontWeight = if (selected.responseMode == "fast") FontWeight.Bold else FontWeight.Normal, fontSize = 13.sp, lineHeight = 19.5.sp) }
+                TextButton(enabled = choice?.thinkingRequired != true, onClick = { selected = selected.copy(responseMode = "fast", thinkingMode = "off", thinkingMappingVersion = 2) }) { Text("极速", fontWeight = if (selected.responseMode == "fast") FontWeight.Bold else FontWeight.Normal, fontSize = 13.sp, lineHeight = 19.5.sp) }
                 TextButton(enabled = choice?.supportsAgent != false, onClick = { selected = selected.copy(responseMode = "agentic", thinkingMode = selected.thinkingMode.takeUnless { it == "off" } ?: "medium") }) { Text("智能体", fontWeight = if (selected.responseMode != "fast") FontWeight.Bold else FontWeight.Normal, fontSize = 13.sp, lineHeight = 19.5.sp) }
             }
             Box {
                 TextButton(enabled = selected.responseMode != "fast", onClick = { menu = "thinking" }) { Text("思考强度：${thinkingLabel(if (selected.responseMode == "fast") "off" else selected.thinkingMode)}", fontSize = 13.sp, lineHeight = 19.5.sp) }
                 DropdownMenu(menu == "thinking", { menu = null }) {
-                    listOf("off", "low", "medium", "high", "xhigh").forEach { mode -> DropdownMenuItem(text = { Text(thinkingLabel(mode), fontSize = 13.sp, lineHeight = 19.5.sp) }, onClick = { selected = selected.copy(thinkingMode = mode); menu = null }) }
+                    (choice?.thinkingModes ?: listOf("off")).forEach { mode -> DropdownMenuItem(text = { Text(thinkingLabel(mode), fontSize = 13.sp, lineHeight = 19.5.sp) }, onClick = { selected = selected.copy(thinkingMode = mode, thinkingMappingVersion = 2); menu = null }) }
                 }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -558,7 +558,7 @@ private fun NativeRetryDialog(
     )
 }
 
-private fun thinkingLabel(mode: String): String = when (mode) { "off" -> "关闭"; "low" -> "低"; "medium" -> "中"; "high" -> "高"; "xhigh" -> "极高"; else -> mode }
+private fun thinkingLabel(mode: String): String = when (mode) { "off" -> "关闭"; "low" -> "低"; "medium" -> "中"; "high" -> "高"; "xhigh" -> "极高"; "max" -> "最高"; else -> mode }
 
 @Composable
 private fun SmallAction(label: String, onClick: () -> Unit, size: Int = 40, background: Color = Color.Transparent, enabled: Boolean = true, hasPopup: Boolean = false, translateOnPress: Boolean = true, content: @Composable () -> Unit) {

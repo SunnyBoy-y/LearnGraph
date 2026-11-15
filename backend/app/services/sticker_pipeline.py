@@ -15,7 +15,7 @@ from app.domain.models import DurableJob, StickerAsset, StickerPack, WorkspaceSe
 from app.providers.factory import vision_provider_for_workspace
 from app.providers.ports.model import ProviderChatMessage
 from app.services.billing import BillingService
-from app.services.stickers import StickerService, clean_semantics, digest
+from app.services.stickers import StickerService, catalog_packs, clean_semantics, digest
 
 
 class SemanticCard(BaseModel):
@@ -95,6 +95,8 @@ class StickerPipeline:
             if not preference or not preference.value.get("auto_analyze"):
                 return {"queued": 0, "waiting_model": False}
         packs = list(self.db.scalars(select(StickerPack).where(StickerPack.workspace_id == self.stickers.workspace_id, StickerPack.owner_id == self.stickers.actor_id, StickerPack.builtin.is_(False), StickerPack.enabled.is_(True))).all())
+        known = catalog_packs()
+        packs = [pack for pack in packs if pack.source_key not in known]
         if pack_id:
             packs = [pack for pack in packs if pack.id == pack_id]
             if not packs:

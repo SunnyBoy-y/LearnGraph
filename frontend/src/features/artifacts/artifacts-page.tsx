@@ -14,7 +14,7 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   artifactShareUrl,

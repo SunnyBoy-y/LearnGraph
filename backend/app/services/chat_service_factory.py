@@ -32,6 +32,9 @@ def build_agent_tool_runtime(
     db: Session,
     context: WorkspaceContext,
     settings: Settings,
+    *,
+    external_web_search_enabled: bool = True,
+    search_route: str = "auto",
 ) -> AgentToolRuntime:
     """Assemble an AgentToolRuntime service graph on the given session.
 
@@ -40,8 +43,10 @@ def build_agent_tool_runtime(
     SQLAlchemy Session/transaction).
     """
     authorization = AuthorizationService(db, context.principal)
-    search_provider = search_provider_for_workspace(
-        db, context.workspace_id, settings
+    search_provider = (
+        search_provider_for_workspace(db, context.workspace_id, settings, **({"route": search_route} if search_route != "auto" else {}))
+        if external_web_search_enabled
+        else None
     )
     image_search_provider = image_search_provider_for_workspace(
         db, context.workspace_id, settings
@@ -81,7 +86,7 @@ def build_agent_tool_runtime(
         if sandbox_authorized and settings.sandbox_agent_enabled
         else None
     )
-    return AgentToolRuntime(
+    runtime = AgentToolRuntime(
         workspace_id=context.workspace_id,
         actor_id=context.principal.user_id,
         search_provider=search_provider,
@@ -112,6 +117,8 @@ def build_agent_tool_runtime(
         fetch_provider=fetch_provider_for_workspace(db, context.workspace_id, settings),
         image_search_provider=image_search_provider,
     )
+    from app.services.web_tool_policy import bind_web_route
+    return bind_web_route(runtime, search_route)
 
 
 def build_agent_tool_worker_runtime(
@@ -122,6 +129,8 @@ def build_agent_tool_worker_runtime(
     tenant_id: str,
     permissions: frozenset[str],
     settings: Settings,
+    external_web_search_enabled: bool = True,
+    search_route: str = "auto",
 ) -> AgentToolRuntime:
     """Rebuild an AgentToolRuntime on an isolated worker session.
 
@@ -159,7 +168,13 @@ def build_agent_tool_worker_runtime(
         workspace=workspace,
         permissions=frozenset(permissions),
     )
-    return build_agent_tool_runtime(db, context, settings)
+    runtime_kwargs = (
+        {} if external_web_search_enabled
+        else {"external_web_search_enabled": False}
+    )
+    if search_route != "auto":
+        runtime_kwargs["search_route"] = search_route
+    return build_agent_tool_runtime(db, context, settings, **runtime_kwargs)
 
 
 def build_background_agent_tool_runtime(
@@ -168,6 +183,7 @@ def build_background_agent_tool_runtime(
     workspace_id: str,
     actor_id: str,
     settings: Settings,
+    search_route: str = "auto",
 ) -> AgentToolRuntime:
     """Build the ordinary authorized tool graph for a durable worker.
 
@@ -201,7 +217,7 @@ def build_background_agent_tool_runtime(
         workspace=workspace,
         permissions=frozenset(permissions),
     )
-    return build_agent_tool_runtime(db, context, settings)
+    return build_agent_tool_runtime(db, context, settings, **({"search_route": search_route} if search_route != "auto" else {}))
 
 
 def build_background_workspace_context(
@@ -283,6 +299,7 @@ def build_chat_service(
     thinking_mode: str | None = None,
     search_route: str | None = None,
     agent_mode: bool = True,
+    prefer_fast: bool = False,
 ) -> ChatService:
     """Assemble a ChatService for a workspace/actor in one place.
 
@@ -293,9 +310,6 @@ def build_chat_service(
     """
     context = workspace_context
     authorization = AuthorizationService(db, context.principal)
-    search_provider = search_provider_for_workspace(
-        db, context.workspace_id, settings, route=search_route
-    )
     memory_service = MemoryService(
         db,
         context.workspace,
@@ -308,23 +322,46 @@ def build_chat_service(
         ),
         settings.memory_root,
     )
-    model_kwargs: dict[str, str] = {}
+    model_kwargs: dict = {}
+    if prefer_fast:
+        model_kwargs["prefer_fast"] = True
     if model_id is not None:
         model_kwargs["model_id"] = model_id
     if provider_id is not None:
         model_kwargs["provider_id"] = provider_id
     if thinking_mode is not None:
         model_kwargs["thinking_mode"] = thinking_mode
-    if search_route not in {None, "disabled"}:
+    if search_route is not None:
         model_kwargs["search_route"] = search_route
+    model_provider = model_provider_for_workspace(
+        db, context.workspace_id, settings, **model_kwargs
+    )
+    effective_route = getattr(model_provider, "search_route", search_route or "auto")
+    native_codex_search = (
+        effective_route == "model_native"
+        and type(model_provider).__name__ != "QwenChatProvider"
+    )
+    # Resolve the model's effective auto route before assembling either the
+    # request runtime or its isolated workers. Native Codex needs no AnySearch.
+    runtime_kwargs = (
+        {"external_web_search_enabled": False} if native_codex_search else {}
+    )
+    if effective_route != "auto":
+        runtime_kwargs["search_route"] = effective_route
+    search_provider = (
+        None if native_codex_search
+        else search_provider_for_workspace(
+            db, context.workspace_id, settings, route=effective_route
+        )
+    )
     agent_tool_runtime = (
-        build_agent_tool_runtime(db, context, settings) if agent_mode else None
+        build_agent_tool_runtime(db, context, settings, **runtime_kwargs) if agent_mode else None
     )
     return ChatService(
         db,
         context.workspace_id,
         context.principal.user_id,
-        model_provider_for_workspace(db, context.workspace_id, settings, **model_kwargs),
+        model_provider,
         tenant_id=context.principal.tenant_id,
         context_builder=(
             # ``db=`` is what makes the router write a retrieval trace: without it
@@ -400,6 +437,7 @@ def build_chat_service(
                 tenant_id=context.principal.tenant_id,
                 permissions=context.permissions,
                 settings=settings,
+                **runtime_kwargs,
             )
         ),
     )

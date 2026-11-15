@@ -81,7 +81,9 @@ fun NativeModelMenu(
         val secondary = MaterialTheme.colorScheme.onSurfaceVariant
         val border = if (dark) Color(0xFF454B52) else MaterialTheme.colorScheme.outline
         val hover = if (dark) Color(0xFF292D32) else MaterialTheme.colorScheme.surfaceVariant
-        val stop = if (options.responseMode == "fast") 0 else listOf("off", "low", "medium", "high", "xhigh").indexOf(options.thinkingMode).coerceAtLeast(0)
+        val choice = choices.find { it.providerId == options.providerId && it.modelId == options.modelId }
+        val modes = choice?.thinkingModes ?: listOf("off")
+        val stop = modes.indexOf(if (options.responseMode == "fast") "off" else options.thinkingMode).coerceAtLeast(0)
         var searchFocused by remember { mutableStateOf(false) }
         val searchBorder by animateColorAsState(if (searchFocused) foreground.copy(alpha = .55f) else border, webMotionTween(150), label = "model-search-border")
         Box(modifier.width(width).webCssBoxShadow().webCssOuterRing(14.dp, foreground.copy(alpha = .1f))
@@ -92,9 +94,12 @@ fun NativeModelMenu(
             LazyColumn(Modifier.fillMaxWidth().heightIn(max = height).selectableGroup(), contentPadding = PaddingValues(6.dp)) {
                 item("response-label") { ModelMenuLabel("响应与思考力度", secondary) }
                 item("thinking") {
-                    WebThinkingSlider(stop, enabled = true, onChange = { index ->
-                        onOptionsChange(options.copy(responseMode = if (index == 0) "fast" else "agentic", thinkingMode = listOf("off", "low", "medium", "high", "xhigh")[index]))
-                    }, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                    WebThinkingSlider(stop, enabled = !loading, onChange = { index ->
+                        val mode = modes[index]
+                        onOptionsChange(options.copy(responseMode = if (mode == "off") "fast" else "agentic", thinkingMode = mode, thinkingMappingVersion = 2))
+                    }, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), labels = modes.map { mode ->
+                        when (mode) { "off" -> "极速"; "low" -> "低"; "medium" -> "中"; "high" -> "高"; "xhigh" -> "极高"; "max" -> "最高"; else -> mode }
+                    })
                 }
                 item("separator") {
                     val line = MaterialTheme.colorScheme.outline

@@ -654,6 +654,27 @@ def test_market_download_verified_images_and_full_license(client, register_user)
     assert client.get("/api/v1/stickers/market/fluent-warm/download").status_code == 401
 
 
+def test_catalog_pack_semantics_are_restored_without_analyzing(client, register_user):
+    workspace, headers, _ = identity(client, register_user)
+    installed = client.post("/api/v1/stickers/market/fluent-warm/install", headers=headers).json()
+    pack_id = installed["pack_id"]
+    with SessionLocal() as db:
+        assets = db.scalars(select(StickerAsset).where(StickerAsset.pack_id == pack_id)).all()
+        assert all(asset.semantics["description"] for asset in assets)
+        assets[0].semantics = {**assets[0].semantics, "description": ""}
+        assets[0].semantic_hash = digest([assets[0].name, assets[0].semantics])
+        asset_id = assets[0].id
+        custom_id = assets[1].id
+        assets[1].semantics = {**assets[1].semantics, "description": "用户自定义描述"}
+        db.commit()
+    status = client.get("/api/v1/stickers", headers=headers).json()
+    assert next(pack for pack in status["packs"] if pack["id"] == pack_id)["catalog"] is True
+    with SessionLocal() as db:
+        assert db.get(StickerAsset, asset_id).semantics["description"]
+        assert db.get(StickerAsset, custom_id).semantics["description"] == "用户自定义描述"
+    assert client.post(f"/api/v1/stickers/packs/{pack_id}/analyze", headers=headers, json={"consent": True}).status_code == 404
+
+
 def test_market_install_idempotent_private_and_roundtrip_export(client, register_user, monkeypatch):
     workspace, headers, actor = identity(client, register_user)
     configured(workspace, actor, monkeypatch)

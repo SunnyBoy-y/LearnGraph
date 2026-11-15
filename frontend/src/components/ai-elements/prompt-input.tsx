@@ -69,6 +69,7 @@ import type {
   PropsWithChildren,
   ReactNode,
   RefObject,
+  SetStateAction,
 } from "react";
 import {
   Children,
@@ -483,6 +484,11 @@ export type PromptInputProps = Omit<
   maxFileSize?: number;
   /** Exposes the same browser file picker used by the attachment action menu. */
   onFileDialogReady?: (openFileDialog: () => void) => void;
+  /** Reports the number of files currently attached to the composer. */
+  onAttachmentCountChange?: (count: number) => void;
+  /** Optional session-owned attachment state; File bytes survive composer remounts. */
+  attachments?: PromptInputMessage["files"];
+  onAttachmentsChange?: (files: PromptInputMessage["files"]) => void;
   onError?: (err: {
     code: "max_files" | "max_file_size" | "accept";
     message: string;
@@ -502,6 +508,9 @@ export const PromptInput = ({
   maxFiles,
   maxFileSize,
   onFileDialogReady,
+  onAttachmentCountChange,
+  attachments: controlledAttachments,
+  onAttachmentsChange,
   onError,
   onSubmit,
   children,
@@ -516,10 +525,28 @@ export const PromptInput = ({
   const formRef = useRef<HTMLFormElement | null>(null);
 
   // ----- Local attachments (only used when no provider)
-  const [items, setItems] = useState<
+  const [items, setLocalItems] = useState<
     (FileUIPart & { id: string; localFile?: File })[]
   >([]);
-  const files = usingProvider ? controller.attachments.files : items;
+  const ownedItems = useMemo(() => controlledAttachments?.map(part => ({
+    ...part, id: (part as FileUIPart & { id?: string }).id ?? nanoid(),
+  })), [controlledAttachments]);
+  const files = usingProvider ? controller.attachments.files : ownedItems ?? items;
+  const currentItemsRef = useRef(files);
+  currentItemsRef.current = files;
+  const setItems = useCallback((update: SetStateAction<(FileUIPart & { id: string; localFile?: File })[]>) => {
+    if (controlledAttachments && onAttachmentsChange) {
+      const next = typeof update === "function" ? update(currentItemsRef.current) : update;
+      currentItemsRef.current = next;
+      onAttachmentsChange(next);
+    } else {
+      setLocalItems(update);
+    }
+  }, [controlledAttachments, onAttachmentsChange]);
+
+  useEffect(() => {
+    onAttachmentCountChange?.(files.length);
+  }, [files.length, onAttachmentCountChange]);
 
   // ----- Local referenced sources (always local to PromptInput)
   const [referencedSources, setReferencedSources] = useState<
@@ -609,7 +636,7 @@ export const PromptInput = ({
         return [...prev, ...next];
       });
     },
-    [matchesAccept, maxFiles, maxFileSize, onError],
+    [matchesAccept, maxFiles, maxFileSize, onError, setItems],
   );
 
   const removeLocal = useCallback(
@@ -621,7 +648,7 @@ export const PromptInput = ({
         }
         return prev.filter((file) => file.id !== id);
       }),
-    [],
+    [setItems],
   );
 
   // Wrapper that validates files before calling provider's add
@@ -680,7 +707,7 @@ export const PromptInput = ({
             }
             return [];
           }),
-    [usingProvider, controller],
+    [usingProvider, controller, setItems],
   );
 
   const clearReferencedSources = useCallback(
@@ -782,7 +809,7 @@ export const PromptInput = ({
 
   useEffect(
     () => () => {
-      if (!usingProvider) {
+      if (!usingProvider && !controlledAttachments) {
         for (const f of filesRef.current) {
           if (f.url) {
             URL.revokeObjectURL(f.url);
@@ -790,7 +817,7 @@ export const PromptInput = ({
         }
       }
     },
-    [usingProvider],
+    [usingProvider, controlledAttachments],
   );
 
   const handleChange: ChangeEventHandler<HTMLInputElement> = useCallback(
@@ -868,7 +895,17 @@ export const PromptInput = ({
         const submitted = await onSubmit({ files: convertedFiles, text }, event);
         if (submitted === false) return;
 
-        clear();
+        if (controlledAttachments) {
+          const submittedIds = new Set(files.map(file => file.id));
+          setItems(current => current.filter(file => {
+            if (!submittedIds.has(file.id)) return true;
+            if (file.url?.startsWith("blob:")) URL.revokeObjectURL(file.url);
+            return false;
+          }));
+          clearReferencedSources();
+        } else {
+          clear();
+        }
         if (usingProvider) {
           controller.textInput.clear();
         } else {
@@ -878,7 +915,7 @@ export const PromptInput = ({
         // Don't clear on error - user may want to retry
       }
     },
-    [usingProvider, controller, files, onSubmit, clear],
+    [usingProvider, controller, files, onSubmit, clear, controlledAttachments, setItems, clearReferencedSources],
   );
 
   // Render with or without local provider
@@ -1059,17 +1096,31 @@ export const PromptInputTextarea = ({
   onChange,
   onKeyDown,
   onPaste,
+  onCompositionStart,
+  onCompositionEnd,
   className,
   placeholder = "What would you like to know?",
   ...props
 }: PromptInputTextareaProps) => {
   const controller = useOptionalPromptInputController();
   const attachments = usePromptInputAttachments();
-  const [isComposing, setIsComposing] = useState(false);
+  const composingRef = useRef(false);
+  const compositionEndedAtRef = useRef<number | null>(null);
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = useCallback(
     (e) => {
-      // Call the external onKeyDown handler first
+      // Native IME owns *all* candidate-navigation keys, before @ menus or submit.
+      if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+      if (e.key === "Enter" && e.shiftKey) {
+        compositionEndedAtRef.current = null;
+        return;
+      }
+      const endedAt = compositionEndedAtRef.current;
+      compositionEndedAtRef.current = null;
+      if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && endedAt !== null && performance.now() - endedAt < 500) {
+        e.preventDefault();
+        return; // Consume only one composition companion; the next normal Enter works.
+      }
       onKeyDown?.(e);
 
       // If the external handler prevented default, don't run internal logic
@@ -1078,9 +1129,6 @@ export const PromptInputTextarea = ({
       }
 
       if (e.key === "Enter") {
-        if (isComposing || e.nativeEvent.isComposing) {
-          return;
-        }
         if (e.shiftKey) {
           return;
         }
@@ -1111,7 +1159,7 @@ export const PromptInputTextarea = ({
         }
       }
     },
-    [onKeyDown, isComposing, attachments],
+    [onKeyDown, attachments],
   );
 
   const handlePaste: ClipboardEventHandler<HTMLTextAreaElement> = useCallback(
@@ -1145,8 +1193,16 @@ export const PromptInputTextarea = ({
     [attachments, onPaste],
   );
 
-  const handleCompositionEnd = useCallback(() => setIsComposing(false), []);
-  const handleCompositionStart = useCallback(() => setIsComposing(true), []);
+  const handleCompositionEnd: NonNullable<ComponentProps<"textarea">["onCompositionEnd"]> = useCallback(event => {
+    composingRef.current = false;
+    compositionEndedAtRef.current = performance.now();
+    onCompositionEnd?.(event);
+  }, [onCompositionEnd]);
+  const handleCompositionStart: NonNullable<ComponentProps<"textarea">["onCompositionStart"]> = useCallback(event => {
+    composingRef.current = true;
+    compositionEndedAtRef.current = null;
+    onCompositionStart?.(event);
+  }, [onCompositionStart]);
 
   const controlledProps = controller
     ? {
@@ -1160,7 +1216,7 @@ export const PromptInputTextarea = ({
         onChange,
       };
 
-  return (
+  const textarea = (
     <InputGroupTextarea
       className={cn("field-sizing-content max-h-48 min-h-16", className)}
       name="message"
@@ -1173,6 +1229,8 @@ export const PromptInputTextarea = ({
       {...controlledProps}
     />
   );
+
+  return textarea;
 };
 
 export type PromptInputHeaderProps = Omit<

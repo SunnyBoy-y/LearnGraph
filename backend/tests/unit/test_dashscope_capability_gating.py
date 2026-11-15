@@ -62,13 +62,8 @@ def test_qwen_defaults_thinking_budget_fallback():
     gated = qwen_model_defaults("qwen3.7-max", dashscope_hosted=False)
     assert gated.get("reasoning_parameter") == "enable_thinking"
     assert gated.get("thinking_budget_max") is None
-    assert gated.get("thinking_mapping") == {
-        "off": False,
-        "low": True,
-        "medium": True,
-        "high": True,
-        "xhigh": True,
-    }
+    assert gated.get("thinking_mapping") == {"off": False, "medium": True}
+    assert gated.get("reasoning_efforts") == ["medium"]
 
     full = qwen_model_defaults("qwen3.7-max", dashscope_hosted=True)
     assert full.get("reasoning_parameter") == "thinking_budget"

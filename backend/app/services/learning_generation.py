@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.errors import AppError
-from app.providers.model_options import resolve_model_call_options
+from app.providers.model_options import ModelCapabilityError, resolve_model_call_options
 
 PayloadT = TypeVar("PayloadT")
 
@@ -577,9 +577,9 @@ def generate_raw(
         raise AppError(503, "learning_model_unavailable", "请在设置中配置可用的结构化生成模型。")
     _force_fast_structured_options(provider)
     if drop_output_cap:
-        # Upstream refused our declared ceiling. Do not fail the stage over a
-        # configuration mismatch we can side-step.
-        setattr(provider, "output_budget_disabled", True)
+        # Legacy argument name retained for callers. Retry with a smaller finite
+        # budget; never bypass the user's spending/output ceiling altogether.
+        provider.max_output_tokens = max(1, int(provider.max_output_tokens) // 2)
     billing = BillingService(db, workspace_id, actor_id)
     quote = billing.preflight_model_call(provider_id=provider.provider_id, model_id=provider.model_id,
         feature="learning_package", estimated_input_tokens=max(1, len(prompt) // 2),
@@ -614,10 +614,15 @@ def _force_fast_structured_options(provider: Any) -> None:
             search_route="disabled",
             disable_thinking_fallback=True,
         )
-    except Exception:
-        # Capability snapshots from older/custom adapters may not contain the
-        # dialect metadata needed to express "off". Keep their original mode.
-        return
+    except ModelCapabilityError:
+        # Thinking-only models keep their supported mode, but background schema
+        # calls still disable hosted search. Do not swallow programming errors.
+        provider.call_options = resolve_model_call_options(
+            capabilities, model_id, search_route="disabled",
+        )
+    provider.thinking_mode = provider.call_options.thinking_mode
+    provider.actual_reasoning_effort = provider.call_options.actual_reasoning_effort
+    provider.search_route = provider.call_options.search_route
 
 
 def generate_checked(
@@ -638,7 +643,7 @@ def generate_checked(
     validation → caller's semantic validator. Each failure is classified; the
     next attempt carries a concrete repair instruction instead of a generic
     "please try again". ``notes`` collects operator-facing, safe observations
-    (for example "the ceiling was refused and dropped").
+    (for example "the ceiling was refused and reduced before retrying").
     """
     budget = _attempt_budget(attempts)
     failures: list[tuple[str, str]] = []
@@ -660,10 +665,10 @@ def generate_checked(
             if cap_rejected:
                 drop_output_cap = True
                 if notes is not None:
-                    notes.append("模型拒绝了声明的输出上限，已改用不指定上限的方式重试。")
+                    notes.append("模型拒绝了声明的输出上限，已降低上限后进行有界重试。")
             if category == CATEGORY_FATAL or attempt >= budget:
                 prefix = f"{label}：" if label else ""
-                suffix = "（已在不指定输出上限的情况下重试过）" if drop_output_cap else ""
+                suffix = "（已在降低输出上限后重试过）" if drop_output_cap else ""
                 raise GenerationFailure(category, attempt, prefix + suffix + detail, failures, label=label) from exc
             if not cap_rejected:
                 prompt = prompt + repair_instruction(category, detail, schema=schema, label=label)

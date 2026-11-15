@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ArrowRight, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, Database, Download, Eye, HardDrive, Play, RefreshCcw, RotateCcw, Search, Settings2, ShieldAlert, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { commitMigration, deleteAuditEvent, deleteAuditEvents, getMigration, listAuditEvents, listMigrationAdapters, listMigrations, preflightMigration, rollbackMigration, startMigration } from "@/api";
 import { ErrorState, LoadingState, PageFrame, PageIntro, SectionHeading, StatePill, Surface, } from "@/components/shared/page-elements";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, } from "@/components/ui/alert-dialog";

@@ -1,5 +1,5 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Route, Routes, useNavigate } from 'react-router-dom';
 import { apiClient } from '@/api/client';
 import type { Sticker } from '@/api/stickers';
@@ -74,7 +74,32 @@ async function ready() {
   await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith('/providers/provider-1/models'));
 }
 
+beforeEach(() => {
+  vi.spyOn(apiClient, 'getConditional').mockImplementation((async (path: string, _etag?: string | null, options?: Parameters<typeof apiClient.getConditional>[2]) => ({
+    notModified: false, etag: null, data: await apiClient.get(path, options),
+  })) as typeof apiClient.getConditional);
+});
+
 describe('sticker message drafts', () => {
+  it('inserts emoji and kaomoji at the selection and sends them as text', async () => {
+    const view = setup();
+    await ready();
+    const input = screen.getByRole('combobox', { name: '输入消息' }) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '你好世界' } });
+    input.setSelectionRange(2, 4);
+    fireEvent.click(screen.getByRole('button', { name: '选择表情包' }));
+    fireEvent.click(screen.getByRole('button', { name: '小表情' }));
+    fireEvent.click(screen.getByRole('button', { name: '插入小表情：开心' }));
+    expect(input).toHaveValue('你好😀');
+    input.setSelectionRange(input.value.length, input.value.length);
+    fireEvent.click(screen.getByRole('button', { name: '选择表情包' }));
+    fireEvent.click(screen.getByRole('button', { name: '颜文字' }));
+    fireEvent.click(screen.getByRole('button', { name: '插入颜文字：开心' }));
+    expect(input).toHaveValue('你好😀(＾▽＾)');
+    fireEvent.submit(view.container.querySelector('form')!);
+    await waitFor(() => expect(apiClient.postSse).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(apiClient.postSse).mock.calls[0][1]).toMatchObject({ content: '你好😀(＾▽＾)' });
+  });
   it('adds and removes a sticker without sending or changing the text', async () => {
     setup();
     await ready();
@@ -87,6 +112,21 @@ describe('sticker message drafts', () => {
     fireEvent.click(within(draft).getByRole('button', { name: '移除表情：表情1' }));
     expect(screen.queryByRole('list', { name: '待发送表情' })).not.toBeInTheDocument();
     expect(apiClient.postSse).not.toHaveBeenCalled();
+  });
+
+  it('does not let an old selection animation frame close a rapidly reopened picker', async () => {
+    setup();
+    await ready();
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frames.push(callback); return frames.length; });
+    await addSticker(0);
+    fireEvent.click(screen.getByRole('button', { name: '选择表情包' }));
+    const next = await screen.findByRole('button', { name: '添加表情：表情2' });
+    act(() => { for (const callback of frames.splice(0)) callback(performance.now()); });
+    expect(next.isConnected).toBe(true);
+    expect(screen.getByRole('button', { name: '添加表情：表情2' })).toBe(next);
+    fireEvent.click(next);
+    expect(within(screen.getByRole('list', { name: '待发送表情' })).getAllByRole('listitem')).toHaveLength(2);
   });
 
   it('sends text and multiple stickers in the same request only on submit', async () => {
@@ -129,7 +169,7 @@ describe('sticker message drafts', () => {
     expect(apiClient.postSse).not.toHaveBeenCalled();
   });
 
-  it('clears unsent stickers when switching conversations', async () => {
+  it('isolates unsent stickers when switching conversations', async () => {
     setup();
     await ready();
     await addSticker();
@@ -138,7 +178,7 @@ describe('sticker message drafts', () => {
     expect(apiClient.postSse).not.toHaveBeenCalled();
   });
 
-  it('keeps stickers in the queued snapshot and restores them for editing', async () => {
+  it('keeps stickers in the queued snapshot while editing the message in place', async () => {
     const view = setup();
     await ready();
     const release = deferred<void>();
@@ -157,7 +197,9 @@ describe('sticker message drafts', () => {
     expect(screen.queryByRole('list', { name: '待发送表情' })).not.toBeInTheDocument();
     expect(apiClient.postSse).toHaveBeenCalledTimes(1);
     fireEvent.click(within(queue).getByRole('button', { name: '重新编辑' }));
-    expect(screen.getByRole('list', { name: '待发送表情' })).toBeInTheDocument();
+    expect(await screen.findByRole('dialog')).toHaveTextContent('1 张表情');
+    expect(screen.queryByRole('list', { name: '待发送表情' })).not.toBeInTheDocument();
+    expect(within(queue).getByLabelText('1 张表情')).toBeInTheDocument();
     await act(async () => { release.resolve(); });
     await waitFor(() => expect(getSessionStream('active')).toBeUndefined());
     expect(apiClient.postSse).toHaveBeenCalledTimes(1);

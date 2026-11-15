@@ -440,7 +440,7 @@ class MessageCreateRequest(BaseModel):
     selection_context: MessageSelectionContext | None = None
     model_id: str | None = Field(default=None, min_length=1, max_length=160)
     provider_id: str | None = Field(default=None, min_length=1, max_length=36)
-    thinking_mode: Literal["off", "low", "medium", "high", "xhigh"] | None = None
+    thinking_mode: Literal["off", "low", "medium", "high", "xhigh", "max"] | None = None
     search_route: Literal["disabled", "model_native", "external", "local", "auto"] = "disabled"
     web_search: bool = False
     agent_mode: bool = False
@@ -475,7 +475,7 @@ class MessageCreateRequest(BaseModel):
 class MessageRetryRequest(BaseModel):
     provider_id: str | None = Field(default=None, min_length=1, max_length=36)
     model_id: str | None = Field(default=None, min_length=1, max_length=160)
-    thinking_mode: Literal["off", "low", "medium", "high", "xhigh"] | None = None
+    thinking_mode: Literal["off", "low", "medium", "high", "xhigh", "max"] | None = None
     agent_mode: bool | None = None
     search_route: Literal["disabled", "model_native", "external", "local", "auto"] | None = None
     web_search: bool = False

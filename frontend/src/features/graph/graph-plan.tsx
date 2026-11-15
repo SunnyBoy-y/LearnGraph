@@ -24,7 +24,7 @@ import {
   Timer,
   X,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   ApiError,

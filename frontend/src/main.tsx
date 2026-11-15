@@ -8,7 +8,9 @@ import '@xyflow/react/dist/style.css'
 import 'katex/dist/katex.min.css'
 import 'streamdown/styles.css'
 import '@/index.css'
+import '@/styles/chat-answer-alignment.css'
 import '@/styles/motion-feedback.css'
+import '@/styles/mobile-hit-areas.css'
 import { registerWebShellCache, updateWebShellCache } from '@/lib/web-shell-cache'
 
 try {

@@ -187,9 +187,35 @@ def unified_model_defaults(
         base = qwen_model_defaults(model_id, dashscope_hosted=dashscope_hosted)
     else:
         base = model_context_defaults(model_id)
+    # Reviewed hosting controls belong only to DashScope. Other endpoints use
+    # catalogue-native effort names, not a Qwen-hosted high/max policy.
+    if not dashscope_hosted:
+        for field in ("reasoning_efforts", "thinking_mapping", "reasoning_parameter", "default_thinking_mode", "thinking_required", "legacy_thinking_mapping"):
+            base.pop(field, None)
     overlay = capability_overlay(model_id, base)
     if overlay:
         base.update(overlay)
+    if (
+        not dashscope_hosted
+        and normalized_provider in {"openai_compatible_chat", "openai_responses", "github_copilot", "codex_chatgpt"}
+        and base.get("reasoning_parameter") in {"enable_thinking", "thinking_budget"}
+    ):
+        # A vendor-neutral reasoning flag does not grant the canonical vendor's
+        # private request fields to a relay. Explicit saved mappings are merged
+        # later and still win; only inferred wire defaults are normalized here.
+        # Budget/toggle controls are not evidence that a generic relay accepts
+        # effort strings. Do not invent max (or any enum) when translation is
+        # unavailable; an explicit endpoint mapping may opt in later.
+        base["reasoning_parameter"] = "reasoning_effort"
+        base["reasoning_efforts"] = []
+        base["thinking_mapping"] = {"off": None}
+        base["default_thinking_mode"] = "off"
+        base["thinking_required"] = False
+    # Hosted web search is a Codex transport capability, not a models.dev
+    # model flag. Do not grant it to generic relays (or image-only models).
+    if normalized_provider == "codex_chatgpt" and base.get("supports_text_output", True):
+        base["hosted_web_search"] = True
+        base["default_search_route"] = "auto"
     # Keep a runtime-only provenance bit. It is intentionally not part of the
     # user-editable capability schema: image routing uses it to distinguish a
     # catalog-confirmed text model from a private model that still needs one
@@ -206,4 +232,7 @@ def unified_model_defaults(
     ):
         base["thinking_required"] = False
         base["default_thinking_mode"] = "off"
+    if base.get("reasoning_parameter") == "enable_thinking" and normalized_provider in {"ollama", "ollama_cloud"}:
+        base["reasoning_parameter"] = "thinking"
+    base["thinking_mapping_version"] = 2
     return base

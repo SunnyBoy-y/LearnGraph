@@ -18,6 +18,7 @@ from app.services.graph_cover import (
     default_graph_cover,
     generate_graph_cover,
     generate_template_cover,
+    resolve_graph_cover,
     validate_custom_svg,
 )
 
@@ -100,7 +101,10 @@ class GraphCoverService:
         *,
         used_default: bool | None = None,
     ) -> GraphCoverView:
-        cover = graph.cover_svg or self._generated(graph, nodes)
+        cover = resolve_graph_cover(
+            graph.cover_svg, graph.title, node_labels=[node.label for node in nodes],
+            progress=sum(node.mastery_stars >= 3 for node in nodes) / len(nodes) if nodes else 0.0,
+        )
         if used_default is None:
             used_default = cover == default_graph_cover(graph.title)
         return GraphCoverView(

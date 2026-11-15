@@ -379,3 +379,88 @@ class SkillLocalProbePolicy(Base, TimestampMixin, WorkspaceScopedMixin):
     allowed_roots_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_scan_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ScheduledExtensionTask(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Persistent user-owned schedule; leases prevent overlapping dispatch."""
+    __tablename__ = "scheduled_extension_tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    created_by: Mapped[str] = mapped_column(String(36), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    task_type: Mapped[str] = mapped_column(String(16))
+    trigger_type: Mapped[str] = mapped_column(String(16), default="time", server_default="time")
+    schedule_mode: Mapped[str] = mapped_column(String(16), default="cron", server_default="cron")
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delay_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    interval_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    time_of_day: Mapped[str] = mapped_column(String(5), default="09:00", server_default="09:00")
+    weekdays: Mapped[list[int]] = mapped_column(JSON, default=lambda:[0,1,2,3,4], server_default="[0,1,2,3,4]")
+    remaining_executions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    execution_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_via: Mapped[str] = mapped_column(String(16), default="user", server_default="user")
+    prompt: Mapped[str] = mapped_column(Text, default="", server_default="")
+    target_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    session_mode: Mapped[str] = mapped_column(String(16), default="new", server_default="new")
+    provider_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    model_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    agent_mode: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    web_search: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    event_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    event_filters: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, server_default="[]")
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, default=60, server_default="60")
+    event_cursor_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    event_cursor_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    webhook_secret_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cron_expression: Mapped[str] = mapped_column(String(120))
+    timezone: Mapped[str] = mapped_column(String(80), default="UTC")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    skill_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    mcp_server_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    tool_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+
+    @property
+    def next_trigger_in_seconds(self):
+        from datetime import timezone
+        from app.domain.models import utc_now
+        if not self.enabled or self.next_run_at is None or self.trigger_type != 'time': return None
+        value = self.next_run_at if self.next_run_at.tzinfo else self.next_run_at.replace(tzinfo=timezone.utc)
+        return max(0, int((value - utc_now()).total_seconds()))
+
+    @property
+    def webhook_configured(self):
+        return bool(self.webhook_secret_hash)
+
+    @property
+    def schedule_summary(self):
+        from app.services.schedule_rules import describe_schedule
+        return describe_schedule(self)
+
+
+class ScheduledExtensionRun(Base, WorkspaceScopedMixin):
+    __tablename__ = "scheduled_extension_runs"
+    __table_args__ = (UniqueConstraint("task_id", "dedup_key", name="uq_scheduled_extension_run"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("scheduled_extension_tasks.id", ondelete="CASCADE"), index=True)
+    dedup_key: Mapped[str] = mapped_column(String(80))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
+    trigger: Mapped[str] = mapped_column(String(16))
+    trigger_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

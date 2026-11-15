@@ -26,7 +26,7 @@ export function validateNativeComposerPrefs(value: unknown): SessionComposerPref
   const record = value as Record<string, unknown>
   const oneOf = (item: unknown, values: readonly string[]) => typeof item === 'string' && values.includes(item)
   if (!oneOf(record.responseMode, ['fast', 'thinking', 'agentic']) ||
-      !oneOf(record.thinkingMode, ['off', 'low', 'medium', 'high', 'xhigh']) ||
+      !oneOf(record.thinkingMode, ['off', 'low', 'medium', 'high', 'xhigh', 'max']) ||
       !oneOf(record.searchRoute, ['disabled', 'model_native', 'external', 'local', 'auto']) ||
       record.generationMode !== undefined && !oneOf(record.generationMode, ['text', 'image'])) return null
   for (const [key, max] of [['providerId', 36], ['modelId', 160], ['imageProviderId', 36], ['imageModelId', 160]] as const) {

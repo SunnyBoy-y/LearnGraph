@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Gauge } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { listSettings, updateSetting } from "@/api";
 import { Surface, LoadingState, ErrorState } from "@/components/shared/page-elements";
 import { Switch } from "@/components/ui/switch";

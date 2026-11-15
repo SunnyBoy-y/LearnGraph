@@ -141,21 +141,21 @@ class DockerStdioMCPRunner(MCPRunnerPort):
         except Exception:  # noqa: BLE001 - persistence is best-effort
             pass
 
-    def probe(self, launch_spec: dict[str, Any]) -> MCPProbeResult:
-        del launch_spec
-        if not self.enabled:
-            raise MCPTransportUnavailable(self.unavailable_reason)
-        capability = self._backend().probe()
-        if not capability.available:
-            raise MCPTransportUnavailable(capability.reason or "MCP stdio runner unavailable")
-        return MCPProbeResult(
-            protocol_version=PROTOCOL_VERSION,
-            server_identity={"runner": "docker-stdio-isolated"},
-            capabilities={"stdio": True, "isolated": True, "network": "none"},
-            tools=[],
-            resources=[],
-            prompts=[],
-        )
+    def probe(self, launch_spec: dict[str, Any], *, credential_envelope: dict[str, Any] | None = None) -> MCPProbeResult:
+        provisioned = self.provision(launch_spec)
+        session_spec = {**launch_spec, **provisioned}
+        try:
+            result = self.call_jsonrpc(session_spec, method="learngraph/discover", params={}, request_id=1,
+                                       credential_envelope=credential_envelope)
+            return MCPProbeResult(
+                protocol_version=result["protocol_version"], server_identity=result["server_identity"],
+                capabilities=result["capabilities"], tools=result["tools"],
+                resources=result["resources"], prompts=result["prompts"],
+            )
+        except (KeyError, TypeError) as exc:
+            raise MCPProtocolFailure("MCP stdio discovery returned an invalid capability snapshot") from exc
+        finally:
+            self.terminate(session_spec)
 
     def provision(self, launch_spec: dict[str, Any]) -> dict[str, Any]:
         if not self.enabled:
@@ -165,6 +165,13 @@ class DockerStdioMCPRunner(MCPRunnerPort):
             raise MCPProtocolFailure("MCP stdio launch spec requires a command list")
         if len(command) > int(self.settings.mcp_stdio_command_args_max):
             raise MCPProtocolFailure("MCP stdio launch command exceeds the argument bound")
+
+        approved_digest = str(launch_spec.get("image_digest") or "").split("@")[-1]
+        actual_digest = str(self.image_ref or "").split("@")[-1]
+        if not approved_digest.startswith("sha256:") or approved_digest != actual_digest:
+            raise MCPTransportUnavailable("MCP runner image does not match the approved immutable digest")
+        if not all(isinstance(part, str) and part and "\x00" not in part for part in command):
+            raise MCPProtocolFailure("MCP launch arguments must be non-empty strings without NUL bytes")
 
         workspace_root = Path(self.settings.sandbox_workspace_root).expanduser().resolve()
         workspace_root.mkdir(parents=True, exist_ok=True)
@@ -208,7 +215,7 @@ class DockerStdioMCPRunner(MCPRunnerPort):
         return {
             "command": list(launch_spec["command"]),
             "max_args": int(self.settings.mcp_stdio_command_args_max),
-            "timeout_seconds": int(self.settings.mcp_stdio_timeout_seconds),
+            "timeout_seconds": min(float(self.settings.mcp_stdio_timeout_seconds), float(launch_spec.get("timeout_seconds", self.settings.mcp_stdio_timeout_seconds))),
             "protocol_version": launch_spec.get("protocol_version", PROTOCOL_VERSION),
             "capability_hash": launch_spec.get("capability_hash"),
             "credential": credential_envelope,
@@ -235,12 +242,12 @@ class DockerStdioMCPRunner(MCPRunnerPort):
             "params": params,
         }
         try:
-            backend.write(session, "mcp-request.json", (json.dumps(request) + "\n").encode("utf-8"))
-            backend.write(
-                session,
-                "mcp-launch.json",
-                json.dumps(self._launch_file(launch_spec, credential_envelope)).encode("utf-8"),
-            )
+            # The semantic fixed-task API accepts one input artifact, not
+            # arbitrary argv flags. Keep the private launch envelope in that
+            # artifact so Docker and sandboxd use the same reviewed contract.
+            backend.write(session, "mcp-request.json", json.dumps({
+                "request": request, "launch": self._launch_file(launch_spec, credential_envelope),
+            }).encode("utf-8"))
             try:
                 result = backend.exec_fixed(
                     session,
@@ -250,8 +257,6 @@ class DockerStdioMCPRunner(MCPRunnerPort):
                         "mcp_stdio",
                         "--input",
                         "mcp-request.json",
-                        "--spec",
-                        "mcp-launch.json",
                         "--output",
                         "mcp-response.json",
                     ),
@@ -274,6 +279,8 @@ class DockerStdioMCPRunner(MCPRunnerPort):
                 raise MCPRunnerTimeout(
                     "MCP stdio runner exceeded the invocation deadline"
                 )
+            if result.exit_code == 124:
+                raise MCPRunnerTimeout("MCP stdio session exceeded its total deadline")
             if result.exit_code != 0:
                 stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()[:500]
                 raise MCPProtocolFailure(stderr or "MCP stdio runner failed")
@@ -282,8 +289,14 @@ class DockerStdioMCPRunner(MCPRunnerPort):
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise MCPProtocolFailure("MCP stdio runner returned invalid JSON") from exc
 
+        if not isinstance(response, dict) or response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
+            raise MCPProtocolFailure("MCP stdio runner returned a mismatched JSON-RPC response")
+        if ("result" in response) == ("error" in response):
+            raise MCPProtocolFailure("MCP response must contain exactly one of result or error")
         if "result" in response:
-            return dict(response["result"] or {})
+            if not isinstance(response["result"], dict):
+                raise MCPProtocolFailure("MCP stdio result must be an object")
+            return response["result"]
         error = response.get("error")
         if isinstance(error, dict):
             raise MCPProtocolFailure(
@@ -374,7 +387,26 @@ class StdioIsolatedMCPAdapter:
         return self._runner.unavailable_reason
 
     def probe(self) -> MCPProbeResult:
+        envelope = self._credential_resolver() if self._credential_resolver else self._credential_envelope
+        if envelope is not None:
+            return self._runner.probe(self._launch_spec, credential_envelope=envelope)
         return self._runner.probe(self._launch_spec)
+
+    def read_resource(self, uri: str) -> MCPToolCallResult:
+        return self._call_method("resources/read", {"uri": uri})
+
+    def get_prompt(self, name: str, arguments: dict[str, str]) -> MCPToolCallResult:
+        return self._call_method("prompts/get", {"name": name, "arguments": arguments})
+
+    def _call_method(self, method: str, params: dict[str, Any]) -> MCPToolCallResult:
+        envelope = self._credential_resolver() if self._credential_resolver else self._credential_envelope
+        spec = {**self._launch_spec, **self._runner.provision(self._launch_spec)}
+        try:
+            return MCPToolCallResult(result=self._runner.call_jsonrpc(
+                spec, method=method, params=params, request_id=1, credential_envelope=envelope,
+            ))
+        finally:
+            self._runner.terminate(spec)
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> MCPToolCallResult:
         # A fresh resolver envelope is fetched at call time so OAuth expiry /

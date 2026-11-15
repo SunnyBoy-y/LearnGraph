@@ -24,11 +24,11 @@
 }
 
 :root.dark[data-color-mode]:not([data-color-mode='mono']) {
-  --bg-sidebar: color-mix(in srgb, var(--theme-color) 5%, #17191c);
-  --bg-selected: color-mix(in srgb, var(--theme-color) 12%, #30343a);
+  --bg-sidebar: color-mix(in srgb, var(--theme-color) 3%, #000000);
+  --bg-selected: color-mix(in srgb, var(--theme-color) 12%, #1a1a1a);
   --sidebar: var(--bg-sidebar);
   --sidebar-accent: var(--bg-selected);
-  --accent: color-mix(in srgb, var(--theme-color) 12%, #24272b);
+  --accent: color-mix(in srgb, var(--theme-color) 12%, #1a1a1a);
 }
 
 :root[data-color-mode]:not([data-color-mode='mono']) .workspace-sidebar,
@@ -41,7 +41,7 @@
   box-shadow: none;
 }
 :root[data-color-mode]:not([data-color-mode='mono']) .sidebar-nav [data-nav-label] > svg {
-  color: var(--primary);
+  color: var(--lg-sidebar-nav-icon, var(--primary));
 }
 :root[data-color-mode]:not([data-color-mode='mono']) .graph-workbench-split .graph-library__spine {
   background: var(--primary);

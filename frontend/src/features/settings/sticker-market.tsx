@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDownToLine, Check, ChevronRight, PackagePlus, Search, Sparkles, Minus } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { toast } from 'sonner';
+import { toast } from '@/lib/notifications';
 import { analyzeStickerPack, configureStickerPipeline, getStickerMarket, getStickerPipeline, installMarketPack, removeMarketPack, marketStickerBlob, type StickerMarketPack } from '@/api/stickers';
 import { useAuth } from '@/features/auth/auth-context-value';
 import { Button } from '@/components/ui/button';

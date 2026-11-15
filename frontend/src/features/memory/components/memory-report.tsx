@@ -93,6 +93,7 @@ export function MemoryReport({
   legacyCount,
   pendingCount,
   profile,
+  refreshing = false,
   onForgetSelection,
   onMigrate,
   onOpenPending,
@@ -104,6 +105,7 @@ export function MemoryReport({
   legacyCount: number
   pendingCount: number
   profile: MemoryProfile | undefined
+  refreshing?: boolean
   onForgetSelection: (selection: MemoryReportSelection) => void
   onMigrate: () => Promise<void>
   onOpenPending: () => void
@@ -159,6 +161,13 @@ export function MemoryReport({
   )
   const updatedHint = memoryUpdatedHint(profile?.generated_at ?? profile?.updated_at ?? null)
   const failure = memoryRefreshFailure(profile?.stale_reason)
+  const hasReportContent = Boolean(
+    sections.length || profile?.overview || profile?.structured_sections.length || profile?.markdown,
+  )
+  const reportRefreshing = refreshing || profile?.status === 'building'
+  const historicalReport = hasReportContent && (
+    reportRefreshing || profile?.status === 'stale' || profile?.status === 'failed'
+  )
 
   function clearSelection() {
     ownsSelection.current = false
@@ -212,7 +221,8 @@ export function MemoryReport({
     const enabled = workspaceRecallEnabled(policy.data)
     const parts: string[] = []
     if (enabled !== null) parts.push(enabled ? '记忆已开启' : '记忆已暂停')
-    if (profile.status === 'stale') parts.push('报告待更新')
+    if (reportRefreshing) parts.push('报告更新中')
+    else if (profile.status === 'stale') parts.push('报告待更新')
     else if (profile.status === 'atomic_snapshot') parts.push('原子快照模式')
     else if (profile.status === 'ready') parts.push('报告为最新')
     else if (profile.status === 'building') parts.push('报告生成中')
@@ -231,7 +241,7 @@ export function MemoryReport({
           AI 导师学习报告
         </h2>
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-          <span>基于 {profile?.source_count ?? 0} 条当前有效记忆</span>
+          <span>{historicalReport ? `此版报告基于 ${profile?.source_count ?? 0} 条记忆` : `基于 ${profile?.source_count ?? 0} 条当前有效记忆`}</span>
           {profile?.generated_at || profile?.updated_at ? (
             <>
               <span className="text-border">·</span>
@@ -292,17 +302,19 @@ export function MemoryReport({
               </div>
             ) : null}
 
-            {profile?.status === 'stale' || profile?.status === 'failed' ? (
-              <div className="mb-7 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/25 bg-amber-50/60 px-4 py-3 text-xs text-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
+            {reportRefreshing || profile?.status === 'stale' || profile?.status === 'failed' ? (
+              <div role="status" className="mb-7 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/25 bg-amber-50/60 px-4 py-3 text-xs text-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
                 <span>
-                  {failure
-                    ? `上次刷新失败：${failure.message}${failure.at ? `（${failure.at}）` : ''}。可重新生成学习报告。`
-                    : profile.status === 'failed'
-                      ? '报告暂时未能生成，可重新刷新报告。'
-                      : '记忆已经有变化，刷新后会重新整理学习报告。'}
+                  {reportRefreshing
+                    ? hasReportContent ? '正在更新学习报告，仍可查看上一版。' : '正在生成学习报告。'
+                    : failure
+                      ? `上次刷新失败：${failure.message}${failure.at ? `（${failure.at}）` : ''}。${hasReportContent ? '仍可查看上一版报告。' : '可重新生成学习报告。'}`
+                      : profile?.status === 'failed'
+                        ? hasReportContent ? '报告刷新失败，仍可查看上一版。' : '报告暂时未能生成，可重新刷新报告。'
+                        : hasReportContent ? '记忆已有变化，当前显示上一版报告。' : '记忆已经有变化，刷新后会重新整理学习报告。'}
                 </span>
-                <Button disabled={busy} onClick={() => void onRefresh()} size="xs" variant="outline">
-                  立即刷新
+                <Button disabled={busy || reportRefreshing} onClick={() => void onRefresh()} size="xs" variant="outline">
+                  {reportRefreshing ? '更新中…' : '立即刷新'}
                 </Button>
               </div>
             ) : profile?.status === 'atomic_snapshot' ? (
@@ -389,14 +401,18 @@ export function MemoryReport({
               ) : (
                 <div>
                   <EmptyState
-                    description={profile?.status === 'failed' || profile?.status === 'stale'
-                      ? '可以点击「立即刷新」重试，或在下方输入框补充需要记住的内容。'
-                      : '在下方输入框告诉 AI 导师值得长期记住的事实、偏好或变化。'}
-                    title={profile?.status === 'failed'
-                      ? '学习报告暂时无法生成'
-                      : profile?.status === 'stale'
-                        ? '学习报告需要更新'
-                        : '还没有可以生成报告的记忆'}
+                    description={reportRefreshing
+                      ? '报告生成后会显示在这里。'
+                      : profile?.status === 'failed' || profile?.status === 'stale'
+                        ? '可以点击「立即刷新」重试，或在下方输入框补充需要记住的内容。'
+                        : '在下方输入框告诉 AI 导师值得长期记住的事实、偏好或变化。'}
+                    title={reportRefreshing
+                      ? '正在生成学习报告'
+                      : profile?.status === 'failed'
+                        ? '学习报告暂时无法生成'
+                        : profile?.status === 'stale'
+                          ? '学习报告需要更新'
+                          : '还没有可以生成报告的记忆'}
                   />
                   {legacyCount ? (
                     <div className="mt-4 flex justify-center">

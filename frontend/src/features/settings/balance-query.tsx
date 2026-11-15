@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { RefreshCcw, FlaskConical } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { updateProviderBalanceQueryConfig } from "@/api";
 import { LoadingState, StatePill } from "@/components/shared/page-elements";

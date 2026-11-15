@@ -34,7 +34,7 @@ import {
   UploadCloud,
 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   deleteFileConfirmed,
@@ -57,6 +57,7 @@ import {
 import { FileDiagnosticsDialog } from "@/components/resources/file-diagnostics-dialog";
 import { SourceAssociationDialog } from "@/components/resources/source-association-dialog";
 import { SourceDetailDialog } from "@/components/resources/source-detail-dialog";
+import { PaperSearchPanel } from "@/features/resources/paper-panels";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
@@ -1417,6 +1418,7 @@ export function SearchPage() {
         eyebrow="Search & fetch"
         title="联网搜索与网页获取"
       />
+      <PaperSearchPanel key={workspaceId} workspaceId={workspaceId} />
       <Surface className="p-5">
         <form className="flex flex-col gap-3 sm:flex-row" onSubmit={submit}>
           <div className="relative flex-1">

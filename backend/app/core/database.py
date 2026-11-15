@@ -1117,13 +1117,23 @@ def _init_database_under_route_lease() -> None:
                     connection.commit()
         else:
             with engine.begin() as connection:
+                if connection.dialect.name == "postgresql":
+                    # Serialize schema initialization across starting workers,
+                    # using the same lock order as search installation/writes.
+                    connection.exec_driver_sql("SELECT pg_advisory_xact_lock(684728190123)")
                 Base.metadata.create_all(bind=connection)
                 apply_schema_migrations(connection)
+            if engine.dialect.name == "postgresql":
+                from app.core.postgresql_search import install_search
+                install_search(engine)
         _ensure_sqlite_skill_package_columns()
         _verify_schema_revisions()
 
     if not is_sqlite:
-        _run_phases()
+        # A secondary/preview participant must never become a schema migrator
+        # after following the primary route from SQLite to PostgreSQL.
+        if not settings.sqlite_read_only:
+            _run_phases()
         return
 
     # 1) Read-only precheck: what (if anything) would this startup change?
@@ -1212,8 +1222,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.16.0"
-CURRENT_SCHEMA_DESCRIPTION = "Persistent user avatars and editable display names"
+CURRENT_SCHEMA_REVISION = "v1.19.0"
+CURRENT_SCHEMA_DESCRIPTION = "Private opening prompt pools and generation budgets"
 
 
 def _compute_schema_checksum() -> str:

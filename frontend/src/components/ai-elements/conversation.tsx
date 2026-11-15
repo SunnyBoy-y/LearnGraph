@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
 import type { ComponentProps } from "react";
+import { createPortal } from "react-dom";
 import {
   createContext,
   useCallback,
@@ -153,11 +154,15 @@ export const ConversationEmptyState = ({
   </div>
 );
 
-export type ConversationScrollButtonProps = ComponentProps<typeof Button>;
+export type ConversationScrollButtonProps = ComponentProps<typeof Button> & {
+  /** Anchor outside the scrolling messages (e.g. the live composer dock). */
+  portalTarget?: HTMLElement | null;
+};
 
 export const ConversationScrollButton = ({
   className,
   children,
+  portalTarget,
   ...props
 }: ConversationScrollButtonProps) => {
   const { controller } = useConversationScrollContext();
@@ -175,7 +180,7 @@ export const ConversationScrollButton = ({
 
   const visible =
     hasNewContent || (!isAtBottom && mode === "MANUAL_READING");
-  if (!visible) return null;
+  if (!visible || portalTarget === null) return null;
 
   // 按钮只保留向下箭头（悬浮态文案会让按钮宽度随状态跳动）；
   // 状态语义仍通过 aria-label 暴露给读屏与测试。
@@ -185,7 +190,7 @@ export const ConversationScrollButton = ({
       : "还有新内容"
     : "回到最新";
 
-  return (
+  const button = (
     <Button
       aria-label={label}
       className={cn(
@@ -201,6 +206,7 @@ export const ConversationScrollButton = ({
       {children ?? <ArrowDownIcon className="size-3.5" />}
     </Button>
   );
+  return portalTarget ? createPortal(button, portalTarget) : button;
 };
 
 const getMessageText = (message: UIMessage): string =>

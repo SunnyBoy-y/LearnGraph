@@ -422,8 +422,10 @@ def voice_memory_llm_service_class() -> Any:
         supports_developer_role = False
 
         def __init__(
-            self, *, memory_bridge: VoiceMemoryBridge | None = None, task_session_id: str = '', **kwargs: Any
+            self, *, memory_bridge: VoiceMemoryBridge | None = None, task_session_id: str = '',
+            model_provider: Any = None, **kwargs: Any
         ) -> None:
+            self._model_provider = model_provider
             super().__init__(**kwargs)
             self._memory_bridge = memory_bridge
             self._pending_memory: VoiceMemoryRecall | None = None
@@ -432,6 +434,47 @@ def voice_memory_llm_service_class() -> Any:
             self.conversation_policy = None
             self.journal = None
             self._projection_query = ''
+
+        def create_client(self, **kwargs: Any):
+            if self._model_provider is not None:
+                from app.voice.model_bridge import ProviderChatClient
+                return ProviderChatClient(self._model_provider)
+            # Keep the standalone SDK surface for older callers/tests; production
+            # always supplies the factory-resolved provider.
+            return super().create_client(**kwargs)
+
+        async def rebind_model_provider(self, provider: Any) -> None:
+            from app.voice.model_bridge import ProviderChatClient
+            if isinstance(self._client, ProviderChatClient):
+                await self._client.rebind(provider)
+            else:
+                await self._client.close()
+                self._client = ProviderChatClient(provider)
+            self._model_provider = provider
+            self._settings.model = provider.model_id
+            self._settings.extra = {}
+            self.set_full_model_name(provider.model_id)
+
+        async def _process_context(self, context: Any):
+            client = self._client
+            try:
+                return await super()._process_context(context)
+            finally:
+                from app.voice.model_bridge import ProviderChatClient
+                # The base service reports the natural-EOF usage chunk. For a
+                # cancelled/failed stream, report the immutable cleanup snapshot
+                # exactly once instead of losing already-known paid input.
+                if isinstance(client, ProviderChatClient) and not client.usage_emitted and client.last_usage:
+                    from pipecat.metrics.metrics import LLMTokenUsage
+                    usage = client.last_usage
+                    client.usage_emitted = True
+                    prompt, output = int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+                    await self.start_llm_usage_metrics(LLMTokenUsage(
+                        prompt_tokens=prompt, completion_tokens=output, total_tokens=prompt + output,
+                        cache_read_input_tokens=usage.get("cached_input_tokens"),
+                        cache_creation_input_tokens=usage.get("cache_creation_input_tokens"),
+                        reasoning_tokens=usage.get("reasoning_tokens"),
+                    ))
 
         @property
         def memory_bridge(self) -> VoiceMemoryBridge | None:

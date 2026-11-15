@@ -3,7 +3,8 @@ import { createRoot } from 'react-dom/client'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MotionConfig } from 'motion/react'
-import { Toaster, toast } from 'sonner'
+import { toast } from '@/lib/notifications'
+import { AppToaster } from '@/components/shared/app-toaster'
 import { authStore } from '@/api/auth-store'
 import { confirmGraphChangeSet, rejectGraphChangeSet, submitUIAction, undoGraphChangeSet } from '@/api/sessions'
 import { AnswerParts } from '@/components/chat/answer-parts'
@@ -187,9 +188,8 @@ function NativeRenderer() {
       const detail = (event as CustomEvent<Record<string, unknown>>).detail
       if (!detail || typeof detail.graphId !== 'string') return
       const base = `/w/${encodeURIComponent(payload.workspaceId)}`
-      navigate(typeof detail.nodeId === 'string'
-        ? `${base}/learn/nodes/${encodeURIComponent(detail.nodeId)}?graphId=${encodeURIComponent(detail.graphId)}`
-        : `${base}/graphs/${encodeURIComponent(detail.graphId)}`)
+      const nodeQuery = typeof detail.nodeId === 'string' ? `?node=${encodeURIComponent(detail.nodeId)}` : ''
+      navigate(`${base}/graphs/${encodeURIComponent(detail.graphId)}${nodeQuery}`)
     }
     const clearLearning = () => { try { window.sessionStorage.removeItem('learngraph:active-learning-node') } catch { /* Optional storage. */ } }
     window.addEventListener('learngraph:compose', compose)
@@ -260,7 +260,7 @@ function NativeRenderer() {
         <Textarea aria-label="拒绝图谱提案的理由" value={reason} onChange={event => setReason(event.currentTarget.value)} placeholder="例如：节点粒度太粗，请拆分后重新生成（可不填）" />
         <DialogFooter><Button variant="outline" onClick={() => resolveReject(null)}>取消</Button><Button variant="destructive" onClick={() => resolveReject(reason.trim())}>确认拒绝</Button></DialogFooter>
       </DialogContent></Dialog>
-      <Toaster closeButton position="top-right" richColors />
+      <AppToaster />
     </MemoryRouter></LightweightAuth>
   </MotionConfig></TooltipProvider></QueryClientProvider>
 }

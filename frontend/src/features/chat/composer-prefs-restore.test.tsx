@@ -24,7 +24,8 @@ const sessionsKey = workspaceQueryKey("test-workspace", "sessions");
 
 function setup(records: Session[], delayedSessions?: Promise<Session[]>, initialSessionId = records[0].id) {
   vi.spyOn(apiClient, "get").mockImplementation(async (path) => {
-    if (path === "/sessions") return delayedSessions ?? records;
+    if (path === '/sessions/page') return { items: [], has_more: false, next_cursor: null, has_previous: false, previous_cursor: null };
+    if (/^\/sessions\/[^/]+$/.test(path)) return (await (delayedSessions ?? Promise.resolve(records))).find(record => record.id === decodeURIComponent(path.split('/').at(-1)!));
     if (path === "/settings") return [];
     if (path === "/providers") return [{
       id: "provider-1", provider_type: "openai_compatible_chat", display_name: "测试模型",
@@ -60,6 +61,40 @@ function setup(records: Session[], delayedSessions?: Promise<Session[]>, initial
 const modeTrigger = () => screen.getByRole("button", { name: "选择响应模式、思考力度和模型" });
 
 describe("composer preference restoration", () => {
+  it.each([
+    { agent: false, external: true }, { agent: true, external: true },
+    { agent: false, external: false }, { agent: true, external: false },
+  ])("sends Codex hosted search with agent=$agent and AnySearch=$external", async ({ agent, external }) => {
+    const id = `codex-search-${agent}-${external}`;
+    setSessionComposerPrefs(id, { providerId: "provider-1", modelId: "model-1",
+      responseMode: agent ? "agentic" : "fast", thinkingMode: agent ? "medium" : "off", searchRoute: "auto" });
+    const view = setup([session(id, staleSnapshot)]);
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith("/providers/provider-1/models"));
+    await act(async () => {
+      view.queryClient.setQueryData(workspaceQueryKey("test-workspace", "providers"), [{
+        id: "provider-1", provider_type: "codex_chatgpt", display_name: "官方登录",
+        enabled: true, remote_capability: true,
+        capabilities: { default_model: "model-1", hosted_web_search: true,
+          reasoning_efforts: ["low", "medium", "high", "xhigh"] },
+      }, ...(external ? [{ id: "search-1", provider_type: "anysearch", display_name: "AnySearch",
+        enabled: true, remote_capability: true, capabilities: {} }] : [])]);
+      view.queryClient.setQueryData(workspaceQueryKey("test-workspace", "provider-models", "provider-1"), {
+        provider_id: "provider-1", status: "ok", models: [{ id: "model-1", roles: ["llm"],
+          enabled: true, remote: true, streaming: true, capabilities: { hosted_web_search: true,
+            reasoning_efforts: ["low", "medium", "high", "xhigh"] } }],
+      });
+    });
+    await waitFor(() => expect(getSessionComposerPrefs(id)?.searchRoute).toBe("model_native"));
+    const input = view.container.querySelector("textarea")!;
+    fireEvent.change(input, { target: { value: "请检索官方最新消息" } });
+    fireEvent.submit(input.closest("form")!);
+    await waitFor(() => expect(apiClient.postSse).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(apiClient.postSse).mock.calls[0][1]).toMatchObject({
+      provider_id: "provider-1", search_route: "model_native", web_search: true, agent_mode: agent,
+    });
+    await waitFor(() => expect(getSessionStream(id)).toBeUndefined());
+  });
+
   it("sends high then fast in the same session without restoring a stale high snapshot", async () => {
     const records = [session("active", { ...staleSnapshot, agent_mode: true, thinking_mode: "high" })];
     const view = setup(records);
@@ -86,6 +121,33 @@ describe("composer preference restoration", () => {
     await waitFor(() => expect(apiClient.postSse).toHaveBeenCalledTimes(2));
     expect(vi.mocked(apiClient.postSse).mock.calls[1][1]).toMatchObject({ agent_mode: false, thinking_mode: "off" });
     expect(getSessionComposerPrefs("active")).toMatchObject({ responseMode: "fast", thinkingMode: "off" });
+  });
+
+  it("refreshes the send gate for the same model without disabling its thinking", async () => {
+    const records = [session("cap-refresh", { ...staleSnapshot, agent_mode: true, thinking_mode: "high" })];
+    const view = setup(records);
+    await waitFor(() => expect(modeTrigger()).toHaveTextContent("高"));
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith("/providers/provider-1/models"));
+    const send = async (text: string, count: number) => {
+      const input = view.container.querySelector("textarea")!;
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.submit(input.closest("form")!);
+      await waitFor(() => expect(apiClient.postSse).toHaveBeenCalledTimes(count));
+      await waitFor(() => expect(getSessionStream("cap-refresh")).toBeUndefined());
+    };
+    await send("第一次", 1);
+    expect(vi.mocked(apiClient.postSse).mock.calls[0][1]).toMatchObject({ agent_mode: true, thinking_mode: "high" });
+    await act(async () => {
+      view.queryClient.setQueryData(workspaceQueryKey("test-workspace", "provider-models", "provider-1"), {
+        provider_id: "provider-1", status: "ok", models: [{ id: "model-1", roles: ["llm"],
+          enabled: true, remote: true, streaming: true, capabilities: { supports_agent_tools: false,
+            reasoning_efforts: ["low", "medium", "high"], thinking_required: true } }],
+      });
+    });
+    vi.mocked(apiClient.get).mockClear();
+    await send("只思考，不使用工具", 2);
+    expect(vi.mocked(apiClient.postSse).mock.calls[1][1]).toMatchObject({ agent_mode: false, goal_mode: false, thinking_mode: "high" });
+    expect(vi.mocked(apiClient.get).mock.calls.map(([path]) => path)).not.toContain("/sandbox/agent/readiness");
   });
 
   it("carries medium thinking from a new draft into both the first and next request", async () => {
@@ -153,7 +215,7 @@ describe("composer preference restoration", () => {
     const pending = deferred<Session[]>();
     const records = [session("fresh", { ...staleSnapshot, agent_mode: true, thinking_mode: "high" })];
     setup(records, pending.promise);
-    await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith("/sessions"));
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith('/sessions/fresh', expect.objectContaining({ signal: expect.any(AbortSignal) })));
     expect(window.localStorage.getItem("learngraph:session-composer-prefs")).toBeNull();
     await act(async () => { pending.resolve(records); });
     await waitFor(() => expect(modeTrigger()).toHaveTextContent("高"));

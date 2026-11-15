@@ -152,6 +152,11 @@ def resolve_thinking_off(
         for key, value in (options.provider_options or {}).items()
         if value is not None
     }
+    if options.actual_reasoning_effort is not None:
+        if options.reasoning_parameter == "reasoning_effort":
+            fields["reasoning_effort"] = options.actual_reasoning_effort
+        elif options.reasoning_parameter == "reasoning.effort":
+            fields["reasoning"] = {"effort": options.actual_reasoning_effort}
     if not fields:
         return ThinkingOff(
             {},

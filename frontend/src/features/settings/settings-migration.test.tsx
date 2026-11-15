@@ -47,6 +47,7 @@ beforeEach(() => {
   vi.mocked(getMemoryPolicy).mockImplementation(async () => structuredClone(policy))
   vi.mocked(listProviders).mockResolvedValue([])
   vi.mocked(listProviderCatalog).mockResolvedValue([])
+  vi.mocked(discoverProviderModels).mockResolvedValue({ provider_id: '', status: 'ok', models: [] })
   vi.mocked(listSessions).mockResolvedValue([])
   vi.mocked(listSettings).mockResolvedValue([])
   vi.mocked(updateMemoryPolicy).mockImplementation(async patch => {
@@ -159,6 +160,61 @@ describe('settings information architecture', () => {
     expect(screen.getByRole('button', { name: 'Embedding 模型', exact: true })).toHaveTextContent('saved-model')
   })
 
+  it('recovers Ollama discovery without changing the configured embedding model', async () => {
+    const modelId = 'qwen3-embedding:0.6b'
+    enhancement.embedding = { ...enhancement.embedding, provider_id: 'ollama-local', model_id: modelId }
+    vi.mocked(listProviders).mockResolvedValue([{ id: 'ollama-local', display_name: 'Ollama Embedding', enabled: true, provider_type: 'ollama_embedding', base_url: 'http://127.0.0.1:11434/v1', capabilities: {} }] as Awaited<ReturnType<typeof listProviders>>)
+    vi.mocked(discoverProviderModels)
+      .mockRejectedValueOnce(new Error('Ollama model discovery failed: [Errno 111] Connection refused'))
+      .mockResolvedValue({ provider_id: 'ollama-local', status: 'ok', models: [{ id: modelId, roles: ['embedding'], streaming: false, remote: true, enabled: true }] })
+    renderWithProviders(<TaskModelSettings/>)
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('ollama serve')
+    expect(alert).toHaveTextContent('手动输入模型 ID 无法修复连接问题')
+    expect(screen.getByRole('button', { name: 'Embedding 模型', exact: true })).toHaveTextContent(`${modelId}（当前配置，发现失败，待验证）`)
+    expect(screen.queryByText(/当前配置，未发现或已停用/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重新发现模型' }))
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Embedding 模型', exact: true })).toHaveTextContent(modelId)
+    expect(screen.getByRole('button', { name: 'Embedding 模型', exact: true })).not.toHaveTextContent('当前配置')
+    expect(updateMemoryEnhancement).not.toHaveBeenCalled()
+  })
+
+  it('keeps an embedding model unverified while discovery is pending', async () => {
+    enhancement.embedding = { ...enhancement.embedding, provider_id: 'embedding-a', model_id: 'saved-model' }
+    vi.mocked(listProviders).mockResolvedValue([{ id: 'embedding-a', enabled: true, provider_type: 'ollama_embedding', capabilities: {} }] as Awaited<ReturnType<typeof listProviders>>)
+    vi.mocked(discoverProviderModels).mockImplementation(() => new Promise(() => {}))
+    renderWithProviders(<TaskModelSettings/>)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Embedding 模型', exact: true })).toHaveTextContent('saved-model（当前配置，待验证）'))
+    expect(screen.queryByText(/当前配置，未发现/)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { models: [], notice: '当前配置，未发现' },
+    { models: [{ id: 'saved-model', roles: ['embedding'], streaming: false, remote: true, enabled: false }], notice: '当前配置，模型已停用' },
+  ])('distinguishes successful discovery state: $notice', async ({ models, notice }) => {
+    enhancement.embedding = { ...enhancement.embedding, provider_id: 'embedding-a', model_id: 'saved-model' }
+    vi.mocked(listProviders).mockResolvedValue([{ id: 'embedding-a', enabled: true, provider_type: 'ollama_embedding', capabilities: {} }] as Awaited<ReturnType<typeof listProviders>>)
+    vi.mocked(discoverProviderModels).mockResolvedValue({ provider_id: 'embedding-a', status: 'ok', models })
+    renderWithProviders(<TaskModelSettings/>)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Embedding 模型', exact: true })).toHaveTextContent(`saved-model（${notice}）`))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('rediscovers embedding models after the provider address is corrected', async () => {
+    enhancement.embedding = { ...enhancement.embedding, provider_id: 'embedding-a', model_id: 'saved-model' }
+    const provider = { id: 'embedding-a', enabled: true, provider_type: 'ollama_embedding', base_url: 'http://127.0.0.1:11435/v1', capabilities: {} }
+    vi.mocked(listProviders).mockResolvedValue([provider] as Awaited<ReturnType<typeof listProviders>>)
+    vi.mocked(discoverProviderModels).mockRejectedValueOnce(new Error('Connection refused'))
+      .mockResolvedValue({ provider_id: 'embedding-a', status: 'ok', models: [{ id: 'saved-model', roles: ['embedding'], streaming: false, remote: true, enabled: true }] })
+    const result = renderWithProviders(<TaskModelSettings/>)
+    await screen.findByRole('alert')
+    result.queryClient.setQueryData(workspaceQueryKey('ws-a', 'providers'), [{ ...provider, base_url: 'http://127.0.0.1:11434/v1' }])
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Embedding 模型', exact: true })).not.toHaveTextContent('当前配置'))
+    expect(updateMemoryEnhancement).not.toHaveBeenCalled()
+  })
+
   it('does not mistake an unavailable session list for an empty workspace', async () => {
     vi.mocked(listSessions).mockRejectedValue(new Error('会话不可访问'))
     renderWithProviders(<MemorySettingsPage/>)
@@ -175,7 +231,7 @@ describe('settings information architecture', () => {
     expect(screen.getByRole('button', { name: '重建索引', exact: true })).toBeDisabled()
   })
 
-  it('persists all five task settings and preserves the paired memory model assignment', async () => {
+  it('persists the four active task settings and preserves the paired memory model assignment', async () => {
     const provider = { id: 'chat-a', display_name: '服务 A', enabled: true, remote_capability: true, provider_type: 'openai_compatible_chat', capabilities: { default_model: 'chat-model', discovered_model_ids: ['chat-model'] } }
     vi.mocked(listProviders).mockResolvedValue([provider] as Awaited<ReturnType<typeof listProviders>>)
     vi.mocked(listProviderCatalog).mockResolvedValue([{ provider_type: provider.provider_type, role: 'model' }] as Awaited<ReturnType<typeof listProviderCatalog>>)
@@ -184,7 +240,6 @@ describe('settings information architecture', () => {
     const fields = [
       ['生成标题模型', 'chat.auto_title_model'], ['生成下一步问题提示模型', 'chat.suggested_prompts_model'],
       ['语音转写整理模型', 'chat.dictation_cleanup_model'], ['练习出题与判分模型', 'practice.exercise_model'],
-      ['教学包生成模型', 'learning.package_model'],
     ]
     for (const [label, key] of fields) {
       fireEvent.click(await screen.findByRole('button', { name: label, exact: true }))
@@ -192,6 +247,7 @@ describe('settings information architecture', () => {
       await waitFor(() => expect(updateSetting).toHaveBeenCalledWith(key, { provider_id: 'chat-a', model_id: 'chat-model' }, { headers: { 'X-Workspace-ID': 'ws-a' } }))
       await waitFor(() => expect(screen.getByRole('button', { name: label, exact: true })).toBeEnabled())
     }
+    expect(screen.queryByRole('button', { name: '教学包生成模型', exact: true })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '记忆整理模型', exact: true }))
     fireEvent.click(await screen.findByRole('option', { name: '跟随对话模型', exact: true }))
     const target = { provider_id: '', model_id: '', follow_conversation: true }

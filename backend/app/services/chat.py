@@ -129,7 +129,6 @@ from app.services.billing import BillingQuote, BillingService
 from app.services.file_references import FileReferenceService
 from app.services.genui_sources import source_reference_hint
 from app.services.document_learning import DocumentLearningService
-from app.services.learning_package_context import learning_package_prompt_context
 from app.services.agent_runtime import AgentToolRuntime
 from app.services.chat_attachment_policy import (
     classify_non_agent_attachment,
@@ -278,12 +277,22 @@ def _normalize_web_sources(raw_sources: list) -> list[dict]:
         if (
             not isinstance(url, str)
             or not url.startswith(("https://", "http://"))
-            or url in seen
         ):
             continue
         if not isinstance(title, str) or not title.strip():
             title = url
         entry: dict = {"url": url, "title": title.strip()[:1_000]}
+        for key in ("evidence_kind", "provider_id", "provider_label"):
+            if isinstance(candidate.get(key), str):
+                entry[key] = candidate[key][:1000]
+        entry["page_read"] = candidate.get("page_read") is True and candidate.get("evidence_kind") == "page_text"
+        if url in seen:
+            if entry["page_read"]:
+                for prior in merged:
+                    if prior["url"] == url:
+                        prior.update({key: entry[key] for key in ("page_read", "evidence_kind", "provider_id", "provider_label") if key in entry})
+                        break
+            continue
         for key in ("start_index", "end_index"):
             value = candidate.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -2919,14 +2928,6 @@ class ChatService:
                     audio_transcripts=audio_transcripts,
                 )
             ]
-            package_context = learning_package_prompt_context(
-                self.db,
-                self.workspace_id,
-                node_ids or [],
-                session=session,
-            )
-            if package_context:
-                context_sections.append(package_context)
             if session.session_kind == "concept_branch" and session.context_capsule:
                 context_sections.append(self._concept_capsule_prompt(session.context_capsule))
             if include_memory and self.memory_context_loader is not None and (get_settings().memory_read_mode != "events" or not get_settings().memory_context_builder_v2):
@@ -2955,7 +2956,7 @@ class ChatService:
             authorized_context = prepared_context
         style_instructions = (
             f"{self._style_instructions()}\n\n"
-            f"{self._mode_tool_policy(agent_mode_enabled=agent_mode, web_search_results_present=web_search_results_present)}"
+            f"{self._mode_tool_policy(agent_mode_enabled=agent_mode, web_search_results_present=web_search_results_present, model_native_search_enabled=getattr(self.model_provider, 'search_route', '') == 'model_native')}"
         )
         if not include_history and not include_memory:
             return style_instructions + chr(10) * 2 + authorized_context, None
@@ -3379,14 +3380,6 @@ class ChatService:
                 audio_transcripts=audio_transcripts,
             )
         ]
-        package_context = learning_package_prompt_context(
-            self.db,
-            self.workspace_id,
-            node_ids or [],
-            session=session,
-        )
-        if package_context:
-            context_sections.append(package_context)
         if session.session_kind == "concept_branch" and session.context_capsule:
             context_sections.append(self._concept_capsule_prompt(session.context_capsule))
         if self.memory_context_loader is not None and (get_settings().memory_read_mode != "events" or not get_settings().memory_context_builder_v2):
@@ -3430,6 +3423,7 @@ class ChatService:
                 content=self._mode_tool_policy(
                     agent_mode_enabled=agent_mode_enabled,
                     web_search_results_present=web_search_results_present,
+                    model_native_search_enabled=getattr(self.model_provider, "search_route", "") == "model_native",
                 ),
             )
         )
@@ -3665,13 +3659,34 @@ class ChatService:
             )
         else:
             events = self.model_provider.stream_chat(messages, tools=tools)
+        def web_lifecycle_events():
+            pending = {}
+            try:
+                for event in events:
+                    if event.type == "web_activity":
+                        activity = event.web_activity
+                        if activity.get("status") in {"pending", "streaming"}:
+                            pending[activity.get("id")] = activity
+                        else:
+                            pending.pop(activity.get("id"), None)
+                    if event.type == "completed":
+                        from app.providers.ports.model import ProviderStreamEvent
+                        for activity in pending.values():
+                            yield ProviderStreamEvent("web_activity", web_activity={**activity, "status": "failed", "completion_unconfirmed": True})
+                        pending.clear()
+                    yield event
+            except Exception:
+                from app.providers.ports.model import ProviderStreamEvent
+                for activity in pending.values():
+                    yield ProviderStreamEvent("web_activity", web_activity={**activity, "status": "failed"})
+                raise
         def completion_events():
             # Rendering and prose proceed during image search. Only an explicit
             # complete waits for its outstanding resource outcomes, so failures
             # can request a drawing through the normal, billed tool loop.
             from app.services.rich_media import RESOURCE_BUDGET_SECONDS
             from app.providers.ports.model import ProviderStreamEvent
-            for event in events:
+            for event in web_lifecycle_events():
                 if event.type == "tool_calls":
                     closing = set()
                     for call in event.tool_calls:
@@ -3721,6 +3736,14 @@ class ChatService:
             logging.getLogger(__name__).warning("Inline UI declaration rejected", exc_info=False)
             return []
 
+    def _web_tool_metadata(self, name, arguments):
+        from types import SimpleNamespace
+        from app.services.web_tool_policy import web_tool_activity
+        runtime = self.agent_tool_runtime or SimpleNamespace(
+            extensions=None, search_provider=self.search_provider, fetch_provider=None,
+        )
+        return web_tool_activity(runtime, name, arguments if isinstance(arguments, dict) else {})
+
     def _agent_tool_definitions(
         self,
         agent_mode_enabled: bool,
@@ -3734,11 +3757,17 @@ class ChatService:
         if not agent_mode_enabled:
             return []
         memory_enabled = self._session_memory_policy_enabled(session_id)
+        native_codex_search = (
+            getattr(self.model_provider, "provider_type", "") == "codex_chatgpt"
+            and getattr(self.model_provider, "search_route", "") == "model_native"
+        )
         # A1-3: cache definitions per (session, memory policy, capability set);
         # a new capability activation (lg_capability_activate) changes the key
         # and rebuilds, preserving progressive-disclosure semantics.
         cache_key = (
             web_search_enabled,
+            getattr(self.model_provider, "search_route", "auto"),
+            native_codex_search,
             session_id,
             memory_enabled,
             tuple(sorted(capability_families or ())),
@@ -3752,6 +3781,8 @@ class ChatService:
             from app.services.managed_agent_session import bind_chat_session
             if session_id:
                 bind_chat_session(self, session_id)
+            from app.services.web_tool_policy import bind_web_route
+            bind_web_route(self.agent_tool_runtime, getattr(self.model_provider, "search_route", "auto"))
             definitions = self.agent_tool_runtime.definitions(
                 agent_mode_enabled=agent_mode_enabled,
                 web_search_enabled=web_search_enabled,
@@ -3759,6 +3790,15 @@ class ChatService:
                 capability_families=capability_families,
                 activated_capabilities=activated_capabilities,
             )
+            # Codex can combine its hosted search with function tools. Do not
+            # also offer AnySearch through the independently assembled runtime.
+            # Keep Qwen's companion lane and unrelated media tools unchanged.
+            if native_codex_search:
+                definitions = [
+                    tool for tool in definitions
+                    if tool.get("function", {}).get("name")
+                    not in {"search_web", "parallel_web_research"}
+                ]
             self._tool_definitions_cache[cache_key] = definitions
             return definitions
         # Fallback path when the full AgentToolRuntime is not wired: still expose
@@ -3769,7 +3809,7 @@ class ChatService:
         definitions.extend(AgentToolRuntime._canvas_tool_definitions())
         from app.services.stream_ui import tool_definitions as stream_ui_tools
         definitions.extend(stream_ui_tools())
-        if web_search_enabled and self.search_provider is not None and (
+        if web_search_enabled and not native_codex_search and self.search_provider is not None and (
             getattr(self.search_provider, "available", True) is not False
         ):
             definitions.append(
@@ -5610,6 +5650,24 @@ class ChatService:
         #    again instead of busy-polling. Waiting blocks only this chat's SSE
         #    stream, never other chats' tool execution. ──
         function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        from types import SimpleNamespace
+        from app.services.web_tool_policy import web_tool_allowed
+        policy_runtime = self.agent_tool_runtime or SimpleNamespace(extensions=None, search_provider=self.search_provider)
+        route = getattr(self.model_provider, "search_route", "auto")
+        if not web_tool_allowed(policy_runtime, str(function.get("name") or ""), search_route=route):
+            return (json.dumps({"error": "web_search_route_denied"}),
+                    {"status": "failed", "reason": "web_search_route_denied"}, [])
+        if (
+            function.get("name") in {"search_web", "parallel_web_research"}
+            and getattr(self.model_provider, "provider_type", "") == "codex_chatgpt"
+            and getattr(self.model_provider, "search_route", "") == "model_native"
+        ):
+            # Also reject stale/hallucinated external calls from old history.
+            return (
+                json.dumps({"error": "native_search_route", "message": "Use the authorized native web_search tool, not an external SearchProvider."}),
+                {"status": "failed", "reason": "native_search_route"},
+                [],
+            )
         if function.get("name") == "sandbox_subagent_wait":
             raw = function.get("arguments")
             try:
@@ -6536,6 +6594,8 @@ class ChatService:
             {
                 **item.model_dump(mode="json"),
                 "index": index,
+                "evidence_kind": "search_snippet",
+                "page_read": False,
             }
             for index, item in enumerate(results, start=1)
         ]
@@ -6731,6 +6791,7 @@ class ChatService:
             try:
                 document = provider.fetch(url)
                 require_public_http_url(document.final_url, domains)
+                self._last_web_fetch_provider = provider
                 return document
             except UnsafeFetchURL:
                 return None
@@ -6740,6 +6801,7 @@ class ChatService:
             try:
                 document = self.search_provider.fetch(url)
                 require_public_http_url(document.final_url, domains)
+                self._last_web_fetch_provider = self.search_provider
                 return document
             except UnsafeFetchURL:
                 return None
@@ -8891,7 +8953,7 @@ class ChatService:
         from app.domain.models import StickerIndexState
         sticker_state = self.db.get(StickerIndexState, self.workspace_id)
         allowed = style.emoji != -2 and (sticker_state is None or sticker_state.ai_enabled)
-        sticker_policy = ("\n聊天贴纸：在轻松、适当的语境可按需用 search_stickers 查找，理解候选的适用限制后用 send_sticker 发送；可不发送，每轮最多一张。只在工具已提供时调用。贴纸不能代替任务所需的完整信息，不必为贴纸重复解释。普通 Unicode Emoji 无需检索。" if allowed else "\n用户已关闭主动表情：不要主动发送贴纸或表情符号。")
+        sticker_policy = ("\n表情表达：根据用户语气、话题和回答风格，自然选择是否使用行内 Unicode Emoji 或颜文字，可放在句中或句末，不需要工具；用户使用表情时可适度回应。严肃、敏感或正式语境保持克制，不要影响内容清晰度，也不必每次使用。需要图片表情时，仅在提供工具的情况下按交际意图用 search_stickers 查找，理解候选的适用限制后用 send_sticker 发送；没有合适候选可放弃，每轮最多一张。贴纸不能代替任务所需的完整信息，不要编造图片地址。" if allowed else "\n用户已关闭主动表情：不要主动发送贴纸或表情符号。")
         return build_style_instructions(style) + sticker_policy
 
     @staticmethod
@@ -8899,6 +8961,7 @@ class ChatService:
         *,
         agent_mode_enabled: bool,
         web_search_results_present: bool = False,
+        model_native_search_enabled: bool = False,
     ) -> str:
         """Transient per-turn tool policy sent only to the Provider.
 
@@ -8923,6 +8986,13 @@ class ChatService:
             )
         # web_search_results_present 已不再改变本指令：预检索联网结果的引用规则
         # 由 source_context 自带（见 _run_web_search），无需在此重复。
+        if model_native_search_enabled:
+            return (
+                "当前为极速或思考模式。本轮已授权模型原生联网搜索，"
+                "需要当前信息时请使用实际提供的原生搜索工具，并依据真实结果附上引用。"
+                "本轮不提供 LearnGraph 自定义函数工具，不能执行文件操作或其他智能体任务；"
+                "不要编造检索结果，也不要将历史工具记录当作本轮已执行的操作。"
+            )
         return (
             "当前为极速或思考模式。本轮不提供可调用的工具接口，请勿发出工具调用，"
             "也不要假装完成过工具操作；历史中的操作、推理与工具格式不赋予本轮执行权限。"
@@ -9889,6 +9959,10 @@ class ChatService:
                             "locator",
                             "chunk_id",
                             "index",
+                            "evidence_kind",
+                            "page_read",
+                            "provider_id",
+                            "provider_label",
                         )
                         if key in item
                     }
@@ -10068,7 +10142,7 @@ class ChatService:
         # correct (the source could sit outside a truncated parent window).
         is_linear = (
             session.parent_session_id is None
-            or session.session_kind in ("concept_branch", "side", "agent")
+            or session.session_kind in ("concept_branch", "side", "agent", "scheduled_task")
         )
         timeline_query = self.messages.query().where(
             Message.session_id == session_id
@@ -10094,15 +10168,10 @@ class ChatService:
         # Both query paths order DESC (newest first) and cap the window, so
         # always reverse back to chronological order for the caller.
         local_messages.reverse()
-        # concept_branch and side sessions are not history-inheriting branches:
-        # concept_branch has its own capsule, side sessions are parallel threads
-        # grouped under a parent but start from scratch.  Both return only their
-        # own local messages without requiring a source_message_id.
-        if session.parent_session_id is None or session.session_kind in (
-            "concept_branch",
-            "side",
-            "agent",
-        ):
+        # These child sessions keep parent links for navigation only. They
+        # use their own local history, unlike edit branches that inherit a
+        # prefix ending immediately before their source_message_id.
+        if is_linear:
             return local_messages
         if session.source_message_id is None:
             raise AppError(
@@ -11439,7 +11508,14 @@ class ChatService:
         )
         if retry_context.web_search and not self._uses_model_native_search(retry_context):
             yield ": phase-searching\n\n"
-        source_results, source_context = self._run_web_search(retry_context)
+        if retry_context.web_search and not self._uses_model_native_search(retry_context):
+            from app.services.web_preflight import stream_web_operation
+            source_results, source_context = yield from stream_web_operation(
+                lambda: self._run_web_search(retry_context), kind="search", provider=self.search_provider,
+                target=retry_context.content,
+            )
+        else:
+            source_results, source_context = self._run_web_search(retry_context)
         skill_package_context = self._agent_skill_package_instructions(
             agent_mode_enabled=retry_agent_mode,
             goal_mode_enabled=retry_goal_mode,
@@ -12034,6 +12110,15 @@ class ChatService:
                                 ):
                                     sequence += 1
                                     yield resource_event
+                                if provider_event.type == "web_activity":
+                                    from app.services.web_activity_parts import push_native_web_activity
+                                    activity_events, sequence, next_ordinal = push_native_web_activity(
+                                        self, provider_event.web_activity, session_id=session_id,
+                                        message_id=message.id, version_id=version.id, sequence=sequence,
+                                        ordinal=next_ordinal, parts=reasoning_records,
+                                    )
+                                    yield from activity_events
+                                    continue
                                 if provider_event.type == "ui_command":
                                     ui_events = self._apply_inline_ui(
                                         provider_event.command, session_id=session_id, message_id=message.id,
@@ -12409,6 +12494,7 @@ class ChatService:
                                             "tool_name": tool_name,
                                             "title": tool_name,
                                             "input": input_data,
+                                            **self._web_tool_metadata(tool_name, input_data),
                                         },
                                     )
                                 )
@@ -12508,6 +12594,12 @@ class ChatService:
                                                 for item in retry_tool_definitions
                                             },
                                         )
+                                    )
+                                if result_sources:
+                                    from app.services.web_evidence import align_tool_sources
+                                    result_content, result_sources = align_tool_sources(
+                                        result_content, result_sources,
+                                        [*((source_record.data or {}).get("results", []) if source_record is not None else []), *retry_agent_sources],
                                     )
                                 if isinstance(result_meta, dict):
                                     injected_image_parts.extend(
@@ -12667,15 +12759,8 @@ class ChatService:
                                                 f"Agent 已检索 {len(retry_agent_sources)} 条来源线索。"
                                             ),
                                             data={
-                                                "provider_id": (
-                                                    self.search_provider.provider_id
-                                                    if self.search_provider is not None
-                                                    else "agent_tool"
-                                                ),
-                                                "remote_capability": bool(
-                                                    self.search_provider
-                                                    and self.search_provider.remote_capability
-                                                ),
+                                                "provider_id": "web_tools",
+                                                "remote_capability": True,
                                                 "results": retry_agent_sources,
                                             },
                                         )
@@ -12685,10 +12770,8 @@ class ChatService:
                                     existing_sources = list(
                                         (source_record.data or {}).get("results", [])
                                     )
-                                    merged_sources = [
-                                        *existing_sources,
-                                        *retry_agent_sources,
-                                    ]
+                                    from app.services.web_evidence import merge_citation_sources
+                                    merged_sources = merge_citation_sources(existing_sources, retry_agent_sources)
                                     source_record.content = (
                                         f"Agent 已检索 {len(merged_sources)} 条来源线索。"
                                     )
@@ -13862,9 +13945,13 @@ class ChatService:
             "original_bytes": encoded_bytes,
             "preview": encoded[:AGENT_EVENT_STRING_PREVIEW_BYTES],
         }
-        for key in ("tool_name", "title", "status"):
+        for key in ("tool_name", "title", "status", "web_activity"):
             if key in data:
                 compact[key] = data[key]
+        if isinstance(data.get("output"), dict) and isinstance(data.get("web_activity"), dict):
+            compact["output"] = {key: data["output"][key]
+                for key in ("status", "reason", "provider_id", "provider_label", "evidence_kind", "page_read")
+                if key in data["output"]}
         return compact
 
     @staticmethod
@@ -14029,8 +14116,9 @@ class ChatService:
             elif fetch_plan == "mixed":
                 if payload.web_search and not self._uses_model_native_search(payload):
                     yield ": phase-searching\n\n"
+                from app.services.web_preflight import stream_mixed_fetch_search
                 source_results, source_context, fetch_source_entries = (
-                    self._run_mixed_fetch_search(
+                    yield from stream_mixed_fetch_search(self,
                         session_id,
                         payload,
                         self._explicit_urls(payload.content),
@@ -14039,9 +14127,14 @@ class ChatService:
             else:
                 if payload.web_search and not self._uses_model_native_search(payload):
                     yield ": phase-searching\n\n"
-                source_results, source_context = self._run_web_search(
-                    payload, multi=self._search_multi_enabled(payload)
-                )
+                if payload.web_search and not self._uses_model_native_search(payload):
+                    from app.services.web_preflight import stream_web_operation
+                    source_results, source_context = yield from stream_web_operation(
+                        lambda: self._run_web_search(payload, multi=self._search_multi_enabled(payload)),
+                        kind="search", provider=self.search_provider, target=payload.content,
+                    )
+                else:
+                    source_results, source_context = self._run_web_search(payload, multi=self._search_multi_enabled(payload))
                 # Explicit URL but no usable FetchProvider: answer from search
                 # only, and surface a one-time gentle "configure fetch" notice
                 # after the answer (dismissible client-side).
@@ -15617,6 +15710,15 @@ class ChatService:
                                 ):
                                     sequence += 1
                                     yield resource_event
+                                if provider_event.type == "web_activity":
+                                    from app.services.web_activity_parts import push_native_web_activity
+                                    activity_events, sequence, next_stream_part_ordinal = push_native_web_activity(
+                                        self, provider_event.web_activity, session_id=session_id,
+                                        message_id=assistant_message.id, version_id=assistant_version.id, sequence=sequence,
+                                        ordinal=next_stream_part_ordinal, parts=streamed_parts,
+                                    )
+                                    yield from activity_events
+                                    continue
                                 if provider_event.type == "ui_command":
                                     ui_events = self._apply_inline_ui(
                                         provider_event.command, session_id=session_id, message_id=assistant_message.id,
@@ -15997,6 +16099,7 @@ class ChatService:
                                             "tool_name": tool_name,
                                             "title": tool_name,
                                             "input": input_data,
+                                            **self._web_tool_metadata(tool_name, input_data),
                                         },
                                     )
                                 )
@@ -16097,6 +16200,12 @@ class ChatService:
                                     )
                                 if cancelled():
                                     raise _GenerationCancellationRequested()
+                                if result_sources:
+                                    from app.services.web_evidence import align_tool_sources
+                                    result_content, result_sources = align_tool_sources(
+                                        result_content, result_sources,
+                                        [*((source_record.data or {}).get("results", []) if source_record is not None else []), *agent_sources],
+                                    )
                                 agent_sources.extend(result_sources)
                                 if isinstance(result_meta, dict):
                                     injected_image_parts.extend(
@@ -16247,23 +16356,22 @@ class ChatService:
                                             status="completed",
                                             content=f"Agent 已检索 {len(agent_sources)} 条来源线索。",
                                             data={
-                                                "provider_id": self.search_provider.provider_id,
-                                                "remote_capability": self.search_provider.remote_capability,
+                                                "provider_id": "web_tools",
+                                                "remote_capability": True,
                                                 "results": agent_sources,
                                             },
                                         )
                                     )
                                     next_stream_part_ordinal += 1
                                 else:
+                                    from app.services.web_evidence import merge_citation_sources
+                                    merged_sources = merge_citation_sources((source_record.data or {}).get("results", []), agent_sources)
                                     source_record.content = (
-                                        f"Agent 已检索 {len((source_record.data or {}).get('results', [])) + len(agent_sources)} 条来源线索。"
+                                        f"Agent 已检索 {len(merged_sources)} 条来源线索。"
                                     )
                                     source_record.data = {
                                         **(source_record.data or {}),
-                                        "results": [
-                                            *((source_record.data or {}).get("results", [])),
-                                            *agent_sources,
-                                        ],
+                                        "results": merged_sources,
                                     }
                                 source_event = self._append_event(
                                     session_id=session_id,

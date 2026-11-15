@@ -3,7 +3,8 @@ import {
   type ComponentProps, type ReactNode,
 } from "react";
 import { ArrowUpRight, Check, Copy, Eye, Globe } from "lucide-react";
-import { toast } from "sonner";
+import { Link, useInRouterContext } from "react-router-dom";
+import { toast } from '@/lib/notifications';
 import {
   Popover, PopoverAnchor, PopoverContent, PopoverTrigger,
 } from "@/components/ui/popover";
@@ -43,6 +44,7 @@ type MessageLinkProps = ComponentProps<"a"> & {
 export function MessageLink({
   href, children, className, node: _node, faviconUrl, variant = "inline", ...props
 }: MessageLinkProps) {
+  const inRouter = useInRouterContext();
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -59,7 +61,12 @@ export function MessageLink({
   const text = linkText(children);
   const label = text && /%[0-9a-f]{2}/i.test(text) ? decodeUrlForDisplay(text) : children;
   if (!external) {
-    return internal ? <a {...props} href={internal} className={className}>{label}</a> : <span>{label}</span>;
+    if (!internal) return <span>{label}</span>;
+    if (inRouter && /^\/w\/[^/]+\/chat\/[^/?#]+(?:[?#]|$)/.test(internal)) {
+      // Streamdown's external-link handler must not intercept local navigation.
+      return <Link {...props} to={internal} onClick={undefined} target={undefined} className={className}>{label}</Link>;
+    }
+    return <a {...props} href={internal} className={className}>{label}</a>;
   }
 
   const changeOpen = (value: boolean) => {

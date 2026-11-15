@@ -162,7 +162,7 @@ export interface MessageCreateRequest {
   file_ids?: string[]
   provider_id?: string
   model_id?: string
-  thinking_mode?: 'off' | 'low' | 'medium' | 'high' | 'xhigh'
+  thinking_mode?: 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   agent_mode?: boolean
   goal_mode?: boolean
   message_kind?: 'normal' | 'subapp_event'

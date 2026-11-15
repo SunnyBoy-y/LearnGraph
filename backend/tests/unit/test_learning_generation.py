@@ -410,7 +410,7 @@ def test_cap_rejected_stage_still_surfaces_the_real_reason(monkeypatch, no_backo
                             normalize=partial(lg.normalize_exam, has_activity=True))
 
     assert caught.value.attempts == 3
-    assert "已在不指定输出上限的情况下重试过" in caught.value.detail
+    assert "已在降低输出上限后重试过" in caught.value.detail
     assert "测评试卷" in caught.value.detail
 
 

@@ -62,15 +62,39 @@ BuiltinSkillPermission = Literal[
 ]
 
 
+class MCPWebToolContract(BaseModel):
+    """Locally authorized result mapping, never inferred from remote annotations."""
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["search", "fetch"]
+    results_path: str = Field(default="results", max_length=160, pattern=r"^[A-Za-z0-9_.-]*$")
+    url_field: str = Field(default="url", min_length=1, max_length=80)
+    title_field: str = Field(default="title", min_length=1, max_length=80)
+    snippet_field: str = Field(default="snippet", min_length=1, max_length=80)
+    content_field: str = Field(default="content", min_length=1, max_length=80)
+    url_argument: str = Field(default="url", min_length=1, max_length=80)
+
+
 class MCPServerManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1.0"] = "1.0"
     identity: str = Field(min_length=1, max_length=200)
-    requested_tools: list[str] = Field(min_length=1, max_length=100)
+    requested_tools: list[str] = Field(default_factory=list, max_length=100)
     permissions: list[MCPPermission] = Field(default_factory=list, max_length=20)
     requested_resources: list[str] = Field(default_factory=list, max_length=100)
     requested_prompts: list[str] = Field(default_factory=list, max_length=100)
+    web_tools: dict[str, MCPWebToolContract] = Field(default_factory=dict, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_web_tools(self):
+        if not (self.requested_tools or self.requested_resources or self.requested_prompts):
+            raise ValueError("MCP manifests must request at least one tool, resource, or prompt")
+        if set(self.web_tools) - set(self.requested_tools):
+            raise ValueError("web_tools must reference requested_tools")
+        if self.web_tools and "network" not in self.permissions:
+            raise ValueError("Web tools require explicit network permission")
+        return self
 
     @field_validator("requested_tools")
     @classmethod
@@ -80,11 +104,18 @@ class MCPServerManifest(BaseModel):
             stripped = name.strip()
             if not stripped or len(stripped) > 128:
                 raise ValueError("MCP tool names must contain 1 to 128 characters")
-            if not all(character.isascii() and (character.isalnum() or character in "._-") for character in stripped):
-                raise ValueError("MCP tool names may contain only ASCII letters, digits, '.', '_' and '-'")
+            if any(ord(character) <= 32 or ord(character) == 127 for character in stripped):
+                raise ValueError("MCP tool names cannot contain whitespace or control characters")
             if stripped not in normalized:
                 normalized.append(stripped)
         return normalized
+
+    @field_validator("requested_resources", "requested_prompts")
+    @classmethod
+    def validate_content_identifiers(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() or len(item) > 2048 or any(ord(c) < 32 for c in item) for item in value):
+            raise ValueError("MCP resource/prompt identifiers must be non-empty bounded strings without control characters")
+        return list(dict.fromkeys(item.strip() for item in value))
 
     @field_validator("permissions")
     @classmethod
@@ -575,6 +606,9 @@ class SkillSandboxRunRequest(BaseModel):
     script_path: str = Field(min_length=1, max_length=500)
     chat_session_id: str | None = Field(default=None, max_length=36)
     argv_extra: list[str] = Field(default_factory=list, max_length=16)
+    cwd_mode: Literal["package", "workspace"] = "package"
+    timeout_seconds: int | None = Field(default=None, ge=1, le=600)
+    yield_time_ms: int | None = Field(default=None, ge=0, le=10000)
 
 
 class SkillSandboxRunResponse(BaseModel):
@@ -595,6 +629,9 @@ class SkillSandboxRunResponse(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     invocation_id: str | None = None
+    package_root: str | None = None
+    job_id: str | None = None
+    cwd_mode: Literal["package", "workspace"] = "package"
 
 
 class SkillMarketCardView(BaseModel):
@@ -849,6 +886,7 @@ class TransportCapabilityView(BaseModel):
     transport: Literal["streamable_http", "stdio"]
     available: bool
     protocol_version: str | None
+    supported_protocol_versions: list[str] = Field(default_factory=list)
     supports_real_execution: bool
     supports_encrypted_bearer_reference: bool
     reason: str

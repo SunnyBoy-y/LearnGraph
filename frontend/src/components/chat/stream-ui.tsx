@@ -27,6 +27,7 @@ import {
   streamUIViewState,
 } from "@/lib/stream-ui-local-state";
 import { GraphCanvas } from "./graph-canvas";
+import { AnswerIcon } from "./answer-icon";
 import { presentation } from "@/genui/presentation-simplifier";
 import "./stream-ui.css";
 import "@/genui/layout-tokens.css";
@@ -434,7 +435,7 @@ function TimelineView({ snapshot: s }: ViewProps) {
   return s.items.length ? <ol className="stream-ui__events" aria-label="阶段安排">
     {s.items.map(item => <li key={item.id}>
       {item.date && <time>{item.date}</time>}
-      <div><strong>{item.label}</strong>{item.description && <p>{item.description}</p>}{item.value != null && <small>{format(item.value)}</small>}</div>
+      <div><strong>{item.icon && <AnswerIcon name={item.icon} />}{item.label}</strong>{item.description && <p>{item.description}</p>}{item.value != null && <small>{format(item.value)}</small>}</div>
     </li>)}
   </ol> : <Empty settled={s.state === "completed"} />;
 }
@@ -454,7 +455,7 @@ function MetricView({ snapshot: s }: ViewProps) {
         const value = split ? split[1] + (split[2] === "%" ? "%" : "") : format(item.value);
         const unit = split ? split[2] === "%" ? "" : split[2] : s.props.unit;
         return <li className="metric-card__item" data-emphasis={index === 0 ? "primary" : index === 1 ? "secondary" : "context"} key={item.id}>
-          <span className="metric-card__label">{item.label}</span>
+          <span className="metric-card__label">{item.icon && <AnswerIcon name={item.icon} />}{item.label}</span>
           <strong className="metric-card__value">
             <span>{value}</span>
             {unit && <small>{unit}</small>}
@@ -525,6 +526,7 @@ function ValidatedUI({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const View = UI_REGISTRY[snapshot.component];
+  const showFooterNote = snapshot.component !== "graph";
 
   const canExplain =
     interactive &&
@@ -569,7 +571,7 @@ function ValidatedUI({
       </p>}
       {snapshot.component !== "document" && <header className="stream-ui__heading">
         <div className="stream-ui__heading-copy">
-          <h3 className="stream-ui__title">{snapshot.props.title}</h3>
+          <h3 className="stream-ui__title">{snapshot.props.icon && <AnswerIcon name={snapshot.props.icon} />}{snapshot.props.title}</h3>
           {snapshot.props.description && <p>{snapshot.props.description}</p>}
         </div>
         {(snapshot.state === "streaming" || failed) && (
@@ -603,8 +605,8 @@ function ValidatedUI({
         ); } : undefined}
       /></Suspense>
       {failed && snapshot.component === "document" && <p className="rich-doc__caption" role="status">生成已中断，已生成内容仍可操作。</p>}
-      {snapshot.component !== "document" && (!embedded || onAction || snapshot.props.source_note || snapshot.props.data_kind === "example") && <footer className="stream-ui__footer">
-        <span>{[snapshot.props.data_kind === "example" ? "示例数据" : "", snapshot.props.source_note, snapshot.component !== "chart" ? snapshot.props.time_range : ""].filter(Boolean).join(" · ")}</span>
+      {snapshot.component !== "document" && (onAction || (showFooterNote && (!embedded || snapshot.props.source_note || snapshot.props.data_kind === "example"))) && <footer className="stream-ui__footer">
+        {showFooterNote && <span>{[snapshot.props.data_kind === "example" ? "示例数据" : "", snapshot.props.source_note, snapshot.component !== "chart" ? snapshot.props.time_range : ""].filter(Boolean).join(" · ")}</span>}
         {onAction && <Button
           size="sm"
           variant="ghost"

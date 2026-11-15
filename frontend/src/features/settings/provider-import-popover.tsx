@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, Check, ChevronRight, FileUp, Loader2, RefreshCw, Search, Sparkles, X } from 'lucide-react';
-import { toast } from 'sonner';
+import { toast } from '@/lib/notifications';
 
 import { commitConfigPreview, getConfigSources, previewConfigSources, type ConfigCandidate, type ConfigPreview, type ConfigSource } from '@/api/provider-automation';
 import { discoverProviderModels, importCcSwitchProviders } from '@/api/providers';

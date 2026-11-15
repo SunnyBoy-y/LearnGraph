@@ -5,6 +5,8 @@ import type { Session } from '@/types/sessions'
 
 export const listProjects = (includeArchived = false) => apiClient.get<Project[]>('/projects', { query: { include_archived: includeArchived } })
 export const createProject = (payload: ProjectCreate) => apiClient.post<Project, ProjectCreate>('/projects', payload)
+/** Resolve the server-persisted graph → learning folder ID mapping. No session mutation. */
+export const openGraphFolder = (graphId: string) => apiClient.post<Project>(`/graphs/${encodeURIComponent(graphId)}/learning-folder`)
 export const updateProject = (id: string, payload: Partial<ProjectCreate & { position: number }>) => apiClient.patch<Project, typeof payload>(`/projects/${encodeURIComponent(id)}`, payload)
 export const archiveProject = (id: string) => apiClient.post<Project>(`/projects/${encodeURIComponent(id)}/archive`)
 export const restoreProject = (id: string) => apiClient.post<Project>(`/projects/${encodeURIComponent(id)}/restore`)

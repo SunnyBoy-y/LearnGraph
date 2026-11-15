@@ -30,6 +30,12 @@ beforeEach(() => {
 });
 
 describe('sticker integration', () => {
+  it('offers semantic analysis only for user-imported packs', async () => {
+    status.packs.push({ id: 'catalog', name: '预置表情', builtin: false, catalog: true, enabled: true, license: '', source: '', count: 1, active_count: 1 });
+    renderWithProviders(<StickerSettingsPanel />);
+    await screen.findByRole('switch', { name: '启用表情包：预置表情' });
+    expect(screen.getAllByRole('button', { name: '补全语义' })).toHaveLength(1);
+  });
   it('keeps retrieval settings consolidated under sticker settings', async () => {
     renderWithProviders(<StickerSettingsPanel />);
     expect(await screen.findByText('坏笑猫')).toBeInTheDocument();

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 """stdio MCP Host Companion: run real-machine stdio MCP servers for Docker.
 
-stdio MCP servers have no network port: LearnGraph normally launches them with
-``npx ...`` on the host. Inside the whole-app Docker deployment the FastAPI
-process cannot (and by design must not — see ``UnavailableStdioMCPAdapter``)
-spawn host processes, and a TCP proxy cannot reach a process with no listener.
-This companion is the host-side counterpart: it spawns a registered stdio MCP
-process on the real machine, speaks JSON-RPC to it over stdin/stdout, and
-exposes the same JSON-RPC surface over HTTP so the container can reach it.
+LearnGraph's normal stdio MCP path uses the approved, digest-pinned isolated
+runner and never falls back to a host command. This optional legacy companion
+is a separate operator-managed host service: it starts only reviewed, explicitly
+enabled launch files and forwards JSON-RPC through an authenticated envelope.
+Its /rpc endpoint requires {launch_id, message}; it is not itself a standard
+Streamable HTTP endpoint and must not be registered as one. The built-in MCP
+HTTP and isolated stdio adapters provide the standard protocol implementation.
 
 Topology:
 
@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+from uuid import uuid4
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -141,6 +142,9 @@ class DirectoryStdioRegistry:
                 continue
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict) or raw.get("enabled") is not True:
+                    self._cache.pop(str(path), None)
+                    continue
                 launch = validate_stdio_launch(raw)
             except (OSError, ValueError, CompanionLaunchInvalid) as exc:
                 logger.error("stdio launch file %s invalid; skipped: %s", path, exc)
@@ -151,7 +155,7 @@ class DirectoryStdioRegistry:
                 continue
             self._cache[str(path)] = (stat.st_mtime_ns, launch)
             current[launch.id] = launch
-        stale = [key for key in self._cache if key not in current]
+        stale = [key for key, value in self._cache.items() if value[1].id not in current]
         for key in stale:
             self._cache.pop(key, None)
         registry.clear()
@@ -166,26 +170,36 @@ class StdioProcess:
         self._proc: asyncio.subprocess.Process | None = None
         self._pending: dict[Any, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._start_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
 
     @property
     def running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
     async def ensure(self) -> None:
-        if self.running:
-            return
-        env = dict(os.environ)
-        env.update(self.launch.env)
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.launch.command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-            cwd=self.launch.cwd,
-        )
-        self._reader_task = asyncio.get_running_loop().create_task(self._read_loop())
-        logger.info("spawned stdio MCP %r: %s", self.launch.id, " ".join(self.launch.command))
+        async with self._start_lock:
+            if self.running:
+                return
+            if self._proc is not None:
+                await self.shutdown()
+            safe_keys = {"PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "LANG", "LC_ALL"}
+            env = {key:value for key,value in os.environ.items() if key.upper() in safe_keys}
+            env.update(self.launch.env)
+            self._proc = await asyncio.create_subprocess_exec(
+                *self.launch.command, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=env, cwd=self.launch.cwd, limit=2*1024*1024,
+            )
+            self._reader_task = asyncio.get_running_loop().create_task(self._read_loop())
+            self._stderr_task = asyncio.get_running_loop().create_task(self._drain_stderr())
+            logger.info("spawned reviewed stdio MCP %r", self.launch.id)
+
+    async def _drain_stderr(self):
+        assert self._proc is not None and self._proc.stderr is not None
+        while await self._proc.stderr.read(4096):
+            pass  # Keep logging separate from protocol stdout; never log credentials.
 
     async def _read_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -219,28 +233,40 @@ class StdioProcess:
         await self.ensure()
         assert self._proc is not None and self._proc.stdin is not None
         message_id = payload.get("id")
-        if message_id is None:
-            raise CompanionRPCError("JSON-RPC request must carry an id")
+        wire_id = uuid4().hex
+        if len(self._pending) >= 32:
+            raise CompanionRPCError("MCP companion concurrency limit reached", status_code=429)
+        wire_payload = {**payload, "id":wire_id} if message_id is not None else dict(payload)
+        line = (json.dumps(wire_payload, ensure_ascii=False) + "\n").encode("utf-8")
+        if len(line) > 1024*1024:
+            raise CompanionRPCError("MCP companion request exceeds 1 MiB", status_code=413)
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[message_id] = future
+        if message_id is not None:
+            self._pending[wire_id] = future
         try:
-            line = json.dumps(payload, ensure_ascii=False) + "\n"
-            self._proc.stdin.write(line.encode("utf-8"))
-            await self._proc.stdin.drain()
+            async with self._write_lock:
+                self._proc.stdin.write(line)
+                await asyncio.wait_for(self._proc.stdin.drain(), timeout=timeout_seconds or self.launch.timeout_seconds)
+            if message_id is None:
+                return {"accepted":True}
             try:
                 response = await asyncio.wait_for(
                     future, timeout=timeout_seconds or self.launch.timeout_seconds
                 )
             except asyncio.TimeoutError as exc:
-                self._pending.pop(message_id, None)
+                self._pending.pop(wire_id, None)
                 raise CompanionRPCError(
                     f"stdio MCP {self.launch.id!r} timed out after "
                     f"{timeout_seconds or self.launch.timeout_seconds}s",
                     status_code=504,
                 ) from exc
-            return response
+            return {**response, "id":message_id}
         except BrokenPipeError as exc:
             raise CompanionRPCError(f"stdio MCP {self.launch.id!r} stdin closed") from exc
+        finally:
+            self._pending.pop(wire_id, None)
+            if not future.done():
+                future.cancel()
 
     async def shutdown(self) -> None:
         if self._reader_task is not None:
@@ -261,6 +287,21 @@ class StdioProcess:
                     pass
             except ProcessLookupError:
                 pass
+        if self._proc is not None:
+            await self._proc.wait()
+            if self._proc.stdin:
+                self._proc.stdin.close()
+                try:
+                    await self._proc.stdin.wait_closed()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except asyncio.CancelledError:
+                pass
+            self._stderr_task = None
         self._proc = None
 
 
@@ -293,7 +334,8 @@ class StdioCompanion:
         return launch
 
     def _require_token(self, request: Request) -> None:
-        if request.headers.get("authorization", "") != f"Bearer {self.token}":
+        import hmac
+        if not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {self.token}"):
             raise CompanionRPCError("missing or invalid bearer token", status_code=403)
 
     def _build_app(self) -> FastAPI:
@@ -380,6 +422,10 @@ class StdioCompanion:
                 await asyncio.sleep(self.refresh_seconds)
                 try:
                     self.source.refresh_into(self.registry)
+                    for launch_id, process in list(self._processes.items()):
+                        if self.registry.get(launch_id) != process.launch:
+                            self._processes.pop(launch_id, None)
+                            await process.shutdown()
                 except Exception:
                     logger.exception("stdio launch registry refresh failed; previous launches remain in force")
         except asyncio.CancelledError:

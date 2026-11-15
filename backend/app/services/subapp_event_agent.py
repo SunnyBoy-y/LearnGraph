@@ -467,6 +467,7 @@ def run_subapp_event_agent_once(payload: dict[str, Any]) -> bool:
                 workspace_context=context,
                 settings=settings,
                 thinking_mode="off",
+                prefer_fast=True,
                 search_route="disabled",
             )
             request = MessageCreateRequest(

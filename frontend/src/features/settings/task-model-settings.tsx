@@ -9,14 +9,13 @@ import { ErrorState, LoadingState } from '@/components/shared/page-elements';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, } from "@/components/ui/alert-dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, } from "@/components/ui/select";
 import { useAuth } from "@/features/auth/auth-context-value";
-import { LearningModelSelect } from "@/features/learning/learning-model-select";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { CHAT_AUTO_TITLE_MODEL_SETTING_KEY, CHAT_DICTATION_CLEANUP_MODEL_SETTING_KEY, CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY, PRACTICE_EXERCISE_MODEL_SETTING_KEY, readChatFeatureModelSetting } from "@/lib/workspace-settings";
 import type { MemoryEnhancementUpdateRequest } from "@/types/memory";
 import type { WorkspaceSetting } from "@/types/settings";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { SettingRow, SettingsSection } from './settings-primitives';
 function useTaskModelSettings() {
     const auth = useAuth();
@@ -95,13 +94,25 @@ function useTaskModelSettings() {
     }, [providerCatalog.data, providers.data, memoryEnhancement.data]);
     const selectedEmbeddingProvider = embeddingProviders.find((provider) => provider.id === memoryEnhancement.data?.embedding.provider_id);
     const embeddingDiscovery = useQuery({
-        queryKey: workspaceQueryKey(auth.workspaceId, "settings-embedding-models", selectedEmbeddingProvider?.id),
+        queryKey: workspaceQueryKey(auth.workspaceId, "settings-embedding-models", selectedEmbeddingProvider?.id, selectedEmbeddingProvider?.base_url, selectedEmbeddingProvider?.provider_type),
         queryFn: () => discoverProviderModels(selectedEmbeddingProvider!.id),
         staleTime: 30000,
+        retry: false,
         enabled: Boolean(selectedEmbeddingProvider?.enabled),
     });
     const embeddingModels = (embeddingDiscovery.data?.models ?? []).filter((model) => model.enabled !== false);
     const configuredEmbeddingModelId = memoryEnhancement.data?.embedding.model_id ?? "";
+    const configuredEmbeddingModelNotice = !selectedEmbeddingProvider
+        ? "当前配置，连接不可用"
+        : !selectedEmbeddingProvider.enabled
+            ? "当前配置，服务已停用"
+            : embeddingDiscovery.data?.models.some((model) => model.id === configuredEmbeddingModelId && model.enabled === false)
+                ? "当前配置，模型已停用"
+                : embeddingDiscovery.isError
+                    ? "当前配置，发现失败，待验证"
+                    : !embeddingDiscovery.isSuccess
+                        ? "当前配置，待验证"
+                        : "当前配置，未发现";
     const visibleEmbeddingModels = configuredEmbeddingModelId &&
         !embeddingModels.some((model) => model.id === configuredEmbeddingModelId)
         ? [
@@ -144,21 +155,23 @@ function useTaskModelSettings() {
         ? FEATURE_MODEL_FOLLOW_CONVERSATION
         : featureModelValue(memoryExtractionCfg?.provider_id || null, memoryExtractionCfg?.model_id || null);
     const memoryModelChoices = withConfiguredModelChoice(featureModelChoices, memoryExtractionCfg?.provider_id ?? "", memoryExtractionCfg?.model_id ?? "", (providers.data ?? []).find((item) => item.id === memoryExtractionCfg?.provider_id)?.display_name);
-    return { embeddingModelDraft, setEmbeddingModelDraft, settings, memoryEnhancement, providers, saveFeatureModel, featureModelChoices, autoTitleModel, suggestedPromptsModel, dictationCleanupModel, exerciseModel, saveMemoryEnhancement, memoryModelChoices, memoryModelValue, auth, embeddingProviders, applyEmbeddingPatch, selectedEmbeddingProvider, embeddingDiscovery, visibleEmbeddingModels, pendingEmbeddingSwitch, setPendingEmbeddingSwitch };
+    return { embeddingModelDraft, setEmbeddingModelDraft, settings, memoryEnhancement, providers, saveFeatureModel, featureModelChoices, autoTitleModel, suggestedPromptsModel, dictationCleanupModel, exerciseModel, saveMemoryEnhancement, memoryModelChoices, memoryModelValue, auth, embeddingProviders, applyEmbeddingPatch, selectedEmbeddingProvider, embeddingDiscovery, visibleEmbeddingModels, configuredEmbeddingModelNotice, pendingEmbeddingSwitch, setPendingEmbeddingSwitch };
 }
 export function TaskModelSettings() {
     const { workspaceId } = useAuth();
     return <TaskModelSettingsForm key={workspaceId}/>;
 }
 function TaskModelSettingsForm() {
-    const { embeddingModelDraft, setEmbeddingModelDraft, settings, memoryEnhancement, providers, saveFeatureModel, featureModelChoices, autoTitleModel, suggestedPromptsModel, dictationCleanupModel, exerciseModel, saveMemoryEnhancement, memoryModelChoices, memoryModelValue, auth, embeddingProviders, applyEmbeddingPatch, selectedEmbeddingProvider, embeddingDiscovery, visibleEmbeddingModels, pendingEmbeddingSwitch, setPendingEmbeddingSwitch } = useTaskModelSettings();
+    const { embeddingModelDraft, setEmbeddingModelDraft, settings, memoryEnhancement, providers, saveFeatureModel, featureModelChoices, autoTitleModel, suggestedPromptsModel, dictationCleanupModel, exerciseModel, saveMemoryEnhancement, memoryModelChoices, memoryModelValue, auth, embeddingProviders, applyEmbeddingPatch, selectedEmbeddingProvider, embeddingDiscovery, visibleEmbeddingModels, configuredEmbeddingModelNotice, pendingEmbeddingSwitch, setPendingEmbeddingSwitch } = useTaskModelSettings();
+    const ollamaConnectionFailed = ["ollama", "ollama_embedding"].includes(selectedEmbeddingProvider?.provider_type ?? "") &&
+        /connection refused|econnrefused|errno 111|10061|all connection attempts failed/i.test(embeddingDiscovery.error?.message ?? "");
     const optionsFor = (configured: typeof autoTitleModel) => withConfiguredModelChoice(featureModelChoices, configured.provider_id ?? '', configured.model_id ?? '', providers.data?.find(item => item.id === configured.provider_id)?.display_name).map(choice => ({ value: choice.value, label: choice.label + (featureModelChoices.some(item => item.value === choice.value) ? '' : '（当前配置，未发现或已停用）') }));
     if (settings.isPending || memoryEnhancement.isPending || providers.isPending)
         return <LoadingState />;
     const readError = settings.error ?? memoryEnhancement.error ?? providers.error;
     if (readError)
         return <ErrorState message={readError.message}/>;
-    return (<SettingsSection title="任务模型分配" description="自动保存到当前工作区；各任务保留原有回退规则。"><SettingRow title="生成标题模型" description="首条用户消息后的自动命名"><SearchableFeatureModelSelect ariaLabel="生成标题模型" disabled={saveFeatureModel.isPending || providers.isPending} onValueChange={(value) => {
+    return (<SettingsSection><SettingRow title="生成标题模型" description="首条用户消息后的自动命名"><SearchableFeatureModelSelect ariaLabel="生成标题模型" disabled={saveFeatureModel.isPending || providers.isPending} onValueChange={(value) => {
             const parsed = parseFeatureModelValue(value);
             saveFeatureModel.mutate({ key: CHAT_AUTO_TITLE_MODEL_SETTING_KEY, ...parsed });
         }} options={[{ value: "default", label: "跟随对话模型" }, ...optionsFor(autoTitleModel)]} placeholder="跟随对话模型" value={featureModelValue(autoTitleModel.provider_id, autoTitleModel.model_id)}/></SettingRow><SettingRow title="生成下一步问题提示模型" description="空会话与每轮完成后的追问建议"><SearchableFeatureModelSelect ariaLabel="生成下一步问题提示模型" disabled={saveFeatureModel.isPending || providers.isPending} onValueChange={(value) => {
@@ -170,7 +183,7 @@ function TaskModelSettingsForm() {
         }} options={[{ value: "default", label: "跟随对话模型" }, ...optionsFor(dictationCleanupModel)]} placeholder="跟随对话模型" value={featureModelValue(dictationCleanupModel.provider_id, dictationCleanupModel.model_id)}/></SettingRow><SettingRow title="练习出题与判分模型" description="复习与练习中心的出题与简答题判分；建议选择支持思考的强模型，未配置时跟随对话模型"><SearchableFeatureModelSelect ariaLabel="练习出题与判分模型" disabled={saveFeatureModel.isPending || providers.isPending} onValueChange={(value) => {
             const parsed = parseFeatureModelValue(value);
             saveFeatureModel.mutate({ key: PRACTICE_EXERCISE_MODEL_SETTING_KEY, ...parsed });
-        }} options={[{ value: "default", label: "跟随对话模型" }, ...optionsFor(exerciseModel)]} placeholder="跟随对话模型" value={featureModelValue(exerciseModel.provider_id, exerciseModel.model_id)}/></SettingRow><SettingRow title="教学包生成模型" description="节点学习页的教材、互动实验、小剧场与闯关测评共用；结构化输出很长，建议选择输出上限足够大的模型"><LearningModelSelect settingsEditor workspaceId={auth.workspaceId}/></SettingRow><SettingRow title="记忆整理模型" description="记忆整理未指定模型时使用工作区默认模型；后台会话摘要需要明确指定模型。"><SearchableFeatureModelSelect ariaLabel="记忆整理模型" disabled={saveMemoryEnhancement.isPending || memoryEnhancement.isPending || providers.isPending} onValueChange={(value) => {
+        }} options={[{ value: "default", label: "跟随对话模型" }, ...optionsFor(exerciseModel)]} placeholder="跟随对话模型" value={featureModelValue(exerciseModel.provider_id, exerciseModel.model_id)}/></SettingRow><SettingRow title="记忆整理模型" description="记忆整理未指定模型时使用工作区默认模型；后台会话摘要需要明确指定模型。"><SearchableFeatureModelSelect ariaLabel="记忆整理模型" disabled={saveMemoryEnhancement.isPending || memoryEnhancement.isPending || providers.isPending} onValueChange={(value) => {
             const follow_conversation = value === FEATURE_MODEL_FOLLOW_CONVERSATION;
             const parsed = parseFeatureModelValue(value);
             const patch = { provider_id: follow_conversation ? "" : (parsed.provider_id ?? ""), model_id: follow_conversation ? "" : (parsed.model_id ?? ""), follow_conversation };
@@ -207,10 +220,21 @@ function TaskModelSettingsForm() {
                   </SelectItem>))}
               </SelectContent>
             </Select>
-            <SearchableFeatureModelSelect ariaLabel="Embedding 模型" disabled={saveMemoryEnhancement.isPending || memoryEnhancement.isPending || !selectedEmbeddingProvider?.enabled || embeddingDiscovery.isPending || visibleEmbeddingModels.length === 0} onValueChange={(model_id) => applyEmbeddingPatch({ embedding: { model_id } })} options={visibleEmbeddingModels.map((model) => ({ value: model.id, label: `${model.id}${model.enabled === false ? "（当前配置，未发现或已停用）" : ""}` }))} placeholder={!selectedEmbeddingProvider ? "请先选择 Embedding Provider" : embeddingDiscovery.isPending ? "正在发现 Embedding 模型…" : visibleEmbeddingModels.length === 0 ? "该 Provider 尚无已启用的已发现模型" : "选择 Embedding 模型"} value={memoryEnhancement.data?.embedding.model_id || ""}/>
+            <SearchableFeatureModelSelect ariaLabel="Embedding 模型" disabled={saveMemoryEnhancement.isPending || memoryEnhancement.isPending || !selectedEmbeddingProvider?.enabled || embeddingDiscovery.isPending || visibleEmbeddingModels.length === 0} onValueChange={(model_id) => applyEmbeddingPatch({ embedding: { model_id } })} options={visibleEmbeddingModels.map((model) => ({ value: model.id, label: `${model.id}${model.enabled === false ? `（${configuredEmbeddingModelNotice}）` : ""}` }))} placeholder={!selectedEmbeddingProvider ? "请先选择 Embedding Provider" : embeddingDiscovery.isPending ? "正在发现 Embedding 模型…" : visibleEmbeddingModels.length === 0 ? "该 Provider 尚无已启用的已发现模型" : "选择 Embedding 模型"} value={memoryEnhancement.data?.embedding.model_id || ""}/>
 
 
-            {embeddingDiscovery.error ? <p role="alert" className="mt-3 text-xs text-destructive">无法发现检索模型：{embeddingDiscovery.error.message}。可重试，或在高级区域手动输入模型 ID。<Button size="sm" variant="ghost" onClick={() => void embeddingDiscovery.refetch()} disabled={embeddingDiscovery.isFetching}>重新发现模型</Button></p> : null}
+            {embeddingDiscovery.error ? <div role="alert" className="mt-3 space-y-2 text-xs">
+              <p className="text-destructive">无法发现检索模型：{embeddingDiscovery.error.message}</p>
+              {ollamaConnectionFailed ? <div className="space-y-1 text-muted-foreground">
+                <p>Ollama 服务连接被拒绝，请在运行 Ollama 的电脑上打开 Ollama 应用，或在终端运行 <code>ollama serve</code>。</p>
+                <p>若 LearnGraph 运行于 Docker，请检查容器到 Ollama 所在宿主机的连接和端口（默认 11434）；容器中的 127.0.0.1 指向容器自身。</p>
+                <p>服务启动后重新发现模型。当前模型配置已保留，手动输入模型 ID 无法修复连接问题。</p>
+              </div> : <p className="text-muted-foreground">请检查 Provider 服务地址和连接状态后重试。仅当服务可连接但不支持模型列表时，在高级区域手动输入模型 ID。</p>}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="outline" onClick={() => void embeddingDiscovery.refetch()} disabled={embeddingDiscovery.isFetching}>{embeddingDiscovery.isFetching ? "正在重新发现…" : "重新发现模型"}</Button>
+                <Link className="underline underline-offset-2" to={`/w/${auth.workspaceId}/settings/models`}>检查 Provider 配置</Link>
+              </div>
+            </div> : null}
             <AdvancedSettings title="手动配置检索模型" description="用于服务尚未发现的模型 ID；保存时保留原有切换确认。"><SettingRow title="Embedding 模型 ID"><div className="flex flex-wrap gap-2"><Input aria-label="手动 Embedding 模型 ID" value={embeddingModelDraft} placeholder={memoryEnhancement.data?.embedding.model_id || '输入模型 ID'} onChange={event => setEmbeddingModelDraft(event.target.value)}/><Button size="sm" variant="outline" disabled={!embeddingModelDraft.trim() || !selectedEmbeddingProvider?.enabled || saveMemoryEnhancement.isPending} onClick={() => applyEmbeddingPatch({ embedding: { model_id: embeddingModelDraft.trim() } })}>保存模型</Button></div></SettingRow></AdvancedSettings>
             <Link className="mt-3 inline-block text-xs underline underline-offset-4" to={`/w/${auth.workspaceId}/settings/memory`}>管理检索索引</Link>
             <AlertDialog open={pendingEmbeddingSwitch !== null} onOpenChange={(open) => {

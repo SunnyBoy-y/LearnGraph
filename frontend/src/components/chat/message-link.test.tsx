@@ -1,6 +1,7 @@
 import "@/test/pdfjs-polyfills";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { MessageResponse } from "@/components/ai-elements/message";
 import { IncrementalMarkdown } from "@/components/ai-elements/incremental-markdown";
 import { MessageLink } from "./message-link";
@@ -25,6 +26,23 @@ const resources = `1. **React 中文官方文档** https://zh-hans.react.dev/lea
 afterEach(() => vi.useRealTimers());
 
 describe("message links", () => {
+  it("navigates to conversation evidence only after a click without reloading", () => {
+    function CurrentLocation() {
+      const location = useLocation();
+      return <output data-testid="link-location">{location.pathname}{location.search}</output>;
+    }
+    render(<MemoryRouter initialEntries={["/w/workspace/chat/source"]}>
+      <MessageLink href="/w/workspace/chat/destination?message=original">查看原消息</MessageLink>
+      <CurrentLocation />
+    </MemoryRouter>);
+    expect(screen.getByTestId("link-location")).toHaveTextContent("/w/workspace/chat/source");
+    const link = screen.getByRole("link", { name: "查看原消息" });
+    expect(link).not.toHaveAttribute("target");
+    fireEvent.click(link);
+    expect(screen.getByTestId("link-location")).toHaveTextContent("/w/workspace/chat/destination?message=original");
+    expect(screen.queryByRole("button", { name: /预览链接/ })).not.toBeInTheDocument();
+  });
+
   it("previews on click, copies the full destination and closes with Escape", async () => {
     const copy = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: copy } });

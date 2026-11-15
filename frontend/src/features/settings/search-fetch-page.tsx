@@ -4,7 +4,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CircleAlert, Plus, RefreshCcw } from "lucide-react";
 import { Link, useParams } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   createEgressApproval,

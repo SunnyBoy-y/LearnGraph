@@ -25,7 +25,7 @@ function Harness({ onRetry, canSearch = true, supportsAgent = true, previousAnsw
       <RetryMenuSettings
         previousAnswerTrace={previousAnswerTrace}
         groups={[
-          { id: "deepseek", label: "DeepSeek", models: [{ id: "deepseek-flash", remote: true }, { id: "deepseek-chat", remote: true }] },
+          { id: "deepseek", label: "DeepSeek", models: [{ id: "deepseek-flash", remote: true, capabilities: { supports_image_input: true } }, { id: "deepseek-chat", remote: true }] },
           { id: "other", label: "其他服务商", models: [{ id: "other-model", remote: true }] },
         ]}
         providerId={model[0]} modelId={model[1]} responseMode={mode}
@@ -71,8 +71,10 @@ describe("anchored retry menu", () => {
     expect(screen.getByRole("menu", { name: "重新生成回答" })).toHaveAttribute("data-side", "top");
     await user.click(screen.getByRole("menuitem", { name: /使用模型/ }));
     expect(await screen.findByText("其他服务商")).toBeVisible();
-    expect(screen.getByRole("menuitemradio", { name: "deepseek-flash" })).toHaveAttribute("aria-checked", "true");
-    screen.getByRole("menuitemradio", { name: "other-model" }).focus();
+    expect(screen.getByRole("menuitemradio", { name: /deepseek-flash/ })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemradio", { name: /deepseek-flash/ })).toHaveTextContent("deepseek-flash · 图片");
+    expect(screen.getByRole("menuitemradio", { name: /deepseek-chat/ })).not.toHaveTextContent("图片");
+    screen.getByRole("menuitemradio", { name: /other-model/ }).focus();
     await user.keyboard("{Enter}");
     expect(onRetry).not.toHaveBeenCalled();
     expect(screen.getByRole("menuitem", { name: /使用模型/ })).toHaveTextContent("other-model");
@@ -119,6 +121,21 @@ describe("anchored retry menu", () => {
     await user.keyboard("{Escape}");
     await waitFor(() => expect(trigger).toHaveFocus());
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("keeps a thinking-only retry available when the model cannot use Agent tools", async () => {
+    const onRetry = vi.fn();
+    const user = userEvent.setup();
+    render(<Harness onRetry={onRetry} supportsAgent={false} />);
+    await user.click(screen.getByRole("button", { name: "重试并保留版本" }));
+    await user.click(screen.getByRole("menuitem", { name: /响应模式/ }));
+    const thinking = await screen.findByRole("menuitemradio", { name: "思考" });
+    expect(thinking).not.toHaveAttribute("aria-disabled", "true");
+    thinking.focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("menuitem", { name: /思考强度/ })).not.toHaveAttribute("aria-disabled", "true");
+    await user.click(screen.getByRole("menuitem", { name: /更改后重试/ }));
+    expect(onRetry).toHaveBeenCalledExactlyOnceWith({ model: ["deepseek", "deepseek-flash"], mode: "thinking", thinking: "low", search: false });
   });
 
   it("disables unavailable search and agent mode with an explanation", async () => {

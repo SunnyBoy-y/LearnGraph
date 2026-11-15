@@ -35,7 +35,7 @@ from app.repositories.domain import (
     GraphRepository,
 )
 from app.services.billing import BillingService
-from app.services.graph_cover import generate_graph_cover
+from app.services.graph_cover import resolve_graph_cover
 
 
 def learning_page_node_ids(db: Session, workspace_id: str, graph_id: str) -> set[str]:
@@ -175,8 +175,8 @@ class GraphService:
                 for node in nodes
             ],
             "edges": edges,
-            "cover_svg": graph.cover_svg or generate_graph_cover(
-                graph.title,
+            "cover_svg": resolve_graph_cover(
+                graph.cover_svg, graph.title,
                 node_labels=[node.label for node in nodes],
                 progress=sum(node.mastery_stars >= 3 for node in nodes) / len(nodes) if nodes else 0.0,
             ),

@@ -32,6 +32,7 @@ export interface SessionComposerPrefs {
   modelId?: string;
   imageProviderId?: string;
   imageModelId?: string;
+  thinkingMappingVersion?: number;
 }
 
 const STORAGE_KEY = "learngraph:session-composer-prefs";
@@ -77,7 +78,8 @@ function isThinkingMode(value: unknown): value is ThinkingMode {
     value === "low" ||
     value === "medium" ||
     value === "high" ||
-    value === "xhigh"
+    value === "xhigh" ||
+    value === "max"
   );
 }
 
@@ -101,6 +103,7 @@ export function normalizeComposerPrefs(
   if (!value || typeof value !== "object") return { ...DEFAULT_PREFS };
   const record = value as Record<string, unknown>;
   return {
+    ...(record.thinkingMappingVersion === 2 ? { thinkingMappingVersion: 2 } : {}),
     responseMode: normalizeResponseMode(record.responseMode),
     thinkingMode: isThinkingMode(record.thinkingMode)
       ? record.thinkingMode

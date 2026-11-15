@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { authStore } from "@/api/auth-store";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { listSettings, updateSetting } from "@/api/settings";
 import {

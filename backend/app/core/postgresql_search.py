@@ -1,7 +1,7 @@
 """PostgreSQL search adapters; SQLite FTS5 paths remain unchanged."""
 from __future__ import annotations
 
-from sqlalchemy import case, false, func, literal, or_, select, text, union
+from sqlalchemy import case, false, func, inspect, literal, or_, select, text, union
 
 
 def lexical_expression(columns, terms):
@@ -15,6 +15,11 @@ def install_search(engine) -> None:
     # pg_trgm ships with the official PostgreSQL image. No external search
     # service, tokenizer download or tenant-policy change is introduced.
     with engine.begin() as connection:
+        # Serialize startup/repair with other installers and application writes.
+        # Migration target engines do not yet have the writer-order listener.
+        # Take the writer lock BEFORE inspecting or locking any schema objects.
+        connection.execute(text("SELECT pg_advisory_xact_lock(684728190123)"))
+        projection_exists = inspect(connection).has_table("document_chunks_fts")
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         for table, column in [("messages", "content"), ("messages", "role"), ("chat_sessions", "title"), ("chat_sessions", "goal_id"), ("chat_sessions", "graph_id"), ("file_text_chunks", "content"), ("memory_search_documents", "content"), ("memory_search_documents", "subject"), ("memory_search_documents", "keywords_text"), ("memory_search_documents", "entity_aliases_text")]:
             connection.execute(text(f'CREATE INDEX IF NOT EXISTS "lg_pg_search_{table}_{column}" ON "{table}" USING gin (lower("{column}") gin_trgm_ops)'))
@@ -22,8 +27,13 @@ def install_search(engine) -> None:
         # writes stay valid; PostgreSQL retrieval uses the same fact rows.
         connection.execute(text("CREATE TABLE IF NOT EXISTS document_chunks_fts(chunk_id TEXT,workspace_id TEXT,file_id TEXT,content TEXT)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS lg_pg_document_projection_id ON document_chunks_fts(chunk_id)"))
-        connection.execute(text("DELETE FROM document_chunks_fts"))
-        connection.execute(text("INSERT INTO document_chunks_fts(chunk_id,workspace_id,file_id,content) SELECT id,workspace_id,file_id,content FROM file_text_chunks WHERE lifecycle_status='active'"))
+        # Table creation and its initial backfill commit atomically. Its presence
+        # is the durable backfill marker, including if the process dies after PG
+        # commits but before a migration's search_verified JSON flag is saved.
+        # Never erase ingestion-maintained content (which can include headings)
+        # when an existing deployment restarts or retries search installation.
+        if not projection_exists:
+            connection.execute(text("INSERT INTO document_chunks_fts(chunk_id,workspace_id,file_id,content) SELECT id,workspace_id,file_id,content FROM file_text_chunks WHERE lifecycle_status='active'"))
         # Verify literal wildcard handling and multilingual substring semantics.
         passed = connection.execute(text("SELECT lower('SQLite 数据库 PostgreSQL') LIKE '%数据库%' AND '100%_literal' LIKE '%100\\%\\_literal%' ESCAPE '\\'" )).scalar_one()
         if not passed:

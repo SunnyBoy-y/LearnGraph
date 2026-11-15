@@ -13,6 +13,8 @@ import {
   streamSessionMessage,
 } from "@/api/sessions";
 import { discoverProviderModels, listProviders } from "@/api/providers";
+import { getSession, listSessionPage } from "@/api/session-browser";
+import { ApiError } from "@/api/client";
 import { setSessionComposerPrefs } from "@/lib/session-composer-prefs";
 import { renderWithProviders } from "@/test/render";
 import { deferred } from "@/test/async";
@@ -28,6 +30,8 @@ vi.mock("@/api/sessions", () => ({
   listSessionMessages: vi.fn(),
   cancelSessionMessage: vi.fn(),
 }));
+
+vi.mock("@/api/session-browser", () => ({ getSession: vi.fn(), listSessionPage: vi.fn() }));
 
 vi.mock("@/api/providers", () => ({
   listProviders: vi.fn(),
@@ -138,6 +142,12 @@ describe("SideConversationRail selection entry", () => {
       models: [{ id: "model-x", roles: ["llm"], streaming: true, remote: true, enabled: true }],
     });
     vi.mocked(listSessions).mockResolvedValue([]);
+    vi.mocked(getSession).mockImplementation(async id => {
+      const item = (await listSessions()).find(session => session.id === id);
+      if (!item) throw new ApiError({ status: 404, code: 'session_not_found', message: 'Session not found', method: 'GET', url: `/sessions/${id}` });
+      return item;
+    });
+    vi.mocked(listSessionPage).mockImplementation(async () => ({ items: (await listSessions()).map(item => ({ ...item, has_children: false })), has_more: false, next_cursor: null, has_previous: false, previous_cursor: null }));
     vi.mocked(listSessionMessages).mockResolvedValue([]);
     vi.mocked(createSession).mockResolvedValue(sideSession);
     vi.mocked(cancelSessionMessage).mockResolvedValue(undefined);

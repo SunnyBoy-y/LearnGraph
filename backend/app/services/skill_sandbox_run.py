@@ -24,7 +24,7 @@ from app.repositories.audit import AuditRepository
 from app.repositories.extensions import ExtensionInvocationRepository, SkillRepository
 from app.services.sandbox import SandboxAgentWorkspaceService
 from app.services.session_workspace import BlobStore
-from app.services.skill_package import normalize_skill_relative_path
+from app.services.skill_package import MAX_SKILL_FILE_BYTES, MAX_SKILL_PACKAGE_BYTES, normalize_skill_relative_path
 
 
 def _hash(value: Any) -> str:
@@ -69,6 +69,24 @@ def _skill_readme(skill: Any, script_paths: list[str]) -> str:
     )
 
 
+def materialize_skill_package(agent, chat_session_id: str, sandbox_session_id: str,
+                              package_root: str, files: list[tuple[str, bytes]]) -> None:
+    """One byte-preserving path for both sandboxd pooling and Docker sessions."""
+    from app.providers.remote.sandbox import validate_agent_workspace_path
+
+    agent._require_chat_session(chat_session_id)
+    root = validate_agent_workspace_path(package_root)
+    session, handle = agent._resolve_file_session(sandbox_session_id, chat_session_id)
+    backend = agent._runtime_backend(session)
+    for relative_path, data in files:
+        path = validate_agent_workspace_path(f"{root}/{relative_path}")
+        if len(data) > agent.settings.sandbox_agent_file_bytes:
+            raise AppError(413, "sandbox_file_too_large", "Skill package file exceeds sandbox limits")
+        container_path = agent._container_path(chat_session_id, path) if agent._pooling_enabled(session) else path
+        backend.write_agent_file(handle, container_path, data)
+    agent._touch_session(session)
+
+
 class SkillSandboxRunService:
     def __init__(
         self,
@@ -101,6 +119,41 @@ class SkillSandboxRunService:
 
     def require_skill(self, skill_id: str) -> SkillRecord:
         return self.skills.require(skill_id, "Skill")
+
+    def refresh_invocation(self, invocation_id: str, *, chat_session_id: str | None = None):
+        from app.domain.models import SandboxAgentCommand, SandboxJob
+        invocation = self.db.query(ExtensionInvocation).filter_by(
+            id=invocation_id, workspace_id=self.workspace_id, target_type="skill_sandbox",
+        ).one_or_none()
+        if invocation is None:
+            raise AppError(404, "skill_run_not_found", "Skill script run was not found")
+        result = dict(invocation.result_json or {})
+        if self.workspace is not None and self.principal is not None and result.get("chat_session_id"):
+            from app.services.authorization import AuthorizationService
+            if not AuthorizationService(self.db, self.principal).can_access_resource(self.workspace, "session", result["chat_session_id"], "read"):
+                raise AppError(404, "skill_run_not_found", "Skill run was not found")
+        if chat_session_id and result.get("chat_session_id") != chat_session_id:
+            raise AppError(404, "skill_run_not_found", "Skill run was not found in this chat")
+        if invocation.status in {"succeeded", "failed"} and invocation.finished_at is not None:
+            return invocation
+        job = self.db.get(SandboxJob, result.get("job_id")) if result.get("job_id") else None
+        if job is None or job.workspace_id != self.workspace_id:
+            return invocation
+        command = self.db.query(SandboxAgentCommand).filter_by(workspace_id=self.workspace_id, job_id=job.id).one_or_none()
+        if command is not None:
+            result.update(command_id=command.id, exit_code=command.exit_code, timed_out=command.timed_out,
+                          stdout_summary=command.stdout_summary, stderr_summary=command.stderr_summary)
+        terminal = job.status in {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}
+        invocation.status = ("succeeded" if job.status == "SUCCEEDED" and command is not None and command.exit_code == 0
+                             else "failed" if terminal else "running")
+        result["cancel_requested"] = bool(job.cancel_requested)
+        invocation.result_json = result
+        invocation.result_hash = _hash(result)
+        invocation.error_code, invocation.error_message = job.error_class, job.error_message
+        invocation.finished_at = (job.finished_at or utc_now()) if terminal else None
+        invocation.result_size_bytes = len(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+        self.db.commit()
+        return invocation
 
     def _resolve_chat_session_id(self, preferred: str | None) -> str:
         if preferred:
@@ -145,11 +198,49 @@ class SkillSandboxRunService:
         ).one_or_none()
         if row is None:
             raise AppError(404, "skill_file_not_found", "Skill script was not found")
-        data = self.blobs.read_bytes(row.blob_sha256)
+        data = self.blobs.read_bytes(row.blob_sha256, limit_bytes=MAX_SKILL_FILE_BYTES)
         return path, data
 
-    def run(self, skill_id: str, payload: SkillSandboxRunRequest) -> SkillSandboxRunResponse:
+    def package_files(self, skill: SkillRecord) -> list[tuple[str, bytes]]:
+        files: list[tuple[str, bytes]] = []
+        total = 0
+        rows = self.db.query(SkillPackageFile).filter_by(
+            workspace_id=self.workspace_id, skill_id=skill.id, is_directory=False,
+        ).all()
+        tree_hash = _hash([{"path": row.relative_path, "sha256": row.blob_sha256, "size": row.size_bytes}
+                           for row in sorted(rows, key=lambda row: row.relative_path)])
+        if tree_hash != (skill.content_hash or skill.manifest_hash):
+            raise AppError(409, "skill_package_version_changed", "Skill package tree no longer matches its authorized version")
+        for row in rows:
+            path = normalize_skill_relative_path(row.relative_path)
+            body = self.blobs.read_bytes(row.blob_sha256, limit_bytes=MAX_SKILL_FILE_BYTES)
+            if hashlib.sha256(body).hexdigest() != row.blob_sha256 or len(body) != row.size_bytes:
+                raise AppError(409, "skill_package_integrity_failed", "Skill package bytes failed integrity validation")
+            total += len(body)
+            if total > MAX_SKILL_PACKAGE_BYTES:
+                raise AppError(413, "skill_package_too_large", "Skill package exceeds its execution size budget")
+            files.append((path, body))
+        return files
+
+    def run(self, skill_id: str, payload: SkillSandboxRunRequest, *, require_authorization: bool = False) -> SkillSandboxRunResponse:
         skill = self.require_skill(skill_id)
+        self.db.refresh(skill)
+        expected_hash = skill.content_hash or skill.manifest_hash
+        if require_authorization:
+            from app.services.skill_script_runtime import require_authorized_skill
+            from app.services.mcp_skills import MCPAndSkillService
+            manager = MCPAndSkillService(self.db, self.workspace_id, self.actor_id, self.settings,
+                                         workspace=self.workspace, principal=self.principal)
+            require_authorized_skill(manager, skill.id)
+        if self.workspace is not None and self.principal is not None:
+            from app.services.authorization import AuthorizationService
+            authz = AuthorizationService(self.db, self.principal)
+            if "workspace.manage" not in authz.workspace_permissions(self.workspace):
+                raise AppError(403, "permission_denied", "Skill code execution requires workspace.manage")
+            if payload.chat_session_id and not authz.can_access_resource(self.workspace, "session", payload.chat_session_id, "write"):
+                raise AppError(404, "session_not_found", "Chat session was not found")
+        if sum(len(arg.encode("utf-8")) for arg in payload.argv_extra) > 64 * 1024 or any("\x00" in arg for arg in payload.argv_extra):
+            raise AppError(422, "skill_argv_invalid", "Skill arguments exceed limits or contain NUL bytes")
         if skill.kind != "agent_skill_package" and skill.package_format != "skill_md_v1":
             raise AppError(400, "skill_not_package", "Only agent_skill_package can run scripts")
         if not skill.has_scripts:
@@ -177,7 +268,7 @@ class SkillSandboxRunService:
             input_json=input_json,
             input_size_bytes=len(json.dumps(input_json)),
             input_hash=_hash(input_json),
-            timeout_ms=int(getattr(self.settings, "sandbox_wall_time_seconds", 30) * 1000),
+            timeout_ms=int((payload.timeout_seconds or getattr(self.settings, "sandbox_wall_time_seconds", 30)) * 1000),
             started_at=utc_now(),
         )
         self.db.add(invocation)
@@ -201,8 +292,8 @@ class SkillSandboxRunService:
             available = bool(prof.get("available"))
             unavail_reason = prof.get("reason")
         except Exception:
-            available = bool(getattr(self.settings, "sandbox_enabled", True))
-            unavail_reason = "sandbox profile probe failed"
+            available = False
+            unavail_reason = "Sandbox profile probe failed; execution remains unavailable"
 
         if not available:
             invocation.status = "failed"
@@ -242,80 +333,80 @@ class SkillSandboxRunService:
             sandbox_session = self.agent.create_session(
                 SandboxAgentSessionCreateRequest(chat_session_id=chat_session_id)
             )
-            # Materialize package scripts into the shared capability area
-            # (once per user, not per chat) under shared/skills/<key>/ plus
-            # SKILL.md, a generated README, and the controlled
-            # references/examples directories. Only text files are copied; the
-            # sandbox stays offline and secret-free.
-            files = [
-                (row.relative_path, self.blobs.read_bytes(row.blob_sha256))
-                for row in (
-                    self.db.query(SkillPackageFile)
-                    .filter_by(workspace_id=self.workspace_id, skill_id=skill.id, is_directory=False)
-                    .all()
-                )
-                if (
-                    row.relative_path == "SKILL.md"
-                    or row.relative_path.startswith(("scripts/", "references/", "examples/"))
-                )
-                and _is_utf8(self.blobs.read_bytes(row.blob_sha256))
-            ]
-            pooling = bool(
-                self.settings.sandbox_instance_pooling_enabled
-                and (sandbox_session.backend_id or "docker") == "sandboxd"
+            # Every original package byte is copied, not only text/scripts. Stage
+            # per invocation in the chat workspace so scripts cannot poison a
+            # shared cached package or leave deleted files behind after an update.
+            files = self.package_files(skill)
+            package_root = f"skills/{skill.id}/{invocation.id}"
+            materialize_skill_package(self.agent, chat_session_id, sandbox_session.id, package_root, files)
+            self.db.refresh(skill)
+            if (skill.content_hash or skill.manifest_hash) != expected_hash:
+                raise AppError(409, "skill_package_version_changed", "Skill version changed before execution")
+            if require_authorization:
+                _, grant = require_authorized_skill(manager, skill.id)
+                invocation.grant_id = grant.id
+                invocation.authorization_hash = manager._skill_authorization_hash(skill)
+            run_rel = script_path if payload.cwd_mode == "package" else f"{package_root}/{script_path}"
+            from app.domain.models import SandboxAgentCommand
+            from types import SimpleNamespace
+            execution_argv = [runner, run_rel, *list(payload.argv_extra or [])]
+            if payload.cwd_mode == "package":
+                from app.services.skill_launcher import LAUNCHER_BYTES
+                launcher_name = f"{invocation.id}.launcher.py"
+                launcher_parent = f"skills/{skill.id}"
+                materialize_skill_package(self.agent, chat_session_id, sandbox_session.id,
+                    launcher_parent, [(launcher_name, LAUNCHER_BYTES)])
+                execution_argv = ["python", f"{launcher_parent}/{launcher_name}", package_root, script_path, *payload.argv_extra]
+            request = SandboxAgentCommandRequest(
+                chat_session_id=chat_session_id,
+                argv=execution_argv,
+                cwd=".",
+                timeout_seconds=payload.timeout_seconds, yield_time_ms=payload.yield_time_ms,
+                sandbox_session_id=sandbox_session.id,
             )
-            if pooling:
-                shared_rel = self.agent.materialize_shared_skill(
-                    chat_session_id,
-                    skill.skill_key,
-                    files,
-                    readme=_skill_readme(skill, [rel for rel, _ in files]),
-                )
-                run_rel = f"/workspace/{shared_rel}/{script_path}"
-            else:
-                for rel, body in files:
-                    text = body.decode("utf-8")
-                    self.agent.write_file(
-                        SandboxAgentFileWriteRequest(
-                            chat_session_id=chat_session_id,
-                            path=f"skills/{skill.skill_key}/{rel}",
-                            content=text,
-                            sandbox_session_id=sandbox_session.id,
-                        )
-                    )
-                run_rel = f"skills/{skill.skill_key}/{script_path}"
-            command = self.agent.execute_command(
-                SandboxAgentCommandRequest(
-                    chat_session_id=chat_session_id,
-                    argv=[runner, run_rel, *list(payload.argv_extra or [])],
-                    cwd=".",
-                    sandbox_session_id=sandbox_session.id,
-                ),
-                idempotency_key=None,
-            )
-            invocation.status = "succeeded" if command.status in {"completed", "succeeded"} and (command.exit_code or 0) == 0 else "failed"
-            if command.status == "failed":
-                invocation.status = "failed"
+            invocation.input_json = {**invocation.input_json, "argv": request.argv, "cwd": request.cwd,
+                                     "cwd_mode": payload.cwd_mode, "timeout_seconds": payload.timeout_seconds}
+            invocation.input_hash = _hash(invocation.input_json)
+            invocation.input_size_bytes = len(json.dumps(invocation.input_json).encode("utf-8"))
+            invocation.status = "running"
+            self.db.commit()
+            job_result = self.agent.execute_agent_tool("sandbox_exec", request.model_dump(exclude_none=True),
+                chat_session_id=chat_session_id, agent_authorized=True)
+            command = self.db.query(SandboxAgentCommand).filter_by(
+                workspace_id=self.workspace_id, job_id=job_result["job_id"],
+            ).one_or_none()
+            if command is None:
+                command = SimpleNamespace(id=None, exit_code=None, timed_out=False, stdout_summary="", stderr_summary="",
+                    argv_redacted=[], error_class=job_result.get("error_class"), error_message=job_result.get("error_message"), latency_ms=0)
+            job_status = str(job_result["status"]).upper()
+            invocation.status = ("succeeded" if job_status == "SUCCEEDED" and command.exit_code == 0
+                                 else "running" if job_status in {"QUEUED", "STARTING", "RUNNING", "PAUSED"}
+                                 else "failed")
             invocation.result_json = {
                 "command_id": command.id,
+                "job_id": job_result["job_id"],
                 "exit_code": command.exit_code,
                 "timed_out": command.timed_out,
                 "stdout_summary": command.stdout_summary,
                 "stderr_summary": command.stderr_summary,
                 "argv_redacted": command.argv_redacted,
                 "sandbox_session_id": sandbox_session.id,
+                "chat_session_id": chat_session_id,
+                "package_root": package_root,
+                "cwd_mode": payload.cwd_mode,
+                "content_hash": skill.content_hash or skill.manifest_hash,
             }
             invocation.result_hash = _hash(invocation.result_json)
             invocation.result_size_bytes = len(json.dumps(invocation.result_json))
             invocation.error_code = command.error_class
             invocation.error_message = command.error_message
-            invocation.finished_at = utc_now()
+            invocation.finished_at = None if invocation.status == "running" else utc_now()
             self.audit.record(
                 actor_id=self.actor_id,
                 action="skill.sandbox_run",
                 resource_type="skill",
                 resource_id=skill.id,
-                outcome="succeeded" if invocation.status == "succeeded" else "failed",
+                outcome=invocation.status,
                 details={
                     "script_path": script_path,
                     "content_hash": skill.content_hash,
@@ -334,6 +425,9 @@ class SkillSandboxRunService:
                 chat_session_id=chat_session_id,
                 sandbox_session_id=sandbox_session.id,
                 command_id=command.id,
+                package_root=package_root,
+                job_id=job_result["job_id"],
+                cwd_mode=payload.cwd_mode,
                 argv_redacted=list(command.argv_redacted or []),
                 exit_code=command.exit_code,
                 timed_out=bool(command.timed_out),

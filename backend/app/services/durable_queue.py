@@ -327,25 +327,15 @@ def run_one_durable_job(worker_id: str) -> bool:
         if job is None:
             return False
         try:
-            if job.kind == "learning.package.build":
-                from app.services.learning_packages import run_build_stage, learning_lease_heartbeat
-                with learning_lease_heartbeat(job.id, job.lease_token):
-                    terminal = run_build_stage(job.id, job.lease_token, str(job.payload["build_id"]))
-                if terminal:
-                    queue.complete(job)
-                else:
-                    queue.rearm(job, delay_seconds=0.1)
+            if job.kind in {"learning.package.build", "learning.package.grade"}:
+                # Retired feature: drain old work without provider calls or deleting history.
+                queue.cancel(job.id, job.workspace_id)
             elif job.kind == "graph.cover.ai":
                 from app.services.graph_cover_ai import run_cover_ai_job
 
                 run_cover_ai_job(
                     job.id, job.lease_token, str(job.payload["cover_job_id"])
                 )
-                queue.complete(job)
-            elif job.kind == "learning.package.grade":
-                from app.services.learning_packages import grade_attempt, learning_lease_heartbeat
-                with learning_lease_heartbeat(job.id, job.lease_token):
-                    grade_attempt(job.id, job.lease_token, str(job.payload["attempt_id"]))
                 queue.complete(job)
             elif job.kind == "document.parse_index":
                 from app.services.document_learning import run_document_job
@@ -425,18 +415,16 @@ async def durable_queue_worker(stop: asyncio.Event, worker_id: str) -> None:
 
     settings = get_settings()
     import time
-    next_learning_sweep = 0.0
+    next_sticker_sweep = 0.0
     while not stop.is_set():
-        if time.monotonic() >= next_learning_sweep:
-            from app.services.learning_packages import reconcile_learning_builds
+        if time.monotonic() >= next_sticker_sweep:
             import logging
             try:
-                await asyncio.to_thread(reconcile_learning_builds)
                 from app.services.stickers import reconcile_sticker_indexes
                 await asyncio.to_thread(reconcile_sticker_indexes)
             except Exception:
-                logging.getLogger(__name__).exception("Learning package reconciliation failed")
-            next_learning_sweep = time.monotonic() + 15
+                logging.getLogger(__name__).exception("Sticker index reconciliation failed")
+            next_sticker_sweep = time.monotonic() + 15
         claimed = await asyncio.to_thread(run_one_durable_job, worker_id)
         if claimed:
             continue

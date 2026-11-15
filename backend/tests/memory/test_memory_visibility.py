@@ -414,6 +414,145 @@ def test_unavailable_report_does_not_substitute_atoms_or_show_old_claims(db: Ses
     assert snapshot.markdown == "Obsolete private claim"
 
 
+def _seed_readable_report(db: Session) -> tuple[m.MemoryRecord, m.MemoryProfileSnapshot]:
+    from app.services.memory_profile import _atom_fingerprint, _eligible_profile_records
+
+    record = m.MemoryRecord(
+        id="report-source", workspace_id=WORKSPACE, tenant_id=TENANT,
+        subject_user_id=ACTOR, title="学习环境", content_hash="original",
+        relative_path="", evidence_ids=["report-evidence"],
+    )
+    db.add(m.MemoryEvidence(
+        id="report-evidence", workspace_id=WORKSPACE, source_kind="user_input",
+        source_id="report-source", authorship="user", content_hash="original",
+        profile_eligible=True,
+    ))
+    db.add(record)
+    db.flush()
+    db.add(m.MemoryRevision(
+        memory_id=record.id, workspace_id=WORKSPACE, revision=1,
+        title=record.title, content="用户使用 Windows 系统学习。",
+        content_hash="original", actor_id=ACTOR,
+    ))
+    db.commit()
+    records = _eligible_profile_records(db, WORKSPACE, ACTOR)
+    assert [item.id for item in records] == [record.id]
+    snapshot = m.MemoryProfileSnapshot(
+        workspace_id=WORKSPACE, owner_subject_id=ACTOR, version=1, status="ready",
+        markdown="你使用 Windows 系统学习。", source_atom_ids=[record.id],
+        source_fingerprint=_atom_fingerprint(records),
+        claim_atom_map={"overview": [record.id], "d0p0": [record.id]},
+        structured_sections=[
+            {"kind": "overview", "heading": "概览", "paragraphs": [
+                {"text": "你使用 Windows 系统学习。", "atom_ids": [record.id]},
+            ]},
+            {"kind": "dimension", "key": "common_environment", "heading": "学习环境", "paragraphs": [
+                {"text": "你的学习环境是 Windows。", "atom_ids": [record.id]},
+            ]},
+        ],
+    )
+    db.add(snapshot)
+    db.commit()
+    return record, snapshot
+
+
+@pytest.mark.parametrize("change", ["added", "updated", "archived"])
+def test_changed_memory_keeps_report_readable_but_out_of_prompt(db: Session, change: str) -> None:
+    from app.services.memory_profile import MemoryProfileService, current_profile_prompt
+
+    record, snapshot = _seed_readable_report(db)
+    assert snapshot.markdown in current_profile_prompt(db, WORKSPACE, ACTOR)
+    if change == "added":
+        db.add(m.MemoryEvidence(
+            id="added-evidence", workspace_id=WORKSPACE, source_kind="user_input",
+            source_id="added-source", authorship="user", content_hash="added",
+            profile_eligible=True,
+        ))
+        db.add(m.MemoryRecord(
+            id="added-source", workspace_id=WORKSPACE, tenant_id=TENANT,
+            subject_user_id=ACTOR, title="新环境", content_hash="added", relative_path="",
+            evidence_ids=["added-evidence"],
+        ))
+        db.flush()
+        db.add(m.MemoryRevision(
+            memory_id="added-source", workspace_id=WORKSPACE, revision=1,
+            title="新环境", content="用户使用 Linux 系统学习。", content_hash="added", actor_id=ACTOR,
+        ))
+    elif change == "updated":
+        record.revision = 2
+        record.content_hash = "updated"
+        db.add(m.MemoryRevision(
+            memory_id=record.id, workspace_id=WORKSPACE, revision=2,
+            title=record.title, content="用户使用 Linux 系统学习。", content_hash="updated", actor_id=ACTOR,
+        ))
+    else:
+        record.zone = "archive"
+    db.commit()
+    service = object.__new__(MemoryProfileService)
+    service.db, service.workspace_id, service.actor_id = db, WORKSPACE, ACTOR
+
+    view = service.get_profile()
+
+    assert view.status == "stale"
+    assert view.markdown == snapshot.markdown
+    assert view.overview == "你使用 Windows 系统学习。"
+    assert view.dimensions[0].paragraphs[0]["text"] == "你的学习环境是 Windows。"
+    assert view.source_count == 1 and view.source_atom_ids == [record.id]
+    assert current_profile_prompt(db, WORKSPACE, ACTOR) == ""
+    # Refreshing the page continues to return the stored report, without a
+    # browser-local cache or an automatic model call.
+    assert service.get_profile().model_dump() == view.model_dump()
+
+
+@pytest.mark.parametrize("status", ["stale", "building", "failed"])
+def test_report_survives_rebuild_states_after_source_change(db: Session, status: str) -> None:
+    from app.services.memory_profile import MemoryProfileService, current_profile_prompt
+
+    record, snapshot = _seed_readable_report(db)
+    record.content_hash = "changed"
+    snapshot.status = status
+    snapshot.stale_reason = "refresh_failed|timeout|" if status == "failed" else "memory_updated"
+    db.commit()
+    service = object.__new__(MemoryProfileService)
+    service.db, service.workspace_id, service.actor_id = db, WORKSPACE, ACTOR
+    if status == "failed":
+        service._note_refresh_failure(TimeoutError("timeout"))
+
+    view = service.get_profile()
+
+    assert view.status == status
+    assert view.markdown == snapshot.markdown
+    assert view.structured_sections == snapshot.structured_sections
+    assert current_profile_prompt(db, WORKSPACE, ACTOR) == ""
+
+
+@pytest.mark.parametrize("restriction", ["deleted", "forgotten", "suppressed", "other-user", "missing"])
+def test_historical_report_hides_inaccessible_sources(db: Session, restriction: str) -> None:
+    from app.services.memory_profile import MemoryProfileService
+
+    record, snapshot = _seed_readable_report(db)
+    snapshot.status = "stale"
+    if restriction == "deleted":
+        record.state = "deleted"
+    elif restriction == "forgotten":
+        record.content_destroyed_at = datetime.now(timezone.utc)
+    elif restriction == "suppressed":
+        record.auto_recall_suppressed = True
+    elif restriction == "other-user":
+        record.subject_user_id = "another-user"
+    else:
+        snapshot.source_atom_ids = ["missing"]
+        snapshot.claim_atom_map = {"overview": ["missing"]}
+    db.commit()
+    service = object.__new__(MemoryProfileService)
+    service.db, service.workspace_id, service.actor_id = db, WORKSPACE, ACTOR
+
+    view = service.get_profile()
+
+    assert view.status == "stale"
+    assert view.markdown == "" and view.overview == "" and view.dimensions == []
+
+
 def test_failed_report_without_current_memories_keeps_failure_status(db: Session) -> None:
     from app.services.memory_profile import MemoryProfileService
 

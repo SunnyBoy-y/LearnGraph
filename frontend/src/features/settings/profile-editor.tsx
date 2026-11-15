@@ -2,7 +2,7 @@ import { useSettingsDirty } from '@/lib/settings-dirty';
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { LoaderCircle, Shuffle, Upload } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { generateDefaultAvatar, updateProfile, uploadAvatar } from "@/api/auth";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";

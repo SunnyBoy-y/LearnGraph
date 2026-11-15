@@ -42,7 +42,7 @@ export interface StickerStatus extends StickerSettings {
     fingerprint: string | null;
     active_model_id: string | null;
   };
-  packs: Array<{ id: string; name: string; builtin: boolean; enabled: boolean; license: string; source: string; count?: number; active_count?: number }>;
+  packs: Array<{ id: string; name: string; builtin: boolean; catalog?: boolean; enabled: boolean; license: string; source: string; count?: number; active_count?: number }>;
 }
 
 export const getStickerStatus = () => apiClient.get<StickerStatus>('/stickers');

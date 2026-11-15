@@ -11,7 +11,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Mic } from "lucide-react";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { AdvancedSettings, SettingRow, SettingsSection } from './settings-primitives';
 function useVoiceInputSettings() {
     const queryClient = useQueryClient();

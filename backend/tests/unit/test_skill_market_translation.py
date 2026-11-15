@@ -57,7 +57,7 @@ def test_translates_full_long_document_and_keeps_fenced_code_without_installatio
     assert all("echo untouched" not in part for batch in calls for part in batch)
     assert result.description == "译文：Summary" and result.changelog == "译文：Release notes"
     assert manager.db.scalar(select(SkillRecord)) is None
-    assert targets[-1] == {"provider_id": "provider-one", "model_id": "model-one", "thinking_mode": "off"}
+    assert targets[-1] == {"provider_id": "provider-one", "model_id": "model-one", "thinking_mode": "off", "prefer_fast": True, "search_route": "disabled"}
 
 
 def test_cache_is_scoped_by_content_language_model_provider_and_workspace(translation):

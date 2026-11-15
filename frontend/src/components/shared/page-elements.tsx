@@ -142,7 +142,7 @@ const statusLabel: Record<string, string> = {
 
 export function StatePill({ status, label }: { status: string; label?: string }) {
   return (
-    <Badge className={cn('font-mono text-[10px] font-medium', statusTone[status] ?? 'border-border bg-muted text-muted-foreground')} variant="outline">
+    <Badge className={cn('font-mono text-xs font-medium', statusTone[status] ?? 'border-border bg-muted text-muted-foreground')} variant="outline">
       {label ?? statusLabel[status] ?? status}
     </Badge>
   )
@@ -220,7 +220,7 @@ export function Timeline({ items }: { items: Array<{ time?: string; title: strin
       {items.map((item, index) => (
         <li className="relative pb-6 pl-6 last:pb-0" key={`${item.title}-${index}`}>
           <span className={cn('absolute -left-1.5 top-1.5 size-3 rounded-full border-2 border-card bg-muted-foreground', item.status === 'done' && 'bg-primary', item.status === 'pending' && 'bg-amber-500')} />
-          <div className="flex items-baseline gap-2"><p className="text-sm font-medium">{item.title}</p>{item.time ? <time className="font-mono text-[11px] text-muted-foreground">{item.time}</time> : null}</div>
+          <div className="flex items-baseline gap-2"><p className="text-sm font-medium">{item.title}</p>{item.time ? <time className="font-mono text-xs text-muted-foreground">{item.time}</time> : null}</div>
           {item.detail ? <p className="mt-1 text-xs leading-5 text-muted-foreground">{item.detail}</p> : null}
         </li>
       ))}

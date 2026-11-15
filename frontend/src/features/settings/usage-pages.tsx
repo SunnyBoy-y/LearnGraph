@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } 
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { useReducedMotionPreference } from "@/lib/motion-preferences";
 import {
   acknowledgeBudgetAlert, clearUsageEvents, createBudgetPolicy, deleteBudgetPolicy, getAlertEmailConfig,
@@ -13,7 +13,7 @@ import {
 import { authStore } from "@/api/auth-store";
 import type { UsageFilters, UsageScope } from "@/api/usage";
 import { useAuth } from "@/features/auth/auth-context-value";
-import { ErrorState, LoadingState, PageFrame, PageIntro, SectionHeading, StatePill, Surface } from "@/components/shared/page-elements";
+import { ErrorState, LoadingState, PageFrame, SectionHeading, StatePill, Surface } from "@/components/shared/page-elements";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
@@ -75,7 +75,7 @@ export function UsagePage() {
     client.removeQueries({ predicate: (query) => legacy.has(String(query.queryKey[0])) });
   }, [client]);
   return <PageFrame>
-    <PageIntro title="用量与预算" description="USD 与人民币 CNY 分别计费、分别统计。价格和已发生费用保持供应商公布的币种。" />
+
     <div className="flex gap-2" role="group" aria-label="计费币种">
       {(["USD", "CNY"] as const).map((code) => <Button key={code} variant={code === currency ? "default" : "outline"} aria-pressed={code === currency} onClick={() => {
         const next = new URLSearchParams(params); next.set("currency", code); setParams(next);

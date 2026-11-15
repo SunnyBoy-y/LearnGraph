@@ -77,14 +77,14 @@ export function RetryAnswerMenu({ children, content, open, onOpenChange }: {
 export type RetryModelGroup = {
   id: string;
   label: string;
-  models: { id: string; remote: boolean }[];
+  models: { id: string; remote: boolean; capabilities?: { supports_image_input?: boolean } }[];
   loading?: boolean;
   failed?: boolean;
 };
 
 export function RetryMenuSettings({
   groups, providerId, modelId, responseMode, thinkingMode, thinkingModes,
-  supportsAgent, webSearch, canSearch, canRetry, modelError, onModelChange,
+  supportsAgent, thinkingRequired = false, webSearch, canSearch, canRetry, modelError, onModelChange,
   onModeChange, onThinkingChange, onSearchChange, onRetry, onRefreshModels, onConfigure,
   allowedDomains = "", onDomainsChange,
   previousAnswerTrace,
@@ -97,6 +97,7 @@ export function RetryMenuSettings({
   thinkingMode: ThinkingMode;
   thinkingModes: ThinkingMode[];
   supportsAgent: boolean;
+  thinkingRequired?: boolean;
   webSearch: boolean;
   canSearch: boolean;
   canRetry: boolean;
@@ -148,7 +149,7 @@ export function RetryMenuSettings({
           </span>
           <span className="text-[11px] text-muted-foreground">
             {settingsChanged
-              ? `${responseMode === "fast" ? "极速" : "智能体"} · 思考${thinkingLabels[effectiveThinking]} · ${effectiveSearch ? "联网已开启" : "联网已关闭"}`
+              ? `${responseMode === "fast" ? "极速" : responseMode === "thinking" ? "思考" : "智能体"} · 思考${thinkingLabels[effectiveThinking]} · ${effectiveSearch ? "联网已开启" : "联网已关闭"}`
               : previousSearch}
           </span>
           {settingsChanged && effectiveSearch && <span className="break-all text-[11px] leading-relaxed text-muted-foreground">
@@ -173,7 +174,7 @@ export function RetryMenuSettings({
                   <DropdownMenuLabel className="px-2.5 pt-2">{group.label}</DropdownMenuLabel>
                   {group.models.map((model) => (
                     <DropdownMenuRadioItem className={`${row} pr-8`} key={model.id} value={modelChoiceValue(group.id, model.id)} disabled={!model.remote} onSelect={keepOpen}>
-                      <span className="truncate">{model.id}</span>
+                      <span className="truncate">{model.id}{model.capabilities?.supports_image_input ? " · 图片" : ""}</span>
                     </DropdownMenuRadioItem>
                   ))}
                   {!group.models.length && <DropdownMenuLabel className="px-2.5 font-normal">{group.loading ? "正在载入模型…" : group.failed ? "模型载入失败" : "暂无可用模型"}</DropdownMenuLabel>}
@@ -188,12 +189,13 @@ export function RetryMenuSettings({
       </DropdownMenuSub>
       <DropdownMenuSub>
         <RetrySubTrigger className={row}>
-          <Bot className="size-4" /><span>响应模式</span><span className={summary}>{responseMode === "fast" ? "极速" : "智能体"}</span>
+          <Bot className="size-4" /><span>响应模式</span><span className={summary}>{responseMode === "fast" ? "极速" : responseMode === "thinking" ? "思考" : "智能体"}</span>
         </RetrySubTrigger>
         <DropdownMenuPortal>
           <RetrySubContent collisionPadding={12} sideOffset={6} className={`${surface} w-52`}>
             <DropdownMenuRadioGroup value={responseMode} onValueChange={(value) => onModeChange(value as ResponseMode)}>
-              <DropdownMenuRadioItem className={row} value="fast" onSelect={keepOpen}>极速</DropdownMenuRadioItem>
+              <DropdownMenuRadioItem className={row} value="fast" disabled={thinkingRequired} onSelect={keepOpen}>极速</DropdownMenuRadioItem>
+              {!supportsAgent && thinkingModes.length > 0 && <DropdownMenuRadioItem className={row} value="thinking" onSelect={keepOpen}>思考</DropdownMenuRadioItem>}
               <DropdownMenuRadioItem className={row} value="agentic" disabled={!supportsAgent} onSelect={keepOpen}>智能体</DropdownMenuRadioItem>
             </DropdownMenuRadioGroup>
             {!supportsAgent && <p className="px-2.5 py-1 text-[11px] text-muted-foreground">当前模型不支持智能体工具</p>}

@@ -3,7 +3,7 @@ import { useSettingsDirty } from '@/lib/settings-dirty';
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CircleAlert, ServerCog } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { getCurrentUser } from "@/api/control";
 import {

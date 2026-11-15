@@ -18,7 +18,10 @@ SourceKey = Annotated[str, Field(min_length=1, max_length=100), AfterValidator(s
 Text = Annotated[str, Field(max_length=2000)]
 Scalar = Annotated[str, Field(max_length=2000)] | float | bool | None
 Component = Literal["chart", "graph", "timeline", "table", "metric", "document"]
-RailIcon = Literal["zap", "brain-circuit", "search", "layers", "shield", "lightbulb", "circle-dot", "check-check", "blocks", "sliders", "file-text", "database", "chart", "book-open", "target", "code"]
+LegacyRailIcon = Literal["zap", "brain-circuit", "search", "layers", "shield", "lightbulb", "circle-dot", "check-check", "blocks", "sliders", "file-text", "database", "chart", "book-open", "target", "code"]
+# Identifiers only: the frontend resolves bundled, same-origin Microsoft 3D assets.
+FluentIcon = Annotated[str, Field(min_length=8, max_length=100, pattern=r"^fluent:[a-z0-9]+(?:-[a-z0-9]+)*$")]
+RailIcon = LegacyRailIcon | FluentIcon
 
 
 class StrictModel(BaseModel):
@@ -41,6 +44,7 @@ class DataReference(StrictModel):
 
 class Props(StrictModel):
     title: Annotated[str, Field(min_length=1, max_length=240)]
+    icon: RailIcon | None = None
     description: Text = ""
     chart_type: Literal["line", "bar"] = "line"
     columns: Annotated[list[Series], Field(max_length=12)] = Field(default_factory=list)
@@ -88,6 +92,7 @@ class Edge(StrictModel):
 class Item(StrictModel):
     id: Id
     label: Annotated[str, Field(min_length=1, max_length=120)]
+    icon: RailIcon | None = None
     value: Scalar = None
     description: Text = ""
     date: Annotated[str, Field(max_length=80)] = ""
@@ -112,7 +117,7 @@ class DocumentNode(StrictModel):
         "image", "image_group", "gallery", "figure", "chart", "diagram", "graph",
         "timeline", "metric", "simulation", "interactive", "section", "stack", "row", "columns",
         "grid", "media_text", "tabs", "accordion",
-        "feature_list", "step_list", "status_list", "rail_item",
+        "feature_list", "step_list", "status_list", "rail_item", "icon",
     ]
     text: Annotated[str, Field(max_length=16000)] = ""
     label: Annotated[str, Field(max_length=240)] = ""
@@ -141,8 +146,10 @@ class DocumentNode(StrictModel):
     def valid_visual(self):
         if self.type == "rail_item" and not self.label.strip():
             raise ValueError("Rail items require a title in label")
-        if self.type != "rail_item" and (self.icon is not None or self.item_status is not None):
-            raise ValueError("Icon and item_status belong to a rail_item")
+        if self.type == "icon" and self.icon is None:
+            raise ValueError("Standalone icon nodes require an icon")
+        if self.type != "rail_item" and self.item_status is not None:
+            raise ValueError("item_status belongs to a rail_item")
         if self.type in {"image", "image_group", "gallery"} and self.media:
             # A pre-search caption describes a requested picture, not the
             # picture actually returned. Source metadata owns resolved labels.

@@ -641,6 +641,11 @@ class TutorAgent(LLMWorker):
         super().__init__(name, llm=llm, bridged=(), active=True)
 
     def build_tools(self) -> list:
+        # Pipecat calls this again on activation/reactivation, not only when we
+        # construct or rebind the initial context. Keep every entry consistent.
+        model_provider = getattr(self.llm, "_model_provider", None)
+        if model_provider is not None and not getattr(model_provider, "supports_agent_tools", False):
+            return []
         # Do not advertise delegation tools when no coordinator is installed.
         # This prevents a model from appearing to accept work that has no
         # durable backend.
@@ -1459,10 +1464,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         or os.getenv("VOICE_LLM_MODEL", "")
         or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     )
-    # 前台恒 off：pipecat 的 OpenAI 服务自己没有思考开关，``Settings.extra`` 是唯一能
-    # 落到请求体上的通道，所以这里必须把厂商自己的"关闭"字段显式拼出来——而且只能放
-    # 进 ``extra_body``（见 ``LlmThinkingOff.settings_extra``：摊在顶层会被 SDK 的签名
-    # 校验拦下，每一轮都抛 TypeError，整通没有回答）。
+    # Foreground voice prefers off, with the factory's supported-mode fallback.
+    # This decision is diagnostic only: the shared provider bridge owns actual
+    # protocol fields, credentials and output budgets, including on model swaps.
     thinking_off = resolve_llm_thinking_off(
         provider_type=getattr(llm_provider, "provider_type", None),
         base_url=llm_base_url,
@@ -1543,12 +1547,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         base_url=llm_base_url,
         memory_bridge=memory_bridge,
         task_session_id=session_id or '',
+        model_provider=llm_provider,
         settings=OpenAILLMService.Settings(
             model=llm_model,
             system_instruction=SYSTEM_INSTRUCTION,
-            # 表达不出关闭时就是空 dict：宁可不发字段（= 该模型按自己的默认走），
-            # 也不能把别的方言的字段塞给它——那会直接让上游 400、整通没有回答。
-            extra=thinking_off.settings_extra,
+            # The provider bridge owns protocol fields and budgets; Pipecat
+            # must not reconstruct a second, Chat-Completions-only request.
+            extra={},
         ),
     )
 
@@ -1718,7 +1723,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         foreground_tools=foreground_text_tools,
     )
     # Activation and initial context must be built from the same authority.
-    context.set_tools(agent.build_tools())
+    if getattr(llm_provider, "supports_agent_tools", False):
+        context.set_tools(agent.build_tools())
+    elif journal is not None:
+        await journal.notice(
+            STAGE_LLM, "model_tools_unavailable",
+            "当前语音模型不支持工具，本次可正常对话，但不能执行工具任务。",
+        )
     speech_floor = VoiceSpeechFloor()
     conversation_policy = VoiceConversationPolicy(
         await asyncio.to_thread(load_conversation_policy, session_id) if session_id else None,
@@ -1933,7 +1944,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 await rtvi.interrupt_bot()
 
         async def _on_model_changed(event: Mapping[str, Any]) -> None:
-            nonlocal context_state, last_context_version
+            nonlocal context_state, last_context_version, llm_provider, llm_model, thinking_off
             if context_adapter is None:
                 return
             handle_now = await asyncio.to_thread(load_session_row, session_id)
@@ -1980,25 +1991,27 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 model_id=pinned_model,
                 capabilities=getattr(pin_llm, "capabilities", None),
             )
-            if llm_service is not None and pinned_model:
+            if llm_service is not None and pin_llm is not None and pinned_model:
                 try:
-                    settings_obj = getattr(llm_service, "_settings", None)
-                    if settings_obj is not None and hasattr(settings_obj, "model"):
-                        settings_obj.model = pinned_model
-                        if pin_llm is not None:
-                            # 新方言表达不出关闭时置空——把上一家的字段继续发过去会让
-                            # 新上游 400，整通没有回答，比"这次换模型仍在思考"更糟。
-                            # 解析不出新 Provider（被停用/删除）时**不动** extra：正在跑
-                            # 的那条链路用的仍是它自己方言的字段。
-                            settings_obj.extra = off.settings_extra
-                        repointed = True
+                    # Wait for a safe turn boundary and swap the actual adapter,
+                    # not just the displayed SDK model name. Credentials, budget,
+                    # protocol and continuation state move together.
+                    await llm_service.rebind_model_provider(pin_llm)
+                    llm_provider = pin_llm
+                    llm_model = pinned_model
+                    thinking_off = off
+                    context.set_tools(agent.build_tools() if getattr(pin_llm, "supports_agent_tools", False) else [])
+                    latency._thinking_off_intent = off.expressible
+                    latency._thinking_off_flagged = False
+                    latency._thinking_off_confirmed = False
+                    repointed = True
                 except Exception:
                     logger.debug("voice model re-pin failed", exc_info=True)
             await journal.context_updated(
                 context_change_report(
                     event.get("payload"),
                     repointed=repointed,
-                    effective_model_id=pinned_model or model,
+                    effective_model_id=getattr(llm_provider, "model_id", None) or model,
                     applied_epoch=handle_now.session_epoch,
                 ),
                 # 一条请求只该有一条回执：request_id 以触发事件为键，重复处理

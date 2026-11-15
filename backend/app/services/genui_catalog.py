@@ -1,6 +1,18 @@
 """Prompt metadata for the registered components; no extra model/router call."""
 from typing import get_args
-from app.domain.schemas.stream_ui import RailIcon
+from app.domain.schemas.stream_ui import LegacyRailIcon
+
+ICON_GUIDANCE = (
+    "图标可选，按语义少量使用，不要求每次回答都带图标。icon 使用 fluent:<slug>（Microsoft Fluent Emoji 3D），"
+    "例如 fluent:rocket、fluent:light-bulb、fluent:brain；常用slug还有 books、direct-hit、check-mark-button、warning、sparkles、"
+    "magnifying-glass-tilted-left、chart-increasing。slug只含ASCII小写字母、数字和单个连字符分隔的非空段，整个标识最多100字符；"
+    "不传URL、路径、SVG、样式或原始emoji到icon字段。兼容旧Lucide白名单：" + ",".join(get_args(LegacyRailIcon)) + "。"
+    "普通document节点均可加icon，例如heading、section、rail_item；独立图标节点用type=icon并必须提供icon，不能有子节点。"
+    "组件标题可用props.icon，metric/timeline条目可用items[].icon（嵌入visual也适用）；item_status仍仅限rail_item。"
+    "图标使用前端同源内置资源，不需要联网、图片搜索或image节点。普通Markdown内联emoji直接写正常Unicode，如🚀、💡、🧠，"
+    "前端会转换已识别的emoji；不要在普通Markdown正文写fluent:slug代替emoji。"
+)
+
 
 COMPONENT_CATALOG = (
     {"name": "MetricGrid", "component": "metric", "description": "明确指标与单位", "whenToUse": "多个可核对的数值", "whenNotToUse": "普通解释或没有数据", "examples": ["月活与增长率", "不要将一句结论包装为指标"]},
@@ -31,7 +43,7 @@ def presentation_catalog_prompt() -> str:
         "编辑式列表直接排在正文中，不要再包卡片。feature_list/step_list/status_list为父节点，其子节点只能是rail_item，用parent_id关联。"
         "rail_item的label是标题、text是Markdown说明、caption是补充说明；feature_list条目可选icon，status_list条目用item_status=pending|active|completed|error。"
         "每组最多12项，通常2至6项。先提交列表父节点，再按阅读顺序增加条目；可用相同id补充text/caption，避免改写已完成的条目。"
-        "图标从白名单按语义选择（不传URL、SVG、emoji或样式）：" + ",".join(get_args(RailIcon)) + "。"
+        + ICON_GUIDANCE +
         "来源写source_note，单位写unit，时间范围写time_range；示例必须data_kind=example，不可当作实测。"
         "有已保存工具结果part_id时，可用data_ref={part_id,path:[字段名或数组索引]}引用其中的rows/items格式集合。"
         "路径从工具output开始，只能引用同一会话内已完成的工具结果，服务端覆盖该集合；未知part_id不要猜测。"

@@ -1,13 +1,13 @@
+import "./graph-rail.css";
+import { scheduleSessionRefresh } from "@/lib/session-refresh";
 import {
   useCallback,
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
   type CSSProperties,
-  type PointerEvent as ReactPointerEvent,
 } from "react"
 import { lazy, memo, Suspense } from "react";
 import { applyAppearance } from "@/lib/appearance";
@@ -25,7 +25,6 @@ import {
   Archive,
   BadgeCheck,
   Bot,
-  BookOpen,
   Brain,
   CalendarDays,
   ChevronDown,
@@ -33,12 +32,8 @@ import {
   CircleDot,
   Files,
   Focus,
-  Folder,
-  FolderOpen,
-  FolderPlus,
   GraduationCap,
   Home,
-  ListChecks,
   LoaderCircle,
   LogOut,
   Menu,
@@ -49,27 +44,34 @@ import {
   Pause,
   Package,
   Pencil,
-  Pin,
   Play,
   Plus,
   Save,
   Search,
-  Share2,
   Settings,
   ShieldCheck,
   SlidersHorizontal,
-  Sparkles,
   Split,
   Target,
-  Trash2,
   X,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { useModalDrawerFocus } from "./use-modal-drawer-focus";
+import { useWorkspaceRailResize } from "./use-workspace-rail-resize";
+import { useSessionNavigator } from "./use-session-navigator";
+import { SessionProjects } from "./session-projects";
+const WorkspaceSearchDialog = lazy(() => import("./workspace-search-dialog").then(module => ({ default: module.WorkspaceSearchDialog })));
+import { toSidebarSession, nestSidebarSessions, flattenSidebarSessions, type SidebarSession, type SidebarProject } from "./session-sidebar-model";
+import { useSessionDetail, updateSessionCaches, summaryOf } from "@/lib/session-queries";
+import { getSessionCounts, getSessionAncestors, listSessionPage, getSession } from "@/api/session-browser";
+import { createGraphOpenCoordinator, graphVisit, rememberGraphVisit, pickGraphConversation } from "@/lib/graph-folder-navigation";
+import { claimLearningNodeNavigation } from "@/lib/learning-node-binding";
+import { openGraphFolder } from "@/api/workflow";
 import { ActivityHeatmap } from "@/components/shared/activity-heatmap";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { Input } from "@/components/ui/input";
@@ -78,11 +80,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuPortal,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -96,7 +94,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { withScrollLockBypass } from "@/lib/scroll-lock";
 import { defaultUserAvatar } from "@/lib/user-avatar";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { SessionGraphBindingMenu } from "@/components/layout/session-graph-binding";
@@ -106,7 +103,6 @@ import {
   type LearningNodeContext,
 } from "@/lib/session-graph-binding";
 import { SettingsModal } from "@/components/layout/settings-modal";
-import { WorkspaceSearchDialog } from "@/components/layout/workspace-search-dialog";
 import { SidebarVersion } from "@/components/layout/sidebar-version";
 import { RouteMotion } from "@/components/shared/route-motion";
 import { NativeActions } from "@/features/mobile/NativeActions";
@@ -124,15 +120,13 @@ import {
   resumeAllPreviews,
   useAllPreviewsPaused,
 } from "@/lib/preview-pause-controller";
-import { isVoiceSessionActive } from "@/features/voice/voice-session-markers";
 import {
   consumePendingSelectionExplanation,
   selectionExplanationOpenEventName,
-  selectionExplanationParentMap,
   type SelectionExplanationOpenDetail,
 } from "@/features/chat/selection-explanation";
 import { useAuth } from "@/features/auth/auth-context-value";
-import type { KnowledgeNode } from "@/components/graph/knowledge-graph";
+import type { KnowledgeNode, KnowledgeGraphCanvasApi } from "@/components/graph/knowledge-graph";
 
 // F1-1: keep @xyflow/react out of the first-screen entry chunk. KnowledgeGraph
 // is a named export, so map it to the default shape React.lazy requires.
@@ -142,12 +136,10 @@ const KnowledgeGraph = lazy(() =>
   })),
 );
 import { NodeExploreChain } from "@/components/graph/node-explore";
-import {
-  SessionFilePreviewRail,
-  SideConversationRail,
-} from "@/features/chat/right-rail-panels";
-import { MemoryProcessRail } from "@/features/memory/components/memory-process-rail";
-import { VoiceLatencyRail } from "@/features/voice/voice-debug-panel";
+const SessionFilePreviewRail = lazy(() => import("@/features/chat/right-rail-panels").then(module => ({ default: module.SessionFilePreviewRail })));
+const SideConversationRail = lazy(() => import("@/features/chat/right-rail-panels").then(module => ({ default: module.SideConversationRail })));
+const MemoryProcessRail = lazy(() => import("@/features/memory/components/memory-process-rail").then(module => ({ default: module.MemoryProcessRail })));
+const VoiceLatencyRail = lazy(() => import("@/features/voice/voice-debug-panel").then(module => ({ default: module.VoiceLatencyRail })));
 import { SessionShareDialog } from "@/features/chat/session-share-dialog";
 import {
   archiveProject,
@@ -166,7 +158,6 @@ import {
   listGraphs,
   listNodeQuestions,
   listProjects,
-  listSessions,
   listSettings,
   restoreProject,
   restoreSession,
@@ -182,10 +173,8 @@ import {
   setDraftSessionId,
 } from "@/lib/draft-session";
 import {
-  getSessionActivity,
   getSessionActivitySnapshot,
   markSessionViewed,
-  sortSidebarSessions,
   subscribeSessionActivity,
 } from "@/lib/session-activity";
 import {
@@ -237,6 +226,7 @@ const primaryNav: NavItem[] = [
   // 会重定向到对应图谱的 ?panel=plan。
   { label: "资料", icon: Files, path: "sources" },
   { label: "产物", icon: Package, path: "artifacts", aliases: ["/artifacts"] },
+  { label: "定时任务", icon: CalendarDays, path: "schedules" },
 ];
 
 const primaryMoreNav: NavItem[] = [
@@ -252,27 +242,6 @@ const primaryMoreNav: NavItem[] = [
   { label: "记忆", icon: Brain, path: "memory" },
 ];
 
-type SidebarSession = {
-  id: string;
-  title: string;
-  pinned: boolean;
-  status: string;
-  updated_at?: string | null;
-  parent_session_id?: string | null;
-  session_kind?: string | null;
-  /** Nested side threads (e.g. 划词解释) shown under this parent as a folder. */
-  children?: SidebarSession[];
-};
-type SidebarProject = {
-  id: string;
-  title: string;
-  status: string;
-  sessions: SidebarSession[];
-  /** Old stored projects omit graph bindings and remain valid. */
-  graphId?: string;
-  graphTitle?: string;
-  goalId?: string;
-};
 
 type SidebarDeleteTarget =
   | { kind: "session"; session: SidebarSession }
@@ -292,21 +261,12 @@ type LearningProjectRequest = {
   nodeId?: string;
   nodeLabel?: string;
   prompt?: string;
+  /** Study submits a turn, but may resume a conversation already bound to this node. */
+  intent?: "study";
   /** When set, the new chat auto-send will request a graph change proposal. */
   graphAction?: "none" | "propose_create" | "propose_update";
-  /** Marks a learning-package canvas entry and receives async open failures. */
-  learningPackage?: boolean;
-  /** A fresh identity for every graph-open request, including cache hits. */
-  openKey?: string;
   onError?: (message: string) => void;
 };
-
-let learningPackageOpenSequence = 0;
-
-function nextLearningPackageOpenKey() {
-  learningPackageOpenSequence += 1;
-  return `graph-learning-${Date.now()}-${learningPackageOpenSequence}`;
-}
 
 function findProjectForSession(projects: SidebarProject[], sessionId?: string) {
   return projects.find((project) =>
@@ -346,109 +306,6 @@ function mergeDeleteImpacts(
   };
 }
 
-function toSidebarSession(session: {
-  id: string;
-  title: string;
-  pinned: boolean;
-  status: string;
-  updated_at?: string | null;
-  parent_session_id?: string | null;
-  session_kind?: string | null;
-}): SidebarSession {
-  return {
-    id: session.id,
-    title: session.title || "新会话",
-    pinned: session.pinned,
-    status: session.status,
-    updated_at: session.updated_at ?? null,
-    parent_session_id: session.parent_session_id ?? null,
-    session_kind: session.session_kind ?? null,
-  };
-}
-
-/**
- * Nest side threads (划词解释 / branches) under their parent so the sidebar
- * can treat the parent as a collapsible folder. Orphan children whose parent
- * is missing from the current list stay as roots (e.g. parent archived).
- *
- * Also consults local 划词解释 history so sessions created before
- * parent_session_id was written still fold under their source conversation.
- */
-function nestSidebarSessions(
-  sessions: SidebarSession[],
-  activity: ReturnType<typeof getSessionActivitySnapshot>,
-): SidebarSession[] {
-  if (!sessions.length) return sessions;
-  const localParents = selectionExplanationParentMap();
-  const byId = new Map(
-    sessions.map((session) => [
-      session.id,
-      {
-        ...session,
-        parent_session_id:
-          session.parent_session_id || localParents[session.id] || null,
-        children: [] as SidebarSession[] | undefined,
-      },
-    ]),
-  );
-  const roots: SidebarSession[] = [];
-  for (const session of byId.values()) {
-    const parentId = session.parent_session_id;
-    if (parentId && byId.has(parentId) && parentId !== session.id) {
-      byId.get(parentId)!.children!.push(session);
-    } else {
-      roots.push(session);
-    }
-  }
-  for (const session of byId.values()) {
-    if (session.children?.length) {
-      session.children = sortSidebarSessions(session.children, activity);
-    } else {
-      session.children = undefined;
-    }
-  }
-  return sortSidebarSessions(roots, activity);
-}
-
-/** Flatten nested sidebar sessions for selection / deletion counts. */
-function flattenSidebarSessions(sessions: SidebarSession[]): SidebarSession[] {
-  const out: SidebarSession[] = [];
-  for (const session of sessions) {
-    out.push(session);
-    if (session.children?.length) out.push(...flattenSidebarSessions(session.children));
-  }
-  return out;
-}
-
-/**
- * 1-based position among the row's legacy 「分支.」 siblings, or undefined
- * when nothing in the group carries a legacy prefix.
- */
-function legacyBranchSiblingIndex(
-  siblings: SidebarSession[],
-  index: number,
-): number | undefined {
-  let count = 0;
-  for (let cursor = 0; cursor <= index && cursor < siblings.length; cursor += 1) {
-    if (/^(?:分支\.)+/.test(siblings[cursor].title.trim())) count += 1;
-  }
-  return count || undefined;
-}
-
-/**
- * Branches created before the backend switched to 「原会话名（n）」 titles still
- * carry a 「分支.」 prefix. Sidebar rows are no longer indented, so legacy rows
- * are displayed with the sibling index instead of the old prefix.
- */
-function branchRowDisplayTitle(
-  title: string,
-  legacyBranchIndex?: number,
-): string {
-  const match = /^(?:分支\.)+(.*)$/.exec(title.trim());
-  if (!match) return title;
-  const base = match[1].trim() || "未命名会话";
-  return legacyBranchIndex ? `${base}（${legacyBranchIndex}）` : base;
-}
 
 const LAST_LEARNED_NODE_STORAGE_KEY = "learngraph:last-learned-nodes";
 
@@ -534,6 +391,7 @@ function SidebarNav({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [creatingConversation, setCreatingConversation] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [projects, setProjects] = useState<SidebarProject[]>([]);
   const [ungroupedSessions, setUngroupedSessions] = useState<SidebarSession[]>(
     [],
@@ -550,11 +408,21 @@ function SidebarNav({
     queryFn: () => listProjects(true),
     staleTime: 30_000,
   });
-  const sessionsQuery = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "sessions"),
-    queryFn: listSessions,
-    staleTime: 30_000,
+  const sessionNavigator = useSessionNavigator(workspaceId);
+  const routedSessionId = new URLSearchParams(search).get("sidebarSession") ?? pathname.match(/\/chat\/([^/]+)/)?.[1];
+  const routedSession = useSessionDetail(workspaceId, routedSessionId);
+  const ancestors = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "sessions", "ancestors", routedSessionId),
+    queryFn: ({ signal }) => getSessionAncestors(routedSessionId!, { signal }),
+    enabled: Boolean(routedSession.data?.parent_session_id), staleTime: 30_000, gcTime: 120_000,
   });
+  const sessionRecords = useMemo(() => {
+    const items = new Map(sessionNavigator.data.map(item => [item.id, item]));
+    for (const ancestor of ancestors.data ?? []) items.set(ancestor.id, ancestor);
+    if (routedSession.data) items.set(routedSession.data.id, summaryOf(routedSession.data, items.get(routedSession.data.id)?.has_children));
+    return [...items.values()];
+  }, [sessionNavigator.data, ancestors.data, routedSession.data]);
+  const sessionsQuery = { data: sessionRecords, refetch: sessionNavigator.refetch };
   const settingsQueryKey = workspaceQueryKey(workspaceId, "settings");
   const settingsQuery = useQuery({
     queryKey: settingsQueryKey,
@@ -790,53 +658,30 @@ function SidebarNav({
 
   useEffect(() => {
     if (!projectsQuery.data || !sessionsQuery.data) return;
-    // Drop a tracked draft that no longer exists on the server.
-    if (
-      hiddenDraftSessionId &&
-      !sessionsQuery.data.some((session) => session.id === hiddenDraftSessionId)
-    ) {
-      releaseDraftSession(hiddenDraftSessionId);
-    }
+    // Absence from a lazy page does NOT mean a draft was deleted.
     // Empty unused draft stays out of the list once the user leaves its chat route
     // without sending a message. Re-open via "新对话" reuses the same draft.
     const viewingDraft =
       Boolean(hiddenDraftSessionId) &&
       pathname.includes(`/chat/${hiddenDraftSessionId}`);
     const hideDraftId = viewingDraft ? null : hiddenDraftSessionId;
-    setProjects(
-      projectsQuery.data.map((project) => ({
-        id: project.id,
-        title: project.title,
-        status: project.status,
-        graphId: project.primary_graph_id ?? undefined,
-        graphTitle: project.primary_graph_id ? project.title : undefined,
-        goalId: project.primary_goal_id ?? undefined,
-        sessions: nestSidebarSessions(
-          sessionsQuery.data
-            .filter(
-              (session) =>
-                session.project_id === project.id &&
-                session.status !== "archived" &&
-                session.id !== hideDraftId,
-            )
-            .map((session) => toSidebarSession(session)),
-          sessionActivity,
-        ),
-      })),
-    );
-    setUngroupedSessions(
-      nestSidebarSessions(
-        sessionsQuery.data
-          .filter(
-            (session) =>
-              !session.project_id &&
-              session.status !== "archived" &&
-              session.id !== hideDraftId,
-          )
-          .map((session) => toSidebarSession(session)),
-        sessionActivity,
-      ),
-    );
+    // One pass over loaded summaries, not one full filter per project.
+    const grouped = new Map<string, SidebarSession[]>();
+    for (const session of sessionsQuery.data) {
+      if (session.status === "archived" || session.id === hideDraftId) continue;
+      const key = session.project_id ?? "";
+      const group = grouped.get(key) ?? [];
+      group.push(toSidebarSession(session));
+      grouped.set(key, group);
+    }
+    setProjects(projectsQuery.data.map(project => ({
+      id: project.id, title: project.title, status: project.status,
+      graphId: project.primary_graph_id ?? undefined,
+      graphTitle: project.primary_graph_id ? project.title : undefined,
+      goalId: project.primary_goal_id ?? undefined,
+      sessions: nestSidebarSessions(grouped.get(project.id) ?? [], sessionActivity),
+    })));
+    setUngroupedSessions(nestSidebarSessions(grouped.get("") ?? [], sessionActivity));
   }, [
     hiddenDraftSessionId,
     pathname,
@@ -978,12 +823,12 @@ function SidebarNav({
             project?: SidebarProject;
             learningNode?: LearningNodeContext;
             pendingGraphAction?: "none" | "propose_create" | "propose_update";
-            learningPackage?: boolean;
             /** Identifies the pinned top-level button from project-row actions. */
             fromNewConversationNav?: boolean;
             onError?: (message: string) => void;
             /** When true, always create a fresh session (project / learning entry). */
             forceNew?: boolean;
+            canNavigate?: () => boolean;
           },
     ) => {
       const options =
@@ -993,8 +838,7 @@ function SidebarNav({
       const isEmptyDraftRequest = Boolean(
         !options.forceNew &&
           !options.pendingPrompt &&
-          !options.learningNode &&
-          !options.learningPackage,
+          !options.learningNode,
       );
       if (isEmptyDraftRequest) {
         const currentParams = new URLSearchParams(search);
@@ -1034,6 +878,7 @@ function SidebarNav({
           project_id: project?.id ?? null,
         };
         const session = await createSession(payload);
+        updateSessionCaches(queryClient, workspaceId, session);
         // Seed the workspace default response mode before the chat canvas
         // hydrates, so a new draft does not inherit another session's "极速".
         // If the workspace setting is still loading (e.g. the user clicked
@@ -1089,8 +934,7 @@ function SidebarNav({
           );
         } else if (
           options.pendingPrompt ||
-          options.learningNode ||
-          options.learningPackage
+          options.learningNode
         ) {
           // Learning-entry paths already have content intent — list them.
           releaseDraftSession();
@@ -1105,6 +949,11 @@ function SidebarNav({
               sessionActivity,
             ),
           );
+        }
+        if (options.canNavigate && !options.canNavigate()) return;
+        if (options.learningNode) {
+          rememberGraphVisit(workspaceId, options.learningNode.graphId, session.id);
+          if (options.learningNode.nodeId) rememberGraphVisit(workspaceId, `${options.learningNode.graphId}/${options.learningNode.nodeId}`, session.id);
         }
         setActiveSessionId(session.id);
         setSelectedProjectId(project?.id);
@@ -1124,7 +973,6 @@ function SidebarNav({
                   ...(options.learningNode
                     ? { learningNode: options.learningNode }
                     : {}),
-                  ...(options.learningPackage ? { learningPackage: true } : {}),
                   ...(options.pendingGraphAction
                     ? { pendingGraphAction: options.pendingGraphAction }
                     : {}),
@@ -1159,68 +1007,96 @@ function SidebarNav({
     ],
   );
 
+  const graphRoute = useRef(`${pathname}${search}`);
+  graphRoute.current = `${pathname}${search}`;
+  const graphOpens = useRef(createGraphOpenCoordinator());
+  useEffect(() => { graphOpens.current.invalidate(); }, [pathname, search]);
+  const graphCreates = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => { const coordinator = graphOpens.current; return () => coordinator.invalidate(); }, [workspaceId]);
   const openLearningProject = useCallback(
-    async (request: LearningProjectRequest) => {
+    (request: LearningProjectRequest) => {
       const graphId = request.graphId?.trim();
-      const title = request.title?.trim();
-      if (!graphId || !title) return;
-      // “立即学习” is intentionally organized by the graph title: a graph can
-      // therefore reopen its own named project without hijacking a differently
-      // named project that happens to share the same source graph.
-      const existing = projects.find((project) => project.title === title);
-      const created = existing
-        ? null
-        : await createProjectRecord({ title, primary_graph_id: graphId });
-      const project: SidebarProject = existing
-        ? { ...existing, graphId, graphTitle: title }
-        : {
-            id: created!.id,
-            title,
-            status: "active",
-            graphId,
-            graphTitle: title,
-            sessions: [],
-          };
-      if (
-        !existing ||
-        existing.graphId !== graphId ||
-        existing.graphTitle !== title
-      ) {
-        setProjects((current) =>
-          existing
-            ? current.map((item) => (item.id === existing.id ? project : item))
-            : [...current, project],
-        );
-        if (existing)
-          await updateProjectRecord(existing.id, { primary_graph_id: graphId });
-        await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
-      }
-      const prompt =
-        request.prompt?.trim() ||
-        (request.nodeLabel ? `什么是 ${request.nodeLabel}？` : undefined);
-      const openKey = request.openKey?.trim() || nextLearningPackageOpenKey();
-      await createConversation({
-        projectId: project.id,
-        project,
-        pendingPrompt: prompt,
-        pendingGraphAction: request.graphAction,
-        learningNode: {
-          graphId,
-          nodeId: request.nodeId,
-          nodeLabel: request.nodeLabel,
-          learningPackage: request.learningPackage,
-          openKey,
-        },
-        learningPackage: request.learningPackage,
-        onError: request.onError,
+      if (!graphId) return Promise.resolve();
+      const openKey = JSON.stringify([workspaceId, graphId, request.nodeId, request.prompt, request.graphAction, request.intent]);
+      const originRoute = graphRoute.current;
+      return graphOpens.current.run(openKey, async (latestRequest) => {
+        const isLatest = () => latestRequest() && graphRoute.current === originRoute;
+        const record = await openGraphFolder(graphId);
+        if (!isLatest()) return;
+        queryClient.setQueryData<import("@/types/workflow").Project[]>(workspaceQueryKey(workspaceId, "projects"), current =>
+          [record, ...(current ?? []).filter(item => item.id !== record.id)]);
+        const project: SidebarProject = {
+          id: record.id, title: record.title, status: record.status,
+          graphId, graphTitle: request.title ?? record.title,
+          goalId: record.primary_goal_id ?? undefined, sessions: [],
+        };
+        setProjects(current => current.some(item => item.id === project.id)
+          ? current.map(item => item.id === project.id ? { ...item, ...project, sessions: item.sessions } : item)
+          : [...current, project]);
+        const remembered = graphVisit(workspaceId, request.nodeId ? `${graphId}/${request.nodeId}` : graphId)?.sessionId;
+        const page = await listSessionPage({ project_id: project.id, graph_id: graphId, node_id: request.nodeId, session_kind: "main", roots_only: false, pinned_first: false });
+        if (!isLatest()) return;
+        // The server filters node_id; summaries intentionally omit current_node_id.
+        // Validate the durable binding on the fetched detail below instead.
+        const recent = pickGraphConversation(page.items, project.id, graphId, { rememberedSessionId: remembered });
+        let detail: Session | undefined;
+        const candidateIds = [...new Set([remembered, recent?.id].filter((id): id is string => Boolean(id)))];
+        for (const candidateId of candidateIds) {
+          let candidate: Session;
+          try { candidate = await getSession(candidateId); } catch (error) {
+            if (error instanceof Error && "status" in error && error.status === 404) continue;
+            throw error;
+          }
+          if (!isLatest()) return;
+          if (candidate.project_id === project.id && candidate.graph_id === graphId
+            && candidate.status !== "archived" && candidate.session_kind !== "side"
+            && (!request.nodeId || candidate.current_node_id === request.nodeId)) { detail = candidate; break; }
+        }
+        if (!isLatest()) return;
+        setFolderOpen("project", project.id, true);
+        setSelectedProjectId(project.id);
+        window.dispatchEvent(new CustomEvent("learngraph:graph-folder-selected", { detail: { workspaceId, graphId, projectId: project.id } }));
+        rememberGraphVisit(workspaceId, graphId, detail?.id);
+        const explicitTask = Boolean(request.prompt || request.graphAction && request.graphAction !== "none");
+        if (detail && (!explicitTask || request.intent === "study")) {
+          window.dispatchEvent(new CustomEvent("learngraph:new-conversation"));
+          updateSessionCaches(queryClient, workspaceId, detail);
+          setActiveSessionId(detail.id);
+          publishProjectContext(project, detail.id);
+          if (request.nodeId) rememberGraphVisit(workspaceId, `${graphId}/${request.nodeId}`, detail.id);
+          // Reused and newly-created destinations use the same one-shot route
+          // contract; a context event alone only prefills the composer.
+          navigate(`${base}/chat/${detail.id}`, request.prompt ? { state: {
+            pendingPrompt: request.prompt.trim(),
+            learningNode: { graphId, nodeId: request.nodeId, nodeLabel: request.nodeLabel },
+            ...(request.graphAction ? { pendingGraphAction: request.graphAction } : {}),
+          } } : undefined);
+          onNavigate?.();
+          return;
+        }
+        if (!request.nodeId && !explicitTask) {
+          await createConversation({ projectId: project.id, project });
+          return;
+        }
+        const creation = graphCreates.current.then(async () => {
+          if (!isLatest()) return;
+          await createConversation({
+          projectId: project.id, project, pendingPrompt: request.prompt?.trim(), pendingGraphAction: request.graphAction,
+          learningNode: { graphId, nodeId: request.nodeId, nodeLabel: request.nodeLabel },
+          onError: request.onError, canNavigate: isLatest,
+          });
+        });
+        graphCreates.current = creation.catch(() => undefined);
+        await creation;
       });
     },
-    [createConversation, projects, queryClient, workspaceId],
+    [base, createConversation, navigate, onNavigate, publishProjectContext, queryClient, setFolderOpen, workspaceId],
   );
 
   useEffect(() => {
     const open = (event: Event) => {
       const detail = (event as CustomEvent<LearningProjectRequest>).detail ?? {};
+      if (!detail.graphId?.trim() || !claimLearningNodeNavigation(event)) return;
       void openLearningProject(detail).catch((error) => {
         const message = error instanceof Error ? error.message : "无法打开学习对话";
         detail.onError?.(message);
@@ -1299,7 +1175,7 @@ function SidebarNav({
       );
     try {
       await assignSessionProject(sessionId, projectId ?? null);
-      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
+      await scheduleSessionRefresh(queryClient, workspaceId);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "移动会话失败");
       await sessionsQuery.refetch();
@@ -1534,9 +1410,12 @@ function SidebarNav({
         onNavigate?.();
       }
 
+      window.dispatchEvent(new CustomEvent('learngraph:sessions-deleted', {
+        detail: { workspaceId, sessionIds: [...removedSessionIds], projectIds: [...removedProjectIds] },
+      }));
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") }),
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") }),
+        scheduleSessionRefresh(queryClient, workspaceId),
         queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memory") }),
         queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memories") }),
         queryClient.invalidateQueries({ queryKey: ["memory-pending"] }),
@@ -1600,26 +1479,13 @@ function SidebarNav({
   }
 
   function patchSidebarSession(sessionId: string, patch: Partial<SidebarSession>) {
-    setProjects((current) =>
-      current.map((project) => ({
-        ...project,
-        sessions: nestSidebarSessions(
-          flattenSidebarSessions(
-            patchSidebarSessionTree(project.sessions, sessionId, patch),
-          ).map(({ children: _children, ...session }) => session),
-          sessionActivity,
-        ),
-      })),
-    );
-    setUngroupedSessions((current) =>
-      nestSidebarSessions(
-        flattenSidebarSessions(
-          patchSidebarSessionTree(current, sessionId, patch),
-        ).map(({ children: _children, ...session }) => session),
-        sessionActivity,
-      ),
-    );
+    setProjects(current => current.map(project => {
+      const sessions = patchSidebarSessionTree(project.sessions, sessionId, patch);
+      return sessions === project.sessions ? project : { ...project, sessions };
+    }));
+    setUngroupedSessions(current => patchSidebarSessionTree(current, sessionId, patch));
   }
+  const pendingSessionMutations = useRef(new Set<string>());
 
   async function renameSession(session: SidebarSession, title: string) {
     const nextTitle = title.trim();
@@ -1627,9 +1493,7 @@ function SidebarNav({
     try {
       const updated = await updateSession(session.id, { title: nextTitle });
       patchSidebarSession(session.id, { title: updated.title });
-      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) =>
-        current?.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      updateSessionCaches(queryClient, workspaceId, updated);
       toast.success("会话名称已更新");
       return true;
     } catch (error) {
@@ -1639,15 +1503,19 @@ function SidebarNav({
   }
 
   async function toggleSessionPin(session: SidebarSession) {
+    if (pendingSessionMutations.current.has(session.id)) return;
+    pendingSessionMutations.current.add(session.id);
+    patchSidebarSession(session.id, { pinned: !session.pinned });
     try {
       const updated = await updateSession(session.id, { pinned: !session.pinned });
       patchSidebarSession(session.id, { pinned: updated.pinned });
-      queryClient.setQueryData<Session[]>(workspaceQueryKey(workspaceId, "sessions"), (current) =>
-        current?.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      updateSessionCaches(queryClient, workspaceId, updated);
       toast.success(updated.pinned ? "会话已置顶" : "已取消置顶");
     } catch (error) {
+      patchSidebarSession(session.id, { pinned: session.pinned });
       toast.error(error instanceof Error ? error.message : "置顶状态更新失败");
+    } finally {
+      pendingSessionMutations.current.delete(session.id);
     }
   }
 
@@ -1659,7 +1527,8 @@ function SidebarNav({
       patchSidebarSession(session.id, {
         status: updated.status,
       });
-      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
+      updateSessionCaches(queryClient, workspaceId, updated);
+      void sessionNavigator.refetch();
       toast.success(session.status === "archived" ? "会话已恢复" : "会话已归档");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "会话状态更新失败");
@@ -1805,20 +1674,29 @@ function SidebarNav({
           <SidebarVersion isSystemAdmin={isSystemAdmin} />
           </div>
         )}
-        {!mobile && !collapsed ? (
-          <Button
-            aria-label="折叠侧边栏"
-            aria-expanded={true}
-            data-sidebar-toggle="collapse"
-            onClick={onCollapse}
-            size="icon-sm"
-            title="折叠侧边栏"
-            variant="ghost"
-          >
-            <PanelLeftClose />
-          </Button>
-        ) : null}
+        <div className="sidebar-nav__top-actions">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button aria-label="搜索文件、会话和消息" aria-haspopup="dialog" className="sidebar-nav__search" onClick={() => setSearchOpen(true)} size="icon-sm" variant="ghost"><Search className="size-4.5" /></Button>
+            </TooltipTrigger>
+            <TooltipContent side={collapsed && !mobile ? "right" : "bottom"}>搜索文件、会话和消息</TooltipContent>
+          </Tooltip>
+          {!mobile && !collapsed ? (
+            <Button
+              aria-label="折叠侧边栏"
+              aria-expanded={true}
+              data-sidebar-toggle="collapse"
+              onClick={onCollapse}
+              size="icon-sm"
+              title="折叠侧边栏"
+              variant="ghost"
+            >
+              <PanelLeftClose />
+            </Button>
+          ) : null}
+        </div>
       </div>
+      {searchOpen ? <Suspense fallback={null}><WorkspaceSearchDialog open onOpenChange={setSearchOpen} onNavigate={onNavigate} workspaceId={workspaceId} /></Suspense> : null}
 
       {/* Only "新对话" stays pinned; remaining nav + sessions share one scroller. */}
       {pinnedNavItem ? (
@@ -1876,6 +1754,7 @@ function SidebarNav({
         ) : null}
 
         <SessionProjects
+          navigator={sessionNavigator}
           activeSessionId={activeSessionId}
           creatingConversation={creatingConversation}
           folderState={folderState}
@@ -1884,7 +1763,7 @@ function SidebarNav({
           onToggleFolders={setFoldersOpen}
           workspaceId={workspaceId}
           onCreateConversation={(projectId) => {
-            const targetProjectId = projectId ?? selectedProjectId;
+            const targetProjectId = projectId === null ? undefined : projectId ?? selectedProjectId;
             return createConversation({
               projectId: targetProjectId,
             });
@@ -2004,1026 +1883,6 @@ function SidebarNav({
  */
 const MemoSidebarNav = memo(SidebarNav);
 
-function SessionProjects({
-  workspaceId,
-  activeSessionId,
-  creatingConversation,
-  folderState,
-  selectedProjectId,
-  onToggleFolder,
-  onToggleFolders,
-  onCreateConversation,
-  onCreateProject,
-  onRequestProjectDeletion,
-  onRenameProject,
-  onToggleProjectArchive,
-  onMoveSession,
-  onRequestSessionBatchDeletion,
-  onRequestMixedBatchDeletion,
-  onRequestSessionDeletion,
-  onRenameSession,
-  onToggleSessionPin,
-  onToggleSessionArchive,
-  onShareSession,
-  onSelectProject,
-  onSelectSession,
-  projects,
-  ungroupedSessions,
-}: {
-  workspaceId: string;
-  activeSessionId: string;
-  creatingConversation: boolean;
-  /** 项目和父会话文件夹共用的前端本地开合状态。 */
-  folderState: SidebarFolderState;
-  /** 当前新建会话要落入的项目文件夹。 */
-  selectedProjectId?: string;
-  /** 统一写入某一种文件夹的开合状态。 */
-  onToggleFolder: (
-    kind: SidebarFolderKind,
-    id: string,
-    open: boolean,
-  ) => void;
-  onToggleFolders: (folders: SidebarFolderRef[], open: boolean) => void;
-  onCreateConversation: (projectId?: string) => Promise<void>;
-  onCreateProject: (title: string) => Promise<string>;
-  onRequestProjectDeletion: (project: SidebarProject) => void;
-  onRenameProject: (project: SidebarProject) => void;
-  onToggleProjectArchive: (project: SidebarProject) => void;
-  onMoveSession: (sessionId: string, projectId?: string) => void;
-  onRequestSessionBatchDeletion: (sessions: SidebarSession[]) => void;
-  onRequestMixedBatchDeletion: (
-    projects: SidebarProject[],
-    sessions: SidebarSession[],
-  ) => void;
-  onRequestSessionDeletion: (session: SidebarSession) => void;
-  onRenameSession: (session: SidebarSession, title: string) => Promise<boolean>;
-  onToggleSessionPin: (session: SidebarSession) => void;
-  onToggleSessionArchive: (session: SidebarSession) => void;
-  onShareSession: (session: SidebarSession) => void;
-  onSelectProject: (projectId?: string) => void;
-  onSelectSession: (sessionId: string, project?: SidebarProject) => void;
-  projects: SidebarProject[];
-  ungroupedSessions: SidebarSession[];
-}) {
-  const [voiceMarkerVersion, setVoiceMarkerVersion] = useState(0);
-  useEffect(() => {
-    const refresh = () => setVoiceMarkerVersion((value) => value + 1);
-    window.addEventListener("learngraph:voice-session-marker", refresh);
-    window.addEventListener("storage", refresh);
-    return () => {
-      window.removeEventListener("learngraph:voice-session-marker", refresh);
-      window.removeEventListener("storage", refresh);
-    };
-  }, []);
-  const [creatingProject, setCreatingProject] = useState(false);
-  const [projectName, setProjectName] = useState("");
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [renamingSessionId, setRenamingSessionId] = useState("");
-  const [renameValue, setRenameValue] = useState("");
-  const [renamePending, setRenamePending] = useState(false);
-  const [selectionMode, setSelectionMode] = useState(false);
-  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [selectedProjectIds, setSelectedProjectIds] = useState<Set<string>>(
-    () => new Set(),
-  );
-  // 会话「更多」菜单受控态（长按/右键唤起，与 MoreHorizontal 触发共用）
-  const [menuOpenFor, setMenuOpenFor] = useState<string | null>(null);
-  const longPressRef = useRef<{
-    timer: number | null;
-    id: string | null;
-    fired: boolean;
-  }>({ timer: null, id: null, fired: false });
-  const beginLongPress =
-    (sessionId: string) => (event: ReactPointerEvent<HTMLElement>) => {
-      if (event.pointerType === "mouse" && event.button !== 0) return;
-      const lp = longPressRef.current;
-      lp.id = sessionId;
-      lp.fired = false;
-      if (lp.timer != null) window.clearTimeout(lp.timer);
-      lp.timer = window.setTimeout(() => {
-        lp.fired = true;
-        setMenuOpenFor(sessionId);
-      }, 500);
-    };
-  const cancelLongPress = () => {
-    const lp = longPressRef.current;
-    if (lp.timer != null) {
-      window.clearTimeout(lp.timer);
-      lp.timer = null;
-    }
-    lp.id = null;
-  };
-  const sessionActivity = useSyncExternalStore(
-    subscribeSessionActivity,
-    getSessionActivitySnapshot,
-    getSessionActivitySnapshot,
-  );
-  const allSessions = useMemo(
-    () => [
-      ...projects.flatMap((project) => flattenSidebarSessions(project.sessions)),
-      ...flattenSidebarSessions(ungroupedSessions),
-    ],
-    [projects, ungroupedSessions],
-  );
-  const recentSessionsId = useId();
-  const recentOpen =
-    folderState[sidebarFolderStateKey("section", "recent")] !== false;
-  const visibleProjects = useMemo(
-    () =>
-      projects.map((project) => ({
-        ...project, sessions: sortSidebarSessions(project.sessions, sessionActivity),
-      })),
-    [projects, sessionActivity],
-  );
-  const visibleUngroupedSessions = useMemo(
-    () =>
-      sortSidebarSessions(ungroupedSessions, sessionActivity),
-    [sessionActivity, ungroupedSessions],
-  );
-  const activeProjectId = useMemo(
-    () => findProjectForSession(projects, activeSessionId)?.id,
-    [activeSessionId, projects],
-  );
-  const projectFolderOpen = useMemo(() => {
-    const open: Record<string, boolean> = {};
-    for (const project of projects) {
-      const stored = folderState[sidebarFolderStateKey("project", project.id)];
-      // A currently viewed project's folder is revealed until the user makes
-      // an explicit choice. An explicit local false always wins.
-      open[project.id] =
-        typeof stored === "boolean"
-          ? stored
-          : project.id === activeProjectId;
-    }
-    return open;
-  }, [activeProjectId, folderState, projects]);
-  const sessionFolderOpen = useMemo(() => {
-    const open: Record<string, boolean> = {};
-    const sessions = [
-      ...projects.flatMap((project) => flattenSidebarSessions(project.sessions)),
-      ...flattenSidebarSessions(ungroupedSessions),
-    ];
-    for (const session of sessions) {
-      if (!session.children?.length) continue;
-      const stored = folderState[sidebarFolderStateKey("session", session.id)];
-      const childActive = flattenSidebarSessions(session.children).some(
-        (child) => child.id === activeSessionId,
-      );
-      open[session.id] =
-        typeof stored === "boolean" ? stored : childActive;
-    }
-    return open;
-  }, [activeSessionId, folderState, projects, ungroupedSessions]);
-  const folderEntries = useMemo(
-    () => [
-      ...projects.map((project) => ({
-        kind: "project" as const,
-        id: project.id,
-      })),
-      ...projects
-        .flatMap((project) => flattenSidebarSessions(project.sessions))
-        .filter((session) => session.children?.length)
-        .map((session) => ({ kind: "session" as const, id: session.id })),
-      ...flattenSidebarSessions(ungroupedSessions)
-        .filter((session) => session.children?.length)
-        .map((session) => ({ kind: "session" as const, id: session.id })),
-    ],
-    [projects, ungroupedSessions],
-  );
-  const allFoldersCollapsed =
-    folderEntries.length > 0 &&
-    folderEntries.every((folder) => {
-      if (folder.kind === "project") return !projectFolderOpen[folder.id];
-      return !sessionFolderOpen[folder.id];
-    });
-  function toggleAllFolders() {
-    const open = allFoldersCollapsed;
-    onToggleFolders(folderEntries, open);
-  }
-  const visibleSessionIds = useMemo(
-    () =>
-      new Set([
-        ...visibleProjects.flatMap((project) =>
-          flattenSidebarSessions(project.sessions).map((session) => session.id),
-        ),
-        ...flattenSidebarSessions(visibleUngroupedSessions).map(
-          (session) => session.id,
-        ),
-      ]),
-    [visibleProjects, visibleUngroupedSessions],
-  );
-  const visibleProjectIds = useMemo(
-    () => new Set(visibleProjects.map((project) => project.id)),
-    [visibleProjects],
-  );
-  const selectedProjects = projects.filter((project) =>
-    selectedProjectIds.has(project.id),
-  );
-  // Sessions nested under a selected project are covered by project deletion.
-  const coveredBySelectedProjects = useMemo(
-    () =>
-      new Set(
-        selectedProjects.flatMap((project) =>
-          flattenSidebarSessions(project.sessions).map((session) => session.id),
-        ),
-      ),
-    [selectedProjects],
-  );
-  const selectedStandaloneSessions = allSessions.filter(
-    (session) =>
-      selectedSessionIds.has(session.id) &&
-      !coveredBySelectedProjects.has(session.id),
-  );
-  const selectedCount =
-    selectedProjects.length + selectedStandaloneSessions.length;
-
-  useEffect(() => {
-    const availableSessions = new Set(allSessions.map((session) => session.id));
-    const availableProjects = new Set(projects.map((project) => project.id));
-    setSelectedSessionIds((current) => {
-      const next = new Set(
-        [...current].filter((id) => availableSessions.has(id)),
-      );
-      return next.size === current.size ? current : next;
-    });
-    setSelectedProjectIds((current) => {
-      const next = new Set(
-        [...current].filter((id) => availableProjects.has(id)),
-      );
-      return next.size === current.size ? current : next;
-    });
-    if (!allSessions.length && !projects.length) setSelectionMode(false);
-  }, [allSessions, projects]);
-
-  function toggleSessionSelection(sessionId: string) {
-    setSelectedSessionIds((current) => {
-      const next = new Set(current);
-      if (next.has(sessionId)) next.delete(sessionId);
-      else if (next.size < 100) next.add(sessionId);
-      return next;
-    });
-    // Deselect a project folder if any of its sessions is unchecked.
-    const parent = projects.find((project) =>
-      flattenSidebarSessions(project.sessions).some(
-        (session) => session.id === sessionId,
-      ),
-    );
-    if (parent && selectedProjectIds.has(parent.id)) {
-      setSelectedProjectIds((current) => {
-        if (!current.has(parent.id)) return current;
-        const next = new Set(current);
-        next.delete(parent.id);
-        return next;
-      });
-    }
-  }
-
-  function toggleProjectSelection(project: SidebarProject) {
-    setSelectedProjectIds((current) => {
-      const next = new Set(current);
-      const selecting = !next.has(project.id);
-      if (selecting) next.add(project.id);
-      else next.delete(project.id);
-      // Keep nested session checkboxes in sync with the project folder.
-      setSelectedSessionIds((sessions) => {
-        const sessionNext = new Set(sessions);
-        for (const session of flattenSidebarSessions(project.sessions)) {
-          if (selecting) {
-            if (sessionNext.size < 100) sessionNext.add(session.id);
-          } else {
-            sessionNext.delete(session.id);
-          }
-        }
-        return sessionNext;
-      });
-      return next;
-    });
-  }
-
-  function requestSelectedDeletion() {
-    if (selectedProjects.length) {
-      onRequestMixedBatchDeletion(
-        selectedProjects,
-        selectedStandaloneSessions,
-      );
-      return;
-    }
-    if (selectedStandaloneSessions.length) {
-      onRequestSessionBatchDeletion(selectedStandaloneSessions);
-    }
-  }
-  async function addProject() {
-    const title = projectName.trim();
-    if (!title) return;
-    try {
-      const id = await onCreateProject(title);
-      // 刚建的空文件夹先展开，方便直接往里加对话；折叠回去同样会
-      // 写入前端本地偏好。
-      onToggleFolder("project", id, true);
-      onSelectProject(id);
-      setProjectName("");
-      setCreatingProject(false);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "新建项目失败");
-    }
-  }
-
-  function beginSessionRename(session: SidebarSession) {
-    setRenamingSessionId(session.id);
-    setRenameValue(session.title);
-  }
-
-  function cancelSessionRename() {
-    if (renamePending) return;
-    setRenamingSessionId("");
-    setRenameValue("");
-  }
-
-  async function commitSessionRename(session: SidebarSession) {
-    const title = renameValue.trim();
-    if (!title) return;
-    setRenamePending(true);
-    const saved = await onRenameSession(session, title);
-    setRenamePending(false);
-    if (saved) {
-      setRenamingSessionId("");
-      setRenameValue("");
-    }
-  }
-
-  function toggleSessionFolder(sessionId: string) {
-    const current = sessionFolderOpen[sessionId] ?? false;
-    onToggleFolder("session", sessionId, !current);
-  }
-
-  function renderSessionRow(
-    session: SidebarSession,
-    options: {
-      project?: SidebarProject;
-      ungrouped?: boolean;
-      depth?: number;
-      /** 1-based index among legacy 「分支.」 siblings; display only. */
-      legacyBranchIndex?: number;
-    } = {},
-  ) {
-    const depth = options.depth ?? 0;
-    // Nested rows share their parent's indent, so branches created before
-    // the backend wrote 「原会话名（n）」 titles are shown with the sibling
-    // index instead of the legacy 「分支.」 prefix.
-    const displayTitle = branchRowDisplayTitle(
-      session.title,
-      options.legacyBranchIndex,
-    );
-    const children = session.children ?? [];
-    const hasChildren = children.length > 0;
-    const open = sessionFolderOpen[session.id] ?? false;
-    const childActive =
-      hasChildren &&
-      flattenSidebarSessions(children).some(
-        (child) => child.id === activeSessionId,
-      );
-    // An explicit local false wins over active-child convenience expansion.
-    const hasStoredOpen =
-      typeof folderState[sidebarFolderStateKey("session", session.id)] ===
-      "boolean";
-    const effectivelyOpen = hasStoredOpen
-        ? open
-        : open || childActive;
-    // Read the marker during render so active voice sessions are identifiable
-    // even after navigating away from the conversation route.
-    void voiceMarkerVersion;
-    const voiceActive = isVoiceSessionActive(workspaceId, session.id);
-
-    return (
-      <div className="sidebar-session-tree" key={session.id}>
-        <div
-          className={cn(
-            "sidebar-project__session group",
-            options.ungrouped && depth === 0 && "sidebar-project__session--ungrouped",
-            depth > 0 && "sidebar-project__session--nested",
-            hasChildren && "sidebar-project__session--folder",
-            activeSessionId === session.id && "is-active",
-            selectionMode && "is-selecting",
-          )}
-        >
-          {selectionMode ? (
-            <Checkbox
-              aria-label={`选择会话 ${displayTitle}`}
-              checked={selectedSessionIds.has(session.id)}
-              onCheckedChange={() => toggleSessionSelection(session.id)}
-            />
-          ) : null}
-          {renamingSessionId === session.id ? (
-            <form
-              className="sidebar-session-rename"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void commitSessionRename(session);
-              }}
-            >
-              <Input
-                aria-label={`编辑会话名称 ${displayTitle}`}
-                autoFocus
-                disabled={renamePending}
-                maxLength={200}
-                onChange={(event) => setRenameValue(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Escape") cancelSessionRename();
-                }}
-                value={renameValue}
-              />
-              <Button
-                aria-label="保存会话名称"
-                disabled={!renameValue.trim() || renamePending}
-                size="icon-xs"
-                type="submit"
-                variant="ghost"
-              >
-                <Save className="size-3" />
-              </Button>
-              <Button
-                aria-label="取消编辑会话名称"
-                disabled={renamePending}
-                onClick={cancelSessionRename}
-                size="icon-xs"
-                type="button"
-                variant="ghost"
-              >
-                <X className="size-3" />
-              </Button>
-            </form>
-          ) : (
-            <button
-              className="sidebar-project__session-title min-w-0 flex-1 truncate text-left"
-              onClick={() => {
-                if (longPressRef.current.fired) {
-                  longPressRef.current.fired = false;
-                  return;
-                }
-                if (selectionMode) {
-                  toggleSessionSelection(session.id);
-                  return;
-                }
-                // Folder rows no longer show a collapse arrow: the whole row
-                // remains the single, quiet-line interaction target.
-                if (hasChildren) toggleSessionFolder(session.id);
-                onSelectSession(session.id, options.project);
-              }}
-              onContextMenu={(event) => {
-                if (selectionMode) return;
-                event.preventDefault();
-                setMenuOpenFor(session.id);
-              }}
-              onPointerCancel={cancelLongPress}
-              onPointerDown={beginLongPress(session.id)}
-              onPointerLeave={cancelLongPress}
-              onPointerUp={cancelLongPress}
-              type="button"
-            >
-              {getSessionActivity(session.id).unreadCompleted ? (
-                <span
-                  aria-label="模型回复已完成"
-                  className="sidebar-session__unread-dot"
-                  title="模型回复已完成"
-                />
-              ) : null}
-              {hasChildren ? (
-                effectivelyOpen ? (
-                  <FolderOpen
-                    aria-hidden="true"
-                    className="size-3.5 shrink-0"
-                  />
-                ) : (
-                  <Folder
-                    aria-hidden="true"
-                    className="size-3.5 shrink-0"
-                  />
-                )
-              ) : null}
-              <span className="min-w-0 flex-1 truncate">{displayTitle}</span>
-              {voiceActive ? <span aria-label="语音导师已开启" className="sidebar-session__voice" title="语音导师已开启">◉</span> : null}
-              {getSessionActivity(session.id).running ? (
-                <LoaderCircle
-                  aria-label="生成中"
-                  className="sidebar-session__running size-3 shrink-0 animate-spin"
-                />
-              ) : null}
-            </button>
-          )}
-          {!selectionMode && renamingSessionId !== session.id ? (
-            <>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    aria-label={
-                      session.pinned
-                        ? `取消置顶 ${displayTitle}`
-                        : `置顶 ${displayTitle}`
-                    }
-                    className={cn(
-                      "sidebar-project__pin",
-                      session.pinned && "is-pinned",
-                    )}
-                    onClick={() => onToggleSessionPin(session)}
-                    size="icon-xs"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <Pin className="size-3" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="right">
-                  {session.pinned ? "取消置顶" : "置顶会话"}
-                </TooltipContent>
-              </Tooltip>
-              <DropdownMenu
-                onOpenChange={(open) =>
-                  setMenuOpenFor(open ? session.id : null)
-                }
-                open={menuOpenFor === session.id}
-              >
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    aria-label={`更多会话操作 ${displayTitle}`}
-                    className="sidebar-project__more"
-                    size="icon-xs"
-                    variant="ghost"
-                  >
-                    <MoreHorizontal className="size-3" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent
-                  align="end"
-                  className="w-48"
-                  side="bottom"
-                >
-                  <DropdownMenuItem onSelect={() => onShareSession(session)}>
-                    <Share2 className="size-3.5" />
-                    分享
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => beginSessionRename(session)}
-                  >
-                    <Pencil className="size-3.5" />
-                    重命名
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => onToggleSessionPin(session)}
-                  >
-                    <Pin
-                      className={cn(
-                        "size-3.5",
-                        session.pinned && "sidebar-project__pin-icon--pinned",
-                      )}
-                    />
-                    {session.pinned ? "取消置顶" : "置顶聊天"}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => onToggleSessionArchive(session)}
-                  >
-                    <Archive className="size-3.5" />
-                    {session.status === "archived" ? "恢复" : "归档"}
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuSub>
-                    <DropdownMenuSubTrigger
-                      disabled={!options.project && projects.length === 0}
-                    >
-                      <Folder className="size-3.5" />
-                      移动到
-                    </DropdownMenuSubTrigger>
-                    <DropdownMenuPortal>
-                      <DropdownMenuSubContent
-                        className="max-h-[min(20rem,var(--radix-dropdown-menu-content-available-height))] w-60 max-w-[calc(100vw-2rem)] overflow-x-hidden overflow-y-auto"
-                        onTouchMove={withScrollLockBypass()}
-                        onWheel={withScrollLockBypass()}
-                      >
-                        {options.project ? (
-                          <>
-                            <DropdownMenuItem
-                              onSelect={() => onMoveSession(session.id)}
-                            >
-                              <Folder className="size-3.5" />
-                              移出项目
-                            </DropdownMenuItem>
-                            {projects.length > 1 ? <DropdownMenuSeparator /> : null}
-                          </>
-                        ) : null}
-                        {projects
-                          .filter((entry) => entry.id !== options.project?.id)
-                          .map((target) => (
-                            <DropdownMenuItem
-                              key={target.id}
-                              onSelect={() => onMoveSession(session.id, target.id)}
-                              title={target.title}
-                            >
-                              <Folder className="size-3.5" />
-                              <span className="min-w-0 truncate">{target.title}</span>
-                            </DropdownMenuItem>
-                          ))}
-                      </DropdownMenuSubContent>
-                    </DropdownMenuPortal>
-                  </DropdownMenuSub>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    onSelect={() => onRequestSessionDeletion(session)}
-                    variant="destructive"
-                  >
-                    <Trash2 className="size-3.5" />
-                    删除会话
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </>
-          ) : null}
-        </div>
-        {hasChildren && effectivelyOpen
-          ? children.map((child, index) =>
-              renderSessionRow(child, {
-                project: options.project,
-                ungrouped: options.ungrouped,
-                depth: depth + 1,
-                legacyBranchIndex: legacyBranchSiblingIndex(children, index),
-              }),
-            )
-          : null}
-      </div>
-    );
-  }
-
-  return (
-    <section
-      className="sidebar-recent sidebar-sessions mt-5 border-t pt-4"
-      aria-label="会话"
-    >
-      <div className="sidebar-sessions__heading group flex items-center justify-between px-3">
-        <p className="text-sm font-bold text-foreground">会话</p>
-        <div className="sidebar-sessions__header-actions">
-          {folderEntries.length ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  aria-label={
-                    allFoldersCollapsed ? "展开所有文件夹" : "折叠所有文件夹"
-                  }
-                  className="sidebar-sessions__folders-trigger"
-                  onClick={toggleAllFolders}
-                  size="icon-xs"
-                  variant="ghost"
-                >
-                  <ChevronDown
-                    className={cn(
-                      "size-3.5 transition-transform",
-                      allFoldersCollapsed && "-rotate-90",
-                    )}
-                  />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="right">
-                {allFoldersCollapsed ? "展开所有文件夹" : "折叠所有文件夹"}
-              </TooltipContent>
-            </Tooltip>
-          ) : null}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                aria-label={searchOpen ? "关闭会话搜索" : "搜索会话"}
-                className="sidebar-sessions__search-trigger"
-                onClick={() => {
-                  setSearchOpen((open) => !open);
-                }}
-                size="icon-xs"
-                variant="ghost"
-              >
-                <Search className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right">搜索文件、会话和消息</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                aria-label={selectionMode ? "退出批量管理" : "批量管理"}
-                onClick={() => {
-                  setSelectionMode((active) => {
-                    const next = !active;
-                    if (next) {
-                      setSelectedSessionIds(
-                        new Set(
-                          allSessions.slice(0, 100).map((session) => session.id),
-                        ),
-                      );
-                      setSelectedProjectIds(
-                        new Set(projects.map((project) => project.id)),
-                      );
-                    } else {
-                      setSelectedSessionIds(new Set());
-                      setSelectedProjectIds(new Set());
-                    }
-                    return next;
-                  });
-                }}
-                size="icon-xs"
-                variant={selectionMode ? "secondary" : "ghost"}
-              >
-                <ListChecks className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right">批量管理</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                aria-label="新建对话"
-                onClick={() => void onCreateConversation()}
-                size="icon-xs"
-                variant="ghost"
-              >
-                <Plus className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right">新建对话</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                aria-label="新建项目"
-                onClick={() => setCreatingProject((open) => !open)}
-                size="icon-xs"
-                variant="ghost"
-              >
-                <FolderPlus className="size-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="right">新建项目</TooltipContent>
-          </Tooltip>
-        </div>
-      </div>
-      <WorkspaceSearchDialog open={searchOpen} onOpenChange={setSearchOpen} workspaceId={workspaceId} />
-      {creatingProject ? (
-        <form
-          className="sidebar-sessions__project-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void addProject();
-          }}
-        >
-          <Input
-            aria-label="项目名称"
-            autoFocus
-            onChange={(event) => setProjectName(event.currentTarget.value)}
-            placeholder="项目名称"
-            value={projectName}
-          />
-          <Button aria-label="确认新建项目" size="icon-xs" type="submit">
-            <Plus className="size-3.5" />
-          </Button>
-        </form>
-      ) : null}
-      <div className="sidebar-sessions__list mt-2 space-y-2">
-        {visibleProjects.map((project) => {
-          const open = projectFolderOpen[project.id] ?? false;
-          return (
-            <section className="sidebar-project" key={project.id}>
-              <div
-                className={cn(
-                  "sidebar-project__heading group",
-                  selectedProjectId === project.id && "is-current",
-                  selectionMode && "is-selecting",
-                )}
-              >
-                {selectionMode ? (
-                  <Checkbox
-                    aria-label={`选择项目 ${project.title}`}
-                    checked={selectedProjectIds.has(project.id)}
-                    className="sidebar-project__select"
-                    onCheckedChange={() => toggleProjectSelection(project)}
-                  />
-                ) : null}
-                <button
-                  aria-expanded={open}
-                  aria-label={
-                    open
-                      ? `折叠文件夹 ${project.title}`
-                      : `展开文件夹 ${project.title}`
-                  }
-                  aria-pressed={selectedProjectId === project.id}
-                  className="sidebar-project__header"
-                  onClick={() => {
-                    if (selectionMode) {
-                      toggleProjectSelection(project);
-                      return;
-                    }
-                    onSelectProject(project.id);
-                    onToggleFolder("project", project.id, !open);
-                  }}
-                  type="button"
-                >
-                  {open ? (
-                    <FolderOpen
-                      aria-hidden="true"
-                      className="size-3.5"
-                    />
-                  ) : (
-                    <Folder aria-hidden="true" className="size-3.5" />
-                  )}
-                  <span>{project.title}</span>
-                  {project.status === "archived" ? <small>已归档</small> : null}
-                </button>
-                {!selectionMode && project.status !== "archived" ? (
-                  <Button
-                    aria-label={`在文件夹 ${project.title} 中新建会话`}
-                    className="sidebar-project__new-session"
-                    disabled={creatingConversation}
-                    onClick={() => {
-                      onSelectProject(project.id);
-                      onToggleFolder("project", project.id, true);
-                      void onCreateConversation(project.id);
-                    }}
-                    size="icon-xs"
-                    title="新建会话"
-                    type="button"
-                    variant="ghost"
-                  >
-                    <Plus className="size-3.5" />
-                  </Button>
-                ) : null}
-                {!selectionMode ? (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      aria-label={`管理项目 ${project.title}`}
-                      className="sidebar-project__delete-project"
-                      size="icon-xs"
-                      type="button"
-                      variant="ghost"
-                    >
-                      <MoreHorizontal className="size-3" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    align="end"
-                    className="w-40"
-                    side="right"
-                  >
-                    {project.status !== "archived" ? (
-                      <DropdownMenuItem
-                        onSelect={() => onRenameProject(project)}
-                      >
-                        <Pencil className="size-3.5" />
-                        改名
-                      </DropdownMenuItem>
-                    ) : null}
-                    <DropdownMenuItem
-                      onSelect={() => onToggleProjectArchive(project)}
-                    >
-                      <Archive className="size-3.5" />
-                      {project.status === "archived" ? "恢复项目" : "归档项目"}
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onSelect={() => onRequestProjectDeletion(project)}
-                      variant="destructive"
-                    >
-                      <Trash2 className="size-3.5" />
-                      永久删除
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-                ) : null}
-              </div>
-              {open && project.status !== "archived" ? (
-                <div className="sidebar-project__sessions">
-                  {project.sessions.length ? (
-                    project.sessions.map((session) =>
-                      renderSessionRow(session, { project }),
-                    )
-                  ) : (
-                    <button
-                      className="sidebar-project__empty"
-                      onClick={() => {
-                        onSelectProject(project.id);
-                        void onCreateConversation(project.id);
-                      }}
-                      type="button"
-                    >
-                      新建此项目的对话
-                    </button>
-                  )}
-                </div>
-              ) : null}
-            </section>
-          );
-        })}
-        {visibleUngroupedSessions.length ? (
-          <section aria-label="最近" className="sidebar-sessions__ungrouped">
-            <h3 className="sidebar-sessions__recent-heading">
-              <button
-                aria-controls={recentSessionsId}
-                aria-expanded={recentOpen}
-                aria-label={recentOpen ? "折叠最近会话" : "展开最近会话"}
-                className="sidebar-sessions__recent-toggle"
-                onClick={() => onToggleFolder("section", "recent", !recentOpen)}
-                type="button"
-              >
-                <span>最近</span>
-                <ChevronDown
-                  aria-hidden="true"
-                  className={cn(
-                    "sidebar-sessions__recent-chevron size-3.5",
-                    !recentOpen && "-rotate-90",
-                  )}
-                />
-              </button>
-            </h3>
-            <div
-              className="sidebar-sessions__recent-list"
-              hidden={!recentOpen}
-              id={recentSessionsId}
-            >
-              {visibleUngroupedSessions.map((session) =>
-                renderSessionRow(session, { ungrouped: true }),
-              )}
-            </div>
-          </section>
-        ) : null}
-      </div>
-      {selectionMode ? (
-        <div className="sidebar-sessions__batch-bar">
-          <div>
-            <strong>{selectedCount}</strong>
-            <span> 个已选</span>
-            {selectedProjects.length ? (
-              <span className="sidebar-sessions__batch-detail">
-                {" "}
-                · {selectedProjects.length} 项目
-                {selectedStandaloneSessions.length
-                  ? ` · ${selectedStandaloneSessions.length} 会话`
-                  : ""}
-              </span>
-            ) : null}
-          </div>
-          <Button
-            onClick={() => {
-              const allVisibleSessionsSelected = [...visibleSessionIds].every(
-                (id) => selectedSessionIds.has(id),
-              );
-              const allVisibleProjectsSelected = [...visibleProjectIds].every(
-                (id) => selectedProjectIds.has(id),
-              );
-              const allSelected =
-                allVisibleSessionsSelected && allVisibleProjectsSelected;
-              if (allSelected) {
-                setSelectedSessionIds((current) => {
-                  const next = new Set(current);
-                  visibleSessionIds.forEach((id) => next.delete(id));
-                  return next;
-                });
-                setSelectedProjectIds((current) => {
-                  const next = new Set(current);
-                  visibleProjectIds.forEach((id) => next.delete(id));
-                  return next;
-                });
-              } else {
-                setSelectedSessionIds((current) => {
-                  const next = new Set(current);
-                  for (const id of visibleSessionIds) {
-                    if (next.size >= 100) break;
-                    next.add(id);
-                  }
-                  return next;
-                });
-                setSelectedProjectIds((current) => {
-                  const next = new Set(current);
-                  visibleProjectIds.forEach((id) => next.add(id));
-                  return next;
-                });
-              }
-            }}
-            size="xs"
-            variant="ghost"
-          >
-            {[...visibleSessionIds].every((id) => selectedSessionIds.has(id)) &&
-            [...visibleProjectIds].every((id) => selectedProjectIds.has(id))
-              ? "取消本页"
-              : "全选可见"}
-          </Button>
-          <Button
-            disabled={!selectedCount}
-            onClick={requestSelectedDeletion}
-            size="xs"
-            variant="destructive"
-          >
-            <Trash2 className="size-3" />
-            删除
-          </Button>
-        </div>
-      ) : null}
-    </section>
-  );
-}
 
 function UserMenu({
   mobile = false,
@@ -3068,7 +1927,7 @@ function UserMenu({
               {username}
             </span>
             <span
-              className="block truncate text-[11px] font-normal text-muted-foreground"
+              className="block truncate text-xs font-normal text-muted-foreground"
               title={workspaceName}
             >
               {workspaceName}
@@ -3176,21 +2035,7 @@ function MobileNavDrawer({
     if (open || dragging) setContentMounted(true);
   }, [dragging, open]);
 
-  useEffect(() => {
-    if (!open) return;
-    const previous = document.activeElement;
-    panelRef.current?.focus({ preventScroll: true });
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onOpenChange(false);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      if (previous instanceof HTMLElement) {
-        previous.focus({ preventScroll: true });
-      }
-    };
-  }, [open, onOpenChange]);
+  useModalDrawerFocus(panelRef, open, handleNavigate);
 
   return (
     <>
@@ -3508,15 +2353,17 @@ export function ContextRail({
   }>();
   const [selectionExplanation, setSelectionExplanation] =
     useState<SelectionExplanationOpenDetail | null>(null);
+  const [contentMounted, setContentMounted] = useState(!collapsed);
+  useEffect(() => { if (!collapsed) setContentMounted(true); }, [collapsed]);
   const railProjects = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "projects"),
     queryFn: () => listProjects(),
     staleTime: 30_000,
   });
-  const railSessions = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "sessions"),
-    queryFn: listSessions,
-    staleTime: 30_000,
+  const railCounts = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "sessions", "counts"),
+    queryFn: ({ signal }) => getSessionCounts({ signal }),
+    staleTime: 30_000, enabled: !collapsed && !pathname.includes("/chat/") && !pathname.includes("/settings/"),
   });
   const isSettings = pathname.includes("/settings/");
   const isMemory = pathname.includes("/memory");
@@ -3527,7 +2374,8 @@ export function ContextRail({
   const sessionId =
     new URLSearchParams(search).get("sidebarSession") ??
     pathname.match(/\/chat\/([^/]+)/)?.[1];
-  const activeSession = railSessions.data?.find((item) => item.id === sessionId);
+  const railSession = useSessionDetail(workspaceId, sessionId);
+  const activeSession = railSession.data;
   const creationParentSessionId = activeSession?.parent_session_id ?? sessionId;
   const showActivity = [
     "/home",
@@ -3552,21 +2400,22 @@ export function ContextRail({
             ],
             [
               "Sessions",
-              `${railSessions.data?.filter((item) => item.status !== "archived").length ?? 0} 个活跃会话`,
+              `${railCounts.data?.active ?? "—"} 个活跃会话`,
             ],
             [
               "Memory",
-              `${railSessions.data?.filter((item) => item.memory_enabled).length ?? 0} 个会话已启用`,
+              `${railCounts.data?.memory_enabled ?? "—"} 个会话已启用`,
             ],
             ["Scope", sessionId ? "当前会话" : "当前工作区"],
           ],
-    [isSettings, railProjects.data, railSessions.data, sessionId],
+    [isSettings, railProjects.data, railCounts.data, sessionId],
   );
 
   useEffect(() => {
-    const session = railSessions.data?.find((item) => item.id === sessionId);
+    const session = railSession.data;
+    const draftProjectId = new URLSearchParams(search).get("project");
     const project = railProjects.data?.find(
-      (item) => item.id === session?.project_id,
+      (item) => item.id === (session?.project_id ?? (sessionId === "new" ? draftProjectId : undefined)),
     );
     setProjectContext({
       project: project
@@ -3581,7 +2430,7 @@ export function ContextRail({
         : undefined,
       sessionId,
     });
-  }, [railProjects.data, railSessions.data, sessionId]);
+  }, [railProjects.data, railSession.data, sessionId, search]);
 
   useEffect(() => {
     const update = (event: Event) => {
@@ -3661,7 +2510,7 @@ export function ContextRail({
       // Collapsed rail stays mounted for CSS slide; inert keeps it out of tab order.
       inert={collapsed || undefined}
     >
-      {(isGoalClarify || isGoalMode) && !selectionExplanation ? (
+      {contentMounted && ((isGoalClarify || isGoalMode) && !selectionExplanation ? (
         <GoalGraphPreviewRail />
       ) : isGraph ? (
         <GraphWorkspaceRail />
@@ -3676,7 +2525,7 @@ export function ContextRail({
           workspaceId={workspaceId}
         />
       ) : isMemory ? (
-        <MemoryProcessRail workspaceId={workspaceId} />
+        <Suspense fallback={<div role="status">正在打开导师过程…</div>}><MemoryProcessRail workspaceId={workspaceId} /></Suspense>
       ) : showActivity ? (
         <ActivityRail />
       ) : (
@@ -3694,7 +2543,7 @@ export function ContextRail({
           <dl className="space-y-3">
             {items.map(([label, value]) => (
               <div className="border-b pb-3" key={label}>
-                <dt className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                <dt className="text-xs uppercase tracking-wide text-muted-foreground">
                   {label}
                 </dt>
                 <dd className="mt-1 text-sm font-medium">{value}</dd>
@@ -3712,7 +2561,7 @@ export function ContextRail({
             </p>
           </div>
         </div>
-      )}
+      ))}
     </aside>
   );
 }
@@ -3759,12 +2608,26 @@ function ChatGraphRail({
   useEffect(() => {
     setSideConversationFocusId(undefined);
   }, [sessionId]);
-  const { binding: sessionBinding, boundNodeId, bindingPending, bindGraph: bindSessionGraph, bindNode } = useSessionGraphBinding(workspaceId, sessionId);
+  const { binding: sessionBinding, boundNodeId } = useSessionGraphBinding(workspaceId, sessionId);
+  const [bookshelfOpen, setBookshelfOpen] = useState(false);
+  useEffect(() => {
+    const opened = (event: Event) => {
+      if ((event as CustomEvent<{ workspaceId: string }>).detail?.workspaceId === workspaceId) setBookshelfOpen(false);
+    };
+    window.addEventListener("learngraph:graph-folder-selected", opened);
+    return () => window.removeEventListener("learngraph:graph-folder-selected", opened);
+  }, [workspaceId]);
+  useEffect(() => {
+    setBookshelfOpen(false);
+    if (session?.graph_id && sessionId && sessionId !== "new") {
+      rememberGraphVisit(workspaceId, session.graph_id, sessionId);
+      if (session.current_node_id) rememberGraphVisit(workspaceId, `${session.graph_id}/${session.current_node_id}`, sessionId);
+    }
+  }, [workspaceId, sessionId, session?.graph_id, session?.current_node_id]);
   const binding = sessionBinding ?? (!session && project?.graphId ? {
     graphId: project.graphId,
     graphTitle: project.graphTitle || project.title,
   } : undefined);
-  const isLearning = view === "learning";
 
   const settings = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "settings"),
@@ -3851,179 +2714,79 @@ function ChatGraphRail({
     if (selectionExplanation) setView("conversation");
   }, [selectionExplanation]);
 
-  const bindGraph = (graph: GraphSummary) => {
-    if (!sessionId || !session) {
-      window.dispatchEvent(new CustomEvent("learngraph:open-learning-project", {
-        detail: { graphId: graph.id, title: graph.title },
-      }));
-      return;
-    }
-    void bindSessionGraph(graph);
+  const openGraph = (graph: GraphSummary) => {
+    window.dispatchEvent(new CustomEvent("learngraph:open-learning-project", {
+      detail: { graphId: graph.id, title: graph.title },
+    }));
   };
 
   return (
-    <div className="chat-graph-rail">
-      <div
-        className="chat-graph-rail__switch"
-        role="tablist"
-        aria-label="右侧工作区"
-      >
-        <Button
-          aria-selected={isLearning}
-          onClick={() => setView("learning")}
-          role="tab"
-          size="xs"
-          variant="ghost"
-        >
-          当前学习
-        </Button>
-        <Button
-          aria-selected={view === "capability"}
-          onClick={() => setView("capability")}
-          role="tab"
-          size="xs"
-          variant="ghost"
-        >
-          能力成长
-        </Button>
-        <Button
-          aria-selected={view === "conversation"}
-          onClick={() => setView("conversation")}
-          role="tab"
-          size="xs"
-          variant="ghost"
-        >
-          侧边对话
-        </Button>
-        <Button
-          aria-selected={view === "files"}
-          onClick={() => setView("files")}
-          role="tab"
-          size="xs"
-          variant="ghost"
-        >
-          会话文件
-        </Button>
-        <Button
-          aria-disabled={!voiceDebugEnabled || undefined}
-          aria-selected={view === "voice"}
-          disabled={!voiceDebugEnabled}
-          onClick={() => setView("voice")}
-          role="tab"
-          size="xs"
-          title={voiceDebugEnabled ? "查看语音延迟" : "请在设置中启用语音调试"}
-          variant="ghost"
-        >
-          语音延迟
-        </Button>
-        <Button
-          aria-label="新建侧边对话"
-          className="chat-graph-rail__add"
-          disabled={creatingSideConversation}
-          onClick={() => void createSideConversation()}
-          size="icon-xs"
-          title="新建侧边对话"
-          variant="ghost"
-        >
-          {creatingSideConversation ? (
-            <LoaderCircle className="size-3.5 animate-spin" />
-          ) : (
-            <Plus className="size-3.5" />
-          )}
+    <Tabs className="chat-graph-rail" value={view} onValueChange={value => setView(value as typeof view)}>
+      <div className="chat-graph-rail__switch">
+        <TabsList aria-label="右侧工作区" className="chat-graph-rail__tabs" variant="line">
+          <TabsTrigger value="learning">当前学习</TabsTrigger>
+          <TabsTrigger value="conversation">侧边对话</TabsTrigger>
+          <TabsTrigger value="files">会话文件</TabsTrigger>
+          {view === "capability" ? <TabsTrigger value="capability">能力成长</TabsTrigger> : null}
+          {voiceDebugEnabled ? <TabsTrigger value="voice">语音延迟</TabsTrigger> : null}
+        </TabsList>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild><Button size="icon-xs" variant="ghost" aria-label="更多工作区"><MoreHorizontal className="size-3.5" /></Button></DropdownMenuTrigger>
+          <DropdownMenuContent align="end"><DropdownMenuItem onSelect={() => setView("capability")}>能力成长</DropdownMenuItem></DropdownMenuContent>
+        </DropdownMenu>
+        <Button aria-label="新建侧边对话" className="chat-graph-rail__add" disabled={creatingSideConversation} onClick={() => void createSideConversation()} size="icon-xs" title="新建侧边对话" variant="ghost">
+          {creatingSideConversation ? <LoaderCircle className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
         </Button>
       </div>
-      {view === "conversation" ? (
-        <SideConversationRail currentSessionId={sessionId} focusSessionId={sideConversationFocusId}
-          selectionDetail={selectionExplanation} creationParentSessionId={creationParentSessionId ?? sessionId}
-          onCloseSelection={onCloseExplanation} workspaceId={workspaceId} />
-      ) : view === "files" ? (
-        <SessionFilePreviewRail
-          sessionId={sessionId}
-          workspaceId={workspaceId}
-        />
-      ) : view === "voice" ? (
-        <VoiceLatencyRail />
-      ) : view === "learning" ? (
-        binding ? (
-          <BoundGraphRail
-            graphId={binding.graphId}
-            onBindNode={session ? bindNode : undefined}
-            selectedNodeId={boundNodeId ?? undefined}
-            sessionId={sessionId}
-            title={binding.graphTitle}
-            workspaceId={workspaceId}
-          />
-        ) : (
-          <ProjectBookshelf
-            bindingPending={bindingPending}
-            onBind={bindGraph}
-            project={project}
-            workspaceId={workspaceId}
-          />
-        )
-      ) : (
-        <CapabilityGraphRail workspaceId={workspaceId} />
-      )}
-    </div>
+      <TabsContent value="conversation" className="chat-graph-rail__panel">
+        <Suspense fallback={<div role="status">正在打开侧边对话…</div>}><SideConversationRail currentSessionId={sessionId} focusSessionId={sideConversationFocusId} selectionDetail={selectionExplanation} creationParentSessionId={creationParentSessionId ?? sessionId} onCloseSelection={onCloseExplanation} workspaceId={workspaceId} /></Suspense>
+      </TabsContent>
+      <TabsContent value="files" className="chat-graph-rail__panel"><Suspense fallback={<div role="status">正在打开会话文件…</div>}><SessionFilePreviewRail sessionId={sessionId} workspaceId={workspaceId} /></Suspense></TabsContent>
+      {voiceDebugEnabled ? <TabsContent value="voice" className="chat-graph-rail__panel"><Suspense fallback={null}><VoiceLatencyRail /></Suspense></TabsContent> : null}
+      <TabsContent value="learning" className="chat-graph-rail__panel">
+        {binding && !bookshelfOpen ? <BoundGraphRail graphId={binding.graphId} boundNodeId={boundNodeId ?? undefined} sessionId={sessionId} title={binding.graphTitle} folderTitle={project?.title} onSwitchGraph={() => setBookshelfOpen(true)} workspaceId={workspaceId} /> : <ProjectBookshelf onOpen={openGraph} onBack={binding ? () => setBookshelfOpen(false) : undefined} workspaceId={workspaceId} />}
+      </TabsContent>
+      <TabsContent value="capability" className="chat-graph-rail__panel"><CapabilityGraphRail workspaceId={workspaceId} /></TabsContent>
+    </Tabs>
   );
 }
 
-function ProjectBookshelf({
-  bindingPending,
-  project,
-  onBind,
-  workspaceId,
-}: {
-  project?: SidebarProject;
-  bindingPending?: boolean;
-  onBind: (graph: GraphSummary) => void;
+function ProjectBookshelf({ onOpen, onBack, workspaceId }: {
+  onOpen: (graph: GraphSummary) => void;
+  onBack?: () => void;
   workspaceId: string;
 }) {
-  const graphs = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "graphs"),
-    queryFn: listGraphs,
-    staleTime: 30_000,
-  });
-  const books = graphs.data ?? [];
-  return (
-    <section
-      aria-label="图谱书架"
-      className="project-bookshelf chat-graph-rail__canvas"
-    >
-      <div className="project-bookshelf__intro">
-        <BookOpen className="size-4" />
-        <div>
-          <p className="text-sm font-semibold">图谱书架</p>
-          <p>
-            {project
-              ? `当前会话尚未绑定图谱${project.graphId ? `；文件夹「${project.title}」已有默认图谱` : ""}`
-              : "当前会话尚未绑定图谱"}
-          </p>
-        </div>
-      </div>
-      <div className="project-bookshelf__list">
-        {books.map((graph) => (
-          <button disabled={bindingPending} key={graph.id} onClick={() => onBind(graph)} type="button">
-            <span className="project-bookshelf__spine">
-              <Network className="size-3.5" />
-            </span>
-            <span>
-              <strong>{graph.title}</strong>
-              <small>
-                {graph.status === "published"
-                  ? "已发布 · 点击绑定并预览"
-                  : "候选图谱 · 点击绑定并预览"}
-              </small>
-            </span>
-            <ChevronRight className="size-3.5" />
-          </button>
-        ))}
-      </div>
-      <p className="project-bookshelf__hint">
-        这里的选择只修改当前会话；文件夹默认图谱不会被改动。
-      </p>
-    </section>
-  );
+  const [search, setSearch] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const graphs = useQuery({ queryKey: workspaceQueryKey(workspaceId, "graphs"), queryFn: listGraphs, staleTime: 30_000 });
+  const books = [...(graphs.data ?? [])].sort((a, b) =>
+    (graphVisit(workspaceId, b.id)?.openedAt ?? 0) - (graphVisit(workspaceId, a.id)?.openedAt ?? 0)
+    || a.title.localeCompare(b.title));
+  const query = search.trim().toLocaleLowerCase();
+  const matching = books.filter(graph => graph.title.toLocaleLowerCase().includes(query));
+  const visible = query || showAll ? matching : matching.slice(0, 6);
+  return <section aria-label="图谱书架" className="project-bookshelf chat-graph-rail__canvas">
+    <div className="graph-rail-heading project-bookshelf__heading">
+      <div className="project-bookshelf__identity"><strong>图谱书架</strong>{graphs.isSuccess ? <span>{books.length} 个图谱</span> : null}</div>
+      {onBack ? <Button size="xs" variant="ghost" onClick={onBack}>返回当前学习</Button> : null}
+    </div>
+    <div className="project-bookshelf__search">
+      <Search aria-hidden="true" />
+      <Input aria-label="搜索图谱" placeholder="搜索图谱" value={search} onChange={event => setSearch(event.target.value)} />
+      {search ? <Button aria-label="清除图谱搜索" size="icon-xs" variant="ghost" onClick={() => setSearch("")}><X aria-hidden="true" className="size-3.5" /></Button> : null}
+    </div>
+    {graphs.isPending ? <p className="project-bookshelf__message" role="status"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在读取图谱…</p> : null}
+    {graphs.isError ? <div className="project-bookshelf__message" role="alert"><span>图谱读取失败</span><Button size="xs" variant="outline" onClick={() => void graphs.refetch()}>重试</Button></div> : null}
+    <div className="project-bookshelf__list">
+      {visible.map(graph => <button key={graph.id} onClick={() => onOpen(graph)} type="button" aria-label={`打开图谱文件夹 ${graph.title}`}>
+        <span aria-hidden="true" className="project-bookshelf__icon"><Network /></span>
+        <span className="project-bookshelf__content"><strong title={graph.title}>{graph.title}</strong><small>{graph.status === "published" ? "已发布" : "候选图谱"}</small></span>
+        <ChevronRight aria-hidden="true" className="project-bookshelf__chevron size-3.5" />
+      </button>)}
+    </div>
+    {!graphs.isPending && !graphs.isError && !visible.length ? <p className="project-bookshelf__message" role="status">{query ? "没有匹配的图谱，试试其他关键词" : "暂无图谱"}</p> : null}
+    {!query && matching.length > 6 ? <Button className="project-bookshelf__more" aria-expanded={showAll} size="xs" variant="ghost" onClick={() => setShowAll(value => !value)}>{showAll ? "收起列表" : `查看全部 ${matching.length} 个图谱`}</Button> : null}
+  </section>;
 }
 
 function toRailKnowledgeGraph(
@@ -4087,15 +2850,19 @@ function toRailKnowledgeGraph(
 }
 
 function BoundGraphRail({
+  boundNodeId,
   graphId,
-  onBindNode,
+  folderTitle,
+  onSwitchGraph,
   selectedNodeId: requestedNodeId,
   sessionId,
   title,
   workspaceId,
 }: {
+  boundNodeId?: string;
   graphId: string;
-  onBindNode?: (nodeId: string | null) => Promise<boolean>;
+  folderTitle?: string;
+  onSwitchGraph?: () => void;
   selectedNodeId?: string;
   sessionId?: string;
   title: string;
@@ -4109,6 +2876,9 @@ function BoundGraphRail({
     enabled: Boolean(graphId),
   });
   const [selectedNodeId, setSelectedNodeId] = useState<string>();
+  const [nodeSearch, setNodeSearch] = useState("");
+  const canvasApi = useRef<KnowledgeGraphCanvasApi | null>(null);
+  const receiveCanvasApi = useCallback((api: KnowledgeGraphCanvasApi) => { canvasApi.current = api; }, []);
   const [editing, setEditing] = useState(false);
   const draftRef = useRef({ label: "", description: "" });
   const [explorePanelOpen, setExplorePanelOpen] = useState(false);
@@ -4118,27 +2888,29 @@ function BoundGraphRail({
   }>();
 
   useEffect(() => {
-    setSelectedNodeId(requestedNodeId);
+    setSelectedNodeId(boundNodeId ?? requestedNodeId);
+    setNodeSearch("");
     setEditing(false);
     setExplorePanelOpen(false);
     setValidation(undefined);
-  }, [graphId, requestedNodeId]);
+  }, [boundNodeId, graphId, requestedNodeId, sessionId]);
 
   const graph = graphQuery.data;
 
   useEffect(() => {
     if (!graph) return;
-    if (requestedNodeId) return;
+    if (boundNodeId || requestedNodeId) return;
     if (selectedNodeId && graph.nodes.some((node) => node.id === selectedNodeId))
       return;
     const preferred = pickDefaultLearningNode(graph);
     if (!preferred) return;
     setSelectedNodeId(preferred.id);
-  }, [graph, graphId, requestedNodeId, selectedNodeId]);
+  }, [boundNodeId, graph, graphId, requestedNodeId, selectedNodeId]);
 
   const selectedNode =
     graph?.nodes.find((node) => node.id === selectedNodeId) ??
     (graph ? pickDefaultLearningNode(graph) : undefined);
+  const boundNode = graph?.nodes.find((node) => node.id === boundNodeId);
   const effectiveNodeId = selectedNodeId ?? selectedNode?.id;
   const questionsQuery = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "node-questions", graphId, effectiveNodeId),
@@ -4161,10 +2933,13 @@ function BoundGraphRail({
         : { ...current, [effectiveNodeId]: next },
     );
   }, [effectiveNodeId, questionsQuery.data]);
+  // Keep every branch in the rail; selection only controls the inspector.
   const railGraph = useMemo(
     () => (graph ? toRailKnowledgeGraph(graph, exploreCounts) : undefined),
     [exploreCounts, graph],
   );
+  const searchMatches = useMemo(() => nodeSearch.trim() ? graph?.nodes.filter(node =>
+    node.label.toLocaleLowerCase().includes(nodeSearch.trim().toLocaleLowerCase())) ?? [] : [], [graph, nodeSearch]);
   // Same query key as chat completion invalidation so "未深入" flips live.
   const questions = questionsQuery.data ?? [];
 
@@ -4339,36 +3114,19 @@ function BoundGraphRail({
       })()
     : undefined;
 
-  async function activateNode(
-    node: Pick<GraphNode, "id" | "label">,
-    options: { learningPackage?: boolean } = {},
-  ) {
-    if (onBindNode && !(await onBindNode(node.id))) return false;
-    setSelectedNodeId(node.id);
-    rememberLastLearnedNode(graphId, node.id);
-    publishLearningNodeContext({
-      graphId,
-      nodeId: node.id,
-      nodeLabel: node.label,
-      sessionId,
-      learningPackage: options.learningPackage,
-    });
-    return true;
-  }
-
-  async function askNode(question: string) {
+  function askNode(question: string, graphAction?: "propose_update") {
     if (!selectedNode) return;
-    if (!(await activateNode(selectedNode))) return;
-    window.dispatchEvent(
-      new CustomEvent("learngraph:compose", { detail: { content: question } }),
-    );
+    window.dispatchEvent(new CustomEvent("learngraph:open-learning-project", { detail: {
+      graphId, title: graph?.title ?? title, nodeId: selectedNode.id, nodeLabel: selectedNode.label,
+      prompt: question, graphAction,
+    } }));
   }
 
   async function studyNode() {
     if (!selectedNode) return;
-    if (!(await activateNode(selectedNode, { learningPackage: true }))) return;
-    // 学习内容和追问必须留在同一个对话画布中。由 shell 创建/复用会话，
-    // ChatCanvasPage 会在收到 learningNode 后挂载阶段式学习包预览。
+    rememberLastLearnedNode(graphId, selectedNode.id);
+    // Submit through the existing pendingPrompt route contract, not a draft-only
+    // node selection. Preview clicks must never publish this intent.
     window.dispatchEvent(
       new CustomEvent("learngraph:open-learning-project", {
         detail: {
@@ -4376,8 +3134,8 @@ function BoundGraphRail({
           title: graph?.title ?? selectedNode.label,
           nodeId: selectedNode.id,
           nodeLabel: selectedNode.label,
-          learningPackage: true,
-          prompt: `请围绕学习节点「${selectedNode.label}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+          prompt: `什么是 ${selectedNode.label}？`,
+          intent: "study",
         },
       }),
     );
@@ -4397,7 +3155,7 @@ function BoundGraphRail({
       toast.message("当前没有更合适的下一个节点。");
       return;
     }
-    if (!(await activateNode(next, { learningPackage: true }))) return;
+    rememberLastLearnedNode(graphId, next.id);
     window.dispatchEvent(
       new CustomEvent("learngraph:open-learning-project", {
         detail: {
@@ -4405,8 +3163,8 @@ function BoundGraphRail({
           title: graph?.title ?? next.label,
           nodeId: next.id,
           nodeLabel: next.label,
-          learningPackage: true,
-          prompt: `请围绕学习节点「${next.label}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+          prompt: `什么是 ${next.label}？`,
+          intent: "study",
         },
       }),
     );
@@ -4424,7 +3182,6 @@ function BoundGraphRail({
 
   async function splitNode() {
     if (!selectedNode) return;
-    if (!(await activateNode(selectedNode))) return;
     const childHint = childNodes.length
       ? `已有下级：${childNodes
           .slice(0, 8)
@@ -4436,16 +3193,7 @@ function BoundGraphRail({
       `在保持教学树 contains 结构的前提下，增加 2～5 个更具体的子概念/练习节点，` +
       `或修正本节点定义；与现有概念去重。${childHint}` +
       `输出需进入图谱变更审核，不要声称已写入正式图谱。`;
-    window.dispatchEvent(
-      new CustomEvent("learngraph:compose", {
-        detail: {
-          content: prompt,
-          autoSend: true,
-          graphAction: "propose_update",
-        },
-      }),
-    );
-    toast.success(`已发起「${selectedNode.label}」拆分变更`);
+    askNode(prompt, "propose_update");
   }
 
   function toggleMastered() {
@@ -4459,22 +3207,46 @@ function BoundGraphRail({
       aria-label={`${title} 右侧图谱`}
       className="bound-graph-rail chat-graph-rail__canvas"
     >
-      <Suspense fallback={null}><KnowledgeGraph
+      <div className="graph-rail-navigation">
+        <div className="graph-rail-heading">
+          <div className="graph-rail-heading__identity"><strong title={graph.title || title}>{graph.title || title}</strong>
+            {folderTitle ? <span title={folderTitle}>文件夹：{folderTitle}</span> : null}</div>
+          {onSwitchGraph ? <Button size="xs" variant="ghost" onClick={onSwitchGraph}>切换图谱</Button> : null}
+        </div>
+        <div className="graph-rail-navigation__tools">
+          <Input aria-label="搜索图谱节点" placeholder="搜索节点" value={nodeSearch} onChange={event => setNodeSearch(event.target.value)} />
+          <Button size="icon-xs" variant="ghost" aria-label="回到当前学习节点" title="回到当前学习节点" onClick={() => {
+            const target = boundNodeId ?? requestedNodeId ?? pickDefaultLearningNode(graph)?.id;
+            if (target) { setSelectedNodeId(target); setNodeSearch(""); setEditing(false); setExplorePanelOpen(false); canvasApi.current?.focusNode(target); }
+          }}><Focus className="size-3.5" /></Button>
+          <Button size="xs" variant="ghost" asChild><Link to={`/w/${workspaceId}/graphs/${graphId}`}>完整图谱</Link></Button>
+        </div>
+        {nodeSearch.trim() ? <div className="graph-rail-search" aria-label="节点搜索结果">
+          <span role="status">{searchMatches.length ? `${searchMatches.length} 个匹配节点` : "没有匹配的节点"}</span>
+          {searchMatches.slice(0, 30).map(node => <button type="button" key={node.id} onClick={() => {
+            setSelectedNodeId(node.id); setNodeSearch(""); setEditing(false); setExplorePanelOpen(false); setValidation(undefined);
+            canvasApi.current?.focusNode(node.id);
+          }}>{node.label}</button>)}
+          {searchMatches.length > 30 ? <span>继续输入可缩小范围</span> : null}
+        </div> : null}
+      </div>
+      <Suspense fallback={<div className="grid min-h-56 place-items-center text-xs text-muted-foreground" role="status">正在打开图谱…</div>}><KnowledgeGraph
+        key={graphId}
         className="bound-graph-rail__canvas"
+        currentId={boundNodeId}
         compact
+        highlightNeighborhood={false}
         edges={railGraph.edges}
         interactive
         layout="tree"
         maximumZoom={2.4}
-        minimumZoom={0.15}
+        minimumZoom={0.01}
+        initialFit="view"
+        onCanvasApi={receiveCanvasApi}
+        showHeading={false}
+        toolbarMode="minimal"
         nodes={railGraph.nodes}
         onOpenExplore={(node) => openExploreHistory(node.id)}
-        onStudy={async (node) => {
-          if (!(await activateNode(node, { learningPackage: true }))) return;
-          window.dispatchEvent(new CustomEvent("learngraph:open-learning-project", {detail: {
-            graphId, title: graph.title || node.label, nodeId: node.id, nodeLabel: node.label, learningPackage: true,
-          }}));
-        }}
         onSelect={(node) => {
           // Selecting a card previews it; binding is explicit in page tools.
           setSelectedNodeId(node.id);
@@ -4484,10 +3256,17 @@ function BoundGraphRail({
         }}
         selectedId={selectedNode?.id}
         showZoomControls
+        studyOnSelect={false}
         title={graph.title || title}
       /></Suspense>
       {selectedNode ? (
         <div className="bound-graph-rail__inspector">
+          <div aria-label="会话节点绑定" className="graph-rail-selection" role="status">
+            <strong>{selectedNode.label}</strong>
+            <span className="graph-rail-context-badge">{selectedNode.id === boundNodeId ? "当前学习" : "预览"}</span>
+            {boundNode && selectedNode.id !== boundNodeId ? <span className="graph-rail-selection__current">正在学：{boundNode.label}</span> : null}
+          </div>
+          {selectedNode.description ? <p className="graph-rail-definition">{selectedNode.description}</p> : null}
           {explorePanelOpen && questions.length ? (
             <NodeExploreChain
               onClose={() => setExplorePanelOpen(false)}
@@ -4584,124 +3363,23 @@ function BoundGraphRail({
           ) : (
             <>
               <div className="bound-graph-rail__actions">
-                <Button onClick={studyNode} size="xs">
-                  <Play className="size-3.5" />
-                  学习此节点
-                </Button>
-                <Button onClick={studyNextNode} size="xs" variant="outline">
-                  <GraduationCap className="size-3.5" />
-                  下一节点
-                </Button>
-                <Button
-                  disabled={masteryMark.isPending}
-                  onClick={toggleMastered}
-                  size="xs"
-                  title={
-                    selectedNode.attention_state === "mastered"
-                      ? "取消已掌握：节点将移出能力成长图谱"
-                      : "标记已掌握：节点进入能力成长图谱"
-                  }
-                  variant={
-                    selectedNode.attention_state === "mastered"
-                      ? "secondary"
-                      : "outline"
-                  }
-                >
-                  <BadgeCheck className="size-3.5" />
-                  {masteryMark.isPending
-                    ? "更新中…"
-                    : selectedNode.attention_state === "mastered"
-                      ? "已掌握"
-                      : "标为已掌握"}
-                </Button>
+                <Button onClick={(event) => { if (event.detail < 2) void studyNode(); }} size="xs"><Play className="size-3.5" />{selectedNode.id === boundNodeId ? "继续学习" : "学习此节点"}</Button>
                 <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button size="xs" variant="ghost">
-                      <MoreHorizontal className="size-3.5" />
-                      更多
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-40">
-                    <DropdownMenuItem onSelect={() => void splitNode()}>
-                      <Split className="size-3.5" />
-                      拆分节点
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => focus.mutate(selectedNode.id)}
-                    >
-                      <Focus className="size-3.5" />
-                      {selectedNode.attention_state === "focused"
-                        ? "已是重点"
-                        : "设为重点"}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onSelect={startEditing}>
-                      <Pencil className="size-3.5" />
-                      编辑
-                    </DropdownMenuItem>
+                  <DropdownMenuTrigger asChild><Button size="xs" variant="ghost" aria-label="更多节点操作"><MoreHorizontal className="size-3.5" />更多</Button></DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-44">
+                    <DropdownMenuItem onSelect={() => void studyNextNode()}><GraduationCap className="size-3.5" />学习下一节点</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => askNode(`请解释「${selectedNode.label}」的定义、边界与典型例子。`)}>百科讲解</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={compareWithParent} disabled={!parentNode}>对比上级</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => askNode(`围绕「${selectedNode.label}」出 3 道由浅入深的自测题，并给出参考答案要点。`)}>自测题</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => askNode(`「${selectedNode.label}」常见误区有哪些？各给一个纠正方式。`)}>常见误区</DropdownMenuItem>
+                    <DropdownMenuItem disabled={!questions.length} onSelect={() => setExplorePanelOpen(open => !open)}><MessageSquareText className="size-3.5" />历史提问{questions.length ? `（${questions.length}）` : ""}</DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem disabled={masteryMark.isPending} onSelect={toggleMastered}><BadgeCheck className="size-3.5" />{selectedNode.attention_state === "mastered" ? "取消已掌握" : "标为已掌握"}</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => focus.mutate(selectedNode.id)} disabled={focus.isPending || selectedNode.attention_state === "focused"}><Focus className="size-3.5" />设为重点</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => void splitNode()}><Split className="size-3.5" />拆分节点</DropdownMenuItem>
+                    <DropdownMenuItem onSelect={startEditing}><Pencil className="size-3.5" />编辑节点</DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
-              </div>
-              <div className="bound-graph-rail__tools">
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button size="xs" variant="secondary">
-                      <Sparkles className="size-3.5" />
-                      学习动作
-                      <ChevronDown className="size-3 opacity-70" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="start" className="w-44">
-                    <DropdownMenuItem
-                      onSelect={() =>
-                        askNode(
-                          `请用百科词条格式解释「${selectedNode.label}」的定义、边界与典型例子。`,
-                        )
-                      }
-                    >
-                      百科讲解
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onSelect={compareWithParent}>
-                      对比上级
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() =>
-                        askNode(
-                          `围绕「${selectedNode.label}」出 3 道由浅入深的自测题，并给出参考答案要点。`,
-                        )
-                      }
-                    >
-                      自测题
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() =>
-                        askNode(
-                          `「${selectedNode.label}」常见误区有哪些？各给一个纠正方式。`,
-                        )
-                      }
-                    >
-                      常见误区
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-                <Button
-                  onClick={() => {
-                    if (!questions.length) {
-                      toast.message("还没有历史提问，先学习或提问后再查看。");
-                      return;
-                    }
-                    setExplorePanelOpen((open) => !open);
-                  }}
-                  size="xs"
-                  variant="outline"
-                >
-                  <MessageSquareText className="size-3.5" />
-                  历史提问
-                  {questions.length ? (
-                    <span className="bound-graph-rail__count">
-                      {questions.length}
-                    </span>
-                  ) : null}
-                </Button>
               </div>
             </>
           )}
@@ -5208,28 +3886,18 @@ export function WorkspaceShell() {
       return next;
     });
   }
-  function beginRailResize(event: ReactPointerEvent<HTMLDivElement>) {
-    if (railCollapsed && !selectionExplanationOpen) return;
-    event.preventDefault();
-    document.body.classList.add("is-resizing");
-    const onMove = (moveEvent: PointerEvent) => {
-      const sidebarWidth = collapsed ? 50 : 268;
-      const maximum = Math.max(280, window.innerWidth - sidebarWidth - 360);
-      setRailWidth(
-        Math.min(maximum, Math.max(280, window.innerWidth - moveEvent.clientX)),
-      );
-    };
-    const onEnd = () => {
-      document.body.classList.remove("is-resizing");
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onEnd);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onEnd);
-  }
+  const collapseRailFromResize = useCallback(() => {
+    setRailCollapsed(true);
+    window.localStorage.setItem("lg-rail-collapsed", "true");
+  }, []);
+  const railResize = useWorkspaceRailResize({
+    width: railWidth, sidebarWidth: collapsed ? 50 : 268,
+    disabled: railCollapsed && !selectionExplanationOpen,
+    setWidth: setRailWidth, collapse: collapseRailFromResize,
+  });
   const shellStyle = {
     "--sidebar-width": collapsed ? "50px" : "268px",
-    "--rail-width": `${railWidth}px`,
+    "--rail-width": `${railResize.value}px`,
   } as CSSProperties;
   // Keep the rail mounted while collapsing so CSS can animate width / slide.
   // Only pages without a context rail use --no-inspector (true unmount).
@@ -5355,7 +4023,13 @@ export function WorkspaceShell() {
             aria-label={isMemory ? "调整 AI 导师过程栏宽度" : "调整图谱栏宽度"}
             aria-orientation="vertical"
             className="workspace-resizer"
-            onPointerDown={beginRailResize}
+            onPointerDown={railResize.begin}
+            onKeyDown={railResize.onKeyDown}
+            tabIndex={railCollapsedEffective ? -1 : 0}
+            aria-valuemin={railResize.minimum}
+            aria-valuemax={railResize.maximum}
+            aria-valuenow={railResize.value}
+            aria-valuetext={`${railResize.value} 像素`}
             role="separator"
           />
           {/* Backdrop / close stay mounted so narrow layouts can fade them out. */}

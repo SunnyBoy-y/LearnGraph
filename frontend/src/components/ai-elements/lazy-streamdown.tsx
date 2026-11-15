@@ -1,5 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { Streamdown } from "streamdown";
+import { createElement, useEffect, useMemo, useState, type ComponentProps, type ReactNode } from "react";
+import { Streamdown, defaultRehypePlugins } from "streamdown";
+import { FluentEmoji } from "@/components/chat/answer-icon";
+import { getFluentEmoji } from "@/lib/fluent-emoji";
+import { rehypeFluentEmoji } from "@/lib/rehype-fluent-emoji";
 import { cjk } from "@streamdown/cjk";
 import { code } from "@streamdown/code";
 import { createMathPlugin } from "@streamdown/math";
@@ -59,6 +62,21 @@ export function LazyStreamdown({
   codeHighlight?: CodeHighlightMode;
   [key: string]: unknown;
 }) {
+  const components = props.components as ComponentProps<typeof Streamdown>["components"];
+  const renderComponents = useMemo(() => {
+    const OriginalSpan = components?.span ?? "span";
+    const EmojiSpan: NonNullable<ComponentProps<typeof Streamdown>["components"]>["span"] = ({ node, ...spanProps }) => {
+      const codepoint = node?.properties?.dataFluentEmoji;
+      const emoji = typeof codepoint === "string" ? getFluentEmoji(`fluent:${codepoint}`) : undefined;
+      if (emoji) return <FluentEmoji emoji={emoji} />;
+      return typeof OriginalSpan === "string" ? createElement(OriginalSpan, spanProps) : <OriginalSpan node={node} {...spanProps} />;
+    };
+    return { ...components, span: EmojiSpan };
+  }, [components]);
+  const suppliedRehypePlugins = props.rehypePlugins as ComponentProps<typeof Streamdown>["rehypePlugins"];
+  const rehypePlugins = useMemo(() => [
+    ...(suppliedRehypePlugins ?? Object.values(defaultRehypePlugins)), rehypeFluentEmoji,
+  ], [suppliedRehypePlugins]);
   const [module, setModule] = useState<StreamdownModule | null>(null);
   const [diagramPlugin, setDiagramPlugin] = useState<unknown>(null);
   const hasMermaid = typeof children === "string" &&
@@ -106,7 +124,7 @@ export function LazyStreamdown({
 
   const { Streamdown, plugins } = module;
   return (
-    <Streamdown {...props} plugins={diagramPlugin ? { ...plugins, mermaid: diagramPlugin } : plugins}>
+    <Streamdown {...props} components={renderComponents} rehypePlugins={rehypePlugins} plugins={diagramPlugin ? { ...plugins, mermaid: diagramPlugin } : plugins}>
       {typeof children === "string" ? children : ""}
     </Streamdown>
   );

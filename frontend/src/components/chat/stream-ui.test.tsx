@@ -135,6 +135,49 @@ describe("stream UI", () => {
     });
   });
 
+  it.each([false, true])("omits graph footer narration and gesture hints while preserving explain actions (embedded=%s)", async (embedded) => {
+    const onAction = vi.fn();
+    const sourceNote = "按用户确认的 6 节点文字骨架绘制；难度假设为高一入门。";
+    const data = {
+      ...snapshot("graph"),
+      state: "completed",
+      revision: 3,
+      props: {
+        title: "高中函数知识图谱",
+        description: "函数概念与基本性质",
+        interaction: "explore",
+        source_note: sourceNote,
+        data_kind: "example",
+        time_range: "高一入门",
+      },
+      nodes: [{ id: "function", label: "函数概念" }],
+    };
+    const { container, rerender } = render(
+      <StreamUI data={data} partId={`graph-footer-${embedded}`} embedded={embedded} onAction={onAction} />,
+    );
+    expect(screen.getByText("函数概念与基本性质")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "函数概念" })).toBeInTheDocument();
+    expect(screen.queryByText(/拖动画布移动/)).not.toBeInTheDocument();
+    expect(screen.queryByText(sourceNote)).not.toBeInTheDocument();
+    expect(screen.queryByText("示例数据")).not.toBeInTheDocument();
+    expect(screen.queryByText("高一入门")).not.toBeInTheDocument();
+    expect(container.querySelector(".stream-ui__footer > span")).toBeNull();
+    await userEvent.setup().click(screen.getByRole("button", { name: "让 AI 解释", exact: true }));
+    expect(onAction).toHaveBeenCalledWith({
+      componentId: `graph-footer-${embedded}`,
+      componentType: "stream_ui",
+      event: "explain",
+      payload: { revision: 3 },
+    });
+    rerender(<StreamUI data={data} partId={`graph-footer-${embedded}`} embedded={embedded} />);
+    expect(container.querySelector(".stream-ui__footer")).toBeNull();
+  });
+
+  it.each(["chart", "table", "metric", "timeline"])("preserves source notes on %s components", (component) => {
+    render(<StreamUI data={{ ...snapshot(component), state: "completed" }} partId={`source-note-${component}`} />);
+    expect(screen.getByText("虚构示例数据")).toBeInTheDocument();
+  });
+
   it("filters tables and sorts numbers numerically", async () => {
     const user = userEvent.setup();
     render(

@@ -411,7 +411,7 @@ export function useConversationScrollController(): ConversationScrollController 
       }
 
       compensateLayoutChange();
-      if (grew) setHasNewContent(true);
+      if (grew || (modeRef.current === "MANUAL_READING" && nextHeight > previousHeight + 1)) setHasNewContent(true);
     });
   }, [compensateLayoutChange, resolveLiveAnchor, scrollToBottom]);
 
@@ -487,6 +487,10 @@ export function useConversationScrollController(): ConversationScrollController 
       processedAnswerTurnRef.current = turnId;
       committedAnswerTurnRef.current = turnId;
       setHasCommittedAnswer(true);
+      if (modeRef.current === "MANUAL_READING") {
+        setHasNewContent(true);
+        return;
+      }
       setMode("ANSWER_ANCHORED");
       setHasNewContent(false);
       resolveCommittedAnswerAnchor(turnId);
@@ -624,13 +628,6 @@ export function useConversationScrollController(): ConversationScrollController 
     // The learner asked for the true bottom: drop the reserved tail so the last
     // message sits directly above the composer again.
     resetTailSpace();
-    if (committedAnswerTurnRef.current) {
-      setMode("MANUAL_READING");
-      updateReadingAnchor(null);
-      setHasNewContent(false);
-      scrollToBottom("return-latest");
-      return;
-    }
     updateReadingAnchor(null);
     setMode("FOLLOW_ACTIVITY");
     setHasNewContent(false);

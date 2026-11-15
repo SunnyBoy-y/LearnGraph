@@ -118,6 +118,7 @@ def stub_chat_service(monkeypatch):
         search_route=None,
         *,
         agent_mode=True,
+        prefer_fast=False,
     ):
         return ChatService(
             db,

@@ -12,7 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   authorizeMcpServer,
@@ -188,9 +188,9 @@ export function ExtensionsOverviewPanel({
 }) {
   const { workspaceId = "" } = useParams();
   const queryClient = useQueryClient();
-  const plugins = useQuery({ queryKey: ["plugins"], queryFn: listPlugins });
-  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
-  const mcpServers = useQuery({ queryKey: ["mcp-servers"], queryFn: listMcpServers });
+  const plugins = useQuery({ queryKey: workspaceQueryKey(workspaceId, "plugins"), queryFn: listPlugins });
+  const skills = useQuery({ queryKey: workspaceQueryKey(workspaceId, "skills"), queryFn: listSkills });
+  const mcpServers = useQuery({ queryKey: workspaceQueryKey(workspaceId, "mcp-servers"), queryFn: listMcpServers });
   const [introduction, setIntroduction] = useState<{
     name: string; category: string; description: string; version: string;
     source: string; permissions: string[]; capabilities: string[];
@@ -200,7 +200,7 @@ export function ExtensionsOverviewPanel({
       togglePlugin(id, { enabled }),
     onSuccess: () => {
       toast.success("插件状态已更新");
-      void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "plugins") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -414,6 +414,10 @@ export function ExtensionsOverviewPanel({
   );
 }
 
+import { McpContentControls, McpStdioControls } from "./mcp-advanced-controls";
+import { SkillScriptControls } from "./skill-script-controls";
+import { workspaceQueryKey } from "@/lib/query-keys";
+
 export function InstallMcpDialog({
   busy,
   onInstall,
@@ -430,11 +434,15 @@ export function InstallMcpDialog({
   const [endpoint, setEndpoint] = useState("");
   const [bearerToken, setBearerToken] = useState("");
   const [tools, setTools] = useState("");
+  const [resourceUris, setResourceUris] = useState("");
+  const [promptNames, setPromptNames] = useState("");
+  const [transport, setTransport] = useState<"streamable_http" | "stdio">("streamable_http");
   const [permissions, setPermissions] = useState("network");
   const [installTab, setInstallTab] = useState("market");
   const applyRegistryItem = (detail: McpRegistryDetail) => {
     const item = detail.item;
     setBearerToken("");
+    setTransport("streamable_http");
     setTools(detail.tools.map((tool) => tool.name).join(","));
     setInstallTab("manual");
     const shortName =
@@ -485,16 +493,16 @@ export function InstallMcpDialog({
       display_name: displayName.trim(),
       source: source.trim(),
       version: version.trim(),
-      transport: "streamable_http",
-      endpoint_url: endpoint.trim(),
-      ...(bearerToken ? { bearer_token: bearerToken } : {}),
+      transport,
+      endpoint_url: transport === "stdio" ? null : endpoint.trim(),
+      ...(transport === "streamable_http" && bearerToken ? { bearer_token: bearerToken } : {}),
       manifest: {
         schema_version: "1.0",
         identity: normalizedServerKey,
         requested_tools: requestedTools,
         permissions: requiredPermissions,
-        requested_resources: [],
-        requested_prompts: [],
+        requested_resources: resourceUris.split("\n").map(value => value.trim()).filter(Boolean),
+        requested_prompts: promptNames.split("\n").map(value => value.trim()).filter(Boolean),
       },
     });
   };
@@ -575,12 +583,14 @@ export function InstallMcpDialog({
               />
             </Label>
           </div>
+          <Label>传输方式<select className="mt-2 h-9 w-full rounded-md border bg-background px-3 text-sm" value={transport} onChange={event => setTransport(event.target.value as "streamable_http" | "stdio")}><option value="streamable_http">Streamable HTTP</option><option value="stdio">stdio（隔离沙箱）</option></select></Label>
           <Label>
             Endpoint URL
             <Input
               onChange={(event) => setEndpoint(event.currentTarget.value)}
               placeholder="https://mcp.example/mcp"
-              required
+              required={transport === "streamable_http"}
+              disabled={transport === "stdio"}
               type="url"
               value={endpoint}
             />
@@ -590,7 +600,6 @@ export function InstallMcpDialog({
             <Input
               onChange={(event) => setTools(event.currentTarget.value)}
               placeholder="search,fetch"
-              required
               value={tools}
             />
           </Label>
@@ -601,6 +610,8 @@ export function InstallMcpDialog({
               value={permissions}
             />
           </Label>
+          <Label>审核资源 URI / 模板（每行一个）<Textarea value={resourceUris} onChange={event => setResourceUris(event.target.value)} /></Label>
+          <Label>审核提示名称（每行一个）<Textarea value={promptNames} onChange={event => setPromptNames(event.target.value)} /></Label>
           <Label>
             Bearer Token（可选，仅本次提交）
             <Input
@@ -808,6 +819,7 @@ function EditMcpDialog({
     permissions: string[];
     requested_resources: string[];
     requested_prompts: string[];
+    web_tools: NonNullable<import("@/types/extensions").MCPServerManifest["web_tools"]>;
   }>;
   const [open, setOpen] = useState(false);
   const [displayName, setDisplayName] = useState(server.display_name);
@@ -817,8 +829,10 @@ function EditMcpDialog({
   const [bearerToken, setBearerToken] = useState("");
   const [clearBearerToken, setClearBearerToken] = useState(false);
   const [tools, setTools] = useState(server.requested_tools.join(", "));
+  const [resourceUris, setResourceUris] = useState((manifest.requested_resources ?? []).join("\n"));
+  const [promptNames, setPromptNames] = useState((manifest.requested_prompts ?? []).join("\n"));
   const [permissions, setPermissions] = useState(
-    server.required_permissions.join(", "),
+    (manifest.permissions ?? server.required_permissions.filter(permission => !permission.startsWith("mcp.tool:"))).join(", "),
   );
 
   return (
@@ -852,8 +866,9 @@ function EditMcpDialog({
                 identity: manifest.identity ?? server.server_key,
                 requested_tools: tools.split(",").map((item) => item.trim()).filter(Boolean),
                 permissions: permissions.split(",").map((item) => item.trim()).filter(Boolean),
-                requested_resources: manifest.requested_resources ?? [],
-                requested_prompts: manifest.requested_prompts ?? [],
+                requested_resources: resourceUris.split("\n").map(value => value.trim()).filter(Boolean),
+                requested_prompts: promptNames.split("\n").map(value => value.trim()).filter(Boolean),
+                web_tools: Object.fromEntries(Object.entries(manifest.web_tools ?? {}).filter(([name]) => tools.split(",").some((tool) => tool.trim() === name))),
               },
             });
           }}
@@ -884,6 +899,8 @@ function EditMcpDialog({
             权限（逗号分隔）
             <Input value={permissions} onChange={(event) => setPermissions(event.currentTarget.value)} />
           </Label>
+          <Label>审核资源 URI / 模板（每行一个）<Textarea value={resourceUris} onChange={event => setResourceUris(event.target.value)} /></Label>
+          <Label>审核提示名称（每行一个）<Textarea value={promptNames} onChange={event => setPromptNames(event.target.value)} /></Label>
           <Label>
             新 Bearer Token（留空则保持不变）
             <Input disabled={clearBearerToken} type="password" value={bearerToken} onChange={(event) => setBearerToken(event.currentTarget.value)} />
@@ -1019,7 +1036,12 @@ function BuiltinToolDetailDialog({
   );
 }
 
-export function ToolsPage({
+export function ToolsPage(props: Parameters<typeof ToolsWorkspace>[0]) {
+  const { workspaceId = "" } = useParams();
+  return <ToolsWorkspace key={workspaceId} {...props} />;
+}
+
+function ToolsWorkspace({
   embedded = false,
   focus = "all",
 }: {
@@ -1028,22 +1050,23 @@ export function ToolsPage({
   focus?: "all" | "skills" | "mcp";
 }) {
   const queryClient = useQueryClient();
+  const { workspaceId = "" } = useParams();
   const showMcp = focus === "all" || focus === "mcp";
   const showSkills = focus === "all" || focus === "skills";
   const servers = useQuery({
-    queryKey: ["mcp-servers"],
+    queryKey: workspaceQueryKey(workspaceId, "mcp-servers"),
     queryFn: listMcpServers,
   });
   const builtinTools = useQuery({
-    queryKey: ["builtin-native-tools"],
+    queryKey: workspaceQueryKey(workspaceId, "builtin-native-tools"),
     queryFn: listBuiltinNativeTools,
     enabled: showMcp,
   });
-  const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills });
+  const skills = useQuery({ queryKey: workspaceQueryKey(workspaceId, "skills"), queryFn: listSkills });
   const refreshOfficialSkillsMutation = useMutation({
     mutationFn: refreshOfficialSkills,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["skills"] });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "skills") });
     },
   });
   const officialSkillsBootRef = useRef(false);
@@ -1060,9 +1083,9 @@ export function ToolsPage({
     refreshOfficialSkillsMutation.mutate();
   }, [skills.isSuccess, skills.data, refreshOfficialSkillsMutation]);
   const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
-    void queryClient.invalidateQueries({ queryKey: ["skills"] });
-    void queryClient.invalidateQueries({ queryKey: ["builtin-native-tools"] });
+    void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "mcp-servers") });
+    void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "skills") });
+    void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "builtin-native-tools") });
   };
   const installMcp = useMutation({
     mutationFn: registerMcpServer,
@@ -1491,6 +1514,8 @@ export function ToolsPage({
                         server.requested_tools.includes(tool),
                       )}
                     />
+                    <McpContentControls key={`${server.id}-${server.current_snapshot_id}`} server={server} />
+                    <McpStdioControls key={`${server.id}-${server.launch_spec_hash ?? "none"}`} server={server} onChanged={refresh} />
                     <EditMcpDialog
                       busy={updateMcpMutation.isPending}
                       onSave={(payload) =>
@@ -1672,6 +1697,7 @@ export function ToolsPage({
                       运行
                     </Button>
                   )}
+                  <SkillScriptControls key={`${skill.id}-${skill.content_hash}`} skill={skill} workspaceId={workspaceId} />
                   {skill.origin_type === "github_import" ? (
                     <Button
                       disabled={

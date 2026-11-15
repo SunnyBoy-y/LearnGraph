@@ -669,11 +669,34 @@ class MemoryProfileService:
                 owner_subject_id=self.actor_id,
             )
         if snapshot.status != "ready" or str(snapshot.stale_reason or "").startswith("refresh_failed"):
-            # A refresh failure may keep a verified report only while its
-            # evidence is unchanged. Never replace a report with an atom list
-            # or expose obsolete claims after sources are changed/deleted.
-            records = _eligible_profile_records(self.db, self.workspace_id, self.actor_id)
-            if snapshot.source_fingerprint != _atom_fingerprint(records):
+            # A changed fingerprint makes a report historical, not unreadable.
+            # Keep its prose available while rebuilding, but never expose claims
+            # whose source was deleted, forgotten, suppressed or moved out of
+            # this user's scope. Current prompt injection has a separate, strict
+            # fingerprint check in current_profile_prompt.
+            source_ids = set(snapshot.source_atom_ids or []) | {
+                atom_id
+                for ids in (snapshot.claim_atom_map or {}).values()
+                for atom_id in ids
+            }
+            readable_ids = set(self.db.scalars(
+                select(MemoryRecord.id).where(
+                    MemoryRecord.id.in_(source_ids),
+                    MemoryRecord.workspace_id == self.workspace_id,
+                    MemoryRecord.tenant_id == select(Workspace.tenant_id).where(
+                        Workspace.id == self.workspace_id
+                    ).scalar_subquery(),
+                    (MemoryRecord.subject_user_id.is_(None))
+                    | (MemoryRecord.subject_user_id == self.actor_id),
+                    MemoryRecord.state == "active",
+                    MemoryRecord.lifecycle_status != "forgotten",
+                    MemoryRecord.deleted_at.is_(None),
+                    MemoryRecord.content_destroyed_at.is_(None),
+                    MemoryRecord.auto_recall_suppressed.is_(False),
+                )
+            ).all())
+            if source_ids - readable_ids:
+                records = _eligible_profile_records(self.db, self.workspace_id, self.actor_id)
                 return MemoryProfileView(
                     id=snapshot.id, workspace_id=snapshot.workspace_id,
                     owner_subject_id=snapshot.owner_subject_id, version=snapshot.version,

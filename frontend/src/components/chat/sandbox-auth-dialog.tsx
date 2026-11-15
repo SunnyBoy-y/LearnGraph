@@ -1,6 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { ShieldAlert } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { createSandboxDestructiveGrant } from "@/api/control";
 import { Button } from "@/components/ui/button";

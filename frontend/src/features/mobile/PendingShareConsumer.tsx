@@ -9,7 +9,7 @@
 
 import { useEffect, useRef } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 
 import { uploadFile } from '@/api/files'
 import { useAuth } from '@/features/auth/auth-context-value'

@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from app.providers.model_options import ModelCallOptions
+from app.providers.model_options import ModelCallOptions, ModelCapabilityError
 from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent, ProviderUsage
 from app.providers.remote.openai import (
     ProviderHTTPError,
@@ -176,7 +176,8 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
             "reasoning_tokens": 0,
         }
 
-    _MODEL_VERSION_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d+))?")
+    # Date suffixes such as -20250514 are not minor model versions.
+    _MODEL_VERSION_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d{1,2})(?!\d))?")
 
     @classmethod
     def _thinking_capabilities(cls, model_id: str) -> tuple[bool, bool, bool]:
@@ -205,7 +206,7 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
         minor = int(match.group(3) or 0)
         if family in {"fable", "mythos"}:
             return True, True, False
-        if family in {"opus", "sonnet"}:
+        if family in {"opus", "sonnet", "haiku"}:
             if major >= 5:
                 return True, True, True
             if major == 4 and minor >= 7:
@@ -216,6 +217,8 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
 
     def _apply_call_options(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
         del responses
+        if payload.get("tools") and not self.supports_agent_tools:
+            raise ProviderResponseError("The selected model does not support Agent tools")
         options = self.call_options
         if options is None:
             return payload
@@ -232,23 +235,46 @@ class AnthropicMessagesProvider(_StreamingHTTPProvider):
         if not thinking_mode:
             return payload
         tier = str(actual or thinking_mode)
-        if tier not in {"low", "medium", "high", "xhigh"}:
+        if tier not in {"low", "medium", "high", "xhigh", "max"}:
             tier = str(thinking_mode)
-        adaptive, supports_xhigh, _ = self._thinking_capabilities(self.model_id)
+        adaptive, supports_xhigh, needs_explicit_disable = self._thinking_capabilities(self.model_id)
+        numeric_budget = options.reasoning_parameter == "thinking_budget" and isinstance(actual, int) and not isinstance(actual, bool)
+        # 4.6 supports adaptive AND legacy budgets. Only newer versions require
+        # adaptive; preserve existing valid numeric configurations on 4.6.
+        if adaptive and numeric_budget and not supports_xhigh and not needs_explicit_disable:
+            adaptive = False
         if adaptive:
+            if options.reasoning_parameter == "thinking_budget" and isinstance(actual, int) and not isinstance(actual, bool):
+                raise ModelCapabilityError(
+                    "This Claude model requires adaptive effort, not a numeric thinking budget"
+                )
             payload["thinking"] = {"type": "adaptive"}
             effort = tier
             if effort == "xhigh" and not supports_xhigh:
                 effort = "high"
-            if effort in {"low", "medium", "high", "xhigh"}:
+            if effort in {"low", "medium", "high", "xhigh", "max"}:
                 payload["output_config"] = {"effort": effort}
         else:
-            budget = {
-                "low": 4_000,
-                "medium": 10_000,
-                "high": 20_000,
-                "xhigh": 32_000,
-            }.get(tier, 10_000)
+            if options.reasoning_parameter == "thinking_budget" and isinstance(actual, int) and not isinstance(actual, bool):
+                budget = actual
+            else:
+                if tier == "max":
+                    raise ModelCapabilityError("Legacy Claude requires an explicit numeric budget for maximum thinking")
+                budget = {
+                    "low": 4_000,
+                    "medium": 10_000,
+                    "high": 20_000,
+                    "xhigh": 32_000,
+                }.get(tier, 10_000)
+            # Background tasks may lower the total output budget after factory
+            # resolution. Thinking consumes that same allowance on every path.
+            ceiling = int(payload.get("max_tokens") or self.max_output_tokens) - 1
+            if budget < 1024 or ceiling < 1024:
+                raise ModelCapabilityError(
+                    "Claude thinking requires at least 1024 thinking tokens and a larger output budget"
+                )
+            budget = min(budget, ceiling)
+            self.effective_reasoning_budget_tokens = budget
             payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
         return payload
 

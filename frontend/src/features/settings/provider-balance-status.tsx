@@ -1,7 +1,7 @@
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { toast } from 'sonner';
+import { toast } from '@/lib/notifications';
 import { getBalanceStatus, rediscoverBalance } from '@/api/provider-automation';
 import { Button } from '@/components/ui/button';
 

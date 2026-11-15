@@ -21,7 +21,7 @@ def keywords(name):
 
 
 def compact_definitions(definitions, *, management_names, active_ids, active_families, progressive):
-    deferred = set(management_names) | set(LEGACY_NAMES)
+    deferred = (set(management_names) | set(LEGACY_NAMES)) - {"lg_scheduled_tasks"}
     deferred.update(d["function"]["name"] for d in definitions
                     if d["function"]["name"].startswith("sandbox_") and d["function"]["name"] not in SANDBOX_CORE)
     descriptors = []

@@ -92,7 +92,7 @@ from app.providers.model_options import (
 )
 from app.providers.dialects import uses_deepseek_native_adapter
 from app.providers.model_catalog import unified_model_defaults
-from app.providers.qwen_catalog import is_dashscope_api_base_url
+from app.providers.qwen_catalog import is_dashscope_api_base_url, protocol_family_for
 from app.providers.remote.deepseek import (
     DeepSeekChatProvider,
 )
@@ -377,6 +377,9 @@ def _pinned_model_rejection(capabilities: dict, model_id: str) -> str | None:
     is asserted there.
     """
 
+    states = capabilities.get("model_states")
+    if isinstance(states, dict) and states.get(model_id) is False:
+        return "The selected model is disabled for this Provider"
     hidden = {
         str(item).strip()
         for item in capabilities.get("hidden_model_ids") or []
@@ -412,6 +415,7 @@ def model_provider_for_workspace(
     search_route: str | None = None,
     provider_id: str | None = None,
     disable_thinking_fallback: bool = False,
+    prefer_fast: bool = False,
 ) -> ModelProviderPort:
     if provider_id is None and model_id is None:
         provider_id, model_id = _functional_model_target(
@@ -429,6 +433,10 @@ def model_provider_for_workspace(
     if provider is not None:
         selected_model_id = model_id.strip() if model_id else ""
         capabilities = dict(provider.capabilities or {})
+        # Recompute protocol facts from the current endpoint; an old discovery
+        # snapshot or a model brand must never grant another gateway's dialect.
+        capabilities["provider_family"] = provider.provider_type
+        capabilities["protocol_family"] = protocol_family_for(provider.provider_type, provider.base_url)
         configured_model_id = str(capabilities.get("default_model") or "").strip()
         resolved_model_id = selected_model_id or configured_model_id
         if resolved_model_id:
@@ -497,12 +505,9 @@ def model_provider_for_workspace(
         # weights, and those models still need DashScope's request shape — a
         # model-name test alone leaves them on the generic adapter, where the
         # hosted search switch silently does nothing.
-        brand_id = str(capabilities.get("brand_id") or "").strip().casefold()
         is_qwen = (
             provider.provider_type == "qwen"
-            or brand_id == "qwen"
             or is_dashscope_api_base_url(provider.base_url)
-            or resolved_model_id.casefold().startswith(("qwen", "qwq"))
         )
         if is_deepseek:
             # Provider-level defaults are protocol facts, not a hard-coded
@@ -512,13 +517,12 @@ def model_provider_for_workspace(
             # 直通（low/medium 档真正发 low/medium），区别于 DashScope 托管模型
             # 仅 high/max 两档的旧映射。
             capabilities = {
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "reasoning_efforts": ["low", "high", "max"],
                 "thinking_mapping": {
                     "off": None,
                     "low": "low",
-                    "medium": "medium",
                     "high": "high",
-                    "xhigh": "max",
+                    "max": "max",
                 },
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "reasoning_effort",
@@ -617,7 +621,10 @@ def model_provider_for_workspace(
         context_window_tokens = int(
             effective_model_capabilities.get("context_window_tokens") or 256_000
         )
-        context_limit_tokens = context_window_tokens
+        context_limit_tokens = min(
+            context_window_tokens,
+            max(1, int(effective_model_capabilities.get("context_limit_tokens") or context_window_tokens)),
+        )
         common = {
             "provider_id": provider.id,
             # Keep the persisted provider type unchanged for legacy workspaces,
@@ -635,7 +642,7 @@ def model_provider_for_workspace(
                     effective_model_capabilities.get("max_output_tokens")
                     or DEFAULT_MAX_OUTPUT_TOKENS
                 ),
-                context_window_tokens,
+                context_limit_tokens,
             ),
             "extra_headers": extra_headers,
         }
@@ -666,6 +673,7 @@ def model_provider_for_workspace(
                 thinking_mode=thinking_mode,
                 search_route=search_route,
                 disable_thinking_fallback=disable_thinking_fallback,
+                prefer_fast=prefer_fast,
             )
         except ModelCapabilityError as exc:
             return UnavailableModelProvider(
@@ -811,6 +819,7 @@ def _qwen_model_candidates(
         for value in candidates
         if (model_id := str(value or "").strip())
         and states.get(model_id, True) is not False
+        and _pinned_model_rejection(capabilities, model_id) is None
     ]
 
 
@@ -964,6 +973,8 @@ def vision_provider_for_workspace(
         )
 
     capabilities = dict(provider.capabilities or {})
+    capabilities["provider_family"] = "openai_responses" if provider.provider_type == "openai_responses_vision" else "openai_compatible_chat"
+    capabilities["protocol_family"] = protocol_family_for(provider.provider_type, provider.base_url)
     configured_model_id = str(
         capabilities.get("default_vision_model_id")
         or capabilities.get("default_model")
@@ -988,6 +999,9 @@ def vision_provider_for_workspace(
         return unavailable(
             "The enabled vision provider has no default vision model"
         )
+    rejection = _pinned_model_rejection(capabilities, resolved_model_id)
+    if rejection:
+        return unavailable(rejection)
     try:
         api_key = _secret_for_provider(db, workspace_id, provider, settings)
     except Exception as exc:  # intentional log-and-skip
@@ -1005,39 +1019,40 @@ def vision_provider_for_workspace(
     else:
         effective_base_url = _resolve_provider_base_url(settings, provider.provider_type, provider.base_url)
     extra_headers = _extra_headers_from_capabilities(capabilities)
+    effective = model_capabilities_for_model(capabilities, resolved_model_id)
+    window = int(effective.get("context_window_tokens") or 128_000)
+    limit = min(window, max(1, int(effective.get("context_limit_tokens") or window)))
+    if effective.get("supports_image_input") is False and (
+        effective.get("models_dev_known") is True or effective.get("capability_source") in {"user_declared", "provider_probe"}
+    ):
+        return unavailable("The selected vision model does not support image input")
     common = {
         "provider_id": provider.id,
         "provider_type": provider.provider_type,
         "model_id": resolved_model_id,
         "base_url": effective_base_url,
         "api_key": api_key,
-        "context_window_tokens": int(capabilities.get("context_window_tokens") or 128_000),
-        "max_output_tokens": int(capabilities.get("max_output_tokens") or 2_048),
+        "context_window_tokens": limit,
+        "max_output_tokens": clamp_max_output_tokens(int(effective.get("max_output_tokens") or 2_048), limit),
         "extra_headers": extra_headers,
         # Vision companions always accept image parts; the catalog role is the
         # capability source, not a per-model user toggle on the primary LLM.
         "supports_image_input": True,
         "image_input_mode": "native",
         "capabilities": {
-            **capabilities,
+            **effective,
+            "context_window_tokens": window,
+            "context_limit_tokens": limit,
             "supports_image_input": True,
-            "supports_video_input": capabilities.get("supports_video_input") is True,
+            "supports_video_input": effective.get("supports_video_input") is True,
             "image_input_mode": "native",
         },
     }
     try:
         common["call_options"] = resolve_model_call_options(
-            {
-                **capabilities,
-                "reasoning_efforts": capabilities.get("reasoning_efforts") or [],
-                "thinking_mapping": capabilities.get("thinking_mapping")
-                or {"off": None},
-                "default_thinking_mode": "off",
-                "hosted_web_search": False,
-                "default_search_route": "disabled",
-            },
+            capabilities,
             resolved_model_id,
-            thinking_mode="off",
+            thinking_mode="medium" if effective.get("thinking_required") is True else "off",
             search_route="disabled",
         )
     except ModelCapabilityError as exc:
@@ -1082,6 +1097,8 @@ def _qwen_vision_companion_for_workspace(
     )
     for provider in providers:
         capabilities = dict(provider.capabilities or {})
+        capabilities["provider_family"] = provider.provider_type
+        capabilities["protocol_family"] = protocol_family_for(provider.provider_type, provider.base_url)
         if not provider.base_url:
             continue
         selected = next(

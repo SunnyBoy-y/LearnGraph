@@ -53,6 +53,14 @@ class OllamaCloudChatProvider(_StreamingHTTPProvider):
 
     def _apply_call_options(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
         del responses
+        if payload.get("tools") and not self.supports_agent_tools:
+            raise ProviderResponseError("The selected model does not support Agent tools")
+        # /api/chat uses the native options object, never OpenAI max_tokens.
+        budget = int(self.max_output_tokens or 0)
+        if budget > 0:
+            native_options = dict(payload.get("options") or {})
+            native_options.setdefault("num_predict", budget)
+            payload["options"] = native_options
         options = self.call_options
         if options is None:
             return payload
@@ -85,6 +93,14 @@ class OllamaCloudChatProvider(_StreamingHTTPProvider):
         for event in self.stream_chat([ProviderChatMessage(role="user", content=prompt)]):
             if event.type == "text_delta" and event.content:
                 yield event.content
+
+    def stream_answer(self, prompt: str):
+        # Legacy/background text callers use the same native request as chat.
+        # Implement the full ModelProviderPort, including usage reset/audit.
+        try:
+            yield from self._stream_answer(prompt)
+        finally:
+            self._audit_thinking_off()
 
     def stream_chat(
         self,

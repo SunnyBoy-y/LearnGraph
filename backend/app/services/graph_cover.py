@@ -10,7 +10,6 @@ from __future__ import annotations
 from html import escape
 import base64
 import logging
-import math
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -29,26 +28,40 @@ def _safe_title(title: str) -> str:
     )
 
 
-def default_graph_cover(title: str = "") -> str:
-    """Return the art-directed default cover with a safe per-graph title overlay."""
+def _artwork_cover(title: str, *, kind: str) -> str:
+    """Keep the illustration full-bleed; the bookshelf already shows its title."""
     title = _safe_title(title) if isinstance(title, str) else ""
+    label = escape(title, quote=True)
     artwork = _default_artwork_data_url(title)
-    label = escape(title[:18], quote=True)
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300">
-<image href="{artwork}" width="640" height="300" preserveAspectRatio="xMidYMid slice"/>
-<rect width="640" height="92" fill="#07111c" opacity=".54"/>
-<text x="30" y="53" font-family="sans-serif" font-size="24" font-weight="600" fill="#f5ead4">{label}</text>
+    # This vector layer also renders if a bundled image is missing or fails to
+    # decode. Never fall back to the retired pastel curve illustration.
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300" data-cover-kind="{kind}" data-cover-version="2">
+<title>{label}</title>
+<defs><radialGradient id="glow"><stop stop-color="#234d58"/><stop offset="1" stop-color="#091b26"/></radialGradient></defs>
+<rect width="640" height="300" fill="url(#glow)"/>
+<g fill="none" stroke="#c6ae7a" stroke-opacity=".4">
+<ellipse cx="430" cy="145" rx="166" ry="92" transform="rotate(-24 430 145)"/>
+<circle cx="430" cy="145" r="65"/><circle cx="430" cy="145" r="111"/>
+<path d="M72 225L180 148L294 196L430 145L563 67M180 148L248 66L430 145"/>
+</g><g fill="#dfc896"><circle cx="72" cy="225" r="3"/><circle cx="180" cy="148" r="5"/>
+<circle cx="294" cy="196" r="4"/><circle cx="430" cy="145" r="12"/><circle cx="563" cy="67" r="4"/>
+<circle cx="248" cy="66" r="3"/></g>
+{f'<image href="{artwork}" width="640" height="300" preserveAspectRatio="xMidYMid slice"/>' if artwork else ''}
 </svg>'''
     return f"data:image/svg+xml,{quote(svg)}"
 
 
-@lru_cache(maxsize=32)
+def default_graph_cover(title: str = "") -> str:
+    """Return an independent, offline-safe illustration for decoration failures."""
+    return _artwork_cover(title, kind="fallback")
+
+
 def _default_artwork_data_url(title: str = "") -> str:
-    """Choose and load a bundled subject artwork once; keep output self-contained."""
+    """Match an illustration to the title without model calls or network access."""
     subjects = (
         ("wen", ("文学", "语文", "写作", "小说", "诗")),
         ("shi", ("历史", "史学", "朝代", "文明")),
-        ("zhe", ("哲学", "哲学", "伦理", "逻辑")),
+        ("zhe", ("哲学", "伦理", "逻辑")),
         ("si", ("思维", "思考", "认知", "心理")),
         ("shu", ("数学", "数理", "算法", "几何", "概率")),
         ("li", ("物理", "力学", "光学", "电磁")),
@@ -56,14 +69,17 @@ def _default_artwork_data_url(title: str = "") -> str:
         ("zheng", ("政治", "政史", "社会", "公共")),
         ("stars", ("星辰", "天文", "宇宙", "星空", "太空")),
     )
-    key = "stars"
-    for candidate, keywords in subjects:
-        if any(keyword in title for keyword in keywords):
-            key = candidate
-            break
-    asset = Path(__file__).resolve().parent.parent / "assets" / "graph-covers" / f"{key}.jpg"
+    key = next((key for key, words in subjects if any(word in title for word in words)), "default")
+    return _load_artwork_data_url(key)
+
+
+@lru_cache(maxsize=16)
+def _load_artwork_data_url(key: str) -> str:
+    """Cache by asset rather than title so a large shelf reuses encoded bytes."""
+    assets = Path(__file__).resolve().parent.parent / "assets"
+    asset = assets / "graph-covers" / f"{key}.jpg" if key != "default" else assets / "graph-cover-default.jpg"
     if not asset.exists():
-        asset = Path(__file__).resolve().parent.parent / "assets" / "graph-cover-default.jpg"
+        asset = assets / "graph-cover-default.jpg"
     try:
         encoded = base64.b64encode(asset.read_bytes()).decode("ascii")
     except OSError:
@@ -176,33 +192,47 @@ def _render_graph_cover(
     progress: float = 0.0,
     node_labels: list[str] | None = None,
 ) -> str:
-    """Build a stable, graph-specific SVG cover.
+    """Use a bundled subject illustration, with progress shown on the card itself."""
+    return _artwork_cover(title, kind="generated")
 
-    ``node_labels`` changes the number and arrangement of the constellation
-    dots, while the title provides the stable palette seed.  Text is escaped
-    before entering SVG so user-created graph titles cannot inject markup.
-    """
-    title = _safe_title(title)
-    seed = sum(ord(char) for char in title) % 360
-    label = escape(title[:18], quote=True)
-    labels = [item for item in (node_labels or []) if item.strip()][:8]
-    points = [(150 + index * 58, 142 + (index % 3) * 24) for index in range(max(3, len(labels)))]
-    nodes = "".join(
-        f'<circle cx="{x}" cy="{y}" r="{8 if index else 14}" fill="hsl({(seed + index * 17) % 360} 35% 35%)"/>'
-        for index, (x, y) in enumerate(points)
+
+def is_legacy_generated_cover(cover: str) -> bool:
+    """Recognize only the retired built-in curve artwork, not custom covers."""
+    prefix = "data:image/svg+xml,"
+    if not cover.startswith(prefix) or len(cover) > 16_384:
+        return False
+    try:
+        root = ElementTree.fromstring(unquote(cover[len(prefix):]))
+    except (ElementTree.ParseError, ValueError):
+        return False
+    namespace = "{http://www.w3.org/2000/svg}"
+    if root.tag != namespace + "svg" or root.get("viewBox") != "0 0 640 300":
+        return False
+    backgrounds = root.findall(namespace + "rect")
+    paths = root.findall(namespace + "path")
+    circles = root.findall(namespace + "circle")
+    return (
+        any(rect.get("width") == "640" and rect.get("height") == "300"
+            and rect.get("fill", "").startswith("hsl(") for rect in backgrounds)
+        and any(path.get("d") in {
+            "M70 230 Q170 90 280 210 T480 180",
+            "M80 230 Q180 90 280 210 T470 180",
+        } and path.get("stroke-width") == "8" for path in paths)
+        and any(circle.get("cx") in {"500", "510"} and circle.get("cy") == "120"
+                and circle.get("r") == "82" for circle in circles)
+        and any(rect.get("y") == "260" and rect.get("height") == "10"
+                and rect.get("fill") == "#d8dadd" for rect in backgrounds)
     )
-    links = "".join(
-        f'<path d="M{points[index][0]} {points[index][1]} L{points[index + 1][0]} {points[index + 1][1]}" stroke="hsl({seed} 25% 60%)" stroke-width="3"/>'
-        for index in range(len(points) - 1)
-    )
-    progress = progress if math.isfinite(progress) else 0.0
-    width = max(0.0, min(1.0, progress)) * 560
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300">
-<rect width="640" height="300" fill="hsl({seed} 18% 94%)"/>
-<circle cx="510" cy="120" r="82" fill="hsl({seed} 35% 78%)"/>
-<path d="M70 230 Q170 90 280 210 T480 180" fill="none" stroke="hsl({seed} 30% 35%)" stroke-width="8"/>
-{links}{nodes}
-<text x="36" y="52" font-family="sans-serif" font-size="24" fill="hsl({seed} 30% 25%)">{label}</text>
-<rect x="40" y="260" width="560" height="10" rx="5" fill="#d8dadd"/><rect x="40" y="260" width="{width:.1f}" height="10" rx="5" fill="hsl({seed} 30% 35%)"/>
-</svg>'''
-    return f"data:image/svg+xml,{quote(svg)}"
+
+
+def resolve_graph_cover(
+    stored_cover: str | None,
+    title: str,
+    *,
+    progress: float = 0.0,
+    node_labels: list[str] | None = None,
+) -> str:
+    """Upgrade old automatic artwork on read without overwriting saved choices."""
+    if stored_cover and not is_legacy_generated_cover(stored_cover):
+        return stored_cover
+    return generate_graph_cover(title, progress=progress, node_labels=node_labels)

@@ -19,12 +19,19 @@ data class NativeModelChoice(
     val supportsAgent: Boolean,
     val providerType: String = "",
     val supportsImageInput: Boolean = false,
+    val reasoningEfforts: List<String> = emptyList(),
+    val thinkingRequired: Boolean = false,
+    val thinkingMapping: JsonObject = JsonObject(emptyMap()),
+    val legacyThinkingMapping: JsonObject? = null,
+    val thinkingMappingVersion: Int? = null,
 ) {
+    val thinkingModes: List<String> get() = (if (thinkingRequired) emptyList() else listOf("off")) +
+        listOf("low", "medium", "high", "xhigh", "max").filter { it in reasoningEfforts }
     /** Same labels as frontend/lib/model-choices.ts. */
     val protocolLabel: String get() = when (providerType) {
         "openai_responses" -> "Responses"
         "anthropic_messages" -> "Anthropic Messages"
-        "ollama" -> "Ollama"
+        "ollama", "ollama_cloud" -> "Ollama"
         else -> "Compatible Chat"
     }
 }
@@ -49,7 +56,27 @@ fun resolveNativeTextModelOptions(options: ComposerOptions, snapshot: JsonObject
     val provider = requestedProvider?.takeIf { it in catalog.providerIds } ?: catalog.providerIds.firstOrNull()
     val models = catalog.choices.filter { it.providerId == provider }
     val model = requestedModel?.takeIf { candidate -> models.any { it.modelId == candidate } } ?: models.firstOrNull()?.modelId
-    return options.copy(providerId = provider, modelId = model)
+    val choice = models.firstOrNull { it.modelId == model }
+    var resolved = options.copy(providerId = provider, modelId = model)
+    if (choice != null && options.thinkingMappingVersion < 2 && requestedProvider == provider && requestedModel == model) {
+        val actual = choice.legacyThinkingMapping?.get(options.thinkingMode)
+        if (actual != null) {
+            val matches = choice.reasoningEfforts.filter { choice.thinkingMapping[it] == actual }
+            val migrated = if (options.thinkingMode in matches) options.thinkingMode else matches.singleOrNull()
+            if (migrated != null) resolved = resolved.copy(thinkingMode = migrated, thinkingMappingVersion = 2)
+        }
+    }
+    if (choice?.thinkingMappingVersion == 2) {
+        val requested = if (resolved.responseMode == "fast") "off" else resolved.thinkingMode
+        if (requested !in choice.thinkingModes && choice.thinkingModes.isNotEmpty()) {
+            val order = listOf("off", "low", "medium", "high", "xhigh", "max")
+            val lower = choice.thinkingModes.lastOrNull { order.indexOf(it) <= order.indexOf(requested) }
+            val next = lower ?: choice.thinkingModes.first()
+            resolved = resolved.copy(thinkingMode = next,
+                responseMode = if (resolved.responseMode == "fast" && next != "off") "agentic" else resolved.responseMode)
+        }
+    }
+    return resolved
 }
 
 /** Web fuzzyModelMatch searches model, provider and protocol as one string. */
@@ -87,7 +114,7 @@ suspend fun loadModelCatalog(api: ApiClient): NativeModelCatalog {
 // Matches frontend/types/providers.ts MODEL_PROVIDER_TYPES and the backend catalog's model role.
 private val textProviderTypes = setOf(
     "openai_responses", "openai_compatible_chat", "qwen", "codex_chatgpt",
-    "deepseek_chat", "anthropic_messages", "github_copilot", "ollama",
+    "deepseek_chat", "anthropic_messages", "github_copilot", "ollama", "ollama_cloud",
 )
 private val catalogJson = Json { ignoreUnknownKeys = true }
 
@@ -162,7 +189,10 @@ private fun modelOptions(provider: CatalogProvider, discovered: List<CatalogMode
     val byId = linkedMapOf<String, CatalogModel>()
     (discovered ?: persistedIds.map(::savedModel)).forEach { byId[it.id] = it }
     // Web adds manual snapshots even if the upstream vendor never reported the ID.
-    saved.keys.filter { it !in persistedIds }.forEach { byId[it] = savedModel(it) }
+    saved.keys.filter { it !in persistedIds }.forEach { id ->
+        val automatic = ((saved[id] as? JsonObject)?.get("capability_source") as? JsonPrimitive)?.contentOrNull == "official_catalog"
+        if (id !in byId || !automatic) byId[id] = savedModel(id)
+    }
     val configured = (capabilities["default_model"] as? JsonPrimitive)
         ?.takeIf { it.isString }?.contentOrNull?.trim().orEmpty()
     if (configured.isNotBlank() && configured !in byId) byId[configured] = CatalogModel(configured, remote = true)
@@ -181,6 +211,13 @@ private fun modelOptions(provider: CatalogProvider, discovered: List<CatalogMode
             providerType = provider.providerType,
             supportsImageInput = (model.capabilities?.get("supports_image_input") as? JsonPrimitive)
                 ?.takeUnless { it.isString }?.booleanOrNull == true,
+            reasoningEfforts = ((model.capabilities?.get("reasoning_efforts") ?: capabilities["reasoning_efforts"]) as? JsonArray).orEmpty()
+                .mapNotNull { (it as? JsonPrimitive)?.contentOrNull },
+            thinkingRequired = (model.capabilities?.get("thinking_required") as? JsonPrimitive)?.booleanOrNull == true,
+            thinkingMapping = model.capabilities?.get("thinking_mapping") as? JsonObject ?: JsonObject(emptyMap()),
+            legacyThinkingMapping = if ((model.capabilities?.get("capability_source") as? JsonPrimitive)?.contentOrNull !in setOf("user_declared", "provider_probe", "runtime_observation"))
+                model.capabilities?.get("legacy_thinking_mapping") as? JsonObject else null,
+            thinkingMappingVersion = (model.capabilities?.get("thinking_mapping_version") as? JsonPrimitive)?.contentOrNull?.toIntOrNull(),
         )
     }
 }

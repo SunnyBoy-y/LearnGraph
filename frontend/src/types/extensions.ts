@@ -9,6 +9,15 @@ export interface MCPServerManifest {
   permissions: string[];
   requested_resources: string[];
   requested_prompts: string[];
+  web_tools?: Record<string, {
+    kind: "search" | "fetch";
+    results_path?: string;
+    url_field?: string;
+    title_field?: string;
+    snippet_field?: string;
+    content_field?: string;
+    url_argument?: string;
+  }>;
 }
 
 export interface MCPServerCreate {
@@ -56,6 +65,10 @@ export interface MCPServer {
   max_result_bytes: number;
   max_concurrency: number;
   current_snapshot_id: string | null;
+  launch_spec_hash?: string | null;
+  launch_status?: string;
+  launch_command?: string[];
+  runner_image_digest?: string | null;
   authorization_generation: number;
   last_error: string | null;
   last_checked_at: IsoDateTime | null;

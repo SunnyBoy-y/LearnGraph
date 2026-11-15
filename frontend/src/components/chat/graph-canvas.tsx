@@ -151,6 +151,5 @@ export function GraphCanvas({ snapshot: s, selected, onSelect }: {
         {!s.nodes.length && <text x="160" y="110" textAnchor="middle" fill="var(--graph-foreground)">{s.state === "streaming" ? "正在生成节点…" : "暂无节点"}</text>}
       </svg>
     </div>
-    <p className="stream-ui__graph-hint">拖动画布移动 · 滚轮 / 双指缩放 · 双击空白处放大 · 拖动节点调整位置</p>
   </div>;
 }

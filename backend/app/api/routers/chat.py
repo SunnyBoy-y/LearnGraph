@@ -66,6 +66,7 @@ from app.domain.schemas.chat import (
     SuggestedPromptGenerateRequest,
 )
 from app.domain.schemas.common import ActionResponse
+from app.domain.schemas.opening_prompts import OpeningPromptRequest, OpeningPromptResponse
 from app.domain.schemas.stream_ui import UIAction
 from app.domain.schemas.graphs import GraphChangeSetView, RejectGraphChangeSetRequest
 from app.providers.factory import (
@@ -468,6 +469,7 @@ def service(
     search_route: str | None = None,
     *,
     agent_mode: bool = True,
+    prefer_fast: bool = False,
 ) -> ChatService:
     # 单一装配点：委托 chat_service_factory.build_chat_service，避免与
     # subapp 路径的 ChatService / AgentToolRuntime 装配漂移（历史上曾因两处
@@ -483,6 +485,7 @@ def service(
         thinking_mode=thinking_mode,
         search_route=search_route,
         agent_mode=agent_mode,
+        prefer_fast=prefer_fast,
     )
 
 
@@ -619,6 +622,9 @@ def cleanup_dictation(
         model_id=payload.model_id,
         provider_id=payload.provider_id,
         thinking_mode="off",
+        prefer_fast=True,
+        search_route="disabled",
+        agent_mode=False,
     ).cleanup_dictation(payload)
 
 
@@ -1005,6 +1011,9 @@ def auto_title_session(
         model_id=payload.model_id,
         provider_id=payload.provider_id,
         thinking_mode="off",
+        prefer_fast=True,
+        search_route="disabled",
+        agent_mode=False,
     ).auto_title_session(session_id, payload)
     return SessionView.model_validate(session)
 
@@ -1025,8 +1034,24 @@ def activity_summary_session(
         model_id=payload.model_id,
         provider_id=payload.provider_id,
         thinking_mode="off",
+        prefer_fast=True,
+        search_route="disabled",
+        agent_mode=False,
     ).activity_summary_session(session_id, payload)
     return SessionView.model_validate(session)
+
+
+@router.post("/opening-prompts")
+def generate_opening_prompts(
+    payload: OpeningPromptRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> OpeningPromptResponse:
+    """Generate fresh workspace openers without creating a session/message/batch."""
+    from app.services.opening_prompts import OpeningPromptService
+
+    return OpeningPromptService(db, context, settings).generate(payload)
 
 
 @router.get(
@@ -1131,6 +1156,9 @@ def generate_suggested_prompts(
         model_id=payload.model_id,
         provider_id=payload.provider_id,
         thinking_mode="off",
+        prefer_fast=True,
+        search_route="disabled",
+        agent_mode=False,
     ).generate_suggested_prompts(session_id, payload)
     if batch is None:
         # Structural refusal (empty session / voice anchor): "no batch" is the

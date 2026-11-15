@@ -24,6 +24,12 @@ class MCPProtocolFailure(MCPTransportFailure):
     code = "mcp_protocol_error"
 
 
+class MCPRemoteError(MCPProtocolFailure):
+    def __init__(self, rpc_code: int | None, data: Any = None):
+        super().__init__(f"MCP server returned JSON-RPC error {rpc_code}")
+        self.rpc_code, self.data = rpc_code, data
+
+
 class MCPRunnerTimeout(MCPTransportFailure):
     """The isolated runner exceeded the invocation deadline."""
 
@@ -59,3 +65,7 @@ class MCPTransportPort(Protocol):
     def probe(self) -> MCPProbeResult: ...
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> MCPToolCallResult: ...
+
+    def read_resource(self, uri: str) -> MCPToolCallResult: ...
+
+    def get_prompt(self, name: str, arguments: dict[str, str]) -> MCPToolCallResult: ...

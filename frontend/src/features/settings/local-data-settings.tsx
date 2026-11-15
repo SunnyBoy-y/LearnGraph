@@ -1,6 +1,6 @@
 import { Trash2 } from "lucide-react";
 import { useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { Surface } from "@/components/shared/page-elements";
 import { Button } from "@/components/ui/button";
 import { clearSelectionExplanations } from "@/features/chat/selection-explanation";

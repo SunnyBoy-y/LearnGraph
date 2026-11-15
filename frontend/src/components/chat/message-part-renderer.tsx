@@ -1,3 +1,4 @@
+import { webActivityLabel } from "@/lib/web-activity";
 import { nativeMoney } from "@/lib/money";
 import type { BillingCurrency } from "@/types/usage";
 import {
@@ -88,7 +89,7 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { isFailedArtifactPart } from "@/features/chat/chat-message-parts";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import {
   documentHref,
   isDocumentCitationHref,
@@ -1495,7 +1496,7 @@ function ToolCallPart({
           : "",
     )
     .filter(Boolean);
-  const title = toolDisplayTitle(toolName, part.data, selectedNodeLabels);
+  const title = webActivityLabel(part) ?? toolDisplayTitle(toolName, part.data, selectedNodeLabels);
   const searchLike = isSearchLikeTool(toolName);
   const toolInput =
     part.data?.input &&
@@ -1597,7 +1598,7 @@ function WebFetchAuthorizationCard({ data }: { data: FetchAuthorizationData }) {
         await resumeFetchAuthorization(requestId);
       } else if (decision !== "deny" && data.requested_url && data.resume_mode !== "server") {
         window.dispatchEvent(new CustomEvent("learngraph:compose", {
-          detail: { content: `已批准抓取 ${data.requested_url}，请继续使用 fetch_web_page 获取网页内容。`, autoSend: true },
+          detail: { content: `已批准读取 ${data.requested_url}，请继续使用 ${data.tool_name === "read_paper" ? "read_paper（沿用上一轮的 provider 和 paper_id）读取论文原文" : data.tool_name === "browser_read_page" ? "browser_read_page 获取网页内容" : "fetch_web_page 获取网页内容"}。`, autoSend: true },
         }));
       }
       // Refresh persisted history after every decision (including deny) so a

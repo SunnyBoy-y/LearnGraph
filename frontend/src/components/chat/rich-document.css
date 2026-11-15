@@ -2,6 +2,7 @@
 .rich-doc__flow,.rich-doc__section,.rich-doc__stack{display:grid;grid-template-columns:minmax(0,1fr);gap:1.1rem 1.25rem;align-items:start}
 .rich-doc__flow>*,.rich-doc__section>*,.rich-doc__stack>*{grid-column:1/-1;min-width:0}
 .rich-doc__node{min-width:0;max-width:100%}.rich-doc__node>*{width:100%;min-width:0;margin-block:0}
+.rich-doc__icon-copy{display:flex;align-items:baseline;gap:.45em}.rich-doc__icon-copy>div{flex:1;min-width:0}.rich-doc__node-icon{min-width:0}.rich-doc__standalone-icon{display:flex;justify-content:flex-start}.rich-doc__standalone-icon[data-align=center]{justify-content:center}.rich-doc__standalone-icon[data-align=end]{justify-content:flex-end}
 .rich-doc h2{font-size:1.35rem;font-weight:650}.rich-doc h3{font-size:1.1rem;font-weight:600}.rich-doc h4,.rich-doc h5,.rich-doc h6{font-weight:600}
 .rich-doc figure{min-width:0;margin:0}.rich-doc figcaption,.rich-doc__caption{font-size:.8rem;color:var(--muted-foreground);line-height:1.6;margin-top:.5rem}
 .rich-doc blockquote{border-inline-start:2px solid var(--border);padding-inline-start:1rem;color:var(--muted-foreground)}

@@ -16,7 +16,7 @@ class GoalClarifyRequest(BaseModel):
     # the user picked in the chat header instead of an implicit workspace default.
     provider_id: str | None = Field(default=None, min_length=1, max_length=36)
     model_id: str | None = Field(default=None, min_length=1, max_length=160)
-    thinking_mode: Literal["off", "low", "medium", "high", "xhigh"] | None = None
+    thinking_mode: Literal["off", "low", "medium", "high", "xhigh", "max"] | None = None
 
 
 class ClarificationQuestion(BaseModel):
@@ -252,7 +252,7 @@ class CandidateGraphRequest(BaseModel):
     seed_concepts: list[str] = Field(default_factory=list, max_length=24)
     provider_id: str | None = Field(default=None, min_length=1, max_length=36)
     model_id: str | None = Field(default=None, min_length=1, max_length=160)
-    thinking_mode: Literal["off", "low", "medium", "high", "xhigh"] | None = None
+    thinking_mode: Literal["off", "low", "medium", "high", "xhigh", "max"] | None = None
 
 
 class CandidateGraphStreamRequest(CandidateGraphRequest):

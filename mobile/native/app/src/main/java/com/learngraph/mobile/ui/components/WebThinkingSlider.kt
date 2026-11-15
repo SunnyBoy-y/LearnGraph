@@ -29,28 +29,32 @@ import kotlin.math.roundToInt
 
 /** Exact ThinkingSlider geometry from index.css:7605; taps and drags commit discrete stops. */
 @Composable
-fun WebThinkingSlider(value: Int, enabled: Boolean, onChange: (Int) -> Unit, modifier: Modifier = Modifier) {
+fun WebThinkingSlider(value: Int, enabled: Boolean, onChange: (Int) -> Unit, modifier: Modifier = Modifier,
+    labels: List<String> = listOf("极速", "低", "中", "高", "极高", "最高")) {
+    if (labels.isEmpty()) return
+    val last = (labels.size - 1).coerceAtLeast(1)
+    val interactive = enabled && labels.size > 1
     val context = LocalContext.current
     var lastIndex by remember { mutableIntStateOf(value) }
     val change by rememberUpdatedState(onChange)
-    LaunchedEffect(value) { lastIndex = value }
-    val fill by rememberWebAnimatedFloat(value / 4f, WebMotionContract.SliderMillis)
+    LaunchedEffect(value, labels) { lastIndex = value }
+    val fill by rememberWebAnimatedFloat(value / last.toFloat(), WebMotionContract.SliderMillis)
     val primary = MaterialTheme.colorScheme.primary
     val foreground = MaterialTheme.colorScheme.onSurface
     fun commit(next: Int): Boolean {
-        if (!enabled || next == lastIndex) return false
+        if (!interactive || next !in labels.indices || next == lastIndex) return false
         lastIndex = next; Haptics.haptic(context, 1); change(next); return true
     }
     Column(modifier.webDrawerSwipeExcluded(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Canvas(Modifier.fillMaxWidth().height(24.dp).semantics {
             contentDescription = "思考力度"
-            progressBarRangeInfo = ProgressBarRangeInfo(value.toFloat(), 0f..4f, 3)
-            if (!enabled) disabled()
-            setProgress { commit(it.roundToInt().coerceIn(0, 4)) }
-        }.pointerInput(enabled) {
-            if (enabled) awaitEachGesture {
+            progressBarRangeInfo = ProgressBarRangeInfo(value.toFloat(), 0f..(labels.size - 1).toFloat(), (labels.size - 2).coerceAtLeast(0))
+            if (!interactive) disabled()
+            setProgress { commit(it.roundToInt().coerceIn(0, labels.lastIndex)) }
+        }.pointerInput(interactive, labels) {
+            if (interactive) awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
-                fun fromX(x: Float) = (x / size.width.coerceAtLeast(1) * 4f).roundToInt().coerceIn(0, 4)
+                fun fromX(x: Float) = (x / size.width.coerceAtLeast(1) * last.toFloat()).roundToInt().coerceIn(0, labels.lastIndex)
                 commit(fromX(down.position.x)); down.consume()
                 while (true) {
                     val event = awaitPointerEvent()
@@ -62,14 +66,14 @@ fun WebThinkingSlider(value: Int, enabled: Boolean, onChange: (Int) -> Unit, mod
         }) {
             drawRoundRect(foreground.copy(alpha = .08f), cornerRadius = CornerRadius(12.dp.toPx()))
             if (fill > 0f) drawRoundRect(primary, size = Size(size.width * fill, size.height), cornerRadius = CornerRadius(12.dp.toPx()))
-            repeat(5) { index -> drawCircle(foreground.copy(alpha = .25f), 2.5.dp.toPx(), Offset(10.dp.toPx() + (size.width - 20.dp.toPx()) * index / 4f, size.height / 2)) }
-            val center = Offset(size.width * value / 4f, size.height / 2)
+            repeat(labels.size) { index -> drawCircle(foreground.copy(alpha = .25f), 2.5.dp.toPx(), Offset(10.dp.toPx() + (size.width - 20.dp.toPx()) * index / last.toFloat(), size.height / 2)) }
+            val center = Offset(size.width * value / last.toFloat(), size.height / 2)
             drawCircle(Color.Black.copy(alpha = .12f), 10.dp.toPx(), center + Offset(0f, 1.dp.toPx()))
             drawCircle(Color.White, 8.dp.toPx(), center)
             drawCircle(primary, 8.dp.toPx(), center, style = Stroke(2.dp.toPx()))
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            listOf("极速", "低", "中", "高", "极高").forEachIndexed { index, label ->
+            labels.forEachIndexed { index, label ->
                 Text(label, fontSize = 11.sp, lineHeight = 16.5.sp, color = if (index == value) foreground else MaterialTheme.colorScheme.onSurfaceVariant,
                     fontWeight = if (index == value) FontWeight.Bold else FontWeight.Normal)
             }

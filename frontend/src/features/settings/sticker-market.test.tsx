@@ -1,13 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
-import { toast } from 'sonner';
+import { toast } from '@/lib/notifications';
 import * as api from '@/api/stickers';
 import { AnalyzeStickerPackButton, StickerMarketPanel, StickerPipelinePanel } from './sticker-market';
 
 vi.mock('@/api/stickers', () => ({ getStickerMarket: vi.fn(), installMarketPack: vi.fn(), removeMarketPack: vi.fn(), downloadStickerPack: vi.fn(), marketStickerBlob: vi.fn(), getStickerPipeline: vi.fn(), configureStickerPipeline: vi.fn(), analyzeStickerPack: vi.fn() }));
 vi.mock('@/features/auth/auth-context-value', () => ({ useAuth: () => ({ workspaceId: 'workspace', userId: 'owner' }) }));
-vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock('@/lib/notifications', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock('@/lib/native-download', () => ({ saveBlobViaNative: vi.fn(async () => true), nativeDownloadSupported: vi.fn(() => false) }));
 
 const pack: api.StickerMarketPack = { id: 'fluent-warm', name: 'Fluent · 温暖陪伴', description: '给你一个抱抱', category: '陪伴', author: 'Microsoft', version: '1.0.0', license: 'MIT · Copyright Microsoft', license_id: 'MIT', source: 'https://github.com/microsoft/fluentui-emoji', style: '3D', count: 6, bytes: 42000, installed_pack_id: null, enabled: false, previews: [{ index: 0, name: '抱抱', description: '安慰' }] };

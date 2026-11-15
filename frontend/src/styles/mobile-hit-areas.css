@@ -1,0 +1,133 @@
+/* Approved mobile Web hit areas. Keep icon sizes and desktop geometry unchanged.
+   The root qualifier overrides legacy shell rules without preview-only markers. */
+@media (max-width: 1024px) {
+  html:root .workspace-topbar button {
+    min-width: 44px !important;
+    min-height: 44px !important;
+    height: 44px !important;
+    transform: none !important;
+  }
+  html:root .workspace-topbar :is(.topbar-menu-trigger, .topbar-graph-toggle, .topbar-status) {
+    width: 44px !important;
+    flex: 0 0 44px;
+  }
+  html:root .workspace-topbar__left,
+  html:root .workspace-topbar__actions { gap: 4px; }
+  html:root .topbar-model-slot { min-width: 0; }
+  html:root .topbar-model-trigger {
+    max-width: min(46vw, calc(100vw - 176px)) !important;
+    width: auto !important;
+    min-width: 44px !important;
+    overflow: hidden;
+  }
+  html:root .topbar-model-trigger > span:first-child {
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+  }
+  html:root .graph-drawer-close {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+  }
+
+  html:root :is(.chat-composer__start, .chat-composer__end) > button,
+  html:root .chat-voice-bar__button {
+    width: 44px !important;
+    height: 44px !important;
+    min-width: 44px !important;
+    min-height: 44px !important;
+    flex: 0 0 44px;
+    touch-action: manipulation;
+  }
+  html:root .chat-composer__start,
+  html:root .chat-composer__end { margin-inline: 0 !important; }
+  html:root .chat-composer__end { gap: 4px !important; }
+  html:root .chat-workbench-toolbar__action {
+    min-height: 44px;
+    height: 44px;
+    min-width: 44px;
+    touch-action: manipulation;
+  }
+
+  /* Five controls fit on a separate row inside the existing 286px drawer. */
+  html:root .sidebar-nav.is-mobile .sidebar-sessions__heading {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding-inline: 8px;
+  }
+  html:root .sidebar-nav.is-mobile .sidebar-sessions__heading > p { padding-inline: 4px; }
+  html:root .sidebar-nav.is-mobile .sidebar-sessions__header-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 2px;
+    opacity: 1;
+    pointer-events: auto;
+  }
+  html:root .sidebar-nav.is-mobile .sidebar-sessions__header-actions button {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    flex: 0 0 44px;
+    touch-action: manipulation;
+  }
+  html:root .sidebar-nav.is-mobile :is(.sidebar-project__header, .sidebar-sessions__recent-toggle) {
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+  html:root .sidebar-nav.is-mobile .sidebar-project__session-title {
+    min-height: 44px;
+    flex: 1;
+  }
+  html:root .sidebar-nav.is-mobile :is(.sidebar-project__new-session, .sidebar-project__delete-project) {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    opacity: 1;
+    pointer-events: auto;
+  }
+  html:root .sidebar-nav.is-mobile .sidebar-sessions__recent-heading { padding-block: 0; }
+  html:root .sidebar-nav.is-mobile .sidebar-sessions__ungrouped { padding-top: 4px; }
+
+  /* Shrink the grid below the input's intrinsic width, keeping both actions visible. */
+  html:root .workspace-search-dialog { grid-template-columns: minmax(0, 1fr); }
+  html:root .workspace-search-input-row { min-width: 0; gap: 6px; padding-inline: 12px; }
+  html:root .workspace-search-input-row button {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+  }
+  html:root .workspace-search-filters { gap: 2px; padding-inline: 12px; }
+  html:root .workspace-search-filters button { min-width: 44px; min-height: 44px; }
+
+  /* Feedback stays inside each real button; no pseudo hitboxes or QA attributes. */
+  html:root :is(
+    .workspace-topbar button, .graph-drawer-close,
+    .chat-composer__start > button, .chat-composer__end > button,
+    .chat-workbench-toolbar__action, .chat-voice-bar__button,
+    .sidebar-nav.is-mobile .sidebar-sessions__header-actions button,
+    .sidebar-nav.is-mobile .sidebar-sessions__recent-toggle,
+    .sidebar-nav.is-mobile .sidebar-project__header,
+    .sidebar-nav.is-mobile .sidebar-project__session-title,
+    .sidebar-nav.is-mobile .sidebar-project__new-session,
+    .sidebar-nav.is-mobile .sidebar-project__delete-project,
+    .workspace-search-input-row button, .workspace-search-filters button
+  ):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: -2px;
+  }
+  html:root :is(
+    .workspace-topbar button, .graph-drawer-close,
+    .chat-composer__start > button, .chat-composer__end > button,
+    .chat-workbench-toolbar__action, .chat-voice-bar__button,
+    .sidebar-nav.is-mobile .sidebar-sessions__header-actions button,
+    .sidebar-nav.is-mobile .sidebar-sessions__recent-toggle,
+    .sidebar-nav.is-mobile .sidebar-project__header,
+    .sidebar-nav.is-mobile .sidebar-project__session-title,
+    .sidebar-nav.is-mobile .sidebar-project__new-session,
+    .sidebar-nav.is-mobile .sidebar-project__delete-project,
+    .workspace-search-input-row button, .workspace-search-filters button
+  ):not(:disabled):active {
+    background-color: color-mix(in srgb, var(--foreground) 10%, var(--background)) !important;
+  }
+}

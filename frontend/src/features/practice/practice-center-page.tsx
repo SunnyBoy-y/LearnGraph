@@ -12,7 +12,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { createPracticeSession, getPracticeOverview } from "@/api";
 import { ApiError } from "@/api/client";

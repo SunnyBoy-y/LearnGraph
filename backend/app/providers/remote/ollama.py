@@ -215,7 +215,7 @@ def ollama_think_value(mode: str | None, actual: Any) -> bool | str:
         "low": "low",
         "medium": "medium",
         "high": "high",
-        "xhigh": "max",
+        "max": "max",
     }.get(mode or "", True)
 
 
@@ -416,6 +416,9 @@ class OllamaChatProvider(OpenAICompatibleChatProvider):
 
     def _apply_call_options(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
         # Skip OpenAI-style reasoning_effort injection; Ollama uses ``think``.
+        if payload.get("tools") and not self.supports_agent_tools:
+            raise ProviderResponseError("The selected model does not support Agent tools")
+        payload = self._apply_output_budget(payload, responses=False)
         options = self.call_options
         if options is None or responses:
             return payload

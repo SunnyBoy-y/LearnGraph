@@ -69,7 +69,7 @@ import { fastBargeInEnabled, VoiceBargeIn } from './voice-barge-in';
 
 export type VoiceTransportState = "idle" | "connecting" | "connected" | "reconnecting" | "error";
 export type VoiceSessionState = "closed" | "ready" | "listening" | "thinking" | "speaking" | "error";
-export type ThinkingLimit = "off" | "low" | "medium" | "high" | "xhigh";
+export type ThinkingLimit = "off" | "low" | "medium" | "high" | "xhigh" | "max";
 export type VoiceTranscriptRole = TranscriptEntry["role"];
 export type VoiceAudioSource = "idle" | "user" | "assistant";
 export type VoiceTranscript = TranscriptEntry;
@@ -1582,7 +1582,7 @@ function readVoiceCursor(sessionId: string): { seq: number; epoch: number } {
   try { const value = JSON.parse(localStorage.getItem(`learngraph.voice.cursor.${sessionId}`) || "null"); return { seq: Number(value?.seq || 0), epoch: Number(value?.epoch || 0) }; } catch { return { seq: 0, epoch: 0 }; }
 }
 function readLimit(): ThinkingLimit {
-  try { const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")?.thinkingLimit; return ["off", "low", "medium", "high", "xhigh"].includes(value) ? value : "high"; } catch { return "high"; }
+  try { const value = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")?.thinkingLimit; return ["off", "low", "medium", "high", "xhigh", "max"].includes(value) ? value : "high"; } catch { return "high"; }
 }
 function readVoicePreferences(): Record<string, unknown> {
   try {

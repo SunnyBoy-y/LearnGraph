@@ -2,7 +2,7 @@ import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Activity, Download, MoreHorizontal, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 
 import {
   runMemoryProfileAgent,
@@ -562,6 +562,7 @@ export function MemoryPage() {
               onSelectionChange={setSelection}
               pendingCount={pendingCount}
               profile={profile.data}
+              refreshing={regenerateProfile.isPending}
             />
           </TabsContent>
 

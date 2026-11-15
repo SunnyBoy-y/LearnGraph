@@ -1,0 +1,30 @@
+/* Answer chrome shares the prose column, not the wider composer column.
+   Keep responsive gutters on chat-messages-content so narrow panes do not
+   receive a second inset. */
+.workspace-main--chat .chat-canvas-page {
+  --chat-answer-column-width: var(--reading-max-width);
+}
+
+.workspace-main--chat .chat-canvas-page .is-assistant .thinking-chain,
+.workspace-main--chat .chat-canvas-page .is-assistant > .message-stream-details,
+.workspace-main--chat .chat-canvas-page .is-assistant > .message-stream-stats,
+.workspace-main--chat .chat-canvas-page .is-assistant > div:last-child:not([data-message-content]),
+.workspace-main--chat .chat-canvas-page .chat-follow-up-prompts {
+  width: 100%;
+  max-width: var(--chat-answer-column-width);
+  margin-inline: auto;
+}
+
+/* The details wrapper already owns the inset; expanded metrics stay flush. */
+.workspace-main--chat .chat-canvas-page .message-stream-details .message-stream-stats {
+  width: 100%;
+  max-width: none;
+  margin-inline: 0;
+}
+
+/* Preserve the existing full-column answer layout when the desktop rail folds. */
+@media (min-width: 1121px) {
+  .workspace-shell--rail-collapsed .workspace-main--chat .chat-canvas-page {
+    --chat-answer-column-width: 100%;
+  }
+}

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDownToLine, Check, ExternalLink, RefreshCw } from 'lucide-react'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 import { ApiError } from '@/api/client'
 import { checkUpdates, getAppVersion, getUpdateStatus, isUpdateRunning, startUpdate } from '@/api/updates'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'

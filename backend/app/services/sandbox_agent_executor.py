@@ -689,6 +689,10 @@ def execute_subagent_job(
             db = SessionLocal()
         sandbox = sandbox_service
 
+        route_snapshot = dict(getattr(task, "spec_json", None) or {}).get("input_snapshot") or {}
+        inherited_web_route = route_snapshot.get("web_search_route") if isinstance(route_snapshot, dict) else None
+        inherited_web_kwargs = ({"search_route": inherited_web_route}
+            if inherited_web_route in {"disabled", "model_native", "external", "local", "auto"} else {})
         if provider is None:
             model_provider = None
             candidates = list(
@@ -696,7 +700,7 @@ def execute_subagent_job(
                     thinking_requested, default=profile.default_thinking_mode
                 )
             )
-            for extra in ("low", "medium", "high", "xhigh", "off"):
+            for extra in ("max", "xhigh", "high", "medium", "low", "off"):
                 if extra not in candidates:
                     candidates.append(extra)
             for candidate in candidates:
@@ -705,6 +709,7 @@ def execute_subagent_job(
                     job.workspace_id,
                     settings,
                     thinking_mode=candidate,
+                    **inherited_web_kwargs,
                 )
                 if getattr(model_provider, "available", True):
                     thinking_effective = candidate
@@ -716,6 +721,8 @@ def execute_subagent_job(
                     break
         else:
             model_provider = provider
+            if inherited_web_route in {"disabled", "model_native", "external", "local"} and getattr(model_provider, "search_route", None) != inherited_web_route:
+                raise AppError(403, "delegated_search_route_locked", "An injected provider cannot replace the parent task's search route")
             thinking_effective = getattr(provider, "thinking_mode", thinking_requested)
         if thinking_effective is None:
             thinking_effective = thinking_requested
@@ -763,9 +770,13 @@ def execute_subagent_job(
                     workspace_id=job.workspace_id,
                     actor_id=job.owner_user_id,
                     settings=settings,
+                    **inherited_web_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001 - safe runtime failure
                 tool_runtime_error = type(exc).__name__
+        if tool_runtime is not None and inherited_web_route is not None:
+            from app.services.web_tool_policy import bind_web_route
+            bind_web_route(tool_runtime, inherited_web_route)
         if requested_tool_names and tool_runtime is not None:
             try:
                 all_definitions = tool_runtime.definitions_for_tools(

@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 from jsonschema import ValidationError
 from jsonschema.validators import validator_for
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -98,7 +98,7 @@ from app.services.skill_package import (
 from app.services.workflow import WorkflowService
 
 
-TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+TOOL_NAME_RE = re.compile(r"^[^\x00-\x20\x7f]{1,128}$")
 CAPABILITY_QUERY_TOKEN_RE = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+")
 
 
@@ -962,6 +962,10 @@ class MCPAndSkillService:
                 continue
             if not isinstance(tool.get("inputSchema"), dict):
                 continue
+            from types import SimpleNamespace
+            from app.services.web_tool_policy import web_tool_allowed
+            if not web_tool_allowed(SimpleNamespace(extensions=self, search_route=getattr(self, "web_search_route", "auto")), self._agent_mcp_function_name(server.id, name)):
+                continue
             result.append((snapshot, tool))
         return result
 
@@ -1256,6 +1260,9 @@ class MCPAndSkillService:
             "activation_required": True,
             "permissions": list(server.required_permissions or []),
             "tool_count": tool_count,
+            "resource_uris": list(manifest.get("requested_resources") or []),
+            "prompt_names": list(manifest.get("requested_prompts") or []),
+            "content_tools": ["lg_mcp_read_resource", "lg_mcp_get_prompt"],
             "function_name": None,
         }
 
@@ -1309,6 +1316,11 @@ class MCPAndSkillService:
         for server in self.list_servers():
             eligible = self._eligible_mcp_tools(server)
             if not eligible:
+                snapshot = self._current_snapshot(server)
+                manifest = server.manifest_json or {}
+                grant = self._usable_grant("mcp_server", server.id, self._server_authorization_hash(server, snapshot)) if snapshot else None
+                if server.enabled and server.agent_auto_invoke and grant and grant.decision == "always" and (manifest.get("requested_resources") or manifest.get("requested_prompts")):
+                    descriptors.append(self._mcp_server_descriptor(server, snapshot, 0))
                 continue
             descriptors.append(self._mcp_server_descriptor(server, eligible[0][0], len(eligible)))
             for _snapshot, tool in eligible:
@@ -1784,6 +1796,10 @@ class MCPAndSkillService:
                     server, name, active_ids, active_families
                 ):
                     continue
+                from types import SimpleNamespace
+                from app.services.web_tool_policy import web_tool_allowed
+                if not web_tool_allowed(SimpleNamespace(extensions=self, search_route=getattr(self, "web_search_route", "auto")), self._agent_mcp_function_name(server.id, name)):
+                    continue
                 definitions.append(
                     {
                         "type": "function",
@@ -1919,8 +1935,8 @@ class MCPAndSkillService:
             "already announces it; do not make a second announcement call. Apply its "
             "instructions. Follow the instructions; do not invent "
             "host-side scripts or claim you executed package scripts unless a "
-            "sandbox tool result confirms it. Package scripts are never automatic "
-            "tools."
+            "sandbox tool result confirms it. Use `lg_skill_run_script` to execute the "
+            "stored package code in the authorized sandbox; never rewrite that code to pretend it ran."
         ]
         if sections:
             parts.append("\n\n".join(sections))
@@ -2346,7 +2362,8 @@ class MCPAndSkillService:
             {
                 "transport": "streamable_http",
                 "available": True,
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": "2026-07-28",
+                "supported_protocol_versions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
                 "supports_real_execution": True,
                 "supports_encrypted_bearer_reference": True,
                 "reason": (
@@ -2357,7 +2374,8 @@ class MCPAndSkillService:
             {
                 "transport": "stdio",
                 "available": stdio_available,
-                "protocol_version": PROTOCOL_VERSION if stdio_available else None,
+                "protocol_version": "2026-07-28" if stdio_available else None,
+                "supported_protocol_versions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
                 "supports_real_execution": stdio_available,
                 "supports_encrypted_bearer_reference": stdio_available,
                 "reason": stdio_reason,
@@ -2740,6 +2758,10 @@ class MCPAndSkillService:
 
     def invoke_mcp(self, server_id: str, payload: MCPInvokeRequest) -> ExtensionInvocation:
         server = self.require_server(server_id)
+        from types import SimpleNamespace
+        from app.services.web_tool_policy import web_tool_allowed
+        if not web_tool_allowed(SimpleNamespace(extensions=self, search_route=getattr(self, "web_search_route", "auto")), self._agent_mcp_function_name(server.id, payload.tool_name)):
+            raise AppError(403, "web_search_route_denied", "The current search route does not authorize this MCP network tool")
         arguments = dict(payload.arguments)
         input_size = len(_canonical_bytes(arguments))
         invocation = self._create_invocation(
@@ -2840,8 +2862,10 @@ class MCPAndSkillService:
         invocation.started_at = utc_now()
         self.db.commit()
         try:
-            result = self._adapter(server).call_tool(payload.tool_name, arguments).result
-            persisted = _redact_sensitive_keys(result)
+            from app.services.extension_capacity import guarded_mcp_call
+            result = guarded_mcp_call(self, server, lambda: self._adapter(server).call_tool(payload.tool_name, arguments)).result
+            from app.services.mcp_result import redact_result
+            persisted = redact_result(self, server, result)
             result_bytes = _canonical_bytes(persisted)
             if len(result_bytes) > server.max_result_bytes:
                 raise MCPResponseTooLarge(
@@ -2849,6 +2873,11 @@ class MCPAndSkillService:
                 )
             if result.get("isError") is True:
                 raise MCPProtocolFailure("MCP tool reported isError=true")
+            if isinstance(tool.get("outputSchema"), dict):
+                try:
+                    _validate_instance(tool["outputSchema"], result.get("structuredContent"), "MCP structured result")
+                except AppError as exc:
+                    raise MCPProtocolFailure(exc.message) from exc
             invocation.status = "succeeded"
             invocation.result_json = persisted
             invocation.result_size_bytes = len(result_bytes)
@@ -3665,15 +3694,20 @@ class MCPAndSkillService:
             subject.status = "disabled"
             subject.enabled = False
 
-    @staticmethod
     def _consume_allow_once(
-        grant: ExtensionPermissionGrant,
+        self, grant: ExtensionPermissionGrant,
         subject: MCPServer | SkillRecord,
     ) -> None:
         if grant.decision != "allow_once":
             return
-        grant.status = "consumed"
-        grant.consumed_at = utc_now()
+        consumed = self.db.execute(update(ExtensionPermissionGrant).where(
+            ExtensionPermissionGrant.id == grant.id,
+            ExtensionPermissionGrant.workspace_id == self.workspace_id,
+            ExtensionPermissionGrant.status == "active",
+        ).values(status="consumed", consumed_at=utc_now()).execution_options(synchronize_session=False))
+        if consumed.rowcount != 1:
+            raise AppError(409, "extension_authorization_consumed", "This one-time grant has already been consumed")
+        self.db.expire(grant)
         subject.status = "authorization_required"
         subject.enabled = False
 
@@ -3836,6 +3870,11 @@ class MCPAndSkillService:
         server.runner_image_digest = f"sha256:{hex_part}"
         server.launch_command = list(command)
         server.launch_spec_hash = launch_spec_hash
+        self._supersede_grants("mcp_server", server.id)
+        server.enabled = False
+        server.current_snapshot_id = None
+        server.authorization_generation += 1
+        server.status = "authorization_required"
         server.launch_status = "unapproved"
         server.launch_approved_by = None
         server.launch_approved_at = None
@@ -3858,7 +3897,7 @@ class MCPAndSkillService:
         self.db.refresh(server)
         return server
 
-    def approve_stdio_launch_spec(self, server_id: str) -> MCPServer:
+    def approve_stdio_launch_spec(self, server_id: str, *, expected_hash: str | None = None) -> MCPServer:
         """Approve a previously registered stdio launch spec (audited).
 
         Only an approved spec unlocks the isolated runner adapter; unreviewed
@@ -3872,10 +3911,16 @@ class MCPAndSkillService:
                 "mcp_stdio_launch_spec_missing",
                 "Register a reviewed stdio launch spec before approving it",
             )
-        server.launch_status = "approved"
-        server.launch_approved_by = self.actor_id
-        server.launch_approved_at = utc_now()
-        server.last_error = None
+        expected_hash = expected_hash or server.launch_spec_hash
+        approved = self.db.execute(update(MCPServer).where(
+            MCPServer.id == server.id, MCPServer.workspace_id == self.workspace_id,
+            MCPServer.launch_spec_hash == expected_hash,
+        ).values(launch_status="approved", launch_approved_by=self.actor_id,
+                 launch_approved_at=utc_now(), last_error=None).execution_options(synchronize_session=False))
+        if approved.rowcount != 1:
+            self.db.rollback()
+            raise AppError(409, "mcp_stdio_launch_spec_changed", "The launch spec changed; review the current spec before approving")
+        self.db.refresh(server)
         self.audit.record(
             actor_id=self.actor_id,
             action="mcp.stdio_launch_spec_approved",
@@ -3893,10 +3938,13 @@ class MCPAndSkillService:
         return server
 
     def _adapter(self, server: MCPServer) -> MCPTransportPort:
+        from app.services.extension_capacity import execution_timeout_ms
+        timeout_ms = execution_timeout_ms(self, server)
         if server.transport == "stdio":
             if self.settings.mcp_stdio_runner_enabled:
                 launch_spec = self._stdio_launch_spec(server)
                 if launch_spec is not None:
+                    launch_spec["timeout_seconds"] = timeout_ms / 1000
                     return StdioIsolatedMCPAdapter(
                         DockerStdioMCPRunner(self.settings),
                         launch_spec,
@@ -3915,10 +3963,12 @@ class MCPAndSkillService:
         bridge_url = self.settings.effective_host_bridge_url
         host_access_mode = self.settings.effective_host_access_mode
         allow_private_hosts: frozenset[str] = frozenset()
-        if host_access_mode == "direct" and is_loopback_url(server.endpoint_url):
-            server.endpoint_url = resolve_loopback_url(
+        endpoint_url = server.endpoint_url
+        via_bridge = False
+        if host_access_mode == "direct" and is_loopback_url(endpoint_url):
+            endpoint_url = resolve_loopback_url(
                 service_id=f"mcp-{sanitize_service_id(server.server_key)}",
-                base_url=server.endpoint_url,
+                base_url=endpoint_url,
                 host_bridge_url=None,
                 deployment_profile=self.settings.deployment_profile,
                 host_access_mode="direct",
@@ -3927,12 +3977,13 @@ class MCPAndSkillService:
         elif (
             bridge_url
             and self.settings.deployment_profile != "personal_desktop"
-            and is_loopback_url(server.endpoint_url)
+            and is_loopback_url(endpoint_url)
         ):
+            via_bridge = True
             service_id = f"mcp-{sanitize_service_id(server.server_key)}"
-            server.endpoint_url = resolve_loopback_url(
+            endpoint_url = resolve_loopback_url(
                 service_id=service_id,
-                base_url=server.endpoint_url,
+                base_url=endpoint_url,
                 host_bridge_url=bridge_url,
                 deployment_profile=self.settings.deployment_profile,
             )
@@ -3943,14 +3994,14 @@ class MCPAndSkillService:
             if bridge_host:
                 allow_private_hosts = frozenset({bridge_host})
         extra_headers: dict[str, str] = {}
-        if bridge_url:
+        if via_bridge:
             bridge_token = read_bridge_token(self.settings.host_bridge_token_file)
             if bridge_token:
                 extra_headers = {HOST_BRIDGE_TOKEN_HEADER: bridge_token}
         return StreamableHTTPMCPAdapter(
-            server.endpoint_url,
+            endpoint_url,
             bearer_token=self._credential_secret(server),
-            timeout_ms=server.timeout_ms,
+            timeout_ms=min(server.timeout_ms, getattr(self, "execution_timeout_ms", server.timeout_ms)),
             max_response_bytes=server.max_result_bytes,
             allow_private_hosts=allow_private_hosts,
             extra_headers=extra_headers,
@@ -3968,12 +4019,18 @@ class MCPAndSkillService:
 
         if server.transport != "stdio":
             return None
-        try:
-            return self.oauth_lifecycle().runner_only_token(
-                server, audience="mcp-stdio-runner"
-            )
-        except AppError:
+        if not server.auth_reference:
             return None
+        credential = self._credential(server)
+        if credential is None:
+            raise MCPTransportUnavailable("MCP credential reference is unavailable")
+        if credential.auth_kind == "oauth_authorization_code":
+            token = self.oauth_lifecycle().runner_only_token(server, audience="mcp-stdio-runner")
+            if token is None:
+                raise MCPTransportUnavailable("MCP OAuth credential is expired or revoked; refresh authorization before execution")
+            return token
+        secret = self._credential_secret(server)
+        return {"audience":"mcp-stdio-runner", "access_token":secret} if secret else None
 
     def _credential(self, server: MCPServer) -> MCPServerCredential | None:
         if not server.auth_reference:
@@ -3988,7 +4045,16 @@ class MCPAndSkillService:
     def _credential_secret(self, server: MCPServer) -> str | None:
         credential = self._credential(server)
         if credential is None:
+            if server.auth_reference:
+                raise MCPTransportUnavailable("MCP credential reference is unavailable")
             return None
+        if credential.auth_kind == "oauth_authorization_code":
+            token = self.oauth_lifecycle().runner_only_token(server, audience="mcp-http-client")
+            if token is None:
+                raise MCPTransportUnavailable("MCP OAuth credential is expired or revoked")
+            return token["access_token"]
+        if credential.status == "revoked" or credential.revoked_at is not None:
+            raise MCPTransportUnavailable("MCP credential has been revoked")
         try:
             return decrypt_mcp_secret(
                 self.settings, credential.ciphertext, label="MCP bearer credential"
@@ -4192,6 +4258,7 @@ class MCPAndSkillService:
                 "subject_id": server.id,
                 "manifest_hash": server.manifest_hash,
                 "snapshot_hash": snapshot.snapshot_hash,
+                "launch_spec_hash": server.launch_spec_hash if server.transport == "stdio" else None,
                 "permissions": server.required_permissions,
             }
         )
@@ -4275,9 +4342,28 @@ class MCPAndSkillService:
     def _normalize_named_items(
         values: list[dict[str, Any]], item_type: str
     ) -> list[dict[str, Any]]:
-        normalized = [_redact_sensitive_keys(dict(item)) for item in values]
         key = "uri" if item_type == "resource" else "name"
-        return sorted(normalized, key=lambda item: str(item.get(key) or ""))
+        normalized = []
+        seen = set()
+        if len(values) > 1000:
+            raise MCPProtocolFailure("MCP content list exceeds its safety limit")
+        for item in values:
+            identifier = item.get(key) if isinstance(item, dict) else None
+            if not isinstance(identifier, str) or not identifier or len(identifier) > 2048 or identifier in seen:
+                raise MCPProtocolFailure("MCP content list returned an invalid or duplicate identifier")
+            if item_type == "prompt":
+                arguments = item.get("arguments", [])
+                if not isinstance(arguments, list) or any(not isinstance(arg, dict) or not isinstance(arg.get("name"), str) or not arg["name"] for arg in arguments):
+                    raise MCPProtocolFailure("MCP prompt declared invalid arguments")
+            if item.get("uriTemplate"):
+                import uri_template
+                try:
+                    uri_template.URITemplate(item["uriTemplate"])
+                except (ValueError, TypeError) as exc:
+                    raise MCPProtocolFailure("MCP returned an invalid resource URI template") from exc
+            seen.add(identifier)
+            normalized.append(_redact_sensitive_keys(dict(item)))
+        return sorted(normalized, key=lambda item: item[key])
 
     @staticmethod
     def _validate_skill_manifest(manifest: SkillManifest) -> dict[str, Any]:
@@ -4598,7 +4684,7 @@ class MCPAndSkillService:
             if bool(arguments["enabled"]):
                 grant = self.authorize_skill(
                     skill.id,
-                    PermissionDecisionRequest(decision="always", reason=reason),
+                    PermissionDecisionRequest(decision="always", reason=reason, permissions=list(skill.required_permissions or [])),
                 )
                 self.db.refresh(skill)
                 return {
@@ -4806,7 +4892,7 @@ class MCPAndSkillService:
                     server.agent_auto_invoke = True
                 grant = self.authorize_server(
                     server.id,
-                    PermissionDecisionRequest(decision="always", reason=reason),
+                    PermissionDecisionRequest(decision="always", reason=reason, permissions=list(server.required_permissions or [])),
                 )
                 self.db.refresh(server)
                 return {

@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Upload, RefreshCw, Search, Pencil, ImagePlus } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { toast } from 'sonner';
+import { toast } from '@/lib/notifications';
 import { listProviders } from '@/api';
 import { configureStickers, getStickerStatus, importStickerPack, rebuildStickerIndex, reorderStickerPacks, searchStickers, setStickerPackEnabled, updateSticker, type Sticker } from '@/api/stickers';
 import { useAuth } from '@/features/auth/auth-context-value';

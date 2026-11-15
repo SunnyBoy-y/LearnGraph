@@ -26,7 +26,7 @@ import {
   type FormEvent,
 } from "react";
 import { useNavigate } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   cancelSessionMessage,
@@ -34,7 +34,6 @@ import {
   fileStreamUrl,
   listSessionFiles,
   listSessionMessages,
-  listSessions,
   listSettings,
   streamSessionMessage,
 } from "@/api";
@@ -44,9 +43,10 @@ import {
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { RailConversationComposer, RailConversationMessage } from "./rail-conversation";
+import { SessionFileTree } from "./session-file-tree";
+import { sessionFileKey as fileKey, sessionFilePath } from "@/lib/session-files";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { FilePreviewContent } from "@/components/resources/file-preview-content";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -65,9 +65,11 @@ import {
 } from "./selection-explanation";
 import { createUuid } from "@/lib/uuid";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { getSession } from "@/api/session-browser";
+import { ApiError } from "@/api/client";
+import { useSessionDetail, useSessionPicker, sessionDetailKey, cacheCreatedSession } from "@/lib/session-queries";
 import { readChatThinkingChainDefault } from "@/lib/workspace-settings";
 import { resolveFilePreviewKind, type FilePreviewKind } from "@/lib/file-preview";
-import type { SessionFile } from "@/types/files";
 import type {
   Message,
   MessageCreateRequest,
@@ -238,13 +240,11 @@ export function SideConversationRail({
   const [streamingSessionIds, setStreamingSessionIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const sessions = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "sessions"),
-    queryFn: listSessions,
-    staleTime: 15_000,
-  });
   const [query, setQuery] = useState("");
+  const [composingSearch, setComposingSearch] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const sessions = useSessionPicker(workspaceId, query, pickerOpen, composingSearch);
+  const currentSessionQuery = useSessionDetail(workspaceId, currentSessionId);
   const [selectedSessionId, setSelectedSessionId] = useState<string | undefined>(
     currentSessionId && currentSessionId !== "new" ? currentSessionId : undefined,
   );
@@ -263,9 +263,8 @@ export function SideConversationRail({
       (session) => session.status !== "archived",
     );
     setSelectedSessionId((current) => {
-      if (current && availableSessions.some((session) => session.id === current)) {
-        return current;
-      }
+      // Missing from a search page is not evidence that a session disappeared.
+      if (current) return current;
       if (
         currentSessionId &&
         availableSessions.some((session) => session.id === currentSessionId)
@@ -284,16 +283,15 @@ export function SideConversationRail({
     }
   }, [focusSessionId]);
 
-  const currentSession = sessions.data?.find(
-    (session) => session.id === currentSessionId,
-  );
+  const currentSession = currentSessionQuery.data;
   const parentSessionId =
     currentSession?.parent_session_id ??
     (currentSessionId && currentSessionId !== "new"
       ? currentSessionId
       : null);
   const activeSessionId = selection ? selection.explanationSessionId : selectedSessionId;
-  const selectedSession = sessions.data?.find((session) => session.id === activeSessionId);
+  const selectedSessionQuery = useSessionDetail(workspaceId, activeSessionId);
+  const selectedSession = selectedSessionQuery.data;
   const { canSend, pending: modelsPending, control: modelControl, persistComposerPrefs, requestPreferences } =
     useRailConversationModel(workspaceId, activeSessionId || currentSessionId || "", activeSessionId, (selectedSession ?? currentSession)?.model_snapshot);
   const messages = useQuery({
@@ -344,6 +342,7 @@ export function SideConversationRail({
           ...(current ?? []).filter((item) => item.id !== session.id),
         ],
       );
+      cacheCreatedSession(queryClient, workspaceId, session);
       queryClient.setQueryData<Message[]>(messageKey(session.id), []);
       setSelection(null);
       onCloseSelection?.();
@@ -356,8 +355,14 @@ export function SideConversationRail({
   });
 
   const ensureExplanationSession = useCallback(async (record: SelectionExplanationRecord): Promise<Session> => {
-    const existing = sessions.data?.find((session) => session.id === record.explanationSessionId);
-    if (existing) return existing;
+    if (record.explanationSessionId) {
+      try {
+        return await queryClient.fetchQuery({ queryKey: sessionDetailKey(workspaceId, record.explanationSessionId),
+          queryFn: ({ signal }) => getSession(record.explanationSessionId!, { signal }), staleTime: 30_000 });
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.status !== 404) throw error;
+      }
+    }
     let pending = creatingExplanationsRef.current.get(record.id);
     if (!pending) {
       const titleSeed = record.selectedText.replace(/\s+/gu, " ").slice(0, 24);
@@ -378,7 +383,8 @@ export function SideConversationRail({
         session, ...(current ?? []).filter((item) => item.id !== session.id),
       ]);
       if (queryClient.getQueryData(messageKey(session.id)) === undefined) {
-        queryClient.setQueryData<Message[]>(messageKey(session.id), []);
+        cacheCreatedSession(queryClient, workspaceId, session);
+      queryClient.setQueryData<Message[]>(messageKey(session.id), []);
       }
       if (activeSelectionIdRef.current === record.id) {
         setSelection(bound ?? { ...record, explanationSessionId: session.id });
@@ -795,7 +801,7 @@ export function SideConversationRail({
           </Button>
           <Button
             aria-label="新建侧边对话"
-            disabled={sessions.isPending || createSideSession.isPending}
+            disabled={createSideSession.isPending}
             onClick={() => createSideSession.mutate()}
             size="icon-xs"
             title="新建侧边对话"
@@ -821,7 +827,7 @@ export function SideConversationRail({
           <PopoverContent align="start" className="rail-session-picker__popover">
             <div className="right-rail-conversation__search">
               <Search className="size-3.5" />
-              <Input aria-label="搜索会话" onChange={(event) => setQuery(event.currentTarget.value)} placeholder="搜索会话…" value={query} />
+              <Input aria-label="搜索会话" onChange={(event) => setQuery(event.currentTarget.value)} onCompositionStart={() => setComposingSearch(true)} onCompositionEnd={() => setComposingSearch(false)} placeholder="搜索会话…" value={query} />
             </div>
             <div aria-label="分屏会话" className="rail-session-picker__list">
               {visibleSessions.map((session) => (
@@ -831,7 +837,10 @@ export function SideConversationRail({
                   {session.id === activeSessionId ? <Check className="size-3.5" /> : null}
                 </button>
               ))}
-              {!visibleSessions.length ? <p className="p-3 text-xs text-muted-foreground">{sessions.isPending ? "正在读取会话…" : "没有匹配的会话"}</p> : null}
+              {sessions.hasPreviousPage ? <Button variant="ghost" size="xs" disabled={sessions.isFetching} onClick={() => void sessions.fetchPreviousPage({ cancelRefetch: false })}>加载较新的会话</Button> : null}
+              {sessions.hasNextPage ? <Button variant="ghost" size="xs" disabled={sessions.isFetching || sessions.waiting} onClick={() => void sessions.fetchNextPage({ cancelRefetch: false })}>加载更多</Button> : null}
+              {sessions.isError ? <Button variant="ghost" size="xs" onClick={() => void sessions.refetch()}>加载失败，点击重试</Button> : null}
+              {!visibleSessions.length ? <p className="p-3 text-xs text-muted-foreground">{sessions.isPending || sessions.waiting ? "正在读取会话…" : "没有匹配的会话"}</p> : null}
             </div>
           </PopoverContent>
         </Popover>
@@ -904,10 +913,7 @@ export function SideConversationRail({
   );
 }
 
-/** Inline session-file browser that reuses the same safe document renderer as
- * the full resource preview dialog. The list stays compact; the selected
- * document occupies the rest of the rail and supports PPT/HTML/DOCX/PDF and
- * other formats already understood by FilePreviewCanvas. */
+/** Session directory and full-rail preview share the resource document renderer. */
 export function SessionFilePreviewRail({
   workspaceId,
   sessionId,
@@ -923,23 +929,29 @@ export function SessionFilePreviewRail({
     staleTime: 10_000,
   });
   const list = useMemo(() => files.data ?? [], [files.data]);
-  const [selectedFileKey, setSelectedFileKey] = useState<string | null>(null);
-  const selectedFile = useMemo(
-    () => list.find((file) => fileKey(file) === selectedFileKey) ?? null,
-    [list, selectedFileKey],
-  );
+  const scope = `${workspaceId}:${sessionId}`;
+  const [selection, setSelection] = useState<{ scope: string; key: string } | null>(null);
+  const selectedFile = selection?.scope === scope
+    ? list.find((file) => fileKey(file) === selection.key) ?? null
+    : null;
+  const selectedButton = useRef<HTMLButtonElement | null>(null);
+  const closeButton = useRef<HTMLButtonElement | null>(null);
   const [downloading, setDownloading] = useState(false);
   useEffect(() => {
-    if (!list.length) {
-      setSelectedFileKey(null);
-      return;
-    }
-    setSelectedFileKey((current) =>
-      current && list.some((file) => fileKey(file) === current)
-        ? current
-        : fileKey(list[0]),
-    );
-  }, [list]);
+    setSelection(null);
+  }, [scope]);
+  useEffect(() => {
+    if (selection?.scope === scope && files.isSuccess && !selectedFile) setSelection(null);
+  }, [files.isSuccess, scope, selectedFile, selection]);
+  const previewKey = selectedFile ? fileKey(selectedFile) : null;
+  useEffect(() => {
+    if (previewKey) closeButton.current?.focus();
+  }, [previewKey]);
+
+  function closePreview() {
+    setSelection(null);
+    requestAnimationFrame(() => selectedButton.current?.focus());
+  }
 
   async function downloadSelected() {
     if (!selectedFile?.file_id || downloading) return;
@@ -964,11 +976,10 @@ export function SessionFilePreviewRail({
 
   return (
     <section aria-label="会话文件预览" className="right-rail-panel right-rail-files">
-      <header className="right-rail-panel__header">
+      <header className="right-rail-panel__header" hidden={Boolean(selectedFile)}>
         <div className="right-rail-panel__heading">
-          <span className="right-rail-panel__eyebrow"><FolderOpen className="size-3.5" />文件工作区</span>
           <strong>会话文件</strong>
-          <small>{list.length ? `${list.length} 个文件 · 选择后在右栏内预览` : "当前会话还没有关联文件"}</small>
+          <small>{list.length} 个文件</small>
         </div>
         <Button
           aria-label="刷新会话文件"
@@ -983,39 +994,42 @@ export function SessionFilePreviewRail({
       </header>
       {files.isPending ? (
         <div className="right-rail-empty right-rail-empty--tall"><LoaderCircle className="size-4 animate-spin" />正在读取文件…</div>
-      ) : files.isError ? (
+      ) : files.isError && !list.length ? (
         <div className="right-rail-empty right-rail-empty--tall is-error">会话文件加载失败，请刷新重试。</div>
       ) : !list.length ? (
         <div className="right-rail-empty right-rail-empty--tall"><ImageIcon className="size-5" /><strong>还没有可预览的文件</strong><span>引用资料、生成图片或下载文件后会显示在这里。</span></div>
       ) : (
         <>
-          <div className="right-rail-files__list" aria-label="文件列表">
-            {list.map((file) => {
-              const { Icon, label, kind } = fileKind(file.filename, file.mime_type);
-              const active = selectedFileKey === fileKey(file);
+          <div className="right-rail-files__list" aria-label="文件列表" hidden={Boolean(selectedFile)}>
+            <SessionFileTree key={scope} files={list} renderFile={(file, name) => {
+              const { Icon, label } = fileKind(file.filename, file.mime_type);
               return (
                 <button
-                  aria-pressed={active}
-                  className={active ? "right-rail-file-card is-active" : "right-rail-file-card"}
-                  key={fileKey(file)}
-                  onClick={() => setSelectedFileKey(fileKey(file))}
+                  aria-label={`预览 ${sessionFilePath(file)}`}
+                  className="right-rail-file-card"
+                  onClick={(event) => {
+                    selectedButton.current = event.currentTarget;
+                    setSelection({ scope, key: fileKey(file) });
+                  }}
+                  title={sessionFilePath(file)}
                   type="button"
                 >
-                  <span className="right-rail-file-card__icon"><Icon className="size-3.5" /></span>
-                  <span className="right-rail-file-card__copy">
-                    <strong title={file.filename}>{file.filename}</strong>
-                    <small>{label} · {formatBytes(file.size_bytes)}{kind === "unsupported" ? " · 需下载" : ""}</small>
-                  </span>
-                  {active ? <Badge variant="secondary">预览</Badge> : null}
+                  <span className="right-rail-file-card__icon"><Icon className="size-4" /></span>
+                  <span className="right-rail-file-card__copy"><strong>{name}</strong><small>{label} · {formatBytes(file.size_bytes)}</small></span>
                 </button>
               );
-            })}
+            }} />
           </div>
           {selectedFile ? (
-            <div className="right-rail-files__preview">
+            <div className="right-rail-files__preview" onKeyDown={(event) => {
+              if (event.key === "Escape" && !event.defaultPrevented) { event.stopPropagation(); closePreview(); }
+            }}>
               <header className="right-rail-files__preview-head">
-                <div className="min-w-0"><strong title={selectedFile.filename}>{selectedFile.filename}</strong><span>{fileKind(selectedFile.filename, selectedFile.mime_type).label}</span></div>
-                <Button disabled={!selectedFile.file_id || downloading} onClick={() => void downloadSelected()} size="icon-xs" title="下载文件" variant="ghost"><Download className="size-3.5" /></Button>
+                <div className="min-w-0"><strong title={sessionFilePath(selectedFile)}>{selectedFile.filename}</strong><span title={sessionFilePath(selectedFile)}>{sessionFilePath(selectedFile)}</span></div>
+                <div className="right-rail-files__preview-actions">
+                  <Button aria-label="下载文件" disabled={!selectedFile.file_id || downloading} onClick={() => void downloadSelected()} size="icon-xs" title="下载文件" variant="ghost"><Download className="size-3.5" /></Button>
+                  <Button ref={closeButton} aria-label="关闭预览，返回文件列表" onClick={closePreview} size="icon-xs" title="关闭预览" variant="ghost"><X className="size-4" /></Button>
+                </div>
               </header>
               <div className="right-rail-files__preview-body">
                 {!selectedFile.file_id ? (
@@ -1037,8 +1051,4 @@ export function SessionFilePreviewRail({
       )}
     </section>
   );
-}
-
-function fileKey(file: SessionFile) {
-  return file.file_id ?? `${file.path ?? ""}:${file.filename}`;
 }

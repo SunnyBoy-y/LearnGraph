@@ -41,7 +41,6 @@
 .stream-ui__graph .stream-ui__node rect { fill:var(--graph-node); stroke:var(--graph-border); }
 .stream-ui__graph .stream-ui__node text { fill:var(--graph-foreground); }
 .stream-ui__graph .stream-ui__node[data-selected=true] rect { fill:var(--graph-node); stroke:var(--genui-accent); }
-.stream-ui__graph-hint { margin:6px 0 0; font-size:12px; color:var(--muted-foreground); }
 .stream-ui__graph[data-direction=TB] .stream-ui__graph-scroll { height:440px; }
 .stream-ui__graph[data-layout=mindmap] .stream-ui__edge path { stroke-width:2.5; }
 .stream-ui__graph[data-layout=mindmap] .stream-ui__edge[data-cross-link=true] path { stroke-dasharray:5 4; stroke-width:1.5; }
@@ -83,6 +82,7 @@
 .stream-ui__metrics [data-emphasis=context] .metric-card__value { font-size:24px; font-weight:500; }
 .stream-ui__metrics .metric-card__value small,.stream-ui__metrics .metric-card__hint { font-size:13px; font-weight:400; letter-spacing:normal; color:var(--muted-foreground); }
 .stream-ui__footer { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:8px 0 0; font-size:12px; color:var(--muted-foreground); }
+.stream-ui[data-ui-component=graph] > .stream-ui__footer { justify-content:flex-end; }
 .stream-ui__footer > span { overflow-wrap:anywhere; white-space:pre-wrap; }
 .stream-ui__footer strong { font-weight:400; }
 .stream-ui__empty { min-height:120px; display:grid; place-items:center; color:var(--muted-foreground); font-size:13px; }

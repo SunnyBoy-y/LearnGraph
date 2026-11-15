@@ -26,6 +26,7 @@ _PRESENTATION_POLICY = presentation_catalog_prompt() + """回答可以自然混�
 """
 
 _DOCUMENT_CATALOG = """document 的 blocks 为稳定 id、可选 parent_id、type 的平面树（先父后子）。内容类型 paragraph/heading/list/quote/code/math/divider 使用 text；code 可设 language。
+可选图标示例：{"id":"intro","type":"heading","text":"概览","icon":"fluent:light-bulb"}；section、rail_item与其他普通节点也支持icon。独立图标用{"id":"launch","type":"icon","icon":"fluent:rocket"}，必须有icon且不能包含子节点。props.icon装饰组件标题，metric/timeline的items[].icon装饰条目，不需要每次使用。
 布局 section/stack/row/columns/grid/media_text/tabs/accordion/figure，可设 label、columns=1..3、align=start|center|end、width=reading|full；最大深度6、160节点、同级40。
 media_text 只是布局；图片必须是另一个 image 子节点，使用 parent_id 关联布局。不要把 query 写在 media_text 等布局节点上，否则校验会提示修正。
 你负责根据内容明确决定布局：section/stack 及文档根节点始终按顺序纵排，前端不会因控件大小或相邻而自动配对。需要比较的简洁图表、彼此关联的要点，可由你放入同一个 row/columns/grid，设 columns=2 或 3；讲解需要连续展开或细节较多时选纵排，复杂图表、多列表格或关系图可独占一行，分栏中的节点设 width=full 可跨整行。图与对应解释可用 media_text。分栏是你给出的内容分组和最大列数意图，前端只按实际可用宽度换行、拉伸填满余下行，并去掉空列；不改变分组、顺序或因图表数据量另选布局。不留空白占位，不为凑列添加无关内容，不必把所有控件都并排。
@@ -107,7 +108,7 @@ class InlineUIParser:
             if not any(
                 node.text.strip()
                 or (node.type in {"image", "image_group", "gallery"} and (node.query or node.fallback_svg))
-                or node.type in {"simulation", "interactive"}
+                or node.type in {"simulation", "interactive", "icon"}
                 or (node.visual and any(node.visual.get(key) for key in ("rows", "nodes", "items")))
                 for node in snapshot.blocks
             ):

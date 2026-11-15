@@ -17,11 +17,37 @@ vi.mock("@/features/auth/auth-context-value", () => ({
   useAuth: () => ({ workspaceId: "test-workspace", username: "tester", workspaceName: "Test workspace", effectivePermissions: [] }),
 }));
 
+beforeEach(() => {
+  vi.spyOn(apiClient, "getConditional").mockImplementation((async (path: string, _etag?: string | null, options?: Parameters<typeof apiClient.getConditional>[2]) => ({
+    notModified: false, etag: null, data: await apiClient.get(path, options),
+  })) as typeof apiClient.getConditional);
+});
+
 describe("unused chat drafts", () => {
   beforeEach(() => {
     vi.spyOn(apiClient, "get").mockResolvedValue([]);
     vi.spyOn(apiClient, "post").mockRejectedValue(new Error("Unexpected write"));
     vi.spyOn(apiClient, "patch").mockRejectedValue(new Error("Unexpected write"));
+  });
+
+  it('opens a draft with malformed persisted attachment fields and keeps its text', async () => {
+    const workspace = `draft-recovery-${crypto.randomUUID()}`;
+    localStorage.setItem(`lg:composer-state:v2:${workspace}:new:root`, JSON.stringify({
+      version: 2, updatedAt: Date.now(), fields: {
+        text: '应当保留的草稿', files: null, pendingFiles: null, stickers: {}, queue: null,
+      },
+    }));
+    const view = renderWithProviders(
+      <TooltipProvider><Routes>
+        <Route path="/w/:workspaceId/chat/:sessionId" element={<ChatCanvasPage />} />
+      </Routes></TooltipProvider>,
+      { initialEntries: [`/w/${workspace}/chat/new`] },
+    );
+    expect(await screen.findByRole('heading', { name: '从一个问题开始' })).toBeInTheDocument();
+    expect(view.container.querySelector('textarea[name="message"]')).toHaveValue('应当保留的草稿');
+    expect(apiClient.post).not.toHaveBeenCalled();
+    expect(apiClient.patch).not.toHaveBeenCalled();
+    view.unmount();
   });
 
   it.each(["", "?project=folder-a"])(
@@ -37,7 +63,7 @@ describe("unused chat drafts", () => {
       );
       const first = open();
       expect(await screen.findByRole("heading", { name: "从一个问题开始" })).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "我现在最应该先学什么？" })).toBeEnabled();
+      expect(screen.queryByRole("region", { name: "新对话推荐" })).not.toBeInTheDocument();
       await act(async () => {
         fireEvent(window, new Event("blur"));
         fireEvent(document, new Event("visibilitychange"));
@@ -88,6 +114,7 @@ describe("first message draft promotion", () => {
     });
     vi.spyOn(apiClient, "post").mockImplementation((path) => {
       if (path === "/sessions") return created.promise;
+      if (path === "/sessions/opening-prompts") return Promise.resolve({ prompts: [{ id: 'memory-generated', content: '我现在最应该先学什么？' }] });
       return Promise.reject(new Error(`Unexpected write: ${path}`));
     });
     vi.spyOn(apiClient, "postSse").mockImplementation((path) => (async function* () {
@@ -207,6 +234,7 @@ describe("first message draft promotion", () => {
     });
     vi.spyOn(apiClient, "post").mockImplementation((path) => {
       if (path === "/sessions") return created.promise;
+      if (path === "/sessions/opening-prompts") return Promise.resolve({ prompts: [{ id: 'memory-generated', content: '我现在最应该先学什么？' }] });
       return Promise.reject(new Error(`Unexpected write: ${path}`));
     });
     vi.spyOn(apiClient, "postSse").mockImplementation(() => (async function* () {

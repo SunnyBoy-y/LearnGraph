@@ -19,10 +19,11 @@ data class ComposerOptions(
     val generationMode: String = "text",
     val imageProviderId: String? = null,
     val imageModelId: String? = null,
+    val thinkingMappingVersion: Int = 1,
 ) {
     private fun validate() {
         require(responseMode in setOf("fast", "thinking", "agentic")) { "Unsupported response mode" }
-        require(thinkingMode in setOf("off", "low", "medium", "high", "xhigh")) { "Unsupported thinking mode" }
+        require(thinkingMode in setOf("off", "low", "medium", "high", "xhigh", "max")) { "Unsupported thinking mode" }
         require(searchRoute in setOf("disabled", "model_native", "external", "local", "auto")) { "Unsupported search route" }
         require(generationMode in setOf("text", "image")) { "Unsupported generation mode" }
         require(listOfNotNull(providerId, imageProviderId).all { it.length <= 36 }) { "Provider ID is too long" }
@@ -35,6 +36,7 @@ data class ComposerOptions(
         return buildJsonObject {
             put("responseMode", if (responseMode == "thinking") "agentic" else responseMode)
             put("thinkingMode", thinkingMode); put("searchRoute", searchRoute); put("generationMode", generationMode)
+            put("thinkingMappingVersion", thinkingMappingVersion)
             providerId?.let { put("providerId", it) }; modelId?.let { put("modelId", it) }
             imageProviderId?.let { put("imageProviderId", it) }; imageModelId?.let { put("imageModelId", it) }
         }
@@ -80,6 +82,7 @@ data class ComposerOptions(
                 providerId = optional("providerId"), modelId = optional("modelId"),
                 generationMode = optional("generationMode") ?: "text",
                 imageProviderId = optional("imageProviderId"), imageModelId = optional("imageModelId"),
+                thinkingMappingVersion = (value["thinkingMappingVersion"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 1,
             ).also { it.validate() }
         }.getOrNull()
     }

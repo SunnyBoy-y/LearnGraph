@@ -8,7 +8,6 @@ express (hosted tools, default thinking state, and protocol-specific controls).
 Keep request-shape decisions here instead of inferring them in HTTP adapters.
 """
 
-from math import floor
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
@@ -30,7 +29,7 @@ QWEN_IMAGE_EDIT_SOURCE = (
     "https://help.aliyun.com/zh/model-studio/qwen-image-edit-api"
 )
 
-LEARNGRAPH_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
+LEARNGRAPH_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 
 def is_dashscope_api_base_url(base_url: str | None) -> bool:
@@ -128,21 +127,13 @@ def protocol_family_for(provider_type: str | None, base_url: str | None) -> str:
 
 
 def proportional_effort_mapping(values: Iterable[str]) -> dict[str, str]:
-    """Map four LearnGraph levels onto a provider subset proportionally."""
+    """Preserve native effort names; never invent or compress enum tiers.
 
-    provider_values = [str(value).strip() for value in values if str(value).strip()]
-    if not provider_values:
-        return {}
-    if len(provider_values) == 1:
-        return {effort: provider_values[0] for effort in LEARNGRAPH_EFFORTS}
-    last = len(provider_values) - 1
-    denominator = len(LEARNGRAPH_EFFORTS) - 1
-    return {
-        effort: provider_values[
-            floor((index * last / denominator) + 0.5)
-        ]
-        for index, effort in enumerate(LEARNGRAPH_EFFORTS)
-    }
+    The historical name is retained for import compatibility. Unknown aliases
+    require an explicit user mapping rather than an order-dependent guess.
+    """
+    native = {str(value).strip().casefold() for value in values}
+    return {effort: effort for effort in LEARNGRAPH_EFFORTS if effort in native}
 
 
 def proportional_budget_mapping(
@@ -150,21 +141,18 @@ def proportional_budget_mapping(
     *,
     minimum: int = 1,
 ) -> dict[str, int]:
-    """Spread the product's four levels evenly across a token budget."""
+    """Map five product levels to bounded, monotonically increasing budgets."""
 
     if maximum < 1:
         return {}
     minimum = max(1, min(minimum, maximum))
     span = maximum - minimum
+    # Preserve the old low/medium/high budgets. The old top budget is now max;
+    # xhigh is a new intermediate budget, avoiding a silent change to all tiers.
+    fractions = (0.25, 0.5, 0.75, 0.875, 1.0)
     return {
-        effort: max(
-            minimum,
-            min(
-                maximum,
-                round(minimum + span * ((index + 1) / len(LEARNGRAPH_EFFORTS))),
-            ),
-        )
-        for index, effort in enumerate(LEARNGRAPH_EFFORTS)
+        effort: max(minimum, min(maximum, round(minimum + span * fraction)))
+        for effort, fraction in zip(LEARNGRAPH_EFFORTS, fractions)
     }
 
 
@@ -527,10 +515,10 @@ def strip_dashscope_private_capabilities(capabilities: dict[str, Any]) -> dict[s
         # fall back to the widely supported boolean ``enable_thinking`` shape.
         capabilities["reasoning_parameter"] = "enable_thinking"
         capabilities.pop("thinking_budget_max", None)
-        capabilities["thinking_mapping"] = {
-            "off": False,
-            **{effort: True for effort in LEARNGRAPH_EFFORTS},
-        }
+        capabilities["reasoning_efforts"] = ["medium"]
+        capabilities["thinking_mapping"] = {"off": False, "medium": True}
+        if capabilities.get("default_thinking_mode") != "off":
+            capabilities["default_thinking_mode"] = "medium"
     return capabilities
 
 
@@ -690,6 +678,8 @@ def _qwen_model_defaults_raw(model_id: str) -> dict[str, Any]:
             "off": None,
             **proportional_effort_mapping(("low", "medium", "xhigh")),
         }
+        result["reasoning_efforts"] = ["low", "medium", "xhigh"]
+        result["legacy_thinking_mapping"] = {"low": "low", "medium": "medium", "high": "medium", "xhigh": "xhigh"}
         result["provider_reasoning_budgets"] = {
             "low": 4_096,
             "medium": 16_384,
@@ -698,31 +688,30 @@ def _qwen_model_defaults_raw(model_id: str) -> dict[str, Any]:
         return result
 
     if _starts(model, ("deepseek-v4-", "glm-5.2", "glm-5.1")) or model == "glm-5":
-        # Alibaba Cloud documents reasoning_effort for these as ``high`` /
-        # ``max`` only: ``low`` and ``medium`` map to ``high``, ``xhigh`` maps
-        # to ``max``, and ``high`` stays ``high``.  (A proportional spread of
-        # {high, max} would wrongly push the ``high`` tier up to ``max``.)
+        # This hosted endpoint documents only high/max. Do not advertise the
+        # canonical vendor's other tiers or alias xhigh to max automatically.
         result["reasoning_parameter"] = "reasoning_effort"
-        result["thinking_mapping"] = {
-            "off": None,
-            **{effort: "high" for effort in ("low", "medium", "high")},
-            "xhigh": "max",
-        }
+        result["reasoning_efforts"] = ["high", "max"]
+        result["default_thinking_mode"] = "high" if (pure or hybrid_on) else "off"
+        result["thinking_mapping"] = {"off": None, "high": "high", "max": "max"}
+        result["legacy_thinking_mapping"] = {"low": "high", "medium": "high", "high": "high", "xhigh": "max"}
         return result
 
     if model == "minimax/minimax-m3":
+        result["reasoning_efforts"] = ["medium"]
         result["reasoning_parameter"] = "thinking"
-        result["thinking_mapping"] = {
-            "off": "disabled",
-            **{effort: "adaptive" for effort in LEARNGRAPH_EFFORTS},
-        }
+        result["thinking_mapping"] = {"off": "disabled", "medium": "adaptive"}
         return result
 
     budget_max = _thinking_budget_max(model)
     if budget_max is not None:
         result["reasoning_parameter"] = "thinking_budget"
         if result["default_thinking_mode"] != "off":
-            result["default_thinking_mode"] = "xhigh"
+            result["default_thinking_mode"] = "max"
+        result["legacy_thinking_mapping"] = {
+            effort: round(1 + (budget_max - 1) * ((index + 1) / 4))
+            for index, effort in enumerate(("low", "medium", "high", "xhigh"))
+        }
         result["thinking_budget_max"] = budget_max
         result["thinking_mapping"] = {
             "off": None,
@@ -730,10 +719,7 @@ def _qwen_model_defaults_raw(model_id: str) -> dict[str, Any]:
         }
         return result
 
-    # Boolean-shaped models expose intensity choices in the product, but every
-    # non-off choice intentionally becomes enable_thinking=true.
-    result["thinking_mapping"] = {
-        "off": False,
-        **{effort: True for effort in LEARNGRAPH_EFFORTS},
-    }
+    # Toggle-shaped models have one enabled mode, not invented intensities.
+    result["reasoning_efforts"] = ["medium"]
+    result["thinking_mapping"] = {"off": False, "medium": True}
     return result

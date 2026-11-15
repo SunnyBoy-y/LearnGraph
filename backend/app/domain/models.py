@@ -861,6 +861,20 @@ class SuggestedPromptBatch(Base, TimestampMixin, WorkspaceScopedMixin):
     provider_trace: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class OpeningPromptCache(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Private opener pools and a shared per-user generation budget."""
+
+    __tablename__ = "opening_prompt_cache"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    pools: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    window_started_at: Mapped[float] = mapped_column(Float, default=0)
+    generation_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_generation_at: Mapped[float] = mapped_column(Float, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[float] = mapped_column(Float, default=0)
+
+
 class ProviderAttempt(Base, TimestampMixin, WorkspaceScopedMixin):
     __tablename__ = "provider_attempts"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)

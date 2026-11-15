@@ -14,11 +14,11 @@ from app.providers.qwen_catalog import (
 )
 
 
-ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
+ThinkingMode = Literal["off", "low", "medium", "high", "xhigh", "max"]
 SearchRoute = Literal["disabled", "model_native", "external", "local", "auto"]
 ImageInputMode = Literal["native", "external_vision", "auto"]
 
-THINKING_MODES: tuple[ThinkingMode, ...] = ("off", "low", "medium", "high", "xhigh")
+THINKING_MODES: tuple[ThinkingMode, ...] = ("off", "low", "medium", "high", "xhigh", "max")
 SEARCH_ROUTES: tuple[SearchRoute, ...] = (
     "disabled",
     "model_native",
@@ -28,12 +28,10 @@ SEARCH_ROUTES: tuple[SearchRoute, ...] = (
 )
 IMAGE_INPUT_MODES: tuple[ImageInputMode, ...] = ("native", "external_vision", "auto")
 
-# ``reasoning_effort`` has no "disabled" tier: every gateway that speaks it also
-# offers a separate boolean switch (DashScope, DeepSeek relays, vLLM, SGLang...).
-# A model whose snapshot maps ``off -> null`` therefore cannot turn thinking off
-# through its declared parameter — the request just omits every thinking field
-# and the upstream silently keeps thinking on. Batch callers that explicitly ask
-# for the fallback get this switch instead.
+# Some effort protocols expose an explicit "none" tier; preserve it. A null
+# off mapping is not evidence that an arbitrary relay accepts a private boolean
+# switch. Only a verified DashScope protocol may use this automatic fallback;
+# other endpoints must declare their wire mapping explicitly.
 DISABLE_THINKING_PARAMETER = "enable_thinking"
 
 # 能力未知（不在目录里、也没有用户声明）时的默认输出上限。旧的 4096 是保守值，
@@ -103,38 +101,62 @@ def _model_capabilities(capabilities: dict[str, Any], model_id: str) -> dict[str
         provider_type=str(capabilities.get("provider_family") or ""),
         dashscope_hosted=dashscope_hosted,
     )
+    catalog_thinking = {key: merged[key] for key in (
+        "reasoning_efforts", "thinking_mapping", "default_thinking_mode", "thinking_required",
+        "reasoning_parameter", "thinking_mapping_version", "legacy_thinking_mapping", "reasoning_controls",
+    ) if key in merged}
     merged.update(capabilities)
-    # A manually entered/private model may have no models.dev record. Keep the
-    # product's generic "思考力度" controls available in that case instead of
-    # allowing a provider-specific catalogue branch (for example Qwen's
-    # unknown-model default) to silently remove every reasoning option. A
-    # persisted per-model snapshot or group template is applied below and can
-    # still intentionally narrow these capabilities.
-    if merged.get("models_dev_known") is False:
-        if not merged.get("reasoning_efforts"):
-            merged["reasoning_efforts"] = ["low", "medium", "high", "xhigh"]
-        if not isinstance(merged.get("thinking_mapping"), dict) or not merged.get(
-            "thinking_mapping"
-        ):
-            merged["thinking_mapping"] = {
-                "off": None,
-                "low": "low",
-                "medium": "medium",
-                "high": "high",
-                "xhigh": "xhigh",
-            }
-        if not merged.get("default_thinking_mode"):
-            merged["default_thinking_mode"] = "medium"
-        if not merged.get("reasoning_parameter"):
-            merged["reasoning_parameter"] = "reasoning_effort"
+    if capabilities.get("capability_source") == "official_catalog":
+        merged.update(catalog_thinking)
+    # Older Codex discovery rows cached hosted_web_search=false even though
+    # search is provided by the authenticated transport. Refresh catalog
+    # defaults without overriding explicit group/per-model user settings below.
+    if (
+        capabilities.get("provider_family") == "codex_chatgpt"
+        and capabilities.get("capability_source", "official_catalog") == "official_catalog"
+    ):
+        defaults = unified_model_defaults(model_id, provider_type="codex_chatgpt")
+        if defaults.get("hosted_web_search") is True:
+            merged["hosted_web_search"] = True
+    # An unknown model does not acquire native tiers from its name. Explicit
+    # provider, group and per-model declarations are still applied and retained.
+    if merged.get("models_dev_known") is False and not capabilities.get("reasoning_efforts"):
+        merged.update(reasoning_efforts=[], thinking_mapping={"off": None},
+                      default_thinking_mode="off", thinking_required=False)
     configured_models = capabilities.get("models")
-    if isinstance(configured_models, dict):
-        selected = configured_models.get(model_id)
-        if isinstance(selected, dict):
+    selected = configured_models.get(model_id) if isinstance(configured_models, dict) else None
+    # Discovery snapshots are defaults, not explicit user overrides. A group
+    # template applies to them, while a model explicitly edited by the user wins.
+    if isinstance(selected, dict):
+        if selected.get("capability_source") == "official_catalog":
+            # Official snapshots are cached defaults, not user declarations.
+            # Refresh their derived fields on every channel, even background
+            # tasks that never run model discovery after a catalogue upgrade.
+            merged = {**selected, **merged}
+        else:
             merged.update(selected)
-    # Model capabilities come from one per-model database snapshot. Legacy
-    # group-template fields are intentionally ignored so they cannot shadow
-    # the model's own saved parameters.
+            merged.pop("legacy_thinking_mapping", None)
+    group = capabilities.get("model_defaults")
+    if capabilities.get("model_defaults_enabled") is True and isinstance(group, dict):
+        merged.update(group)
+        if isinstance(selected, dict) and selected.get("capability_source") != "official_catalog":
+            merged.update(selected)
+    # Protocol identity cannot be changed by either an old group template or a
+    # per-model snapshot; the factory derives it from the selected endpoint.
+    for field in ("protocol_family", "provider_family"):
+        if field in capabilities:
+            merged[field] = capabilities[field]
+    if capabilities.get("supports_agent_tools") is False:
+        merged["supports_agent_tools"] = False
+    from app.providers.thinking_metadata import automatic_thinking_metadata, THINKING_FIELDS
+    previous = selected if isinstance(selected, dict) else capabilities
+    # Only persisted automatic evidence can migrate a preference. A current
+    # catalogue's inferred historical mapping is not proof of a past request.
+    merged.pop("legacy_thinking_mapping", None)
+    explicit_group = capabilities.get("model_defaults_enabled") is True and isinstance(group, dict) and any(key in group for key in THINKING_FIELDS)
+    explicit_model = isinstance(selected, dict) and selected.get("capability_source") != "official_catalog"
+    if not explicit_group and not explicit_model:
+        merged.update(automatic_thinking_metadata(merged, previous))
     return merged
 
 
@@ -153,6 +175,7 @@ def resolve_model_call_options(
     thinking_mode: str | None = None,
     search_route: str | None = None,
     disable_thinking_fallback: bool = False,
+    prefer_fast: bool = False,
 ) -> ModelCallOptions:
     resolved = _model_capabilities(capabilities, model_id)
     requested_thinking = thinking_mode or resolved.get("default_thinking_mode") or "off"
@@ -181,6 +204,11 @@ def resolve_model_call_options(
         requested_thinking = (
             lower[-1] if lower else supported[0] if supported else "off"
         )
+
+    if prefer_fast and requested_thinking == "off" and resolved.get("thinking_required") is True:
+        # Auxiliary tasks prefer a fast reply; unlike an explicit UI off choice,
+        # they may use the lowest supported effort on a thinking-only model.
+        requested_thinking = next((mode for mode in THINKING_MODES[1:] if mode in efforts), "off")
 
     if requested_thinking == "off":
         actual = raw_mapping.get("off")
@@ -214,6 +242,8 @@ def resolve_model_call_options(
         "thinking",
     }:
         raise ModelCapabilityError("Unsupported reasoning parameter mapping")
+    if parameter in {"reasoning_effort", "reasoning.effort"} and actual is not None and not isinstance(actual, str):
+        raise ModelCapabilityError("Reasoning effort mappings must resolve to a string, not a boolean or token budget")
     provider_options: dict[str, Any] = {}
     if parameter == "enable_thinking":
         if requested_thinking != "off" and requested_thinking not in efforts:
@@ -253,10 +283,14 @@ def resolve_model_call_options(
                 )
             provider_options["thinking_budget"] = actual
     elif parameter == "thinking":
-        provider_options["thinking"] = actual
+        if actual is not None:
+            provider_options["thinking"] = actual
+        elif requested_thinking == "off":
+            provider_options["thinking"] = {"type": "disabled"}
 
     if (
         disable_thinking_fallback
+        and resolved.get("protocol_family") == PROTOCOL_FAMILY_DASHSCOPE
         and requested_thinking == "off"
         and actual is None
         and parameter in {"reasoning_effort", "reasoning.effort", "thinking"}
@@ -336,7 +370,7 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
 
     efforts = payload.get("reasoning_efforts", [])
     if not isinstance(efforts, list) or any(item not in THINKING_MODES[1:] for item in efforts):
-        raise ModelCapabilityError("reasoning_efforts may only contain low/medium/high/xhigh")
+        raise ModelCapabilityError("reasoning_efforts may only contain low/medium/high/xhigh/max")
     mapping = payload.get("thinking_mapping", {})
     if not isinstance(mapping, dict) or any(key not in THINKING_MODES for key in mapping):
         raise ModelCapabilityError("thinking_mapping contains an unknown LearnGraph mode")
@@ -450,9 +484,10 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
 
 # Mirrors the frontend's blank capability form: the baseline a catalog record
 # is merged over so the persisted snapshot is always complete.
-_CATALOG_BASE_CAPABILITIES: dict[str, Any] = {    "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-    "thinking_mapping": {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh"},
-    "default_thinking_mode": "medium",
+_CATALOG_BASE_CAPABILITIES: dict[str, Any] = {
+    "reasoning_efforts": [],
+    "thinking_mapping": {"off": None},
+    "default_thinking_mode": "off",
     "reasoning_parameter": "reasoning_effort",
     "thinking_required": False,
     "hosted_web_search": False,
@@ -509,25 +544,12 @@ def catalog_capability_snapshot(
             dashscope_hosted=bool(dashscope_hosted),
         )
     )
-    # models.dev has no record for this model: initialize the editable
-    # snapshot with the full generic thinking-strength surface. This is only
-    # an initialization fallback; later user edits remain authoritative.
+    # Unknown IDs remain editable, but are not advertised as confirmed effort
+    # support. Users can opt in to any of the five tiers in advanced settings.
     if merged.get("models_dev_known") is False:
-        merged.update(
-            {
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-                "thinking_mapping": {
-                    "off": None,
-                    "low": "low",
-                    "medium": "medium",
-                    "high": "high",
-                    "xhigh": "xhigh",
-                },
-                "default_thinking_mode": "medium",
-                "reasoning_parameter": "reasoning_effort",
-                "thinking_required": False,
-            }
-        )
+        merged.update(reasoning_efforts=[], thinking_mapping={"off": None},
+                      default_thinking_mode="off", reasoning_parameter="reasoning_effort",
+                      thinking_required=False)
     if dashscope_hosted is False:
         strip_dashscope_private_capabilities(merged)
     efforts = [
@@ -578,6 +600,7 @@ def catalog_capability_snapshot(
     merged["agent_compaction_ratio"] = min(
         1.0, max(0.1, float(merged.get("agent_compaction_ratio", 1 / 3)))
     )
+    merged.pop("legacy_thinking_mapping", None)
     return merged
 
 

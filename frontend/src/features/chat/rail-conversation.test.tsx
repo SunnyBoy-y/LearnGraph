@@ -16,6 +16,10 @@ vi.mock("@/api", () => ({
 }));
 
 vi.mock("@/api/providers", () => ({ listProviders: vi.fn(), discoverProviderModels: vi.fn() }));
+vi.mock("@/api/session-browser", () => ({
+  getSession: vi.fn(async (id: string) => (await listSessions()).find(item => item.id === id)),
+  listSessionPage: vi.fn(async () => ({ items: (await listSessions()).map(item => ({ ...item, has_children: false })), has_more: false, next_cursor: null, has_previous: false, previous_cursor: null })),
+}));
 
 function session(id: string, title: string): Session {
   return { id, title, workspace_id: "ws-1", goal_id: null, graph_id: null, project_id: null,
@@ -43,7 +47,7 @@ describe("side conversation picker", () => {
     expect(screen.queryByLabelText("搜索会话")).not.toBeInTheDocument();
     await user.click(picker);
     await user.type(screen.getByLabelText("搜索会话"), "二分");
-    await user.click(screen.getByRole("button", { name: /二分查找.*主会话/ }));
+    await user.click(await screen.findByRole("button", { name: /二分查找.*主会话/ }));
     await waitFor(() => expect(picker).toHaveTextContent("二分查找"));
     expect(screen.queryByLabelText("搜索会话")).not.toBeInTheDocument();
     await waitFor(() => expect(listSessionMessages).toHaveBeenCalledWith("side-1", { compact: false }));

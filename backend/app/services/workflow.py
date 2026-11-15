@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.core.errors import AppError
 from app.core.security import Principal
@@ -15,7 +16,7 @@ from app.domain.models import (
     ActionItem, AuditEvent, ChatSession, CompositeDraft, ContextSummary, FetchAuthorizationRequest, FileReference, Goal, Graph, GraphChangeSet, GraphEdge, GraphNode,
     ImageGenerationTask, Message, MessageControl, MessagePartRecord, MessageStreamEvent, MessageSubmission,
     MessageVersion, Project, ProviderAttempt, ProviderResponseState, Roadmap, SourceLink, SourceRecord, Workspace,
-    SuggestedPromptBatch,
+    SuggestedPromptBatch, WorkspaceSetting,
 )
 from app.domain.schemas.chat import SessionUpdateRequest
 from app.domain.schemas.workflow import (
@@ -81,6 +82,78 @@ class WorkflowService:
         self.audit.record(actor_id=self.actor_id, action="project.create", resource_type="project", resource_id=item.id)
         self.db.commit(); self.db.refresh(item)
         return item
+
+    def open_graph_folder(self, graph_id: str) -> Project:
+        """Resolve one durable learning folder without touching any conversation.
+
+        The workspace setting is an ID-to-ID mapping, not a title heuristic.
+        Its existing unique constraint arbitrates simultaneous first opens from
+        multiple windows; a losing transaction rolls back its folder creation.
+        """
+        for attempt in range(3):
+            graph = self.db.scalar(select(Graph).where(
+                Graph.workspace_id == self.workspace_id, Graph.id == graph_id,
+            ))
+            if graph is None or not self.authz.can_access_resource(self.workspace, "graph", graph_id, "read"):
+                raise AppError(404, "graph_not_found", "Graph was not found")
+            key = f"learning.graph-folder.{graph_id}"
+            mapping = self.db.scalar(select(WorkspaceSetting).where(
+                WorkspaceSetting.workspace_id == self.workspace_id, WorkspaceSetting.key == key,
+            ))
+            project = self.db.scalar(select(Project).where(
+                Project.workspace_id == self.workspace_id,
+                Project.id == (mapping.value if mapping and isinstance(mapping.value, str) else ""),
+                Project.primary_graph_id == graph_id,
+            ))
+            if project is not None and not self.authz.can_access_resource(self.workspace, "project", project.id, "read"):
+                raise AppError(404, "project_not_found", "Learning folder was not found")
+            if project is None:
+                # Adopt legacy folders only by graph ID. Once chosen, persist
+                # the exact project ID even when several projects share a graph.
+                candidates = self.db.scalars(select(Project).where(
+                    Project.workspace_id == self.workspace_id,
+                    Project.primary_graph_id == graph_id,
+                    Project.status != "archived",
+                ).order_by(Project.created_at, Project.id))
+                project = next((item for item in candidates if self.authz.can_access_resource(
+                    self.workspace, "project", item.id, "read",
+                )), None)
+                if project is None:
+                    project = Project(workspace_id=self.workspace_id, title=graph.title,
+                                      primary_graph_id=graph.id, primary_goal_id=graph.goal_id)
+                    self.db.add(project)
+                    self.db.flush()
+                    self.audit.record(actor_id=self.actor_id, action="project.create", resource_type="project",
+                                      resource_id=project.id, details={"graph_id": graph.id, "origin": "graph_folder"})
+            if project.status == "archived":
+                if not self.authz.can_access_resource(self.workspace, "project", project.id, "write"):
+                    raise AppError(404, "project_not_found", "Learning folder was not found")
+                project.status, project.archived_at = "active", None
+                self.audit.record(actor_id=self.actor_id, action="project.restore", resource_type="project", resource_id=project.id)
+            if mapping is not None and mapping.value == project.id and not self.db.is_modified(project):
+                return project
+            if mapping is None:
+                self.db.add(WorkspaceSetting(workspace_id=self.workspace_id, key=key, value=project.id))
+            else:
+                # A stale mapping may be repaired concurrently by another
+                # window. Compare-and-swap also arbitrates this UPDATE case;
+                # losing must roll back the newly created project, not orphan it.
+                changed = self.db.execute(update(WorkspaceSetting).where(
+                    WorkspaceSetting.id == mapping.id,
+                    WorkspaceSetting.updated_at == mapping.updated_at,
+                ).values(value=project.id).execution_options(synchronize_session="fetch"))
+                if changed.rowcount != 1:
+                    self.db.rollback()
+                    continue
+            try:
+                self.db.commit()
+                self.db.refresh(project)
+                return project
+            except IntegrityError:
+                self.db.rollback()
+                if attempt == 2:
+                    raise
+        raise AppError(409, "graph_folder_conflict", "Learning folder changed concurrently; please retry")
 
     def update_project(self, project_id: str, payload: ProjectUpdate) -> Project:
         item = self._project(project_id); values = payload.model_dump(exclude_unset=True)

@@ -12,6 +12,8 @@ from app.domain.migration_models import SchemaRevision
 from app.core.migrations.voice_reliability import apply_voice_reliability_migration
 from app.domain.models import SubAppInteractionEvent, utc_now
 from app.core.migrations.native_billing import apply_native_billing_migration
+from app.core.migrations.scheduled_automation import apply_scheduled_automation
+from app.core.migrations.session_browser import apply_session_browser
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +396,12 @@ def _user_avatar(connection: Connection) -> None:
         connection.exec_driver_sql("ALTER TABLE users ADD COLUMN avatar_url TEXT")
 
 
+def _opening_prompt_cache(connection: Connection) -> None:
+    from app.domain.models import OpeningPromptCache
+
+    OpeningPromptCache.__table__.create(bind=connection, checkfirst=True)
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -493,6 +501,18 @@ MIGRATIONS = (
         "v1.16.0",
         "Persistent user avatars and editable display names",
         _user_avatar,
+    ),
+    SchemaMigration(
+        "v1.17.0", "Prompt automation, finite schedules and event triggers",
+        apply_scheduled_automation,
+    ),
+    SchemaMigration(
+        "v1.18.0", "Bounded session navigator and ACL lookup indexes",
+        apply_session_browser,
+    ),
+    SchemaMigration(
+        "v1.19.0", "Private opening prompt pools and generation budgets",
+        _opening_prompt_cache,
     ),
 )
 

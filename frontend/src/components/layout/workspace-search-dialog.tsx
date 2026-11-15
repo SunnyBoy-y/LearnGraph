@@ -24,29 +24,32 @@ function Highlight({ text, query }: { text: string; query: string }) {
   return result;
 }
 
-export function WorkspaceSearchDialog({ open, onOpenChange, workspaceId }: {
+export function WorkspaceSearchDialog({ open, onOpenChange, workspaceId, onNavigate }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   workspaceId: string;
+  onNavigate?: () => void;
 }) {
   // Mount a fresh search session on every open; closed dialogs do no requests.
   return <Dialog open={open} onOpenChange={onOpenChange}>
-    {open && <WorkspaceSearchContent workspaceId={workspaceId} onClose={() => onOpenChange(false)} />}
+    {open && <WorkspaceSearchContent workspaceId={workspaceId} onClose={() => onOpenChange(false)} onNavigate={onNavigate} />}
   </Dialog>;
 }
 
-function WorkspaceSearchContent({ workspaceId, onClose }: { workspaceId: string; onClose: () => void }) {
+function WorkspaceSearchContent({ workspaceId, onClose, onNavigate }: { workspaceId: string; onClose: () => void; onNavigate?: () => void }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [composing, setComposing] = useState(false);
   const [kind, setKind] = useState<WorkspaceSearchKind>("all");
   const [active, setActive] = useState(-1);
   const resultsRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    if (composing) return;
     const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 250);
     return () => window.clearTimeout(timer);
-  }, [query]);
-  const waiting = query.trim() !== debouncedQuery;
+  }, [query, composing]);
+  const waiting = composing || query.trim() !== debouncedQuery;
   const search = useInfiniteQuery({
     queryKey: workspaceQueryKey(workspaceId, "workspace-search", debouncedQuery, kind),
     initialPageParam: 0,
@@ -55,6 +58,7 @@ function WorkspaceSearchContent({ workspaceId, onClose }: { workspaceId: string;
     staleTime: 0,
     gcTime: 0,
     retry: 1,
+    enabled: !waiting,
   });
   const items = waiting ? [] : search.data?.pages.flatMap((page) => page.items) ?? [];
   const busy = waiting || search.isPending;
@@ -67,6 +71,7 @@ function WorkspaceSearchContent({ workspaceId, onClose }: { workspaceId: string;
         state: hit.kind === "message" ? { targetMessageId: hit.id } : null,
       });
     }
+    onNavigate?.();
   }
   function moveActive(direction: number) {
     if (!items.length) return;
@@ -81,6 +86,7 @@ function WorkspaceSearchContent({ workspaceId, onClose }: { workspaceId: string;
       <Search aria-hidden="true" />
       <input autoFocus aria-label="搜索文件、会话、消息或 ID" placeholder="搜索文件、会话、消息或 ID…"
         maxLength={240} value={query} onChange={(event) => { setQuery(event.target.value); setActive(-1); }}
+        onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)}
         onKeyDown={(event) => {
           if (event.nativeEvent.isComposing) return;
           if (event.key === "ArrowDown" || event.key === "ArrowUp") {

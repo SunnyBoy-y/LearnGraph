@@ -8,8 +8,8 @@
 
 锁定规则：
 - 默认行为不变：不显式申请回退时，off 仍然不发任何思考字段；
-- 显式申请回退时：off 产出 ``enable_thinking=False``（``thinking`` 类映射
-  产出 ``{"type": "disabled"}``）；
+- 只有已知 DashScope 协议才自动回退到 ``enable_thinking=False``；普通 relay 必须显式声明字段，
+  ``thinking`` 类映射使用 ``{"type": "disabled"}``；
 - ``thinking_required`` 的模型仍然拒绝 off；
 - 既有三类映射（enable_thinking / thinking_budget / thinking）语义不变。
 """
@@ -56,17 +56,26 @@ class TestOffFallback:
         assert options.actual_reasoning_effort is None
         assert options.provider_options == {}
 
-    def test_off_with_fallback_emits_disable_switch(self) -> None:
+    def test_generic_relay_fallback_does_not_guess_a_private_switch(self) -> None:
         options = resolve_model_call_options(
             _relay_snapshot(),
             "deepseek-flash",
             thinking_mode="off",
             disable_thinking_fallback=True,
         )
-        assert options.provider_options == {DISABLE_THINKING_PARAMETER: False}
+        assert options.provider_options == {}
+        # A relay can declare enable_thinking explicitly (tested below), but
+        # merely asking for a fallback must not invent unsupported wire fields.
         # The declared parameter still owns the payload when a tier is selected.
         assert options.reasoning_parameter == "reasoning_effort"
         assert options.actual_reasoning_effort is None
+
+    def test_dashscope_fallback_still_uses_its_own_switch(self) -> None:
+        options = resolve_model_call_options(
+            {**_relay_snapshot(), "protocol_family": "dashscope"},
+            "deepseek-flash", thinking_mode="off", disable_thinking_fallback=True,
+        )
+        assert options.provider_options == {DISABLE_THINKING_PARAMETER: False}
 
     def test_fallback_does_not_touch_labelled_modes(self) -> None:
         for mode in ("low", "medium", "high", "xhigh"):

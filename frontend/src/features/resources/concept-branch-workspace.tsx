@@ -1,16 +1,18 @@
 import { useMemo, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "motion/react";
 import { BookOpenText, ExternalLink, GripHorizontal, Merge, Network, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
-import { listSessionMessages, listSessions, promoteConceptBranch } from "@/api/sessions";
+import { listSessionMessages, promoteConceptBranch } from "@/api/sessions";
 import { createMemory } from "@/api/memory";
 import { Button } from "@/components/ui/button";
 import type { FileRecord } from "@/types/files";
 import type { PendingDocumentSelection } from "./document-chat-panel";
 import { DocumentChatPanel } from "./document-chat-panel";
+import { getSession } from "@/api/session-browser";
+import { sessionDetailKey } from "@/lib/session-queries";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { useReducedMotionPreference } from "@/lib/motion-preferences";
 
@@ -30,7 +32,10 @@ export function ConceptBranchWorkspace({
   const reducedMotion = useReducedMotionPreference();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
+  const branchQueries = useQueries({ queries: branchIds.map(id => ({
+    queryKey: sessionDetailKey(workspaceId, id), queryFn: ({ signal }: { signal: AbortSignal }) => getSession(id, { signal }), staleTime: 30_000,
+  })) });
+  const sessions = { data: branchQueries.flatMap(query => query.data ? [query.data] : []) };
   const [activeId, setActiveId] = useState(branchIds.at(-1) ?? "");
   const [position, setPosition] = useState({ x: 72, y: 92 });
   const dragRef = useRef<{ x: number; y: number; startX: number; startY: number } | null>(null);

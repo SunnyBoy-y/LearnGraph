@@ -463,7 +463,11 @@ def install_postgres_writer_order(engine: Engine) -> None:
             connection.exec_driver_sql("SELECT pg_advisory_xact_lock(684728190123)")
             connection.info["_lg_pg_writer"] = True
 
-    def clear(connection):
+    def clear(connection, *_args):
         connection.info.pop("_lg_pg_writer", None)
     event.listen(engine, "commit", clear)
     event.listen(engine, "rollback", clear)
+    # PostgreSQL releases locks acquired after a savepoint when it rolls back.
+    # Invalidate the cached flag even if the lock predates that savepoint:
+    # reacquiring a transaction advisory lock already held by us is safe.
+    event.listen(engine, "rollback_savepoint", clear)

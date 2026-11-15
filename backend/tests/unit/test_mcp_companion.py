@@ -74,7 +74,7 @@ class TestValidateLaunch:
 class TestDirectoryStdioRegistry:
     def test_loads_valid_skips_invalid(self, tmp_path: Path) -> None:
         (tmp_path / "fake.json").write_text(
-            json.dumps({"id": "fake", "command": ["python"]}), encoding="utf-8"
+            json.dumps({"id": "fake", "command": ["python"], "enabled": True}), encoding="utf-8"
         )
         (tmp_path / "bad.json").write_text("{oops", encoding="utf-8")
         (tmp_path / "mismatch.json").write_text(
@@ -102,6 +102,27 @@ class TestStdioProcess:
         assert resp["result"]["echo"] == {"tool": "echo", "x": 1}
 
 
+def test_companion_parallel_external_ids_do_not_collide():
+    process = StdioProcess(_fake_launch())
+    async def run():
+        try:
+            replies = await asyncio.gather(*[process.request({"id":1,"method":"tools/call","params":{"index":index}}) for index in range(10)])
+            assert [reply["result"]["echo"]["index"] for reply in replies] == list(range(10))
+            assert all(reply["id"] == 1 for reply in replies)
+            assert await process.request({"method":"notifications/initialized"}) == {"accepted":True}
+        finally:
+            await process.shutdown()
+    asyncio.run(run())
+
+
+def test_companion_registry_defaults_to_disabled(tmp_path):
+    path = tmp_path / "disabled.json"
+    path.write_text(json.dumps({"id":"disabled","command":["python"]}),encoding="utf-8")
+    registry = {}
+    DirectoryStdioRegistry(tmp_path).refresh_into(registry)
+    assert registry == {}
+
+
 class TestCompanionHTTP:
     def _client(self) -> TestClient:
         companion = StdioCompanion(token=TOKEN, registry={"fake": _fake_launch()})
@@ -118,18 +139,18 @@ class TestCompanionHTTP:
         assert resp.json()["processes"]["fake"] == "stopped"
 
     def test_rpc_roundtrip(self) -> None:
-        client = self._client()
-        resp = client.post(
-            "/rpc",
-            headers={"Authorization": f"Bearer {TOKEN}"},
-            json={
-                "launch_id": "fake",
-                "message": {"id": 7, "method": "tools/call", "params": {"tool": "echo"}},
-            },
-        )
-        assert resp.status_code == 200
-        assert resp.json()["id"] == 7
-        assert resp.json()["result"]["echo"] == {"tool": "echo"}
+        with self._client() as client:
+            resp = client.post(
+                "/rpc",
+                headers={"Authorization": f"Bearer {TOKEN}"},
+                json={
+                    "launch_id": "fake",
+                    "message": {"id": 7, "method": "tools/call", "params": {"tool": "echo"}},
+                },
+            )
+            assert resp.status_code == 200
+            assert resp.json()["id"] == 7
+            assert resp.json()["result"]["echo"] == {"tool": "echo"}
 
     def test_unknown_launch_404(self) -> None:
         client = self._client()

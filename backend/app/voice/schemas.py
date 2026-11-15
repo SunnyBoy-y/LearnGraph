@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
+ThinkingMode = Literal["off", "low", "medium", "high", "xhigh", "max"]
 
 VOICE_EVENT_TYPES = (
     "tool.started", "tool.completed", "tool.failed", "tool.cancelled",

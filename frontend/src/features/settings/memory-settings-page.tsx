@@ -38,7 +38,7 @@ Trash2
 } from "lucide-react";
 import { useEffect,useMemo,useState } from "react";
 import { Link } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { AdvancedSettings,SettingRow,SettingsSection } from './settings-primitives';
 function useMemorySettingsPage() {
 const auth = useAuth();

@@ -5,11 +5,13 @@ import { authStore } from '@/api/auth-store'
 import { listProviders, discoverProviderModels } from '@/api/providers'
 import { listSettings } from '@/api/settings'
 import { getSessionSuggestedPrompts, generateSessionSuggestedPrompts, listMessageVersions, listSessions } from '@/api/sessions'
+import { getSession } from '@/api/session-browser'
 import { toast } from 'sonner'
 import { NativeSuggestedPrompts } from './suggested-prompts'
 
 vi.mock('@/api/providers', () => ({ listProviders: vi.fn(), discoverProviderModels: vi.fn() }))
 vi.mock('@/api/settings', () => ({ listSettings: vi.fn() }))
+vi.mock('@/api/session-browser', () => ({ getSession: vi.fn() }))
 vi.mock('@/api/sessions', () => ({ getSessionSuggestedPrompts: vi.fn(), generateSessionSuggestedPrompts: vi.fn(), listMessageVersions: vi.fn(), listSessions: vi.fn() }))
 vi.mock('sonner', () => ({ toast: { error: vi.fn() } }))
 
@@ -23,6 +25,7 @@ describe('native follow-up prompts use the original Web component and generation
     authStore.setSession({ accessToken: 'fixture-account', workspaceId: 'w' })
     vi.mocked(listSettings).mockResolvedValue([])
     vi.mocked(listSessions).mockResolvedValue([{ id: 's', status: 'active' }] as never)
+    vi.mocked(getSession).mockResolvedValue({ id: 's', status: 'active' } as never)
     vi.mocked(listProviders).mockResolvedValue([{ id: 'p', enabled: true, remote_capability: true, provider_type: 'openai_compatible_chat', capabilities: { default_model: 'm' } }] as never)
     vi.mocked(discoverProviderModels).mockResolvedValue({ models: [{ id: 'm', roles: ['llm'], remote: true, enabled: true }] } as never)
     vi.mocked(listMessageVersions).mockResolvedValue([{ id: 'v1', version: 1, status: 'completed' }] as never)

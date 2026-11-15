@@ -1,4 +1,4 @@
-import { act, render, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { buildKnowledgeTreeHierarchy, buildKnowledgeTreeLayout, buildSpatialLayout, getKnowledgeGraphTreeDepths, FREE_NODE_W, FREE_NODE_H } from './knowledge-graph-layout'
 import { KnowledgeGraph, type KnowledgeNode } from './knowledge-graph'
@@ -50,6 +50,60 @@ describe('graph layout regression', () => {
 })
 
 describe('graph rendering regression', () => {
+  it('fits the whole graph even with a selected learning node and keeps selection in overview', async () => {
+    const g = graph(30, true)
+    const flow = { getZoom: () => .12, getNode: (id: string) => capture.props.nodes.find((node: KnowledgeNode) => node.id === id), getNodes: () => capture.props.nodes, fitView: vi.fn(), setCenter: vi.fn(), fitBounds: vi.fn() }
+    const ui = render(<KnowledgeGraph {...g} compact layout="tree" initialFit="view" selectedId="15" minimumZoom={.01} toolbarMode="minimal" />)
+    act(() => capture.props.onInit(flow))
+    await waitFor(() => expect(flow.fitView).toHaveBeenCalled())
+    expect(flow.setCenter).not.toHaveBeenCalled()
+    expect(capture.props.fitView).toBe(true)
+    expect(capture.props.nodes).toHaveLength(30)
+    ui.rerender(<KnowledgeGraph {...g} compact layout="tree" initialFit="view" selectedId="29" minimumZoom={.01} toolbarMode="minimal" />)
+    await waitFor(() => expect(capture.props.nodes.find((node: KnowledgeNode) => node.id === '29')?.selected).toBe(true))
+    expect(flow.setCenter).not.toHaveBeenCalled()
+    const fits = flow.fitView.mock.calls.length
+    act(() => capture.props.onMove({ type: 'wheel' }, { zoom: 1 }))
+    fireEvent.click(ui.getByRole('button', { name: '适应完整图谱' }))
+    expect(flow.fitView).toHaveBeenCalledTimes(fits + 1)
+    expect(flow.setCenter).not.toHaveBeenCalled()
+  })
+
+  it('refits the full overview on resize instead of centering the selected node', () => {
+    const observers: { callback: ResizeObserverCallback; active: boolean }[] = []
+    vi.stubGlobal('ResizeObserver', class {
+      entry: typeof observers[number]
+      constructor(callback: ResizeObserverCallback) { this.entry = { callback, active: true }; observers.push(this.entry) }
+      observe() {}
+      disconnect() { this.entry.active = false }
+    })
+    vi.useFakeTimers()
+    const frames = new Map<number, FrameRequestCallback>()
+    let sequence = 0
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frames.set(++sequence, callback); return sequence })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(id => { frames.delete(id) })
+    let ui: ReturnType<typeof render> | undefined
+    try {
+      const g = graph(20)
+      const flow = { getZoom: () => .2, getNode: (id: string) => capture.props.nodes.find((node: KnowledgeNode) => node.id === id), getNodes: () => capture.props.nodes, fitView: vi.fn(), setCenter: vi.fn() }
+      ui = render(<KnowledgeGraph {...g} compact layout="tree" initialFit="view" selectedId="1" minimumZoom={.01} />)
+      act(() => capture.props.onInit(flow))
+      act(() => vi.advanceTimersByTime(0))
+      flow.fitView.mockClear()
+      act(() => observers.filter(observer => observer.active).forEach(observer => observer.callback(
+        [{ contentRect: { width: 360, height: 600 } } as ResizeObserverEntry], {} as ResizeObserver,
+      )))
+      act(() => vi.advanceTimersByTime(120))
+      act(() => { frames.forEach(frame => frame(120)); frames.clear() })
+      expect(flow.fitView).toHaveBeenCalledTimes(1)
+      expect(flow.setCenter).not.toHaveBeenCalled()
+    } finally {
+      ui?.unmount()
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
+  })
+
   it.each(['camera', 'node'])('cancels a queued resize frame when the learner moves the %s first', (target) => {
     const observers: { callback: ResizeObserverCallback; active: boolean }[] = []
     vi.stubGlobal('ResizeObserver', class {
@@ -119,6 +173,15 @@ describe('graph rendering regression', () => {
     ui.rerender(<KnowledgeGraph {...g} layout="tree" interactive initialFit="focus" selectedId="2" />)
     await waitFor(() => expect(capture.props.nodes.find((node: KnowledgeNode) => node.id === '2')?.selected).toBe(true))
     expect(capture.props.nodes.find((node: KnowledgeNode) => node.id === '4')).toBe(previous)
+  })
+  it('previews a clicked node without starting a study or binding action', () => {
+    const g = graph(3)
+    const onSelect = vi.fn()
+    const onStudy = vi.fn()
+    render(<KnowledgeGraph {...g} layout="tree" interactive selectedId="1" onSelect={onSelect} onStudy={onStudy} />)
+    act(() => capture.props.onNodeClick({}, capture.props.nodes.find((node: KnowledgeNode) => node.id === '2')))
+    expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: '2' }))
+    expect(onStudy).not.toHaveBeenCalled()
   })
   it('keeps the camera still when a learner selects another node', async () => {
     const g = graph(4)

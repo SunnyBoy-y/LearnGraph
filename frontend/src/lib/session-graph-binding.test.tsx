@@ -142,7 +142,7 @@ describe("page tools binding menu", () => {
     const trigger = await screen.findByRole("menuitem", { name: "绑定节点" });
     fireEvent.keyDown(trigger, { key: "ArrowRight" });
     fireEvent.click(await screen.findByRole("menuitem", { name: "节点 B" }));
-    expect(await screen.findByText("绑定节点 · 节点 B")).toBeVisible();
+    expect(await screen.findByText("绑定节点：节点 B")).toBeVisible();
     expect(screen.queryByRole("menuitem", { name: "绑定节点" })).toBeNull();
   });
 });

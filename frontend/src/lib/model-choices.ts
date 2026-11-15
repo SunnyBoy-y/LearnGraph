@@ -9,7 +9,14 @@ import type {
   ProviderModel,
   ThinkingMode,
 } from "@/types/providers";
-import { isDashscopeProvider } from "@/types/providers";
+import { isDashscopeProvider, isModelProvider } from "@/types/providers";
+
+/** The same model-level Agent gate for first send, retry, rail and documents. */
+export function modelSupportsAgent(provider: Provider | undefined, model: ProviderModel | undefined): boolean {
+  return Boolean(provider?.enabled && provider.remote_capability && isModelProvider(provider)
+    && provider.capabilities.supports_agent_tools !== false && model?.remote
+    && model.enabled !== false && model.capabilities?.supports_agent_tools !== false);
+}
 
 export const thinkingLabels: Record<ThinkingMode, string> = {
   off: "关闭",
@@ -17,13 +24,13 @@ export const thinkingLabels: Record<ThinkingMode, string> = {
   medium: "中",
   high: "高",
   xhigh: "极高",
+  max: "最高",
 };
 
 export function capabilityThinkingModes(value: unknown): ThinkingMode[] {
   if (!Array.isArray(value)) return [];
-  return value.filter(
-    (item): item is ThinkingMode =>
-      typeof item === "string" && item in thinkingLabels,
+  return (Object.keys(thinkingLabels) as ThinkingMode[]).filter((mode) =>
+    mode !== "off" && value.includes(mode),
   );
 }
 
@@ -96,13 +103,15 @@ export function providerModelOptions(
       capabilities: persistedCapabilities[id],
     }));
   const byId = new Map(
-    [...(discovered ?? persistedModels), ...manualModels].map((model) => [
+    [...(discovered ?? persistedModels), ...manualModels.filter(model =>
+      !discovered?.some(item => item.id === model.id) || model.capabilities?.capability_source !== "official_catalog",
+    )].map((model) => [
       model.id,
       model,
     ]),
   );
   const configured = providerCapabilityString(provider, defaultModelCapability);
-  if (configured && !byId.has(configured))
+  if (configured && !byId.has(configured) && discovered === undefined)
     byId.set(configured, {
       id: configured,
       roles: ["llm"],
@@ -115,9 +124,25 @@ export function providerModelOptions(
     rawStates && typeof rawStates === "object" && !Array.isArray(rawStates)
       ? (rawStates as Record<string, unknown>)
       : {};
-  return [...byId.values()].filter(
-    (model) => model.enabled !== false && states[model.id] !== false,
-  );
+  const hidden = new Set(Array.isArray(provider.capabilities.hidden_model_ids)
+    ? provider.capabilities.hidden_model_ids : []);
+  const group = provider.capabilities.model_defaults_enabled === true
+    && provider.capabilities.model_defaults && typeof provider.capabilities.model_defaults === "object"
+    ? provider.capabilities.model_defaults as ProviderModel["capabilities"] : undefined;
+  return [...byId.values()]
+    .filter((model) => model.enabled !== false && states[model.id] !== false && !hidden.has(model.id))
+    .map((model) => {
+      const saved = persistedCapabilities[model.id];
+      const explicit = saved && saved.capability_source !== "official_catalog" ? saved : undefined;
+      const effective = group || explicit
+        ? { ...model.capabilities, ...group, ...explicit }
+        : model.capabilities ?? saved;
+      return { ...model, capabilities: effective as ProviderModel["capabilities"] };
+    })
+    .filter((model) => defaultModelCapability !== "default_model" || model.capabilities?.supports_text_output !== false)
+    // Existing selection is retained by callers; only their fallback uses this
+    // order. A configured default must actually be available and enabled.
+    .sort((a, b) => Number(b.id === configured) - Number(a.id === configured));
 }
 
 export function fuzzyModelMatch(value: string, query: string): boolean {

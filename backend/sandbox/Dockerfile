@@ -159,6 +159,7 @@ RUN set -eu; \
 
 COPY --from=toolchain /node_modules /node_modules
 COPY --chown=65532:65532 runner.py /opt/learngraph/runner.py
+COPY --chown=65532:65532 mcp_session.py /opt/learngraph/mcp_session.py
 COPY --chown=65532:65532 environment-manifest.json /opt/learngraph/environment-manifest.json
 COPY --chown=65532:65532 browser-launch.js /opt/learngraph/browser-launch.js
 COPY --chown=65532:65532 browser-smoke.js /opt/learngraph/browser-smoke.js

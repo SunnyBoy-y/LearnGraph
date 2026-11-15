@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LearnGraph 手机热区方案审核</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f5f3;color:#252522;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1120px;margin:auto;padding:28px 28px 36px}h1{margin:0;font-size:25px;font-weight:650;letter-spacing:-.6px}p{margin:8px 0;color:#696963}.intro{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}.badge{flex:none;font-size:12px;border:1px solid #d5d5cf;padding:5px 10px;border-radius:20px;color:#62625c}.controls{display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin:22px 0}.group{display:flex;align-items:center;gap:4px}button,select{font:inherit;color:inherit;background:transparent;border:1px solid #d6d6d0;border-radius:7px;padding:8px 12px;min-height:40px;cursor:pointer}button[aria-pressed=true]{background:#292925;color:white;border-color:#292925}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #8f5e43;outline-offset:3px}label{display:flex;align-items:center;gap:6px;cursor:pointer}input[type=checkbox]{width:16px;height:16px;accent-color:#3c3c35}.legend{margin-left:auto;font-size:12px;color:#945336}.comparison{display:flex;justify-content:center;align-items:flex-start;gap:26px;overflow-x:auto;padding-bottom:12px}.column{flex:none;width:390px}.column header{display:flex;align-items:center;justify-content:space-between;padding:8px 0 12px;font-size:15px;font-weight:600}.column header span{font-size:12px;font-weight:400;color:#6b6b63}.viewport{height:740px;border:1px solid #d4d4ce;border-radius:16px;overflow:hidden;background:white}iframe{display:block;width:100%;height:100%;border:0;background:white}.notes{display:grid;grid-template-columns:1fr 1fr;gap:26px;margin:14px auto 0;max-width:806px}.notes p{font-size:13px;margin:0}.notes strong{color:#34342e;font-weight:600}.foot{margin:18px 0 0;font-size:12px;color:#76766f}.dark{background:#191a18;color:#ecece6}.dark p,.dark .column header span{color:#a8aaa1}.dark button,.dark select{border-color:#53554e}.dark select option{background:#292b26}.dark .viewport{border-color:#53554e}.dark button[aria-pressed=true]{background:#e5e7dd;color:#22251d}.dark .notes strong{color:#e5e7dd}@media(max-width:700px){main{padding:18px 14px}.intro{display:block}.badge{display:inline-block;margin-top:6px}.comparison{justify-content:flex-start}.controls{gap:10px}.notes{grid-template-columns:1fr;gap:8px}.legend{margin-left:0}h1{font-size:21px}}
+</style>
+</head>
+<body>
+<main>
+<div class="intro"><div><h1>手机热区，先让每一下都点得准</h1><p>真实 LearnGraph 组件的前后对比。图标保持原尺寸，点击空间按布局留足。</p></div><span class="badge">已确认 · 已接入正式界面</span></div>
+<div class="controls">
+<div class="group" aria-label="预览场景"><button data-scene="chat" aria-pressed="true">对话</button><button data-scene="sidebar" aria-pressed="false">侧栏</button><button data-scene="search" aria-pressed="false">搜索</button></div>
+<label>宽度 <select id="width"><option value="320">320px</option><option value="360">360px</option><option value="390" selected>390px</option><option value="430">430px</option></select></label>
+<label><input id="outlines" type="checkbox" checked />显示热区</label><label><input id="dark" type="checkbox" />深色</label><span class="legend">虚线框 = 实际按钮边界</span>
+</div>
+<div class="comparison">
+<section class="column"><header>调整前 <span>24–40px 的混合热区</span></header><div class="viewport"><iframe title="调整前手机界面" id="current" src="/mobile-hit-area-frame.html?variant=current"></iframe></div></section>
+<section class="column"><header>已确认方案 <span>本轮入口统一预留 44px</span></header><div class="viewport"><iframe title="正式手机热区样式" id="candidate" src="/mobile-hit-area-frame.html?variant=candidate"></iframe></div></section>
+</div>
+<div class="notes"><p><strong>顶部与输入框</strong><br />增加按钮自身尺寸；输入框动作行与工具条略增高，图标不跟着放大。</p><p><strong>侧栏</strong><br />会话操作独立一行，五个动作仍放得下；会话行增至至少 44px，列表可见条数会减少。</p></div>
+<p class="foot">右侧复用正式界面已接入的手机热区样式，左侧保留调整前对照。模拟数据不调用模型、不保存业务数据；本页不代表 Android 真机或键盘弹出后的验收。</p>
+</main>
+<script>
+const frames=[...document.querySelectorAll('iframe')];let scene='chat';
+function send(frame, payload){frame.contentWindow.postMessage({type:'hit-area-review',...payload},location.origin)}
+function appearance(){const outlines=document.querySelector('#outlines').checked,dark=document.querySelector('#dark').checked;document.body.classList.toggle('dark',dark);for(const frame of frames)send(frame,{outlines,dark})}
+function changeScene(next){scene=next;for(const button of document.querySelectorAll('[data-scene]'))button.setAttribute('aria-pressed',String(button.dataset.scene===scene));for(const frame of frames)send(frame,{scene})}
+for(const button of document.querySelectorAll('[data-scene]'))button.addEventListener('click',()=>changeScene(button.dataset.scene));
+document.querySelector('#width').addEventListener('change',event=>{for(const column of document.querySelectorAll('.column'))column.style.width=event.target.value+'px'});
+document.querySelector('#outlines').addEventListener('change',appearance);document.querySelector('#dark').addEventListener('change',appearance);
+window.addEventListener('message',event=>{if(event.origin!==location.origin||event.data?.type!=='hit-area-ready')return;const frame=frames.find(item=>item.contentWindow===event.source);if(!frame)return;send(frame,{outlines:document.querySelector('#outlines').checked,dark:document.querySelector('#dark').checked,scene})});
+</script>
+</body>
+</html>

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { ArrowRight, BookOpen, ChevronDown, FlaskConical, LoaderCircle, Medal, MessageCircle, Play } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { apiClient } from "@/api/client";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";

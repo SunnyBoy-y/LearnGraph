@@ -16,7 +16,7 @@ export function SessionGraphBindingMenu({ workspaceId, sessionId }: { workspaceI
       <div className="session-graph-binding__summary">
         <span>当前会话</span>
         <strong>{binding?.graphTitle ?? "未绑定图谱"}</strong>
-        <small>{binding ? boundNodeId ? `绑定节点 · ${boundNode?.label ?? "读取中…"}` : "未绑定具体节点" : "选择图谱后可绑定节点"}</small>
+        <small>{binding ? boundNodeId ? `绑定节点：${boundNode?.label ?? "读取中…"}` : "未绑定具体节点" : "选择图谱后可绑定节点"}</small>
       </div>
       {bindingPending ? <DropdownMenuItem disabled><LoaderCircle className="size-3.5 animate-spin" />正在更新绑定…</DropdownMenuItem> : null}
       {binding ? (

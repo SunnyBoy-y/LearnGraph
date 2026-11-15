@@ -1,7 +1,7 @@
 import type { FormEvent, ReactNode, Ref } from "react";
-import { ArrowUp, Copy, Square } from "lucide-react";
-import { toast } from "sonner";
-import { Message as AiMessage, MessageContent, MessageActions, MessageAction } from "@/components/ai-elements/message";
+import { ArrowUp, Square } from "lucide-react";
+import { CopyMessageAction } from '@/components/shared/copy-feedback';
+import { Message as AiMessage, MessageContent, MessageActions } from "@/components/ai-elements/message";
 import { ChatStreamPartRenderer } from "@/components/chat/chat-stream-part-renderer";
 import { QuestionSetPager, groupAnswerParts } from "@/components/chat/question-set-pager";
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
@@ -13,6 +13,7 @@ import { InputGroup } from "@/components/ui/input-group";
 import { Textarea } from "@/components/ui/textarea";
 import { groupPartsForDisplay, isReasoningTextPart, thinkingDurationSeconds, toolCallCount } from "@/features/chat/chat-message-parts";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
+import { messageCopyText } from "./message-copy";
 import type { Message, MessagePart } from "@/types/sessions";
 
 function railMessageParts(message: Message): MessagePart[] {
@@ -174,10 +175,7 @@ export function RailConversationMessage({ message, onAction, thinkingChainDefaul
         <StreamStatsBadge messageId={message.id} status={message.status} providerTrace={message.provider_trace} />
         {message.status !== "streaming" && message.status !== "pending" ? (
           <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
-            <MessageAction label="复制全文" tooltip="复制全文" onClick={() => {
-              const text = message.content || message.parts.filter((part) => part.type === "text").map((part) => part.content ?? "").join("\n");
-              void navigator.clipboard.writeText(text).then(() => toast.success("已复制回答")).catch(() => toast.error("无法复制回答"));
-            }}><Copy className="size-3.5" /></MessageAction>
+            <CopyMessageAction label="复制全文" scope={message.id} text={messageCopyText(message.parts, message.content)} />
           </MessageActions>
         ) : null}
       </> : null}

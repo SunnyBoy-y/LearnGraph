@@ -1,0 +1,131 @@
+// Run with: npm exec --package=playwright@1.56.1 -- node scripts/check-notifications.mjs
+// Uses an isolated Edge process, not the user's logged-in browser.
+import fs from 'node:fs'
+import path from 'node:path'
+import { createRequire } from 'node:module'
+import assert from 'node:assert/strict'
+import clipAudit from './notification-clip-audit.mjs'
+const bin = process.env.PATH.split(path.delimiter).find(entry => entry.includes('_npx') && entry.endsWith('.bin'))
+const require = bin ? createRequire(path.resolve(bin, '../playwright/package.json')) : createRequire(import.meta.url)
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')
+const browser = await chromium.launch({ channel: 'msedge', headless: true })
+const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, reducedMotion: 'no-preference', permissions: ['clipboard-read', 'clipboard-write'] })
+const page = await context.newPage()
+const errors = []
+page.on('pageerror', error => errors.push(error.message))
+page.setDefaultTimeout(15000)
+const output = path.resolve(import.meta.dirname, '../../docs')
+const report = { cases: [], screenshots: [], pageErrors: errors }
+const notices = page.locator('[data-sonner-toast]:not([data-removed="true"])')
+const click = label => page.getByRole('button', { name: label, exact: true }).click()
+const waitGone = async () => { await click('关闭全部'); await notices.waitFor({ state: 'hidden' }).catch(async () => { await page.waitForFunction(() => !document.querySelector('[data-sonner-toast]')) }) }
+const sample = async name => {
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-sonner-toast]:not([data-removed="true"])')].every(node => node.dataset.mounted === 'true' && node.getAnimations().every(animation => animation.playState === 'finished')))
+  const value = await page.evaluate(() => {
+    const node = document.querySelector('[data-sonner-toast]:not([data-removed="true"])')
+    const close = node.querySelector('[data-close-button]')
+    const rect = node.getBoundingClientRect(), target = close.getBoundingClientRect(), css = getComputedStyle(node)
+    const ancestors = []
+    for (let n = node.parentElement; n; n = n.parentElement) { const s = getComputedStyle(n); ancestors.push({ tag: n.tagName, overflow: s.overflow, contain: s.contain }) }
+    return { width: rect.width, height: rect.height, x: rect.x, top: rect.top, right: innerWidth - rect.right, bottom: innerHeight - rect.bottom, closeWidth: target.width, closeHeight: target.height, closeInside: target.left >= rect.left && target.right <= rect.right && target.top >= rect.top && target.bottom <= rect.bottom, background: css.backgroundColor, color: css.color, transition: css.transitionDuration, theme: node.closest('ol').dataset.sonnerTheme, horizontalOverflow: document.documentElement.scrollWidth > innerWidth, ancestors }
+  })
+  assert.equal(value.horizontalOverflow, false)
+  assert.equal(value.closeInside, true)
+  assert.equal(value.closeWidth, 32)
+  assert.equal(value.closeHeight, 32)
+  assert.ok(value.right >= 15 && value.bottom >= 0)
+  const clip = await page.evaluate(clipAudit, { root: '.lg-toaster', viewport: true })
+  assert.equal(clip.cut, 0, JSON.stringify(clip))
+  report.cases.push({ name, ...value, clip })
+}
+try {
+  await page.goto('http://localhost:5173/notification-preview.html')
+  await page.getByRole('heading', { name: '通知与就地反馈验收' }).waitFor()
+  await click('可处理错误')
+  await notices.first().waitFor()
+  await sample('light-actionable')
+  await page.getByRole('button', { name: '关闭通知', exact: true }).hover()
+  await sample('light-hover')
+  await page.mouse.move(20, 20)
+  await page.screenshot({ path: path.join(output, 'notification-light.png') })
+  report.screenshots.push(path.join(output, 'notification-light.png'))
+  await page.locator('textarea').focus()
+  await page.keyboard.press('Alt+t')
+  assert.equal(await page.evaluate(() => !!document.activeElement.closest('[data-sonner-toaster]')), true)
+  await page.keyboard.press('Escape')
+  assert.equal(await page.evaluate(() => document.activeElement.tagName), 'TEXTAREA')
+  await page.waitForFunction(() => !document.querySelector('[data-sonner-toast]'))
+  report.cases.push({ name: 'keyboard-alt-t-escape-restore-focus', passed: true })
+  await click('重复五次')
+  await notices.first().waitFor()
+  assert.equal(await notices.count(), 1)
+  await waitGone()
+  report.cases.push({ name: 'duplicate-five-times', visible: 1 })
+  await click('连续五条')
+  await page.waitForFunction(() => document.querySelectorAll('[data-sonner-toast]').length === 2)
+  assert.equal(await notices.count(), 2)
+  const initial = await notices.allTextContents()
+  await page.getByRole('button', { name: '关闭通知', exact: true }).first().click()
+  await page.waitForFunction(() => [...document.querySelectorAll('[data-title]')].some(n => n.textContent.includes('后台任务 3')) && document.querySelectorAll('[data-sonner-toast]:not([data-removed="true"])').length === 2)
+  assert.equal(await notices.count(), 2)
+  report.cases.push({ name: 'fifo-queue-real-close', initial, next: await notices.allTextContents() })
+  await sample('expanded-two-notices')
+  await waitGone()
+  await click('可处理错误')
+  await page.getByRole('button', { name: '重试', exact: true }).click()
+  await page.getByText('已完成 1 次预览重试').waitFor()
+  await waitGone()
+  report.cases.push({ name: 'action-releases-queue', passed: true })
+  await click('深色主题')
+  await click('长中文')
+  await page.waitForFunction(() => document.querySelector('[data-sonner-toaster]')?.dataset.sonnerTheme === 'dark')
+  await sample('dark-long-chinese')
+  await page.screenshot({ path: path.join(output, 'notification-dark.png') })
+  report.screenshots.push(path.join(output, 'notification-dark.png'))
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  assert.equal(await notices.first().evaluate(node => getComputedStyle(node).transitionDuration), '0s')
+  report.cases.push({ name: 'system-reduced-motion', passed: true })
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
+  await click('减弱动态效果')
+  assert.equal(await notices.first().evaluate(node => getComputedStyle(node).transitionDuration), '0s')
+  await click('恢复动效')
+  await page.setViewportSize({ width: 720, height: 500 })
+  await sample('200-percent-equivalent-css-viewport')
+  await page.setViewportSize({ width: 390, height: 844 })
+  await sample('narrow-390')
+  await page.screenshot({ path: path.join(output, 'notification-narrow.png') })
+  report.screenshots.push(path.join(output, 'notification-narrow.png'))
+  await waitGone()
+  await context.setOffline(true)
+  await page.getByText('网络已断开，请检查连接。').waitFor()
+  await context.setOffline(false)
+  await page.getByText('网络已断开，请检查连接。').waitFor({ state: 'hidden' })
+  report.cases.push({ name: 'offline-persistent-online-clears', passed: true })
+  await click('成功通知')
+  await notices.first().waitFor()
+  await notices.first().hover()
+  await page.waitForTimeout(3100) // Deliberately exceed the 2800ms lifetime while actually hovered.
+  assert.equal(await notices.count(), 1)
+  await page.getByRole('button', { name: '关闭通知', exact: true }).focus()
+  await page.mouse.move(20, 20)
+  await page.waitForTimeout(3100) // Pointer leave must not expire a keyboard-focused notification.
+  assert.equal(await notices.count(), 1)
+  await page.locator('textarea').focus()
+  await page.waitForFunction(() => !document.querySelector('[data-sonner-toast]'))
+  report.cases.push({ name: 'hover-and-keyboard-focus-pause', passed: true })
+  await page.getByRole('button', { name: '复制全文', exact: true }).click()
+  await page.getByRole('button', { name: '已复制', exact: true }).waitFor()
+  assert.equal(await notices.count(), 0)
+  await page.getByRole('button', { name: '复制全文', exact: true }).waitFor()
+  report.cases.push({ name: 'copy-local-2500ms-no-toast', passed: true })
+  assert.deepEqual(errors, [])
+  report.passed = true
+} catch (error) {
+  report.passed = false
+  report.failure = String(error.stack ?? error)
+  process.exitCode = 1
+} finally {
+  fs.writeFileSync(path.join(output, 'notification-qa.json'), JSON.stringify(report, null, 2))
+  console.log(JSON.stringify(report, null, 2))
+  await browser.close()
+}

@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -447,7 +448,7 @@ def render_component(path: Path) -> dict:
     }
 
 
-def mcp_stdio(request_path: Path, launch_path: Path, target: Path) -> dict:
+def mcp_stdio(request_path: Path, launch_path: Path | None, target: Path) -> dict:
     """One-shot JSON-RPC over stdio inside the isolated container.
 
     The FastAPI host never spawns the third-party server command; only this
@@ -456,7 +457,15 @@ def mcp_stdio(request_path: Path, launch_path: Path, target: Path) -> dict:
     hard timeout carried in the immutable launch spec.
     """
 
-    launch_payload = json.loads(launch_path.read_bytes().decode("utf-8"))
+    request_bytes = request_path.read_bytes()
+    if not request_bytes or len(request_bytes) > MAX_MCP_REQUEST_BYTES:
+        raise ValueError("MCP input envelope is empty or exceeds its size limit")
+    if launch_path is None:
+        envelope = json.loads(request_bytes)
+        launch_payload = envelope["launch"]
+        request_bytes = json.dumps(envelope["request"]).encode("utf-8")
+    else:
+        launch_payload = json.loads(launch_path.read_bytes().decode("utf-8"))
     command = launch_payload.get("command")
     if not isinstance(command, list) or not command or not all(
         isinstance(part, str) and part for part in command
@@ -469,37 +478,24 @@ def mcp_stdio(request_path: Path, launch_path: Path, target: Path) -> dict:
     if executable not in MCP_SERVER_EXECUTABLES:
         raise ValueError("MCP server executable is not in the runner allowlist")
 
-    request_bytes = request_path.read_bytes()
     if not request_bytes:
         raise ValueError("MCP request is empty")
     if len(request_bytes) > MAX_MCP_REQUEST_BYTES:
         raise ValueError("MCP request exceeds the size limit")
+    from mcp_session import execute_session
+
     timeout_seconds = float(launch_payload.get("timeout_seconds") or 60)
-    completed = subprocess.run(
-        command,
-        input=request_bytes,
-        capture_output=True,
-        timeout=timeout_seconds,
-        check=False,
+    parsed = execute_session(
+        command, json.loads(request_bytes), timeout=timeout_seconds,
+        max_bytes=MAX_MCP_RESPONSE_BYTES, credential=launch_payload.get("credential"),
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip()[:500]
-        raise ValueError(f"MCP server exited {completed.returncode}: {detail}")
-    if len(completed.stdout) > MAX_MCP_RESPONSE_BYTES:
-        raise ValueError("MCP response exceeds the size limit")
-    try:
-        parsed = json.loads(completed.stdout.decode("utf-8", errors="strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("MCP server returned non-JSON output") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("MCP server returned a non-object JSON-RPC response")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(parsed, ensure_ascii=False), encoding="utf-8")
     return {
         "schema_version": "1.0",
         "task_type": "mcp_stdio",
         "status": "ok",
-        "bytes": len(completed.stdout),
+        "bytes": len(json.dumps(parsed).encode("utf-8")),
     }
 
 
@@ -639,9 +635,11 @@ def main() -> int:
     elif args.task == "render_component":
         result = render_component(source)
     elif args.task == "mcp_stdio":
-        if not args.spec:
-            raise ValueError("mcp_stdio requires a launch spec file")
-        result = mcp_stdio(source, safe_relative(args.spec), target)
+        try:
+            result = mcp_stdio(source, safe_relative(args.spec) if args.spec else None, target)
+        except TimeoutError:
+            print("MCP stdio session exceeded its total deadline", file=sys.stderr)
+            return 124
         # ``mcp_stdio`` already wrote the JSON-RPC response to ``target``; the
         # fixed-task summary goes to stdout only, so the caller reads exactly
         # the server response instead of a wrapper artifact.

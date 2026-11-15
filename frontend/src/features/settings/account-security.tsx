@@ -8,7 +8,7 @@ import { useAuth } from "@/features/auth/auth-context-value";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { KeyRound, Trash2 } from "lucide-react";
 import { useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { useSettingsDirty } from '@/lib/settings-dirty';
 export function PasswordSecurity({ username }: {
     username: string;

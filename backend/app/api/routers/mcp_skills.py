@@ -233,10 +233,11 @@ def approve_stdio_launch_spec(
     db: DB,
     context: CurrentWorkspace,
     settings: AppSettings,
+    expected_launch_spec_hash: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
 ) -> MCPStdioLaunchSpecView:
     """审批已注册的 stdio 启动规范，使其可被隔离 runner 执行（可审计）。"""
     manager = service(db, context, settings)
-    server = manager.approve_stdio_launch_spec(server_id)
+    server = manager.approve_stdio_launch_spec(server_id, expected_hash=expected_launch_spec_hash)
     return MCPStdioLaunchSpecView(
         server_id=server.id,
         workspace_id=server.workspace_id,

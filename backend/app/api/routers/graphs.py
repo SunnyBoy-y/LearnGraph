@@ -31,7 +31,7 @@ from app.domain.schemas.graphs import (
 )
 from app.services.graphs import GraphService
 from app.services.authorization import AuthorizationService
-from app.services.graph_cover import generate_graph_cover
+from app.services.graph_cover import resolve_graph_cover
 from app.services.graph_cover_ai import GraphCoverAIService
 from app.services.graph_cover_management import GraphCoverService
 
@@ -91,8 +91,8 @@ def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> lis
     return [
         GraphSummary.model_validate({
             **item.__dict__,
-            "cover_svg": item.cover_svg or generate_graph_cover(
-                item.title,
+            "cover_svg": resolve_graph_cover(
+                item.cover_svg, item.title,
                 node_labels=node_labels.get(item.id),
                 progress=mastered_counts.get(item.id, 0) / max(1, len(node_labels.get(item.id, []))),
             ),

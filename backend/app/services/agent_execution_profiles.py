@@ -50,6 +50,8 @@ _NETWORK_CAPABILITY_RANK: Mapping[NetworkCapability, int] = {
 # RESTRICTED_EGRESS, so adding a new tool can never silently inherit OFFLINE.
 _TOOL_NETWORK_REQUIREMENTS: Mapping[str, NetworkCapability] = {
     "search_web": NetworkCapability.FETCH,
+    "search_papers": NetworkCapability.FETCH,
+    "read_paper": NetworkCapability.FETCH,
     "parallel_web_research": NetworkCapability.FETCH,
     "fetch_web_page": NetworkCapability.FETCH,
     "download_external_image": NetworkCapability.FETCH,
@@ -188,6 +190,8 @@ READ_ONLY_TOOL_NAMES = frozenset(
     {
         "get_current_time",
         "search_web",
+        "search_papers",
+        "read_paper",
         "parallel_web_research",
         "fetch_web_page",
         "search_images",
@@ -239,7 +243,7 @@ _ROLE_DEFAULT_THINKING: dict[AgentRole, str] = {
     AgentRole.GENERIC: "medium",
 }
 
-_THINKING_ORDER = ("off", "low", "medium", "high", "xhigh")
+_THINKING_ORDER = ("off", "low", "medium", "high", "xhigh", "max")
 
 
 def normalize_agent_role(role_key: str | None) -> AgentRole:
@@ -249,7 +253,7 @@ def normalize_agent_role(role_key: str | None) -> AgentRole:
 
 def normalize_thinking_mode(value: str | None, *, default: str = "medium") -> str:
     normalized = str(value or default).strip().casefold()
-    aliases = {"none": "off", "fast": "off", "max": "xhigh"}
+    aliases = {"none": "off", "fast": "off"}
     normalized = aliases.get(normalized, normalized)
     if normalized not in _THINKING_ORDER:
         raise AgentProfileError(f"Unsupported thinking mode: {value!r}")

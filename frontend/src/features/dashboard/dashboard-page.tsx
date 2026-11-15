@@ -12,13 +12,12 @@ import {
   Target,
 } from "lucide-react";
 import { Link, useParams } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   createAction,
   getDashboard,
   listSessionMessages,
-  listSessions,
   updateAction,
 } from "@/api";
 import { MessageResponse } from "@/components/ai-elements/message";
@@ -35,6 +34,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { listSessionPage } from "@/api/session-browser";
 import { cn } from "@/lib/utils";
 
 const SUMMARY_CHARACTER_LIMIT = 100;
@@ -96,11 +96,11 @@ export function DashboardPage() {
     staleTime: 30_000,
   });
   const sessions = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "sessions"),
-    queryFn: listSessions,
+    queryKey: workspaceQueryKey(workspaceId, "sessions", "dashboard-recent"),
+    queryFn: ({ signal }) => listSessionPage({ roots_only: false, pinned_first: false }, {}, { signal }),
     staleTime: 30_000,
   });
-  const recentSession = sessions.data?.[0];
+  const recentSession = sessions.data?.items[0];
   const recentMessages = useQuery({
     queryKey: workspaceQueryKey(
       workspaceId,
@@ -200,7 +200,7 @@ export function DashboardPage() {
         title: action.title,
         detail: `计划行动 · ${formatDueAt(action.due_at)}`,
       })),
-    ...(sessions.data ?? [])
+    ...(sessions.data?.items ?? [])
       .filter((session) => isSameLocalDay(session.created_at, today))
       .map((session) => ({
         id: `session-${session.id}`,

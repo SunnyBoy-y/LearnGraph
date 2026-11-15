@@ -10,7 +10,7 @@ import { CHAT_CONTEXT_USAGE_SETTING_KEY, CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY,
 import type { MemoryEnhancementUpdateRequest } from "@/types/memory";
 import type { WorkspaceSetting } from "@/types/settings";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { AdvancedSettings, SettingRow, SettingsSection } from './settings-primitives';
 import { StickerSettingsPanel } from './sticker-settings';
 function useConversationSettingsPage() {

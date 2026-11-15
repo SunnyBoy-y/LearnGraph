@@ -24,7 +24,7 @@ export interface GoalClarifyRequest {
   /** Optional model selection so the Goal wizard reuses the chat-selected model. */
   provider_id?: string
   model_id?: string
-  thinking_mode?: "off" | "low" | "medium" | "high" | "xhigh" | null
+  thinking_mode?: "off" | "low" | "medium" | "high" | "xhigh" | "max" | null
 }
 
 export interface ClarificationQuestion {
@@ -83,7 +83,7 @@ export interface CandidateGraphRequest {
   seed_concepts?: string[]
   provider_id?: string
   model_id?: string
-  thinking_mode?: "off" | "low" | "medium" | "high" | "xhigh" | null
+  thinking_mode?: "off" | "low" | "medium" | "high" | "xhigh" | "max" | null
 }
 
 /** Streaming candidate-graph generation: mode selects the generation budget. */

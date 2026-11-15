@@ -1,7 +1,7 @@
 import { type FormEvent, type ReactNode, useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { History, Info, MoreHorizontal, Pencil, RotateCcw, Trash2 } from 'lucide-react'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 
 import { getMemory, listMemoryRevisions, updateMemory } from '@/api'
 import { EmptyState, ErrorState, LoadingState } from '@/components/shared/page-elements'

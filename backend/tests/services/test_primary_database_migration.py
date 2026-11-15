@@ -168,6 +168,105 @@ def target_url():
         engine.dispose()
 
 
+@pytest.mark.parametrize("write_before_savepoint", [False, True])
+def test_postgresql_writer_lock_after_savepoint_rollback(target_url, write_before_savepoint):
+    from app.core.database_routing import install_postgres_writer_order
+
+    engine = postgres_engine(target_url)
+    observer = postgres_engine(target_url)
+    install_postgres_writer_order(engine)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE writer_probe(id INTEGER PRIMARY KEY)")
+        with engine.connect() as connection, observer.connect() as other:
+            with connection.begin():
+                if write_before_savepoint:
+                    connection.execute(text("INSERT INTO writer_probe VALUES(1)"))
+                savepoint = connection.begin_nested()
+                connection.execute(text("INSERT INTO writer_probe VALUES(2)"))
+                assert other.execute(text("SELECT pg_try_advisory_xact_lock(684728190123)")).scalar_one() is False
+                other.rollback()
+                savepoint.rollback()
+                assert not connection.info.get("_lg_pg_writer")
+                # PostgreSQL releases a lock obtained inside the rolled-back
+                # savepoint, but retains a lock that predates the savepoint.
+                assert other.execute(text("SELECT pg_try_advisory_xact_lock(684728190123)")).scalar_one() is (not write_before_savepoint)
+                other.rollback()
+                connection.execute(text("INSERT INTO writer_probe VALUES(3)"))
+                assert other.execute(text("SELECT pg_try_advisory_xact_lock(684728190123)")).scalar_one() is False
+                other.rollback()
+            assert other.execute(text("SELECT pg_try_advisory_xact_lock(684728190123)")).scalar_one() is True
+            other.rollback()
+    finally:
+        observer.dispose()
+        engine.dispose()
+
+
+def test_direct_postgresql_bootstrap_installs_search_without_rebuilding_on_restart(target_url, monkeypatch):
+    from app.core import database
+    from sqlalchemy import inspect
+
+    engine = postgres_engine(target_url)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "is_sqlite", False)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(database.settings, "sqlite_read_only", False)
+    try:
+        database.init_database()
+        with engine.begin() as connection:
+            assert inspect(connection).has_table("document_chunks_fts")
+            assert connection.execute(text("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname LIKE 'lg_pg_search_%'")).scalar_one() == 10
+            # Ingestion maintains richer content than the raw chunk. A restart
+            # or retry must neither erase it nor reconstruct it from fact rows.
+            connection.execute(text("INSERT INTO document_chunks_fts VALUES('chunk','workspace','file',:content)"), {"content": "heading\nbody"})
+        database.init_database()
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT content FROM document_chunks_fts WHERE chunk_id='chunk'")).scalar_one() == "heading\nbody"
+    finally:
+        engine.dispose()
+
+
+def test_postgresql_search_installation_is_atomic_and_retryable(target_url):
+    from app.core.postgresql_search import install_search
+
+    engine = postgres_engine(target_url)
+    try:
+        with engine.begin() as connection:
+            for ddl in [
+                "CREATE TABLE messages(content TEXT,role TEXT)",
+                "CREATE TABLE chat_sessions(title TEXT,goal_id TEXT,graph_id TEXT)",
+                "CREATE TABLE file_text_chunks(id TEXT,workspace_id TEXT,file_id TEXT,content TEXT,lifecycle_status TEXT)",
+                "CREATE TABLE memory_search_documents(content TEXT,subject TEXT,keywords_text TEXT,entity_aliases_text TEXT)",
+            ]:
+                connection.exec_driver_sql(ddl)
+            connection.execute(text("INSERT INTO file_text_chunks VALUES('active','ws','file','body','active'),('stale','ws','file','old','stale')"))
+
+        def fail_verification(_connection, _cursor, statement, *_args):
+            if statement.startswith("SELECT lower("):
+                raise ValueError("simulated interruption after search backfill")
+
+        event.listen(engine, "before_cursor_execute", fail_verification)
+        try:
+            with pytest.raises(ValueError, match="simulated interruption"):
+                install_search(engine)
+        finally:
+            event.remove(engine, "before_cursor_execute", fail_verification)
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT to_regclass('document_chunks_fts')")).scalar_one() is None
+            assert connection.execute(text("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname LIKE 'lg_pg_search_%'")).scalar_one() == 0
+        install_search(engine)
+        with engine.begin() as connection:
+            assert connection.execute(text("SELECT chunk_id FROM document_chunks_fts")).scalars().all() == ["active"]
+            connection.execute(text("UPDATE document_chunks_fts SET content='enriched heading and body' WHERE chunk_id='active'"))
+        # Simulate PG commit followed by a crash before the JSON search flag:
+        # repeating the installer is safe and preserves the committed projection.
+        install_search(engine)
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT content FROM document_chunks_fts")).scalar_one() == "enriched heading and body"
+    finally:
+        engine.dispose()
+
+
 def test_unmapped_unique_index_cannot_silently_disappear(tmp_path):
     metadata = MetaData()
     Table("items", metadata, Column("id", Integer, primary_key=True), Column("value", String))
@@ -180,6 +279,40 @@ def test_unmapped_unique_index_cannot_silently_disappear(tmp_path):
     assert next(check for check in report["checks"] if check["key"] == "source_indexes")["unmapped_indexes"] == ["items.custom_unique_value"]
     assert not (controller.root / "active.json").exists()
     router.dispose()
+
+
+def test_resume_after_search_failure_completes_real_postgresql_activation(tmp_path, target_url, monkeypatch):
+    from app.core.database import Base, init_database
+    from app.core import postgresql_search
+
+    init_database()
+    settings, router, capture = source(tmp_path, Base.metadata)
+    controller = DatabaseMigrationController(settings, router, capture, Base.metadata)
+    try:
+        with monkeypatch.context() as interrupted:
+            def fail_install(_engine):
+                raise ValueError("simulated interruption between baseline and search")
+            interrupted.setattr(postgresql_search, "install_search", fail_install)
+            controller.start(actor_id="admin", workspace_id="ws", managed=False, target_url=target_url, auto_activate=True)
+            controller._thread.join(120)
+            state = controller.status()
+            assert state["state"] == "FAILED", state
+            assert state["baseline_verified"] and not state.get("search_verified")
+            assert router.dialect.name == "sqlite"
+        controller.resume()
+        controller._thread.join(120)
+        state = controller.status()
+        assert state["state"] == "COMPLETED", state
+        assert state["search_verified"] and router.dialect.name == "postgresql"
+        with router.connect() as connection:
+            assert connection.execute(text("SELECT to_regclass('document_chunks_fts')")).scalar_one() is not None
+    finally:
+        if controller._thread and controller._thread.is_alive():
+            controller.cancel()
+            controller._thread.join(10)
+        if controller._target is not None:
+            controller._target.dispose()
+        router.dispose()
 
 
 @pytest.mark.parametrize("restart_before_activation", [False, True])

@@ -694,6 +694,8 @@ class Settings(BaseSettings):
     # execution only becomes available when this flag is on AND an immutable
     # pinned sandbox image provides the fixed ``mcp_stdio`` task; otherwise the
     # default ``UnavailableStdioMCPAdapter`` stays in effect.
+    scheduled_tasks_enabled: bool = True
+    scheduled_tasks_poll_seconds: int = Field(default=15, ge=1, le=300)
     mcp_stdio_runner_enabled: bool = False
     mcp_stdio_command_args_max: int = 16
     mcp_stdio_result_bytes: int = 256 * 1024

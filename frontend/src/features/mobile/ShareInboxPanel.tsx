@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 import { BookmarkPlus, Inbox, MessageSquarePlus, Target, Trash2, X } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'

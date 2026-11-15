@@ -53,7 +53,7 @@ import {
 import { cn } from "@/lib/utils";
 import { motionDuration } from "@/lib/motion-preferences";
 import { graphRelationKey, useGraphRelationFeedback } from "./graph-motion";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import {
   TREE_CARD_W,
   TREE_MAIN_W,
@@ -151,6 +151,7 @@ export interface KnowledgeGraphProps {
   minimumZoom?: number;
   maximumZoom?: number;
   showZoomControls?: boolean;
+  toolbarMode?: "full" | "minimal";
   onSelect?: (node: KnowledgeNodeData & { id: string }) => void;
   onSelectionChange?: (
     nodes: Array<KnowledgeNodeData & { id: string }>,
@@ -166,6 +167,8 @@ export interface KnowledgeGraphProps {
   currentId?: string;
   /** Search hits: ringed on the canvas without hiding anything. */
   matchIds?: string[];
+  /** Keep unrelated branches visible in whole-graph overview hosts. */
+  highlightNeighborhood?: boolean;
   /**
    * Learning-plan execution order (dashed,极淡) — deliberately a different
    * visual language from the knowledge edges: solid = dependency, dashed =
@@ -176,6 +179,8 @@ export interface KnowledgeGraphProps {
   showHeading?: boolean;
   /** Imperative camera API so a host toolbar can locate / focus a node. */
   onCanvasApi?: (api: KnowledgeGraphCanvasApi) => void;
+  /** Host-owned positions for a readable sidebar neighbourhood. */
+  nodePositions?: Record<string, { x: number; y: number }>;
   /**
    * Initial camera: `view` fits the whole graph (legacy behaviour, used by the
    * rails), `focus` centers the selected node at 100% so card text stays
@@ -532,6 +537,7 @@ export function KnowledgeGraph({
   minimumZoom = layout === "tree" || compact ? 0.3 : 0.5,
   maximumZoom = 1.8,
   showZoomControls = false,
+  toolbarMode = "full",
   onSelect,
   onSelectionChange,
   onStudy,
@@ -543,10 +549,12 @@ export function KnowledgeGraph({
   title = "学习图谱",
   currentId,
   matchIds,
+  highlightNeighborhood = true,
   planEdges = emptyEdges,
   showHeading = true,
   initialFit = "view",
   onCanvasApi,
+  nodePositions,
   collapsedIds: collapsedIdsProp,
   onCollapsedIdsChange,
 }: KnowledgeGraphProps) {
@@ -681,18 +689,12 @@ export function KnowledgeGraph({
         // Recheck here so stale automatic framing never wins that race.
         if (suppressAutoFit.current || userInteracted.current) return;
         const focusedNode = focusId ? flowInstance.getNode(focusId) : undefined;
-        if (focusedNode) {
+        if (focusedNode && initialFit === "focus") {
           const previous = resizeViewport.current;
-          const ratio = Math.min(
-            previous && previous.width > 0 ? width / previous.width : 1,
-            previous && previous.height > 0 ? height / previous.height : 1,
-          );
-          // Focus mode keeps the reading zoom the learner chose; only the
-          // framing follows the viewport (a settle must not shrink the cards).
+          // Focus mode keeps the reading zoom; overview mode below refits
+          // every branch instead of replacing the overview with a selection.
           const targetZoom = clampGraphZoom(
-            initialFit === "focus"
-              ? (previous?.zoom ?? flowInstance.getZoom())
-              : (previous?.zoom ?? flowInstance.getZoom()) * ratio,
+            previous?.zoom ?? flowInstance.getZoom(),
             minimumZoom,
             maximumZoom,
           );
@@ -776,7 +778,7 @@ export function KnowledgeGraph({
     return structureSkeleton.depths[focusId] === 0 || Boolean(nodes.find((node) => node.id === focusId)?.data.root);
   }, [focusId, nodes, structureSkeleton]);
 
-  const neighborhoodHighlight = Boolean(focusId) && !focusIsRoot;
+  const neighborhoodHighlight = highlightNeighborhood && Boolean(focusId) && !focusIsRoot;
 
   const highlightIds = useMemo(() => {
     const set = new Set<string>();
@@ -999,6 +1001,7 @@ export function KnowledgeGraph({
           className: cn("graph-node-enter", relationFeedback.targets.has(node.id) && "graph-relation-target"),
           selected: internalSelectedIds.includes(node.id),
           position:
+            nodePositions?.[node.id] ??
             positionOverrides[node.id] ??
             centered ??
             freeLayoutPositions[node.id] ??
@@ -1050,6 +1053,7 @@ export function KnowledgeGraph({
       layoutItemById,
       matchIds,
       positionOverrides,
+      nodePositions,
       relationFeedback.targets,
       rootEmphasis,
       structuredTree.childrenByParent,
@@ -1149,7 +1153,7 @@ export function KnowledgeGraph({
 
   // Focus the selected learning node at its actual center and 100% scale.
   useEffect(() => {
-    if (!flowInstance || view !== "tree" || !focusId) return;
+    if (initialFit !== "focus" || !flowInstance || view !== "tree" || !focusId) return;
     // Selecting a node is a detail-panel action. Once the learner has
     // interacted with the canvas, keep the current camera exactly where it is
     // instead of recentering and forcing a zoom animation for every click.
@@ -1167,7 +1171,12 @@ export function KnowledgeGraph({
     }
     if (lastFocusedId.current === focusId) return;
     lastFocusedId.current = focusId;
-    const pos = structuredTree.positions[focusId];
+    const sourcePosition = nodePositions?.[focusId];
+    const flowNode = sourcePosition ? flowInstance.getNode?.(focusId) : undefined;
+    const localNode = sourcePosition ? laidOutNodes.find(node => node.id === focusId) : undefined;
+    const localWidth = flowNode?.measured?.width ?? (typeof localNode?.style?.width === "number" ? localNode.style.width : TREE_CARD_W);
+    const localHeight = flowNode?.measured?.height ?? (localNode?.data.kind === "root" ? TREE_ROOT_SIZE : TREE_NODE_H);
+    const pos = sourcePosition ? { x: sourcePosition.x + localWidth / 2, y: sourcePosition.y + localHeight / 2 } : structuredTree.positions[focusId];
     if (!pos) return;
     suppressAutoFit.current = true;
     const targetZoom = clampGraphZoom(1, minimumZoom, maximumZoom);
@@ -1181,9 +1190,12 @@ export function KnowledgeGraph({
   }, [
     focusId,
     flowInstance,
+    initialFit,
     maximumZoom,
     minimumZoom,
     structuredTree.positions,
+    nodePositions,
+    laidOutNodes,
     view,
   ]);
 
@@ -1508,7 +1520,13 @@ export function KnowledgeGraph({
         ) : (
           <span />
         )}
-        {interactive &&
+        {interactive && toolbarMode === "minimal" ? <div className="graph-rail-zoom pointer-events-auto flex items-center gap-1">
+          <Button aria-label="缩小图谱" disabled={!flowInstance || zoom <= minimumZoom + 0.01} onClick={() => zoomBy(-0.15)} size="icon-sm" variant="ghost"><ZoomOut className="size-3.5" /></Button>
+          <output aria-live="polite" className="text-xs tabular-nums">{Math.round(zoom * 100)}%</output>
+          <Button aria-label="放大图谱" disabled={!flowInstance || zoom >= maximumZoom - 0.01} onClick={() => zoomBy(0.15)} size="icon-sm" variant="ghost"><ZoomIn className="size-3.5" /></Button>
+          <Button aria-label="适应完整图谱" title="适应完整图谱" disabled={!flowInstance} onClick={resetView} size="icon-sm" variant="ghost"><RotateCcw className="size-3.5" /></Button>
+        </div> : null}
+        {interactive && toolbarMode === "full" &&
           (toolbarNarrow ? (
             <div className="nodrag nopan nowheel pointer-events-auto shrink-0 rounded-xl border bg-card/90 p-1">
               <DropdownMenu

@@ -1,3 +1,4 @@
+import { scheduleSessionRefresh } from "@/lib/session-refresh";
 import {
   memo,
   useCallback,
@@ -19,6 +20,8 @@ import type { Sticker } from "@/api/stickers";
 import { useNativeComposerContract } from "@/lib/native-composer-contract";
 import { useLatestCallback } from "@/hooks/use-latest-callback";
 import { useLiveChatMessages } from "./use-live-chat-messages";
+import { useComposerField, promoteComposerScope } from "./composer-session-state";
+import { requestConfirmedStop, type StopState } from "./confirmed-cancellation";
 import {
   useMutation,
   useQueries,
@@ -66,14 +69,17 @@ import { SandboxAuthDialog, type SandboxAuthRequest } from "@/components/chat/sa
 import { SandboxBuildProgress } from "@/components/shared/sandbox-build-progress";
 import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
 import { RetryAnswerMenu, RetryMenuSettings } from "@/components/chat/retry-answer-menu";
-import { FollowUpPrompts, SuggestedPromptContent } from "@/components/chat/suggested-prompts";
+import { FollowUpPrompts } from "@/components/chat/suggested-prompts";
+import { MemoryOpeningSuggestions } from "./memory-opening-suggestions";
 import {
   beginStreamStats,
   deltaTextOf,
   recordStreamDelta,
 } from "@/features/chat/stream-stats";
 
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
+import { ComposerFeedback, useComposerFeedback } from '@/components/chat/composer-feedback';
+import { CopyMessageAction, useCopyFeedback } from '@/components/shared/copy-feedback';
 import { createStreamRenderQueue } from "@/features/chat/stream-render-queue";
 import { markStreamTextUpdate } from "@/lib/stream-text-epoch";
 
@@ -102,11 +108,9 @@ import {
   listProviders,
   listGraphs,
   listProjects,
-  listMemories,
   listSessionMessages,
   listSessionMessagesPage,
   listSettings,
-  listSessions,
   listFiles,
   lookupFile,
   parseFile,
@@ -139,7 +143,8 @@ import { voiceSessionController } from "@/features/voice/voice-session-controlle
 import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controller";
 import { hashFileSha256 } from "@/lib/file-hash";
 import { PREFILL_COMPOSER_EVENT } from "@/features/mobile/PendingShareConsumer";
-import { ThinkingSlider, THINKING_STOPS, thinkingStopIndex } from "@/components/chat/thinking-slider";
+import { migrateThinkingPreference } from "@/lib/thinking-effort-migration";
+import { ThinkingSlider, supportedThinkingStops, thinkingStopIndex } from "@/components/chat/thinking-slider";
 import { DictationBar } from "@/components/chat/dictation-bar";
 import {
   startDictationOrchestrator,
@@ -158,7 +163,6 @@ import {
 import {
   Conversation,
   ConversationContent,
-  ConversationEmptyState,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import { useConversationScrollController } from "@/features/chat/use-conversation-scroll-controller";
@@ -295,7 +299,7 @@ import type { FileRecord } from "@/types/files";
 import {
   isDashscopeProvider,
   isDeepSeekProvider,
-  isModelProviderType,
+  isModelProvider,
   type ProviderModel,
 } from "@/types/providers";
 import type { WorkspaceSetting } from "@/types/settings";
@@ -333,8 +337,10 @@ import {
   providerAsrModelId,
   providerCapabilityString,
   providerModelOptions,
+  modelSupportsAgent,
   thinkingLabels,
 } from "@/lib/model-choices";
+import { resolveNetworkSearchRoute } from "@/lib/network-search-route";
 import {
   areChatSuggestedPromptsEnabled,
   isAsrVadAdaptive,
@@ -364,9 +370,11 @@ import {
   setSessionGoalMode,
 } from "@/lib/session-goal-mode";
 import { cn } from "@/lib/utils";
+import { matchesSessionLearningNode } from "@/lib/learning-node-binding";
 import {
   workspaceQueryKey,
 } from "@/lib/query-keys";
+import { useSessionNeighborhood } from "@/lib/session-queries";
 import {
   groupPartsForDisplay,
   isReasoningTextPart,
@@ -374,12 +382,9 @@ import {
   thinkingDurationSeconds,
   toolCallCount,
 } from "@/features/chat/chat-message-parts";
+import { messageCopyText } from "@/features/chat/message-copy";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
-import {
-  LearningPackageCanvas,
-  type LearningCanvasNode,
-} from "@/features/learning/learning-package-canvas";
 import {
   GoalSetupConversation,
   useGoalSetupFlow,
@@ -394,7 +399,6 @@ import type {
   MessageSelectionContext,
   Session,
   SessionMessageStreamData,
-  SuggestedPrompt,
 } from "@/types/sessions";
 
 type ChatStatus = "ready" | "submitted" | "streaming" | "error";
@@ -408,6 +412,8 @@ type ImageSize = NonNullable<MessageCreateRequest["image_size"]>;
  */
 type PendingSendItem = {
   id: string;
+  workspaceId: string;
+  sessionId: string;
   text: string;
   /** Raw form attachments snapshotted at queue time (sent as-is). */
   files: PromptInputMessage["files"];
@@ -474,8 +480,6 @@ type LearningNodeContext = {
   nodeIds?: string[];
   nodeLabel?: string;
   sessionId?: string;
-  learningPackage?: boolean;
-  openKey?: string;
 };
 
 type TextSelectionMenu = MessageSelectionContext & {
@@ -1511,29 +1515,6 @@ function findOptimisticCounterpart(
   return undefined;
 }
 
-async function copySelectionText(text: string): Promise<void> {
-  const content = text || "";
-  if (!content) return;
-  try {
-    await navigator.clipboard.writeText(content);
-  } catch {
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = content;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    } catch {
-      toast.error("复制失败");
-      return;
-    }
-  }
-  toast.success("已复制");
-}
-
 function readTextSelection(): TextSelectionMenu | null {
   const selection = window.getSelection();
   if (!selection || selection.rangeCount === 0 || selection.isCollapsed)
@@ -1695,15 +1676,8 @@ function UserMessage({
   onStartEdit: () => void;
   onRetryVoice?: () => void;
 }) {
-  const copyMessage = async () => {
-    try {
-      const stickerText = message.parts.filter(part => part.type === "sticker").map(part => `[表情：${String(part.data?.alt ?? "表情包")}]`).join("\n");
-      await navigator.clipboard.writeText([message.content === "[表情]" ? "" : message.content, stickerText].filter(Boolean).join("\n"));
-      toast.success("已复制消息");
-    } catch {
-      toast.error("无法复制消息");
-    }
-  };
+  const stickerText = message.parts.filter(part => part.type === "sticker").map(part => `[表情：${String(part.data?.alt ?? "表情包")}]`).join("\n");
+  const copyText = [message.content === "[表情]" ? "" : message.content, stickerText].filter(Boolean).join("\n");
 
   const markedSegments = useMemo(() => {
     const marks = selectionMarks
@@ -1818,13 +1792,7 @@ function UserMessage({
               <RefreshCcw className="size-3.5" />
             </MessageAction>
           ) : null}
-          <MessageAction
-            label="复制消息"
-            onClick={() => void copyMessage()}
-            tooltip="复制消息"
-          >
-            <Copy className="size-3.5" />
-          </MessageAction>
+          <CopyMessageAction label="复制消息" text={copyText} scope={message.id} />
           <MessageAction
             disabled={disabled}
             label="编辑消息"
@@ -2016,11 +1984,7 @@ function AssistantMessageInner({
     live: shown.status === "streaming",
   });
   // Budget approval needs a clickable card outside the collapsed thinking fold.
-  const fullText = shown.parts
-    .filter((part) => part.type === "text" || part.type === "acknowledgement" || part.type === "sticker")
-    .map((part) => part.type === "sticker" ? `[表情：${String(part.data?.alt ?? "表情包")}]` : part.content ?? "")
-    .filter((content) => content && content.trim() !== "正在思考")
-    .join("\n");
+  const fullText = messageCopyText(shown.parts, shown.content);
     const renderPart = (part: MessagePart) => {
     const rendered = (
     <ChatStreamPartRenderer
@@ -2123,7 +2087,7 @@ function AssistantMessageInner({
       onFocus={() => setVersionsRequested(true)}
     >
       {versions.data && versions.data.length > 1 ? (
-        <div className="chat-message-version-row mb-2 flex items-center gap-1 text-[10px] text-muted-foreground">
+        <div className="chat-message-version-row mb-2 flex items-center gap-1 text-xs text-muted-foreground">
           版本：
           {versions.data.map((version) => (
             <Button
@@ -2212,18 +2176,7 @@ function AssistantMessageInner({
       }
       {!voiceActionsVisible(shown) ? null : (
         <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
-          <MessageAction
-            label="复制全文"
-            onClick={() =>
-             void navigator.clipboard
-                .writeText(fullText)
-                .then(() => toast.success("已复制回答"))
-                .catch(() => toast.error("无法复制回答"))
-            }
-            tooltip="复制全文"
-          >
-          <Copy className="size-3.5" />
-        </MessageAction>
+          <CopyMessageAction label="复制全文" text={fullText} scope={shown.id + ':' + shown.version} />
         {retryMenuContent === undefined ? (
           <MessageAction disabled={retryDisabled} label="重试并保留版本" onClick={onRetry} tooltip={retryDisabledReason ?? "重试并保留版本"}>
             <RefreshCcw className="size-3.5" />
@@ -2258,7 +2211,7 @@ function AssistantMessageInner({
                 从此创建分支
               </span>
               {branchDisabled && branchDisabledReason ? (
-                <span className="pl-5 text-[10px] text-muted-foreground">
+                <span className="pl-5 text-xs text-muted-foreground">
                   {branchDisabledReason}
                 </span>
               ) : null}
@@ -2270,7 +2223,7 @@ function AssistantMessageInner({
               >
                 <Copy className="size-3.5" />
                 复制消息 ID
-                <span className="ml-auto font-mono text-[10px] text-muted-foreground">
+                <span className="ml-auto font-mono text-xs text-muted-foreground">
                   {shortMessageId}
                   {" · "}v{shown.version}
                 </span>
@@ -2327,70 +2280,6 @@ const AssistantMessage = memo(
   AssistantMessageInner,
   areEqualAssistantMessage,
 );
-
-function EmptySessionPrompts({
-  prompts,
-  onSelect,
-  disabled,
-  isPending,
-  isUnavailable,
-  onConfigureProvider,
-}: {
-  prompts: SuggestedPrompt[];
-  onSelect: (content: string) => void;
-  disabled: boolean;
-  isPending: boolean;
-  isUnavailable: boolean;
-  onConfigureProvider: () => void;
-}) {
-  return (
-    <ConversationEmptyState className="chat-empty-state">
-      <div className="chat-empty-state__content">
-        <p className="chat-empty-state__eyebrow">新会话</p>
-        <h2>从一个问题开始</h2>
-        <SuggestedPromptContent
-          disabled={disabled}
-          isPending={isPending}
-          isUnavailable={isUnavailable}
-          onConfigureProvider={onConfigureProvider}
-          onSelect={onSelect}
-          prompts={prompts}
-        />
-      </div>
-    </ConversationEmptyState>
-  );
-}
-
-/** 空会话默认问题：优先来自记忆，否则使用中文通用开场提示。 */
-function buildMemoryBackedEmptyPrompts(
-  memories: Array<{ id: string; title: string; content: string | null }>,
-): SuggestedPrompt[] {
-  const active = memories.filter((item) => (item.title || item.content)?.trim());
-  if (!active.length) {
-    return [
-      {
-        id: "empty-zh-1",
-        content: "我现在最应该先学什么？",
-      },
-      {
-        id: "empty-zh-2",
-        content: "请根据我当前的学习目标，帮我梳理可学的主题。",
-      },
-    ];
-  }
-  return active.slice(0, 2).map((item, index) => {
-    const title = (item.title || "").trim();
-    const snippet = (item.content || "").trim().replace(/\s+/g, " ").slice(0, 48);
-    const topic = title || snippet || "这段记忆";
-    return {
-      id: `memory-prompt-${item.id || index}`,
-      content:
-        index === 0
-          ? `结合我记住的「${topic}」，接下来该怎么学？`
-          : `请基于「${topic}」帮我回顾关键点，并给出下一步练习。`,
-    };
-  });
-}
 
 /** 工作台工具栏的一个能力入口；窄屏按 primary 决定是否收进「更多」。 */
 type WorkbenchCapability = {
@@ -2595,6 +2484,9 @@ export function ChatCanvasPage() {
     ? new URLSearchParams(location.search).get("project")
     : null;
   const conversationResetKey = `${workspaceId}:${sessionId}${sessionId === "new" ? `:${draftProjectId ?? "root"}` : ""}`;
+  const { notice: composerNotice, show: showComposerNotice, clear: clearComposerNotice } = useComposerFeedback(conversationResetKey);
+  const configureModels = useCallback(() => navigate(`/w/${workspaceId}/settings/models`), [navigate, workspaceId]);
+  const selectionCopy = useCopyFeedback(conversationResetKey + ':selection');
   // Giving the visible draft its durable id is not a conversation switch.
   // Keep its composer and the first turn's scroll anchor through that handoff.
   const promotingDraftSessionIdRef = useRef<string | null>(null);
@@ -2618,7 +2510,7 @@ export function ChatCanvasPage() {
   >(() => listSelectionExplanations(sessionId));
   const [activeConversationQuestionId, setActiveConversationQuestionId] =
     useState<string | null>(null);
-  const [longPaste, setLongPaste] = useState<string | null>(null);
+  const [longPaste, setLongPaste] = useComposerField<string | null>(conversationResetKey, "longPaste", null);
   useEffect(() => {
     setSelectionExplanationMarks(listSelectionExplanations(sessionId));
     const refresh = (event: Event) => {
@@ -2649,16 +2541,35 @@ export function ChatCanvasPage() {
     },
     [selectionExplanationMarks, sessionId],
   );
-  const [pendingFiles, setPendingFiles] = useState<FileRecord[]>([]);
-  const [composerText, setComposerText] = useState("");
-  const [pendingStickers, setPendingStickers] = useState<Sticker[]>([]);
+  const [pendingFiles, setPendingFiles] = useComposerField<FileRecord[]>(conversationResetKey, "pendingFiles", []);
+  const [composerText, setComposerText] = useComposerField(conversationResetKey, "text", "");
+  const [composerFiles, setComposerFiles] = useComposerField<PromptInputMessage["files"]>(conversationResetKey, "files", []);
+  const attachmentCount = composerFiles.length;
+  const [missingAttachments, setMissingAttachments] = useComposerField<string[]>(conversationResetKey, "missingAttachments", []);
+  const [draftStorageWarning] = useComposerField(conversationResetKey, "storageWarning", "");
+  const [stopState, setStopState] = useComposerField<StopState>(conversationResetKey, "stopState", { phase: "idle" });
+  const viewingComposerScopeRef = useRef(conversationResetKey);
+  viewingComposerScopeRef.current = conversationResetKey;
+  const cancellationRequestsRef = useRef(new Map<string, Promise<boolean>>());
+  const [pendingStickers, setPendingStickers] = useComposerField<Sticker[]>(conversationResetKey, "stickers", []);
   // 待发送队列：回复进行中提交的消息先进队列，生成结束后自动发出。
-  const [pendingSendQueue, setPendingSendQueue] = useState<PendingSendItem[]>([]);
+  const [pendingSendQueue, setPendingSendQueue] = useComposerField<PendingSendItem[]>(conversationResetKey, "queue", []);
   const pendingSendQueueRef = useRef<PendingSendItem[]>([]);
-  const dispatchInFlightRef = useRef(false);
-  const autoDispatchBlockedRef = useRef(false);
+  const queueControlsRef = useRef(new Map<string, { dispatching: { current: boolean }; blocked: { current: boolean } }>());
+  const queueControls = useMemo(() => {
+    const existing = queueControlsRef.current.get(conversationResetKey);
+    if (existing) return existing;
+    const controls = { dispatching: { current: false }, blocked: { current: false } };
+    queueControlsRef.current.set(conversationResetKey, controls);
+    return controls;
+  }, [conversationResetKey]);
+  const dispatchInFlightRef = queueControls.dispatching;
+  const autoDispatchBlockedRef = queueControls.blocked;
+  const [queueEditItem, setQueueEditItem] = useState<PendingSendItem | null>(null);
+  const [queueEditText, setQueueEditText] = useState("");
   const composerHasText = composerText.trim().length > 0;
-  const composerHasDraft = composerHasText || pendingStickers.length > 0;
+  const composerHasDraft = composerHasText || pendingStickers.length > 0 ||
+    attachmentCount > 0 || pendingFiles.length > 0 || longPaste !== null;
   const streamOrSubmitted = status === "streaming" || status === "submitted";
   const queueOnClick = streamOrSubmitted && composerHasDraft;
   const [graphAction, setGraphAction] = useState<GraphAction>("none");
@@ -2694,10 +2605,8 @@ export function ChatCanvasPage() {
   const [searchRoute, setSearchRoute] = useState<SearchRoute>(
     initialComposerPrefs.searchRoute,
   );
-  const [generationMode, setGenerationMode] = useState<GenerationMode>(
-    initialComposerPrefs.generationMode,
-  );
-  const [imageSize, setImageSize] = useState<ImageSize>("auto");
+  const [generationMode, setGenerationMode] = useComposerField<GenerationMode>(conversationResetKey, "generationMode", initialComposerPrefs.generationMode);
+  const [imageSize, setImageSize] = useComposerField<ImageSize>(conversationResetKey, "imageSize", "auto");
   useEffect(() => {
     if (promotingDraftSessionIdRef.current === sessionId) return;
     setStreamConnectionNotice(null);
@@ -2945,7 +2854,6 @@ export function ChatCanvasPage() {
     initialLearningNode.current,
   );
   const abortRef = useRef<AbortController | null>(null);
-  const activeCancellationRef = useRef<Promise<void> | null>(null);
   const activeMessageId = useRef<string | null>(null);
   const activeStreamSessionId = useRef<string | null>(null);
   /** Always the session currently on screen — background streams must not mutate UI. */
@@ -2979,9 +2887,10 @@ export function ChatCanvasPage() {
   const optimisticSessionId = useRef<string | null>(null);
   const retryExpectedVersionRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-  /** 底部 Composer 整体（快捷栏 + 状态条 + 输入框）高度写入 --composer-height，
-      驱动正文动态安全区 / 底部淡出 / 悬浮按钮位置，禁止固定像素值。 */
-  const composerDockRef = useRef<HTMLDivElement | null>(null);
+  /** 底部 Composer 整体高度写入 --composer-height，驱动正文安全区 / 淡出。
+      悬浮按钮直接挂到真实 dock 上，不能依赖回合进行中锁定的预留高度。 */
+  const [composerDockElement, setComposerDockElement] =
+    useState<HTMLDivElement | null>(null);
   /** 已写入 --composer-height 的高度，以及回合进行中被推迟的收缩值。 */
   const composerHeightRef = useRef(0);
   const composerPendingShrinkRef = useRef<number | null>(null);
@@ -3006,7 +2915,12 @@ export function ChatCanvasPage() {
     setComposerEnlarged(false);
   }, [conversationResetKey]);
   const openFileDialogRef = useRef<() => void>(() => undefined);
-  const pendingHandled = useRef(false);
+  // Navigation intents survive effect replay; a later navigation may still
+  // legitimately send the same text, so identity must not depend on content.
+  const handledRouteIntents = useRef(new Set<string>());
+  // A second navigation has a new location key even while the first send is
+  // still awaiting sandbox preflight. Keep one auto-send in flight per scope.
+  const pendingRouteAutoSends = useRef(new Set<string>());
   const draftSessionCreationRef = useRef<{
     scope: string;
     promise: Promise<Session>;
@@ -3097,13 +3011,13 @@ export function ChatCanvasPage() {
     };
   }, [composerText, composerInstanceKey, composerEnlarged]);
 
-  // 底部 Composer 高度变化时写入 --composer-height：正文动态安全区、底部
-  // 淡出区域与「回到底部」按钮统一依赖该变量，而不是各自的固定像素值。
+  // 底部 Composer 高度变化时写入 --composer-height，供正文安全区和底部淡出使用。
+  // 「回到底部」按钮由 dock 本身定位，不依赖这里可能被锁定的历史高度。
   // 回合进行中只允许变高：正文的 padding-bottom 依赖该变量，收缩会直接改变
   // 内容滚动高度（被当成「内容变多」，并让滚动位置被重新钳位）。收缩值先
   // 记账，回合结束后补写。
   useEffect(() => {
-    const element = composerDockRef.current;
+    const element = composerDockElement;
     if (!element) return;
     const observer = new ResizeObserver(([entry]) => {
       if (!entry) return;
@@ -3122,7 +3036,7 @@ export function ChatCanvasPage() {
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, []);
+  }, [composerDockElement]);
 
   // 回合结束（空闲）后解除收缩抑制，并补写被推迟的收缩值。
   useEffect(() => {
@@ -3160,7 +3074,7 @@ export function ChatCanvasPage() {
     setGraphAction("none");
     setSearchRoute("disabled");
     setGenerationMode("text");
-  }, [goalMode]);
+  }, [goalMode, setGenerationMode]);
 
   // Remember goal mode per session while it is active: sidebar session
   // switches navigate without the ?mode=goal query, so this flag is the only
@@ -3236,7 +3150,7 @@ export function ChatCanvasPage() {
     // primary bound, this is the safety net for unobserved caches.
     gcTime: 15_000,
   });
-  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
+  const sessions = useSessionNeighborhood(workspaceId, sessionId);
 
   // Reset older-page cursor state when the active session changes.
   useEffect(() => {
@@ -3423,7 +3337,6 @@ export function ChatCanvasPage() {
       setResponseMode(defaults.responseMode);
       setThinkingMode(defaults.thinkingMode);
       setSearchRoute(defaults.searchRoute);
-      setGenerationMode(defaults.generationMode);
       // Batched with the mode updates above; persist sees them on the next render.
       setComposerPrefsReadySessionId(sessionId || "new");
       return;
@@ -3467,7 +3380,7 @@ export function ChatCanvasPage() {
     sessions.isPending,
     settings.isPending,
     workspaceDefaultResponseMode,
-  ]);
+   setGenerationMode]);
 
   // Clear the in-flight resume latch when switching sessions so a new session
   // can auto-resume independently. Do NOT abort background streams — concurrent
@@ -3503,30 +3416,13 @@ export function ChatCanvasPage() {
     queryFn: listProviders,
   });
   const graphs = useQuery({ queryKey: workspaceQueryKey(workspaceId, "graphs"), queryFn: listGraphs });
-  // 空会话提示优先参考工作区记忆；无记忆时使用中文默认问题。
-  const emptySessionMemories = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "memories", "empty-session-prompts"),
-    queryFn: () => listMemories({ state: "active", zone: "hot" }),
-    staleTime: 60_000,
-  });
-  const memoryFallbackPrompts = useMemo(
-    () =>
-      buildMemoryBackedEmptyPrompts(
-        (emptySessionMemories.data ?? []).map((item) => ({
-          id: item.id,
-          title: item.title,
-          content: item.content,
-        })),
-      ),
-    [emptySessionMemories.data],
-  );
   const modelProviders = useMemo(
     () =>
       (providers.data ?? []).filter(
         (provider) =>
           provider.enabled &&
           provider.remote_capability &&
-          isModelProviderType(provider.provider_type),
+          isModelProvider(provider),
       ),
     [providers.data],
   );
@@ -3682,7 +3578,7 @@ export function ChatCanvasPage() {
       }
       return retained;
     });
-  }, [generationMode, imageEditEnabled]);
+  }, [generationMode, imageEditEnabled, setPendingFiles]);
   const composerFileAccept = useMemo(() => {
     if (generationMode === "image")
       return imageEditEnabled ? "image/png,image/jpeg,image/webp" : "";
@@ -3756,18 +3652,8 @@ export function ChatCanvasPage() {
   const retrySelectedModel = retryModelOptions.find(
     (model) => model.id === retryModelId,
   );
-  const retrySupportsAgentMode = Boolean(
-    retryProvider &&
-      isModelProviderType(retryProvider.provider_type) &&
-      retryProvider.capabilities.supports_agent_tools !== false &&
-      retrySelectedModel?.capabilities?.supports_agent_tools !== false &&
-      retrySelectedModel?.remote,
-  );
-  const activeProviderSupportsStructuredAgent = Boolean(
-    activeModelProvider &&
-      isModelProviderType(activeModelProvider.provider_type) &&
-      activeModelProvider.capabilities.supports_agent_tools !== false,
-  );
+  const retrySupportsAgentMode = modelSupportsAgent(retryProvider, retrySelectedModel);
+  const activeProviderSupportsStructuredAgent = modelSupportsAgent(activeModelProvider, selectedModel);
   const activeProviderIsDeepSeek = Boolean(
     activeModelProvider && isDeepSeekProvider(activeModelProvider),
   );
@@ -3806,7 +3692,7 @@ export function ChatCanvasPage() {
         selectedModel?.capabilities?.reasoning_efforts ??
           activeModelProvider?.capabilities.reasoning_efforts ??
           (activeProviderIsDeepSeek
-            ? ["low", "medium", "high", "xhigh"]
+            ? ["low", "high", "max"]
             : undefined),
       ),
     [
@@ -3821,7 +3707,7 @@ export function ChatCanvasPage() {
         retrySelectedModel?.capabilities?.reasoning_efforts ??
           retryProvider?.capabilities.reasoning_efforts ??
           (retryProvider && isDeepSeekProvider(retryProvider)
-            ? ["low", "medium", "high", "xhigh"]
+            ? ["low", "high", "max"]
             : undefined),
       ),
     [
@@ -3941,11 +3827,14 @@ export function ChatCanvasPage() {
     sessionId,
   ]);
   useEffect(() => {
+    if (providers.isPending || discoveredModels?.isPending) return;
+    const migrated = migrateThinkingPreference(sessionId, activeModelProvider?.id, selectedModel?.id, selectedModel?.capabilities, thinkingMode);
+    if (migrated !== thinkingMode) { setThinkingMode(migrated); return; }
     if (!thinkingModes.length) return;
     setThinkingMode((current) =>
-      thinkingModes.includes(current) ? current : thinkingModes[0],
+      thinkingModes.includes(current) || (current === "off" && selectedModel?.capabilities?.thinking_required !== true) ? current : thinkingModes[0],
     );
-  }, [thinkingModes]);
+  }, [thinkingModes, providers.isPending, discoveredModels?.isPending, sessionId, activeModelProvider?.id, selectedModel?.id, selectedModel?.capabilities, thinkingMode]);
   useEffect(() => {
     if (retryDiscoveredModels.isPending) return;
     setRetryModelId((current) =>
@@ -3956,8 +3845,10 @@ export function ChatCanvasPage() {
   }, [retryDiscoveredModels.isPending, retryModelOptions]);
   useEffect(() => {
     if (!retryTarget || retryDiscoveredModels.isPending) return;
-    if (!retrySupportsAgentMode) setRetryResponseMode("fast");
-    if (retryResponseMode === "fast" || !retrySupportsAgentMode || !retryThinkingModes.length) {
+    const required = retrySelectedModel?.capabilities?.thinking_required === true;
+    if (retryResponseMode === "agentic" && !retrySupportsAgentMode) setRetryResponseMode("thinking");
+    if (retryResponseMode === "fast" && required) setRetryResponseMode(retrySupportsAgentMode ? "agentic" : "thinking");
+    if ((retryResponseMode === "fast" && !required) || !retryThinkingModes.length) {
       setRetryThinkingMode("off");
       return;
     }
@@ -3975,6 +3866,7 @@ export function ChatCanvasPage() {
   const supportsAgentMode =
     activeProviderSupportsStructuredAgent &&
     Boolean(selectedModel?.remote);
+  const effectiveAgentMode = responseMode === "agentic" && supportsAgentMode;
   // Response mode is an explicit user preference. Capability changes may make
   // the selected mode temporarily unavailable, but must never silently rewrite
   // 智能体 to 思考/极速; the disabled send path explains the unavailable model.
@@ -3992,6 +3884,7 @@ export function ChatCanvasPage() {
     discoveredModels?.isPending,
     providers.isPending,
     responseMode,
+    effectiveAgentMode,
     supportsThinkingMode,
   ]);
   useEffect(() => {
@@ -4013,11 +3906,17 @@ export function ChatCanvasPage() {
   // against an unavailable SearchProvider.
   useEffect(() => {
     if (providers.isPending || providers.isError) return;
-    if (searchRoute === "disabled" || searchRoute === "model_native") return;
-    if (!hasAuthorizedAgentSearchProvider) {
-      setSearchRoute("disabled");
-    }
+    const nativeSearch = Boolean(
+      selectedModel?.capabilities?.hosted_web_search ??
+        activeModelProvider?.capabilities.hosted_web_search,
+    );
+    const resolved = resolveNetworkSearchRoute(
+      searchRoute, nativeSearch, hasAuthorizedAgentSearchProvider,
+    );
+    if (resolved !== searchRoute) setSearchRoute(resolved);
   }, [
+    activeModelProvider?.capabilities.hosted_web_search,
+    selectedModel?.capabilities?.hosted_web_search,
     hasAuthorizedAgentSearchProvider,
     providers.isError,
     providers.isPending,
@@ -4031,6 +3930,9 @@ export function ChatCanvasPage() {
     generationMode === "image" ? activeImageProvider : activeModelProvider;
   const activeGenerationModelId =
     generationMode === "image" ? selectedImageModel?.id ?? "" : selectedModel?.id ?? "";
+  useEffect(() => {
+    clearComposerNotice();
+  }, [composerText, composerFiles, pendingFiles, pendingStickers, selectedModelId, selectedImageModelId, generationMode, clearComposerNotice]);
   const messages = useMemo(() => {
     const persisted =
       optimisticSessionId.current === sessionId ? [] : history.data ?? [];
@@ -4509,7 +4411,7 @@ export function ChatCanvasPage() {
           await queryClient.invalidateQueries({
             queryKey: workspaceQueryKey(workspaceId, "messages", streamSessionId),
           });
-          void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
+          void scheduleSessionRefresh(queryClient, workspaceId);
           // Always drop the optimistic row once the durable message is terminal,
           // even if the user is currently looking at another session.
           setLocalMessages((current) =>
@@ -4666,9 +4568,7 @@ export function ChatCanvasPage() {
       return next.length === current.length ? current : next;
     });
   }, [history.data, sessionId, setLocalMessages]);
-  const currentSession = sessions.data?.find(
-    (session) => session.id === sessionId,
-  );
+  const currentSession = sessions.session;
   const managedTasks = useManagedSessionTasks(sessionId !== "new" && currentSession?.session_kind !== "agent" ? sessionId : null);
   const currentVoiceTasks = voiceSnapshotForGating.sessionId === sessionId ? voiceSnapshotForGating.tasks : [];
   const roundTasks = useMemo(() => mergeConversationTasks(managedTasks.tasks, currentVoiceTasks), [managedTasks.tasks, currentVoiceTasks]);
@@ -4738,6 +4638,11 @@ export function ChatCanvasPage() {
       ? [{ id: parent.id, label: "原会话", active: false }]
       : [];
   }, [currentSession, sessions.data]);
+  useEffect(() => {
+    if (stopState.phase === "idle" || !history.isSuccess) return;
+    const target = stopState.messageId ? history.data?.find(message => message.id === stopState.messageId) : history.data?.findLast(message => message.role === "assistant");
+    if (target && TERMINAL_MESSAGE_STATUSES.includes(target.status as (typeof TERMINAL_MESSAGE_STATUSES)[number])) setStopState({ phase: "idle" });
+  }, [history.data, history.isSuccess, stopState, setStopState]);
   const sessionIsClosed = currentSession?.status === "closed";
   const isEmptySession = messages.length === 0;
   const latestAssistantMessage = useMemo(() => {
@@ -4785,14 +4690,14 @@ export function ChatCanvasPage() {
       sessionId,
       activeModelProvider?.id ?? "",
       selectedModel?.id ?? "",
-      responseMode === "agentic",
+      effectiveAgentMode,
       persistedTimelineStamp,
     ),
     queryFn: () =>
       getSessionContextUsage(sessionId, {
         provider_id: activeModelProvider?.id,
         model_id: selectedModel?.id,
-        agent_mode: responseMode === "agentic",
+        agent_mode: effectiveAgentMode,
       }),
     enabled:
       contextUsageEnabled &&
@@ -4995,8 +4900,7 @@ export function ChatCanvasPage() {
   // 锚点上：语音回合的回答永不充当锚点（`!suggestionAnchorIsVoice`）。通话结束后提示
   // 不会自己回来，直到用户在输入框里发出一轮文本回合。
   //
-  // 空会话同理：还没有任何回合可锚，开场提示来自工作区记忆（客户端），不该为它读库、
-  // 调模型，也不该写下批次行。
+  // 空会话的开场问题单独从授权记忆生成，不创建会话或持久化回合批次。
   const canPrepareSuggestedPrompts = Boolean(
     !goalMode &&
       !voiceBlocksComposer &&
@@ -5129,10 +5033,6 @@ export function ChatCanvasPage() {
       : undefined;
   const promptSuggestions =
     (generatedSuggestionBatch ?? persistedSuggestionBatch)?.prompts ?? [];
-  const emptySessionDisplayPrompts =
-    promptSuggestions.length > 0
-      ? promptSuggestions
-      : memoryFallbackPrompts;
   const suggestionAnchorPending = Boolean(
     suggestionAnchor !== null &&
       (suggestionAnchorVersions.isPending || suggestionAnchorVersions.isFetching),
@@ -5271,6 +5171,7 @@ export function ChatCanvasPage() {
       generationMode,
       queryClient,
       responseMode,
+      effectiveAgentMode,
       searchRoute,
       selectedImageModelId,
       selectedImageProviderId,
@@ -5329,6 +5230,7 @@ export function ChatCanvasPage() {
     void ensureDraftSession().then((session) => {
       if (cancelled) return;
       rememberCreatedSession(session);
+      promoteComposerScope(conversationResetKey, `${workspaceId}:${session.id}`, session.id);
       preserveDraftForSessionRef.current = session.id;
       navigate(`/w/${workspaceId}/chat/${session.id}`, { replace: true });
     }).catch((error: unknown) => {
@@ -5337,7 +5239,7 @@ export function ChatCanvasPage() {
       toast.error(error instanceof Error ? error.message : "无法开始语音会话");
     });
     return () => { cancelled = true; };
-  }, [ensureDraftSession, navigate, rememberCreatedSession, sessionId, voiceModeOpen, workspaceId]);
+  }, [ensureDraftSession, navigate, rememberCreatedSession, sessionId, voiceModeOpen, workspaceId, conversationResetKey]);
 
   const completeGoalSetup = useCallback(
     async ({ goal, graph }: { goal: Goal; graph: Graph }) => {
@@ -5399,7 +5301,7 @@ export function ChatCanvasPage() {
       rememberCreatedSession,
       sessionId,
       workspaceId,
-    ],
+     setPendingFiles, setComposerText],
   );
   const goalFlow = useGoalSetupFlow({
     enabled: goalMode,
@@ -5415,7 +5317,7 @@ export function ChatCanvasPage() {
     // produces fewer batches, 思考 allows the provider thinking budget.
     graphMode: responseMode === "fast" ? "fast" : "thinking",
     // 智能体模式下右侧图谱预览由会话消息驱动，关闭向导自身的广播以免覆盖。
-    previewEnabled: responseMode !== "agentic",
+    previewEnabled: !effectiveAgentMode,
     // 会话切换保留向导进度；手动点「目标」退出则丢弃进度，下次重新开始。
     preserveOnDisable: !goalModeExitedManuallyRef.current,
   });
@@ -5459,12 +5361,12 @@ export function ChatCanvasPage() {
     goalDraftRestoredScopeRef.current = scope;
     const draft = getSessionGoalDraft(workspaceId, sessionId);
     if (draft) setComposerText(draft);
-  }, [composerText, goalFlow.stage, goalMode, sessionId, workspaceId]);
+  }, [composerText, goalFlow.stage, goalMode, sessionId, workspaceId, setComposerText]);
 
   // 智能体模式：把会话消息里的 create 图谱提案实时同步到右侧「目标图谱预览」，
   // 提案待审核 → reviewing；确认后（状态为 confirmed）→ approved（通过审核）。
   useEffect(() => {
-    if (!goalMode || responseMode !== "agentic") return;
+    if (!goalMode || !effectiveAgentMode) return;
     const proposalParts = messages.flatMap((message) =>
       (message.parts ?? []).map((part) => ({ part, message })),
     );
@@ -5532,7 +5434,7 @@ export function ChatCanvasPage() {
         },
       }),
     );
-  }, [goalMode, messages, responseMode]);
+  }, [goalMode, messages, effectiveAgentMode]);
   const closeSessionMutation = useMutation({
     mutationFn: () => {
       if (!currentSession || sessionId === "new") {
@@ -5550,7 +5452,7 @@ export function ChatCanvasPage() {
       );
       setCloseDialogOpen(false);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") }),
+        scheduleSessionRefresh(queryClient, workspaceId),
         // The session is closed — evict its message history and per-message
         // derived caches rather than just marking them stale. invalidate keeps
         // the (potentially large) cached message array resident; remove drops
@@ -5587,7 +5489,7 @@ export function ChatCanvasPage() {
             })
           : Promise.resolve(),
       ]);
-      toast.success("学习会话已结束，复盘已触发。");
+      toast.success("学习会话已结束，复盘已触发", { scope: `${workspaceId}:${closedSession.id}`, context: closedSession.title });
     },
     onError: (error) =>
       toast.error(
@@ -5694,6 +5596,7 @@ export function ChatCanvasPage() {
           ? message.id
           : undefined;
       if (!sourceSessionId || !sourceMessageId) return undefined;
+      if (sessions.hasMoreRelated) return undefined;
       const branchSessionIds = (sessions.data ?? [])
         .filter(
           (session) =>
@@ -5721,6 +5624,7 @@ export function ChatCanvasPage() {
       navigate,
       sessionId,
       sessions.data,
+      sessions.hasMoreRelated,
       workspaceId,
     ],
   );
@@ -5772,6 +5676,7 @@ export function ChatCanvasPage() {
         analysisOnly?: boolean;
       } = {},
     ) => {
+      if (viewingComposerScopeRef.current !== conversationResetKey || stopState.phase !== "idle") return;
       const stickers = options.stickers ?? [];
       const content = contentValue.trim() || (stickers.length ? "[表情]" : "");
       if (!content) return;
@@ -5796,22 +5701,23 @@ export function ChatCanvasPage() {
       )
         return;
       if (closeSessionMutation.isPending) {
-        toast.error("正在结束学习会话，请稍候。");
+        // The confirm button and persistent inline status already report pending.
         return;
       }
       if (sessionIsClosed) {
-        toast.error("该学习会话已结束。请创建分支或新会话继续学习。");
+        showComposerNotice("会话已结束，可创建分支或新会话继续学习。");
         return;
       }
       const requestedGenerationMode = options.generationMode ?? generationMode;
       if (
         requestedGenerationMode === "text" &&
-        responseMode === "agentic" &&
+        effectiveAgentMode &&
         !options.analysisOnly &&
         !options.sandboxPreflighted
       ) {
         if (!(await ensureAgentSandboxReady())) return;
       }
+      if (viewingComposerScopeRef.current !== conversationResetKey) return;
       // Image retries can override the composer selection with an explicit
       // provider/model so switching models does not race React state updates.
       const overrideImageProvider =
@@ -5829,15 +5735,11 @@ export function ChatCanvasPage() {
           ? options.imageModelId ?? selectedImageModel?.id ?? ""
           : selectedModel?.id ?? "";
       if (!requestProvider || !requestModelId) {
-        toast.error(
-          requestedGenerationMode === "image"
-            ? "当前工作区未启用带默认模型的真实绘图 Provider。"
-            : "当前工作区未启用真实模型 Provider，请先到设置中完成配置。",
-        );
+        showComposerNotice(requestedGenerationMode === "image" ? "尚未配置绘图模型" : "尚未配置对话模型", { label: "配置模型", onClick: configureModels });
         return;
       }
       if (requestedGenerationMode === "text" && !selectedModel?.remote) {
-        toast.error("当前选择的模型没有可验证的远程能力。");
+        showComposerNotice("当前模型暂不可用，请选择其他模型。", { label: "选择模型", onClick: () => setModelMenuOpen(true) });
         return;
       }
       const requestedGraphAction =
@@ -5848,14 +5750,14 @@ export function ChatCanvasPage() {
         requestedGraphAction === "propose_create" &&
         !currentSession?.goal_id
       ) {
-        toast.error("当前会话尚未绑定已确认的学习目标，不能生成图谱提案。");
+        showComposerNotice("请先确认学习目标，再生成图谱提案。");
         return;
       }
       if (
         requestedGraphAction === "propose_update" &&
         !currentSession?.graph_id
       ) {
-        toast.error("当前会话尚未绑定图谱，不能生成增量提案。");
+        showComposerNotice("请先绑定图谱，再生成增量提案。");
         return;
       }
       const stamp = Date.now();
@@ -5941,6 +5843,7 @@ export function ChatCanvasPage() {
           targetSessionId = targetSession.id;
           optimisticSessionId.current = targetSessionId;
           promotingDraftSessionIdRef.current = targetSessionId;
+          promoteComposerScope(conversationResetKey, `${workspaceId}:${targetSessionId}`, targetSessionId);
           rememberCreatedSession(targetSession);
           // Let the router commit independently of the SSE state updates.
           // Keep rows on the visible draft until that commit; promoting them
@@ -6032,6 +5935,12 @@ export function ChatCanvasPage() {
             suffix: options.selectionContext.suffix.slice(0, 500),
           }
         : undefined;
+      const effectiveSearchRoute = resolveNetworkSearchRoute(
+        requestedGenerationMode === "image" || options.analysisOnly ? "disabled" : searchRoute,
+        Boolean(selectedModel?.capabilities?.hosted_web_search ??
+          requestProvider.capabilities.hosted_web_search),
+        hasAuthorizedAgentSearchProvider,
+      );
       const request: MessageCreateRequest = {
         content,
         sticker_ids: stickers.length ? stickers.map(sticker => sticker.id) : undefined,
@@ -6055,34 +5964,17 @@ export function ChatCanvasPage() {
         thinking_mode:
           requestedGenerationMode === "image" ? "off" : effectiveThinkingMode,
         agent_mode:
-          requestedGenerationMode === "text" && responseMode === "agentic" && !options.analysisOnly,
+          requestedGenerationMode === "text" && effectiveAgentMode && !options.analysisOnly,
         goal_mode:
           requestedGenerationMode === "text" &&
-          responseMode === "agentic" &&
+          effectiveAgentMode &&
           !options.analysisOnly &&
           goalMode,
         // Agent mode no longer forces web_search just because a SearchProvider
         // exists. Network search follows the explicit searchRoute (and the
         // composer "联网" toggle), while agent tools still run without search.
-        search_route:
-          requestedGenerationMode === "image" || options.analysisOnly
-            ? "disabled"
-            : responseMode === "agentic" &&
-                !hasAuthorizedAgentSearchProvider &&
-                searchRoute !== "model_native"
-              ? "disabled"
-              : searchRoute === "auto" ||
-                  searchRoute === "external" ||
-                  searchRoute === "local"
-                ? hasAuthorizedAgentSearchProvider
-                  ? searchRoute
-                  : "disabled"
-                : searchRoute,
-        web_search:
-          requestedGenerationMode === "text" &&
-          !options.analysisOnly &&
-          searchRoute !== "disabled" &&
-          (searchRoute === "model_native" || hasAuthorizedAgentSearchProvider),
+        search_route: effectiveSearchRoute,
+        web_search: effectiveSearchRoute !== "disabled",
         graph_action: requestedGraphAction,
         graph_id:
           requestedGraphAction === "propose_update"
@@ -6137,7 +6029,7 @@ export function ChatCanvasPage() {
             persistedAssistant,
           ],
         );
-        if (isViewingStream()) {
+        if (optimisticSessionId.current === targetSessionId) {
           optimisticSessionId.current = null;
         }
         setLocalMessages((current) =>
@@ -6414,35 +6306,18 @@ export function ChatCanvasPage() {
         });
         if (isViewingStream()) setStatus("ready");
         if (isViewingStream()) setStreamConnectionNotice(null);
-        void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
+        void scheduleSessionRefresh(queryClient, workspaceId);
       } catch (error) {
         if (controller.signal.aborted) {
-          const cancellation = activeCancellationRef.current;
-          if (cancellation) await cancellation;
-          frameQueue.clear();
-          if (isViewingStream()) {
-            setLocalMessages((current) =>
-              current.map((message) =>
-                message.id === assistant.id
-                  ? {
-                      ...message,
-                      status: "cancelled",
-                      parts: message.parts.map((part) => ({
-                        ...part,
-                        status: "failed" as const,
-                      })),
-                    }
-                  : message,
-              ),
-            );
-          }
+          await frameQueue.drain();
           try {
-            await reconcilePersisted(["cancelled"]);
+            await reconcilePersisted(TERMINAL_MESSAGE_STATUSES);
+            markSessionRunning(targetSessionId, false);
+            if (isViewingStream()) setStatus("ready");
           } catch {
+            if (isViewingStream()) setStatus("error");
             retryPersistedReconciliation();
           }
-          markSessionRunning(targetSessionId, false);
-          if (isViewingStream()) setStatus("ready");
         }
         else {
           await frameQueue.drain();
@@ -6531,6 +6406,8 @@ export function ChatCanvasPage() {
     },
     [
       queryClient,
+      conversationResetKey,
+      stopState.phase,
       activeModelProvider,
       setLocalMessages,
       activeImageProvider,
@@ -6548,8 +6425,10 @@ export function ChatCanvasPage() {
       messages,
       selectedModel?.id,
       selectedModel?.remote,
+      selectedModel?.capabilities?.hosted_web_search,
       selectedImageModel?.id,
       responseMode,
+      effectiveAgentMode,
       effectiveThinkingMode,
       ensureAgentSandboxReady,
       ensureDraftSession,
@@ -6565,6 +6444,8 @@ export function ChatCanvasPage() {
       voiceTextFallback,
       notifyUserTurnStarted,
       workspaceId,
+      showComposerNotice,
+      configureModels,
     ],
   );
 
@@ -6640,7 +6521,7 @@ export function ChatCanvasPage() {
 
   const uploadAndIndex = useCallback(
     async (file: File, options?: { agentMode?: boolean }) => {
-      const agentMode = options?.agentMode ?? responseMode === "agentic";
+      const agentMode = options?.agentMode ?? effectiveAgentMode;
       let stored: FileRecord | null = null;
       try {
         const digest = await hashFileSha256(file);
@@ -6657,7 +6538,7 @@ export function ChatCanvasPage() {
       await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
       return prepareStoredFile(stored, agentMode);
     },
-    [prepareStoredFile, queryClient, responseMode, workspaceId],
+    [prepareStoredFile, queryClient, effectiveAgentMode, workspaceId],
   );
 
   // 大文本粘贴被拦截后：点击「放入文本框」时把内容写回输入框（优先光标处，
@@ -6678,19 +6559,33 @@ export function ChatCanvasPage() {
     }
     setLongPaste(null);
     window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
-  }, [composerText, longPaste]);
+  }, [composerText, longPaste, setComposerText, setLongPaste]);
 
-  const discardLongPaste = useCallback(() => setLongPaste(null), []);
+  const discardLongPaste = useCallback(() => setLongPaste(null), [ setLongPaste]);
+
+  const insertComposerExpression = useCallback((text: string) => {
+    const input = composerTextareaRef.current;
+    const start = input?.selectionStart ?? composerText.length;
+    const end = input?.selectionEnd ?? start;
+    setComposerText(composerText.slice(0, start) + text + composerText.slice(end));
+    window.requestAnimationFrame(() => {
+      input?.focus({ preventScroll: true });
+      input?.setSelectionRange(start + text.length, start + text.length);
+    });
+  }, [composerText, setComposerText]);
 
   const addStickerToDraft = useCallback((sticker: Sticker) => {
-    if (pendingStickers.some(item => item.id === sticker.id)) return;
-    if (pendingStickers.length >= 4) {
-      toast.message("每条消息最多添加 4 张表情。");
-      return;
-    }
-    setPendingStickers(current => [...current, sticker]);
-    window.requestAnimationFrame(() => composerTextareaRef.current?.focus({ preventScroll: true }));
-  }, [pendingStickers]);
+    setPendingStickers(current => {
+      if (current.some(item => item.id === sticker.id)) return current;
+      if (current.length >= 4) {
+        toast.message("每条消息最多添加 4 张表情。");
+        return current;
+      }
+      return [...current, sticker];
+    });
+    // Popover owns close-time focus restoration; a delayed rAF would steal focus
+    // from a picker the user has already reopened and silently drop the next selection.
+  }, [setPendingStickers]);
 
   const submitPrompt = useCallback(
     async (
@@ -6698,6 +6593,10 @@ export function ChatCanvasPage() {
       _event?: unknown,
       draft?: PendingSendDraft,
     ) => {
+      if (viewingComposerScopeRef.current !== conversationResetKey) return false;
+      if (closeSessionMutation.isPending || sessionIsClosed) return false;
+      clearComposerNotice();
+      if (stopState.phase !== "idle") { showComposerNotice("请先确认当前任务已停止，草稿已保留。"); return false; }
       const effectiveFiles = draft?.files ?? message.files;
       const effectivePendingFiles = draft?.pendingFiles ?? pendingFiles;
       const effectiveStickers = draft?.stickers ?? pendingStickers;
@@ -6747,22 +6646,24 @@ export function ChatCanvasPage() {
             clearSubmittedDraft();
             return true;
           }
-          toast.message("语音通道尚未就绪，请稍后重试，或退出语音模式后再发送。");
+          showComposerNotice("语音通道尚未就绪，请稍后重试，或退出语音模式后再发送。");
           return false;
         }
         // Voice mode owns the composer; never let a disconnected call or an
         // attachment fall through to the ordinary SSE chat sender.
-        toast.message("语音模式下请等待语音通道连接，或先退出语音模式。附件与快捷操作暂不可用。");
+        showComposerNotice("语音模式下请等待语音通道连接，或先退出语音模式。附件与快捷操作暂不可用。");
         return false;
       }
       if (voiceModeOpen && !voiceTextFallback) {
-        toast.message("语音模式下附件与快捷操作暂不可用，请退出语音模式后再使用。");
+        showComposerNotice("语音模式下附件与快捷操作暂不可用，请退出语音模式后再使用。");
         return false;
       }
-      if (generatingNow && (trimmedText || effectiveStickers.length)) {
+      if (generatingNow && (trimmedText || effectiveStickers.length || effectiveFiles.length || effectivePendingFiles.length || effectiveLongPaste !== null)) {
         const queued: PendingSendItem = {
           id: `pending-send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          text: trimmedText,
+          workspaceId,
+          sessionId,
+          text: message.text,
           files: effectiveFiles,
           pendingFiles: effectivePendingFiles,
           stickers: effectiveStickers,
@@ -6773,7 +6674,7 @@ export function ChatCanvasPage() {
         };
         autoDispatchBlockedRef.current = false;
         setPendingSendQueue((current) => [...current, queued]);
-        toast.message("已加入发送队列，当前回复结束后自动发送。");
+        // The visible queue itself is the confirmation; do not duplicate it globally.
         // 与正常发送一致地清空草稿（文本与附件已移入队列条目）。
         clearSubmittedDraft();
         return true;
@@ -6810,21 +6711,29 @@ export function ChatCanvasPage() {
           hasImageMention || effectiveGenerationMode === "image"
             ? "image"
             : "text";
-        if (effectiveStickers.length && requestedGenerationMode !== "text") {
-          toast.message("请切回文字模式，或移除表情后再生成图片。");
+        // Validate the selected model before uploading files or clearing a draft.
+        const requestModelReady = requestedGenerationMode === "image"
+          ? activeImageProvider && selectedImageModel
+          : activeModelProvider && selectedModel?.remote;
+        if (!requestModelReady) {
+          showComposerNotice(requestedGenerationMode === "image" ? "尚未配置可用的绘图模型" : "尚未配置可用的对话模型", { label: "配置模型", onClick: configureModels });
           return false;
         }
-        if (effectiveStickers.length && goalMode && responseMode !== "agentic") {
-          toast.message("请切回普通对话，或移除表情后再进行目标澄清。");
+        if (effectiveStickers.length && requestedGenerationMode !== "text") {
+          showComposerNotice("请切回文字模式，或移除表情后再生成图片。");
+          return false;
+        }
+        if (effectiveStickers.length && goalMode && !effectiveAgentMode) {
+          showComposerNotice("请切回普通对话，或移除表情后再进行目标澄清。");
           return false;
         }
         if (effectiveStickers.length && (!activeModelProvider || !selectedModel?.remote)) {
-          toast.error("请先选择可用的对话模型，表情已保留在草稿中。");
+          showComposerNotice("请先选择可用的对话模型，表情已保留在草稿中。", { label: "配置模型", onClick: configureModels });
           return false;
         }
         if (
           requestedGenerationMode === "text" &&
-          responseMode !== "agentic"
+          !effectiveAgentMode
         ) {
           const blockedNames = [
             ...files
@@ -6849,13 +6758,13 @@ export function ChatCanvasPage() {
               .map((file) => file.original_name),
           ];
           if (blockedNames.length) {
-            toast.error(nonAgentAttachmentBlockedMessage(blockedNames));
+            showComposerNotice(nonAgentAttachmentBlockedMessage(blockedNames));
             return false;
           }
         }
         if (
           requestedGenerationMode === "text" &&
-          responseMode === "agentic" &&
+          effectiveAgentMode &&
           !goalMode &&
           !(await ensureAgentSandboxReady())
         ) {
@@ -6875,7 +6784,7 @@ export function ChatCanvasPage() {
           requestedGenerationMode === "image" &&
           (!activeImageProvider || !selectedImageModel)
         ) {
-          toast.error("请先启用绘图 Provider 并选择已配置的文生图模型。");
+          showComposerNotice("尚未配置绘图模型", { label: "配置模型", onClick: configureModels });
           return false;
         }
         if (
@@ -6884,7 +6793,7 @@ export function ChatCanvasPage() {
             (file) => !IMAGE_EDIT_MIME_TYPES.has(file.mime_type.toLowerCase()),
           )
         ) {
-          toast.error("绘图模式的参考附件只能是图片。");
+          showComposerNotice("绘图模式的参考附件只能是图片。");
           return false;
         }
         if (
@@ -6892,7 +6801,7 @@ export function ChatCanvasPage() {
           (files.length > 0 || effectivePendingFiles.length > 0) &&
           !isImageEditModel(selectedImageModel)
         ) {
-          toast.error("图生图和图片编辑仅支持支持参考图的绘图模型。");
+          showComposerNotice("当前模型不支持参考图，请切换绘图模型。", { label: "选择模型", onClick: () => setModelMenuOpen(true) });
           return false;
         }
         if (
@@ -6904,14 +6813,14 @@ export function ChatCanvasPage() {
               ),
           )
         ) {
-          toast.error("绘图模式的参考附件只能是图片。");
+          showComposerNotice("绘图模式的参考附件只能是图片。");
           return false;
         }
         const preparedPendingFiles =
           requestedGenerationMode === "text"
             ? await Promise.all(
                 effectivePendingFiles.map((file) =>
-                  prepareStoredFile(file, responseMode === "agentic"),
+                  prepareStoredFile(file, effectiveAgentMode),
                 ),
               )
             : pendingFiles;
@@ -6932,17 +6841,18 @@ export function ChatCanvasPage() {
               new File([blob], part.filename ?? `attachment-${index + 1}`, {
                 type: part.mediaType || blob.type || "application/octet-stream",
               }),
-              { agentMode: responseMode === "agentic" },
+              { agentMode: effectiveAgentMode },
             );
           }),
         );
+        if (viewingComposerScopeRef.current !== conversationResetKey) return false;
         const attachmentFiles = [...preparedPendingFiles, ...uploaded].filter(
           (file, index, files) =>
             files.findIndex((candidate) => candidate.id === file.id) === index,
         );
         const attachmentFileIds = attachmentFiles.map((file) => file.id);
         if (requestedGenerationMode === "image" && attachmentFileIds.length > 4) {
-          toast.error("当前绘图模型最多支持 4 张参考图片。");
+          showComposerNotice("当前绘图模型最多支持 4 张参考图片。");
           return false;
         }
         const fileIds =
@@ -6954,11 +6864,11 @@ export function ChatCanvasPage() {
           (fileIds.length ? "请阅读并结合附件内容回答。" : effectiveStickers.length ? "[表情]" : "");
         if (!content) {
           if (requestedGenerationMode === "image")
-            toast.message("请补充要生成的画面描述。");
+            showComposerNotice("请补充要生成的画面描述。");
           return false;
         }
         if (goalMode && requestedGenerationMode === "text") {
-          if (responseMode === "agentic") {
+          if (effectiveAgentMode) {
             // 智能体目标模式走统一聊天流：Agent 通过工具从会话上下文中
             // 挖掘学习需求与方向，创建/确认 Goal，再生成待审核的图谱提案，
             // 与普通对话共用同一套 provider/model/thinking 协议。
@@ -6974,7 +6884,7 @@ export function ChatCanvasPage() {
             return true;
           }
           if (goalFlow.stage !== "capture" || goalFlow.busy) {
-            toast.message("请先完成上方的目标审核。");
+            showComposerNotice("请先完成上方的目标审核。");
             return false;
           }
           if (fileIds.length) {
@@ -6995,20 +6905,34 @@ export function ChatCanvasPage() {
             imageSize: effectiveImageSize,
             sourceFileIds,
             sandboxPreflighted:
-              requestedGenerationMode === "text" && responseMode === "agentic",
+              requestedGenerationMode === "text" && effectiveAgentMode,
           });
           clearSubmittedDraft();
           void sending.catch(() => undefined);
           return true;
         }
       } catch (error) {
-        toast.error(error instanceof Error ? error.message : "附件处理失败");
+        showComposerNotice(error instanceof Error ? error.message : "附件处理失败，请检查附件后重新发送。", undefined, "error");
         throw error;
       }
     },
     [
       activeImageProvider,
       activeModelProvider,
+      showComposerNotice,
+      clearComposerNotice,
+      configureModels,
+      closeSessionMutation.isPending,
+      sessionIsClosed,
+      workspaceId,
+      conversationResetKey,
+      stopState.phase,
+      setPendingSendQueue,
+      setComposerText,
+      setPendingFiles,
+      setPendingStickers,
+      setLongPaste,
+      setGenerationMode,
       ensureAgentSandboxReady,
       generationMode,
       goalFlow,
@@ -7019,6 +6943,7 @@ export function ChatCanvasPage() {
       pendingStickers,
       prepareStoredFile,
       responseMode,
+      effectiveAgentMode,
       selectedImageModel,
       selectedModel,
       send,
@@ -7028,31 +6953,51 @@ export function ChatCanvasPage() {
       voiceModeOpen,
       voiceTextFallback,
       voiceBlocksComposer,
-    ],
+     autoDispatchBlockedRef],
   );
 
   // --- 待发送队列：打断 / 编辑 / 取消 / 自动发送 ---------------------------
 
-  const stopCurrentGeneration = useCallback(() => {
-    const messageId = activeMessageId.current;
-    const streamSessionId = activeStreamSessionId.current;
-    const cancellation =
-      messageId && streamSessionId
-        ? cancelSessionMessage(streamSessionId, messageId)
-            .catch((error: Error) => toast.error(error.message))
-            .then(() => undefined)
-        : Promise.resolve();
-    activeCancellationRef.current = cancellation;
-    void cancellation.finally(() => {
-      if (activeCancellationRef.current === cancellation)
-        activeCancellationRef.current = null;
-    });
-    // Only abort the currently viewed session's stream.
-    abortSessionStream(streamSessionId ?? sessionId);
-    abortRef.current?.abort();
-    markSessionRunning(streamSessionId ?? sessionId, false);
-    setStatus("submitted");
-  }, [sessionId]);
+  const stopCurrentGeneration = useCallback((): Promise<boolean> => {
+    const scope = conversationResetKey;
+    const existing = cancellationRequestsRef.current.get(scope);
+    if (existing) return existing;
+    const streamSessionId = sessionId;
+    const handle = getSessionStream(streamSessionId);
+    const messageId = handle?.messageId ?? (activeStreamSessionId.current === streamSessionId ? activeMessageId.current : null) ?? stopState.messageId;
+    if (!messageId || streamSessionId === "new") {
+      setStopState({ phase: "unconfirmed", detail: "任务尚未返回持久标识，请稍后重试停止。" });
+      return Promise.resolve(false);
+    }
+    setStopState({ phase: "requesting", messageId });
+    const operation = (async () => {
+      try {
+        const snapshot = await requestConfirmedStop({
+          cancel: () => cancelSessionMessage(streamSessionId, messageId),
+          snapshot: () => getMessageSnapshot(streamSessionId, messageId),
+        });
+        queryClient.setQueryData<Message[]>(workspaceQueryKey(workspaceId, "messages", streamSessionId), current => mergeMessageIntoCache(current, snapshot));
+        setStopState({ phase: "idle" });
+        abortSessionStream(streamSessionId);
+        if (viewingComposerScopeRef.current === scope) {
+          if (activeStreamSessionId.current === streamSessionId) abortRef.current?.abort();
+          setStatus(snapshot.status === "failed" ? "error" : "ready");
+        }
+        markSessionRunning(streamSessionId, false);
+        return true;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "无法确认任务已停止";
+        setStopState({ phase: "unconfirmed", messageId, detail });
+        // Keep the stream and partial output: a failed cancel must not masquerade as success.
+        if (viewingComposerScopeRef.current === scope) toast.error("停止未确认", { description: detail });
+        return false;
+      } finally {
+        cancellationRequestsRef.current.delete(scope);
+      }
+    })();
+    cancellationRequestsRef.current.set(scope, operation);
+    return operation;
+  }, [conversationResetKey, sessionId, stopState.messageId, workspaceId, queryClient, setStopState]);
 
   /** Wait until an aborted stream's finally block clears abortRef. */
   const waitForAbortSettle = useCallback(async (timeoutMs = 5_000) => {
@@ -7077,6 +7022,10 @@ export function ChatCanvasPage() {
   /** Replay a queued item through the full composer pipeline (uploads etc.). */
   const dispatchQueuedSend = useCallback(
     async (item: PendingSendItem): Promise<boolean> => {
+      if (item.workspaceId !== workspaceId || item.sessionId !== sessionId || viewingSessionIdRef.current !== sessionId) {
+        setPendingSendQueue(current => current.some(entry => entry.id === item.id) ? current : [item, ...current]);
+        return false;
+      }
       try {
         const ok = await submitPrompt(
           { text: item.text, files: item.files },
@@ -7104,7 +7053,7 @@ export function ChatCanvasPage() {
         return false;
       }
     },
-    [submitPrompt],
+    [submitPrompt, workspaceId, sessionId, setPendingSendQueue, autoDispatchBlockedRef],
   );
 
   /** 打断当前回复并立即发送该队列条目。 */
@@ -7121,7 +7070,11 @@ export function ChatCanvasPage() {
       try {
         const streamSessionId = activeStreamSessionId.current;
         if (streamSessionId === sessionId || isSessionStreaming(sessionId)) {
-          stopCurrentGeneration();
+          if (!(await stopCurrentGeneration())) {
+            setPendingSendQueue(current => current.some(entry => entry.id === item.id) ? current : [item, ...current]);
+            autoDispatchBlockedRef.current = true;
+            return;
+          }
           await waitForAbortSettle();
         }
         await dispatchQueuedSend(item);
@@ -7129,33 +7082,23 @@ export function ChatCanvasPage() {
         dispatchInFlightRef.current = false;
       }
     },
-    [dispatchQueuedSend, sessionId, stopCurrentGeneration, waitForAbortSettle],
+    [dispatchQueuedSend, sessionId, stopCurrentGeneration, waitForAbortSettle, dispatchInFlightRef, autoDispatchBlockedRef, setPendingSendQueue],
   );
 
-  /** 重新编辑：把队列条目回填到输入框（保留资料库引用与大文本附件）。 */
+  /** Swap the complete draft with an edited queue item; parked drafts never auto-send. */
   const handleEditQueued = useCallback((item: PendingSendItem) => {
-    autoDispatchBlockedRef.current = false;
-    setPendingSendQueue((current) =>
-      current.filter((entry) => entry.id !== item.id),
-    );
-    setComposerText(item.text);
-    setPendingFiles(item.pendingFiles);
-    setPendingStickers(item.stickers);
-    setLongPaste(item.longPaste);
-    setGenerationMode(item.generationMode);
-    setImageSize(item.imageSize);
-    if (item.files.length) {
-      toast.message("已回到输入框；该消息原先直接附加的文件需要重新选择。");
-    }
-    window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
-  }, []);
+    if (item.workspaceId !== workspaceId || item.sessionId !== sessionId) return;
+    autoDispatchBlockedRef.current = true;
+    setQueueEditItem(item);
+    setQueueEditText(item.text);
+  }, [workspaceId, sessionId, autoDispatchBlockedRef]);
 
   /** 取消发送：把队列条目丢弃。 */
   const handleCancelQueued = useCallback((id: string) => {
     setPendingSendQueue((current) =>
       current.filter((entry) => entry.id !== id),
     );
-  }, []);
+  }, [ setPendingSendQueue]);
 
   // Keep a ref in sync so async dispatch paths read the freshest queue.
   useEffect(() => {
@@ -7165,9 +7108,10 @@ export function ChatCanvasPage() {
   // 当前会话空闲时自动发送队列中的下一条消息。
   useEffect(() => {
     if (dispatchInFlightRef.current) return;
-    if (autoDispatchBlockedRef.current) return;
+    if (autoDispatchBlockedRef.current || stopState.phase !== "idle" || queueEditItem?.sessionId === sessionId) return;
     if (!pendingSendQueue.length) return;
-    if (sessionId === "new") return;
+    if (sessionId === "new" || !history.isSuccess || history.data?.some(message => message.role === "assistant" && IN_FLIGHT_MESSAGE_STATUSES.includes(message.status as (typeof IN_FLIGHT_MESSAGE_STATUSES)[number]))) return;
+    if (pendingSendQueue[0].workspaceId !== workspaceId || pendingSendQueue[0].sessionId !== sessionId) return;
     if (isSessionStreaming(sessionId)) return;
     if (status !== "ready") return;
     if (goalFlow.busy || closeSessionMutation.isPending || sessionIsClosed)
@@ -7187,10 +7131,15 @@ export function ChatCanvasPage() {
     dispatchQueuedSend,
     goalFlow.busy,
     pendingSendQueue,
+    stopState.phase,
+    queueEditItem,
+    history.isSuccess,
+    history.data,
+    workspaceId,
     sessionId,
     sessionIsClosed,
     status,
-  ]);
+   dispatchInFlightRef, autoDispatchBlockedRef, setPendingSendQueue]);
 
   const reviewGraphChange = useMutation({
     mutationFn: ({
@@ -7271,7 +7220,7 @@ export function ChatCanvasPage() {
         queryClient.invalidateQueries({
           queryKey: workspaceQueryKey(workspaceId, "graph-change-sets", sessionId),
         }),
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") }),
+        scheduleSessionRefresh(queryClient, workspaceId),
         queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graphs") }),
         changeSet.graph_id
           ? queryClient.invalidateQueries({
@@ -7322,7 +7271,7 @@ export function ChatCanvasPage() {
 
   const graphReviewPendingRef = useRef(false);
   const submitGraphReview = useCallback((payload: Parameters<typeof reviewGraphChange.mutate>[0]) => {
-    if (graphReviewPendingRef.current) { toast.message("图谱变更正在处理，请稍候。"); return; }
+    if (graphReviewPendingRef.current) return;
     graphReviewPendingRef.current = true;
     const notification = toast.loading("正在处理图谱变更…");
     void reviewGraphChange.mutateAsync(payload).catch(() => { /* mutation reports the error */ }).finally(() => {
@@ -7487,7 +7436,6 @@ export function ChatCanvasPage() {
       setLocalMessages([]);
       return;
     }
-    pendingHandled.current = false;
     if (optimisticSessionId.current !== sessionId) {
       optimisticSessionId.current = null;
     }
@@ -7498,10 +7446,7 @@ export function ChatCanvasPage() {
     // The draft route may reuse the key it had before promotion. A reset
     // counter still clears PromptInput's internal files on a real switch back.
     setComposerInstanceKey((current) => current + 1);
-    setComposerText("");
-    setPendingFiles([]);
-    setPendingStickers([]);
-    setLongPaste(null);
+    // Draft fields are scoped outside this component; switching must not erase them.
     setGraphAction("none");
     // Keep workspace defaults for a fresh /chat/new canvas; existing sessions
     // restore their own prefs via the sessionId effect above.
@@ -7512,7 +7457,6 @@ export function ChatCanvasPage() {
       setResponseMode(defaults.responseMode);
       setThinkingMode(defaults.thinkingMode);
       setSearchRoute(defaults.searchRoute);
-      setGenerationMode(defaults.generationMode);
     } else {
       // Do not force searchRoute to disabled when switching existing sessions —
       // the prefs restore effect owns that state.
@@ -7550,13 +7494,26 @@ export function ChatCanvasPage() {
       learningNode?: LearningNodeContext;
       targetMessageId?: string;
     } | null;
-    const targetMessageId = routeState?.targetMessageId;
+    const targetMessageId = routeState?.targetMessageId
+      || new URLSearchParams(location.search).get("message");
     if (targetMessageId && history.isSuccess) {
+      const finishMessageNavigation = () => {
+        const search = new URLSearchParams(location.search);
+        search.delete("message");
+        const query = search.toString();
+        const state = routeState ? { ...routeState } : null;
+        if (state) delete state.targetMessageId;
+        navigate(`${location.pathname}${query ? `?${query}` : ""}${location.hash}`, {
+          replace: true,
+          state,
+        });
+      };
       // Search can target assistant rows and history hidden by the DOM cap.
       // The stable mount host exists even before its lazy content is painted.
       setRevealedHistoryCount(historyTotalCount);
       let attempts = 0;
       let cancelled = false;
+      let loadingOlder = false;
       const timer = window.setInterval(() => {
         const target = document.querySelector<HTMLElement>(
           `[data-message-mount-id="${CSS.escape(targetMessageId)}"]`,
@@ -7566,37 +7523,66 @@ export function ChatCanvasPage() {
           target.classList.add("ring-2", "ring-primary", "ring-offset-2");
           window.setTimeout(() => target.classList.remove("ring-2", "ring-primary", "ring-offset-2"), 1800);
           window.clearInterval(timer);
-          navigate(`${location.pathname}${location.search}`, { replace: true });
+          finishMessageNavigation();
         } else if (historyHasMoreBefore) {
+          if (loadingOlder) return;
+          loadingOlder = true;
           void loadOlderMessages().then((loaded) => {
             if (!cancelled && loaded === false) {
               window.clearInterval(timer);
-              navigate(`${location.pathname}${location.search}`, { replace: true });
+              toast.error("未能定位到该消息，请重新搜索");
+              finishMessageNavigation();
             }
-          });
+          }).catch(() => {
+            if (!cancelled) {
+              window.clearInterval(timer);
+              toast.error("加载历史消息失败，请重试");
+              finishMessageNavigation();
+            }
+          }).finally(() => { loadingOlder = false; });
         } else if (++attempts >= 12) {
           window.clearInterval(timer);
           toast.error("未能定位到该消息，请重新搜索");
-          navigate(`${location.pathname}${location.search}`, { replace: true });
+          finishMessageNavigation();
         }
       }, 120);
       return () => { cancelled = true; window.clearInterval(timer); };
     }
-    if (routeState?.learningNode?.graphId) {
-      const context = { ...routeState.learningNode, sessionId };
+    const pendingPrompt = routeState?.pendingPrompt;
+    const requested = routeState?.learningNode;
+    if (!pendingPrompt && !requested?.graphId) return;
+    const intentKey = JSON.stringify([conversationResetKey, location.key]);
+    if (handledRouteIntents.current.has(intentKey)) return;
+    // Keep the complete intent until both the destination and its model are
+    // ready. Clearing only learningNode first creates a second navigation
+    // carrying the same pendingPrompt and can race the initial send.
+    if (pendingPrompt && (
+      !activeModelProvider || !selectedModel?.remote ||
+      composerPrefsReadySessionId !== (sessionId || "new") ||
+      (sessionId !== "new" && !history.isSuccess)
+    )) return;
+    if (requested?.graphId) {
+      // A route intent may not override the session's durable node binding.
+      if (!currentSession || currentSession.id !== sessionId) return;
+      const matches = requested.graphId === currentSession.graph_id
+        && (!requested.nodeId || requested.nodeId === currentSession.current_node_id);
+      if (!matches) {
+        handledRouteIntents.current.add(intentKey);
+        navigate(`${location.pathname}${location.search}`, { replace: true });
+        return;
+      }
+      const context = { ...requested, sessionId };
       learningNodeRef.current = context;
       setLearningNode(context);
       storeLearningNodeContext(context);
     }
-    const pendingPrompt = routeState?.pendingPrompt;
-    if (
-      pendingPrompt &&
-      activeModelProvider &&
-      !pendingHandled.current &&
-      (sessionId === "new" || !history.isPending)
-    ) {
-      pendingHandled.current = true;
-      navigate(`${location.pathname}${location.search}`, { replace: true });
+    // Claim synchronously before navigating or entering async sandbox preflight.
+    // Session/settings reset effects must never release this one-shot claim.
+    handledRouteIntents.current.add(intentKey);
+    navigate(`${location.pathname}${location.search}`, { replace: true });
+    if (pendingPrompt) {
+      if (pendingRouteAutoSends.current.has(conversationResetKey)) return;
+      pendingRouteAutoSends.current.add(conversationResetKey);
       const pendingAttachmentFiles = routeState.pendingAttachmentFiles ?? [];
       const pendingFileIds = Array.from(
         new Set([
@@ -7608,13 +7594,20 @@ export function ChatCanvasPage() {
         fileIds: pendingFileIds,
         attachmentFiles: pendingAttachmentFiles,
         graphAction: routeState.pendingGraphAction,
+      }).finally(() => {
+        // A fresh user click after success or failure may submit again.
+        pendingRouteAutoSends.current.delete(conversationResetKey);
       });
     }
   }, [
     activeModelProvider,
-    history.isPending,
+    selectedModel?.remote,
+    composerPrefsReadySessionId,
+    conversationResetKey,
+    location.key,
     location.pathname,
     location.search,
+    location.hash,
     location.state,
     navigate,
     send,
@@ -7624,6 +7617,9 @@ export function ChatCanvasPage() {
     loadOlderMessages,
     scrollMessageIntoView,
     sessionId,
+    currentSession?.id,
+    currentSession?.graph_id,
+    currentSession?.current_node_id,
   ]);
 
   useEffect(() => {
@@ -7685,7 +7681,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     };
     window.addEventListener(PREFILL_COMPOSER_EVENT, listener);
     return () => window.removeEventListener(PREFILL_COMPOSER_EVENT, listener);
-  }, []);
+  }, [ setComposerText, setPendingFiles]);
 
   useEffect(() => {
     const listener = () => {
@@ -7704,7 +7700,11 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     const selectLearningNode = (event: Event) => {
       const detail = (event as CustomEvent<LearningNodeContext>).detail;
       if (!detail || typeof detail.graphId !== "string") return;
-      if (detail.sessionId && detail.sessionId !== sessionId) return;
+      // Read the saved binding at event time, including just-completed menu mutations.
+      const boundSession = queryClient.getQueryData<Session[]>(
+        workspaceQueryKey(workspaceId, "sessions"),
+      )?.find((item) => item.id === sessionId);
+      if (!matchesSessionLearningNode(sessionId, boundSession, detail)) return;
       const context = { ...detail, sessionId };
       const previousLabel = learningNodeRef.current?.nodeLabel;
       learningNodeRef.current = context;
@@ -7733,7 +7733,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         "learngraph:learning-node-selected",
         selectLearningNode,
       );
-  }, [sessionId]);
+  }, [queryClient, sessionId, workspaceId, setComposerText]);
 
   useEffect(
     () => () => {
@@ -8418,6 +8418,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       // session cache rather than re-fetching a full timeline.
       void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
     }
+    return sourceMessage;
   };
   const retry = useMutation<
     { expectedVersion: number; status: "cancelled" | "completed"; tempId: string },
@@ -8566,25 +8567,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           );
       } catch (error) {
         if (controller.signal.aborted) {
-          const cancellation = activeCancellationRef.current;
-          if (cancellation) await cancellation;
-          frameQueue.clear();
-          if (isViewingRetry()) {
-            setLocalMessages((current) =>
-              current.map((message) =>
-                message.id === tempId
-                  ? {
-                      ...message,
-                      status: "cancelled",
-                      parts: message.parts.map((part) => ({
-                        ...part,
-                        status: "failed" as const,
-                      })),
-                    }
-                  : message,
-              ),
-            );
-          }
+          await frameQueue.drain();
+          const confirmed = await reconcileRetryHistory(sourceSessionId, messageId, expectedVersion, TERMINAL_MESSAGE_STATUSES);
+          completed = confirmed.status === "completed";
+          if (!completed && confirmed.status !== "cancelled") throw new Error("生成已停止，但服务端记录为失败或中断；阶段输出已保留。");
         }
         else {
           await frameQueue.drain();
@@ -8622,7 +8608,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       }
       return {
         expectedVersion,
-        status: controller.signal.aborted ? "cancelled" : "completed",
+        status: completed ? "completed" : "cancelled",
         tempId,
       };
     },
@@ -8713,7 +8699,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   });
   const goalComposerLocked = Boolean(
     goalMode &&
-      responseMode !== "agentic" &&
+      !effectiveAgentMode &&
       goalFlow.stage !== "capture",
   );
   // 右槽（输入框右下角那一格）三态判定，2026-09-17 修订。
@@ -8729,7 +8715,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   //
   // 目标流程（`goalFlow.busy`）没有取消 API，期间不给中断键，语音入口维持
   // 渲染但置灰 —— 否则那一格会空掉。
-  const voiceDialBlocked = streamOrSubmitted || goalFlow.busy;
+  const voiceDialBlocked = streamOrSubmitted || goalFlow.busy || stopState.phase !== "idle";
   const composerShowsInterrupt =
     !voiceModeOpen && !composerHasDraft && streamOrSubmitted && !goalFlow.busy;
   const goalStageLabel =
@@ -8756,7 +8742,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     params.set("mode", "goal");
     navigate(`${location.pathname}?${params.toString()}`);
     window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
-  }, [location.pathname, location.search, navigate]);
+  }, [location.pathname, location.search, navigate, setComposerText, setGenerationMode]);
 
   const leaveGoalMode = useCallback(() => {
     // Manual exit is the only way to cancel a session's goal state: forget the
@@ -8794,7 +8780,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   );
   const preferredAgentThinkingMode = useMemo(
     () =>
-      (["xhigh", "high", "medium", "low"] as ThinkingMode[]).find((mode) =>
+      (["max", "xhigh", "high", "medium", "low"] as ThinkingMode[]).find((mode) =>
         thinkingModes.includes(mode),
       ) ?? "off",
     [thinkingModes],
@@ -8829,7 +8815,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       hasAuthorizedAgentSearchProvider,
       preferredAgentThinkingMode,
       supportsAgentMode,
-    ],
+     setGenerationMode],
   );
   const prepareTaskPrompt = useCallback(
     (
@@ -8847,7 +8833,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       if (agent) enableAgentMode({ enableSearch });
       focusComposer();
     },
-    [enableAgentMode, focusComposer],
+    [enableAgentMode, focusComposer, setComposerText, setGenerationMode],
   );
   const setGraphProposal = useCallback(() => {
     if (voiceBlocksComposer) return;
@@ -8865,16 +8851,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     setSearchRoute((current) => {
       if (current !== "disabled") return "disabled";
       if (!canUseNetworkSearch) return "disabled";
-      // Prefer external SearchProvider when authorized; model_native only when
-      // the active model explicitly hosts web search and no SearchProvider is on.
-      if (hasAuthorizedAgentSearchProvider) return "auto";
-      if (
-        selectedModel?.capabilities?.hosted_web_search ||
-        activeModelProvider?.capabilities.hosted_web_search
-      ) {
-        return "model_native";
-      }
-      return "disabled";
+      return resolveNetworkSearchRoute(
+        "auto",
+        Boolean(selectedModel?.capabilities?.hosted_web_search ??
+          activeModelProvider?.capabilities.hosted_web_search),
+        hasAuthorizedAgentSearchProvider,
+      );
     });
     if (!canUseNetworkSearch) {
       toast.message("无法开启联网搜索", {
@@ -8891,23 +8873,23 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     selectedModel?.capabilities?.hosted_web_search,
     voiceModeOpen,
     voiceBlocksComposer,
-  ]);
+   setGenerationMode]);
   const toggleAgentMode = useCallback(() => {
-    if (responseMode === "agentic") {
+    if (effectiveAgentMode) {
       setResponseMode("fast");
       focusComposer();
       return;
     }
     enableAgentMode();
     focusComposer();
-  }, [enableAgentMode, focusComposer, responseMode]);
+  }, [enableAgentMode, focusComposer, effectiveAgentMode]);
   const toggleImageMode = useCallback(() => {
     if (voiceBlocksComposer) return;
     setGenerationMode((current) => (current === "image" ? "text" : "image"));
     setGraphAction("none");
     setSearchRoute("disabled");
     focusComposer();
-  }, [focusComposer, voiceModeOpen, voiceBlocksComposer]);
+  }, [focusComposer, voiceModeOpen, voiceBlocksComposer, setGenerationMode]);
   const composerCommands = [
     {
       id: "goal" as const,
@@ -9069,15 +9051,15 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         if (current.some((item) => item.id === file.id)) return current;
         if (generationMode === "image") {
           if (!imageEditEnabled) {
-            toast.error("当前绘图模型不支持图生图。");
+            showComposerNotice("当前绘图模型不支持图生图。");
             return current;
           }
           if (!IMAGE_EDIT_MIME_TYPES.has(file.mime_type.toLowerCase())) {
-            toast.error("绘图模式的参考附件只能是图片。");
+            showComposerNotice("绘图模式的参考附件只能是图片。");
             return current;
           }
           if (current.length >= 4) {
-            toast.error("当前绘图模型最多支持 4 张参考图片。");
+            showComposerNotice("当前绘图模型最多支持 4 张参考图片。");
             return current;
           }
         }
@@ -9086,7 +9068,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       toast.message(`已引用资料「${file.original_name}」`);
       focusComposer();
     },
-    [focusComposer, generationMode, imageEditEnabled],
+    [focusComposer, generationMode, imageEditEnabled, setComposerText, setPendingFiles],
   );
   const activateComposerCommand = useCallback(
     (action: ComposerCommandId) => {
@@ -9162,7 +9144,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       setGraphProposal,
       voiceModeOpen,
       voiceBlocksComposer,
-    ],
+     setComposerText, setGenerationMode],
   );
   const clearSelectedLearningNode = useCallback((persisted = false) => {
     const previousLabel = learningNodeRef.current?.nodeLabel;
@@ -9189,7 +9171,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       isLearningNodeComposerDraft(current, previousLabel) ? "" : current,
     );
     focusComposer();
-  }, [currentSession, focusComposer, queryClient, workspaceId]);
+  }, [currentSession, focusComposer, queryClient, workspaceId, setComposerText]);
   // The binding menu persists first, then clears the local learning context.
   // Other callers can still request both persistence and local cleanup.
   useEffect(() => {
@@ -9222,7 +9204,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   const handleNativePhoto = useCallback(() => {
     takePhoto(async (dataUrl) => {
       if (!dataUrl) {
-        toast.error("拍照失败或已取消");
+        // Cancellation returns no image; avoid reporting an unverified failure.
         return;
       }
       try {
@@ -9239,38 +9221,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         toast.error("照片处理失败");
       }
     });
-  }, [focusComposer]);
+  }, [focusComposer, setPendingFiles]);
 
 
-  // 离线草稿（断网 reload / 刷新后恢复当前会话未发送输入）
-  useEffect(() => {
-    if (!sessionId || sessionId === "new" || !workspaceId) return;
-    try {
-      const saved = window.localStorage.getItem(
-        `lg:composer-draft:${workspaceId}:${sessionId}`,
-      );
-      if (saved) setComposerText(saved);
-    } catch {
-      // localStorage 不可用（隐私模式等）静默
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, workspaceId]);
-  useEffect(() => {
-    if (!sessionId || sessionId === "new" || !workspaceId) return;
-    const timer = window.setTimeout(() => {
-      try {
-        const key = `lg:composer-draft:${workspaceId}:${sessionId}`;
-        if (composerText.trim()) {
-          window.localStorage.setItem(key, composerText);
-        } else {
-          window.localStorage.removeItem(key);
-        }
-      } catch {
-        // ignore
-      }
-    }, 800);
-    return () => window.clearTimeout(timer);
-  }, [composerText, sessionId, workspaceId]);
+  // Text, files and queued snapshots are now saved synchronously by composer-session-state.
   const selectComposerMenuCommand = useCallback(
     (command: ComposerCommandId) => {
       if (command === "goal") {
@@ -9311,8 +9265,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     webSearch: searchRoute !== "disabled",
   };
   const submitRetry = () => {
-    if (retry.isPending || !retryTarget || !retryProvider || !retrySelectedModel?.remote ||
-        (retryResponseMode === "agentic" && !retrySupportsAgentMode)) return;
+    if (stopState.phase !== "idle" || retry.isPending || !retryTarget || !retryProvider || !retrySelectedModel?.remote) return;
     const useWebSearch = retryWebSearch && retryCanUseNetworkSearch;
     const allowedDomains = [...new Set(retryAllowedDomains.split(/[\s,，]+/u).map((domain) => domain.trim()).filter(Boolean))];
     const variables = {
@@ -9323,11 +9276,14 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         model_id: retrySelectedModel.id,
         thinking_mode:
           retryResponseMode === "fast" ? "off" : retryThinkingMode,
-        agent_mode: retryResponseMode === "agentic",
+        agent_mode: retryResponseMode === "agentic" && retrySupportsAgentMode,
         search_route: useWebSearch
-          ? hasAuthorizedAgentSearchProvider
-            ? "auto"
-            : "model_native"
+          ? resolveNetworkSearchRoute(
+              "auto",
+              Boolean(retrySelectedModel.capabilities?.hosted_web_search ??
+                retryProvider.capabilities.hosted_web_search),
+              hasAuthorizedAgentSearchProvider,
+            )
           : "disabled",
         web_search: useWebSearch,
         allowed_domains: useWebSearch ? allowedDomains : [],
@@ -9381,8 +9337,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   );
   };
 
+  const showNewChatWelcome = isEmptySession && !roundTasks.length && !goalMode && !voiceModeOpen;
+
   return (
-    <div className="chat-canvas-page relative flex h-full min-h-0 flex-col bg-background" data-session-id={sessionId}>
+    <div className={cn("chat-canvas-page relative flex h-full min-h-0 flex-col bg-background", showNewChatWelcome && "is-new-chat-welcome")} data-session-id={sessionId}>
       {currentSession?.session_kind === "agent" && currentSession.parent_session_id ? <ManagedChildSessionControls sessionId={sessionId} parentId={currentSession.parent_session_id} /> : null}
       <ConversationJumpNav
         branches={conversationBranchLinks}
@@ -9397,7 +9355,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         }}
       />
       <Conversation
-        className="min-h-0 flex-1"
+        className={cn("min-h-0 flex-1", showNewChatWelcome && "new-chat-conversation")}
         controller={conversationScroll}
       >
         <ConversationContent
@@ -9436,35 +9394,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             });
           }}
         >
-          {learningNode?.nodeId ? (
-            <LearningPackageCanvas
-              learningNode={learningNode as LearningCanvasNode}
-              sessionId={sessionId}
-              workspaceId={workspaceId}
-            />
-          ) : null}
-          {isEmptySession && !roundTasks.length && !learningNode?.nodeId && !goalMode && !voiceModeOpen ? (
-            <EmptySessionPrompts
-              disabled={
-                (sessionId !== "new" && history.isPending) || status !== "ready" || sessionIsClosed
-              }
-              isPending={
-                (showSuggestedPromptState && suggestedPromptsPending) ||
-                (emptySessionMemories.isPending &&
-                  emptySessionDisplayPrompts.length === 0)
-              }
-              isUnavailable={
-                showSuggestedPromptState &&
-                suggestedPromptsUnavailable &&
-                emptySessionDisplayPrompts.length === 0
-              }
-              onConfigureProvider={() =>
-                navigate(`/w/${workspaceId}/settings/providers`)
-              }
-              onSelect={(content) => void send(content)}
-              prompts={emptySessionDisplayPrompts}
-            />
-          ) : (
+          {showNewChatWelcome ? null : (
             <>
               {historyHasMoreBefore || loadingOlderMessages ? (
                 <div className="flex flex-col items-center gap-1 pb-2">
@@ -9658,8 +9588,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                           responseMode={retryResponseMode} thinkingMode={retryThinkingMode}
                           thinkingModes={!retryThinkingModes.length ? [] : retrySelectedModel?.capabilities?.thinking_required ? retryThinkingModes.filter((mode) => mode !== "off") : [...new Set<ThinkingMode>(["off", ...retryThinkingModes])]}
                           supportsAgent={retrySupportsAgentMode}
+                          thinkingRequired={retrySelectedModel?.capabilities?.thinking_required === true}
                           webSearch={retryWebSearch} canSearch={retryCanUseNetworkSearch}
-                          canRetry={!retry.isPending && Boolean(retryProvider && retrySelectedModel?.remote) && (retryResponseMode !== "agentic" || retrySupportsAgentMode)}
+                          canRetry={!retry.isPending && Boolean(retryProvider && retrySelectedModel?.remote)}
                           modelError={retryDiscoveredModels.isError}
                           onModelChange={(providerId, modelId) => { setRetryProviderId(providerId); setRetryModelId(modelId); }}
                           onModeChange={(mode) => {
@@ -9750,7 +9681,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               {streamConnectionNotice ? (
                 <StreamConnectionFeedback notice={streamConnectionNotice} />
               ) : null}
-              {goalMode && responseMode !== "agentic" ? (
+              {goalMode && !effectiveAgentMode ? (
                 <GoalSetupConversation
                   flow={goalFlow}
                   hasConversationMessages={!isEmptySession}
@@ -9770,7 +9701,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             </>
           )}
         </ConversationContent>
-        <ConversationScrollButton className="chat-scroll-to-bottom" />
+        <ConversationScrollButton portalTarget={composerDockElement} />
       </Conversation>
 
       {selectionMenu ? (
@@ -9781,13 +9712,13 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           style={{ left: selectionMenu.left, top: selectionMenu.top }}
         >
           <Button
-            aria-label="复制划词文本"
-            onClick={() => void copySelectionText(selectionMenu.selected_text)}
+            aria-label={selectionCopy.copied ? "划词文本已复制" : "复制划词文本"}
+            onClick={() => void selectionCopy.copy(selectionMenu.selected_text)}
             size="xs"
             variant="ghost"
           >
-            <Copy className="size-3.5" />
-            复制
+            {selectionCopy.copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            {selectionCopy.copied ? "已复制" : "复制"}
           </Button>
           <Button
             onClick={() => {
@@ -9877,9 +9808,10 @@ ${detail.text!.trim()}` : detail.text!.trim(),
 
       <div
         className={cn("chat-composer-dock", composerEnlarged && "is-enlarged")}
-        ref={composerDockRef}
+        ref={setComposerDockElement}
       >
-        {responseMode === "agentic" ? (
+        {showNewChatWelcome ? <h2 className="new-chat-heading">从一个问题开始</h2> : null}
+        {effectiveAgentMode ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
         ) : null}
       {longPaste ? (
@@ -9930,18 +9862,11 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             ))}
           </div>
         ) : null}
-        {!providers.isPending && !activeModelProvider ? (
-          <div className="mb-2 flex w-full flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/35 dark:text-amber-100">
-            <span>没有可用的真实模型 Provider，发送已暂停。</span>
-            <Button
-              onClick={() => navigate(`/w/${workspaceId}/settings/providers`)}
-              size="xs"
-              variant="outline"
-            >
-              配置 Provider
-            </Button>
-          </div>
-        ) : null}
+        {providers.isError ? <ComposerFeedback id={`${mentionMenuId}-provider`} notice={{ message: "未能载入模型配置", tone: "error", action: { label: "重新加载", onClick: () => void providers.refetch() } }} />
+          : !providers.isPending && !activeGenerationProvider ? <ComposerFeedback id={`${mentionMenuId}-provider`} notice={{ message: generationMode === "image" ? "尚未配置绘图模型" : "尚未配置对话模型", action: { label: "配置模型", onClick: configureModels } }} />
+          : !providers.isPending && !discoveredModels?.isPending && !discoveredImageModels?.isPending && !activeGenerationModelId ? <ComposerFeedback id={`${mentionMenuId}-provider`} notice={{ message: "请选择可用的模型", action: { label: "选择模型", onClick: () => setModelMenuOpen(true) } }} /> : null}
+        {closeSessionMutation.isPending ? <ComposerFeedback id={`${mentionMenuId}-closing`} notice={{ message: "正在结束学习会话…" }} />
+          : sessionIsClosed ? <ComposerFeedback id={`${mentionMenuId}-closed`} notice={{ message: "会话已结束，既有消息仍可查看。", action: { label: "新会话", onClick: () => navigate(`/w/${workspaceId}/chat/new`) } }} /> : null}
         {graphAction !== "none" ? (
           <div className="chat-graph-action" role="status">
             <Network className="size-3.5" />
@@ -10034,7 +9959,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         ) : null}
         {isListening ? (
           <span
-            className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
+            className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
             title="当前语音识别语言（设置页可修改）"
           >
             {asrLanguageLabel}
@@ -10077,6 +10002,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             <em>点击跳过</em>
           </button>
         ) : null}
+        {stopState.phase !== "idle" ? <div role="status" aria-live="polite" className="flex items-center gap-2 text-xs text-muted-foreground"><span>{stopState.phase === "requesting" ? "正在请求停止，等待服务端确认…" : "停止未确认，任务可能仍在运行。"}{stopState.detail ? ` ${stopState.detail}` : ""}</span><Button size="xs" variant="outline" disabled={stopState.phase === "requesting"} onClick={() => void stopCurrentGeneration()}>重试停止</Button></div> : null}
+        {draftStorageWarning ? <p role="status" className="text-xs text-muted-foreground">{draftStorageWarning}</p> : null}
+        {missingAttachments.length ? <div role="alert" className="flex items-center gap-2 text-xs text-destructive"><span>以下本地附件未能恢复，请重新选择：{missingAttachments.join("、")}</span><Button size="xs" variant="ghost" onClick={() => setMissingAttachments([])}>知道了</Button></div> : null}
         {pendingSendQueue.length ? (
           <div aria-label="待发送队列" className="chat-send-queue" role="region">
             {pendingSendQueue.map((item) => {
@@ -10093,7 +10021,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                       </span>
                     ) : null}
                     {item.stickers.length ? <span aria-label={`${item.stickers.length} 张表情`} className="chat-send-queue__files"><Smile className="size-3" />{item.stickers.length}</span> : null}
-                    {item.text || "表情消息"}
+                    {item.text || (attachmentCount || item.longPaste !== null ? "附件消息" : "表情消息")}
                   </span>
                   <span className="chat-send-queue__actions">
                     <button
@@ -10391,7 +10319,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           multiple
           onError={(error) => {
             if (error.code === "accept") {
-              toast.error(
+              showComposerNotice(
                 generationMode === "image"
                   ? imageEditEnabled
                     ? "参考图仅支持 PNG、JPEG、WEBP 等图片格式。"
@@ -10400,9 +10328,11 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               );
               return;
             }
-            toast.error(error.message);
+            showComposerNotice(error.message);
           }}
           onFileDialogReady={registerFileDialog}
+          attachments={composerFiles}
+          onAttachmentsChange={setComposerFiles}
           onSubmit={submitPrompt}
         >
           <PromptInputAttachments portalTarget={attachmentRowHost} />
@@ -10527,6 +10457,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               aria-controls={showMentionMenu ? mentionMenuId : undefined}
               aria-expanded={showMentionMenu}
               aria-label="输入消息"
+              aria-describedby={composerNotice ? `${mentionMenuId}-feedback` : undefined}
               className="chat-composer__textarea"
               id={`${mentionMenuId}-input`}
               disabled={
@@ -10607,7 +10538,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                     ? pendingFiles.length
                       ? "描述你想如何修改参考图片…"
                       : "描述你想生成的画面…"
-                    : "输入消息，或输入 @ 选择模式 / 文件…"
+                    : showNewChatWelcome
+                      ? "询问 LearnGraph"
+                      : "输入消息，或输入 @ 选择模式 / 文件…"
               }
               ref={composerTextareaRef}
               onPointerCancel={handleComposerPointerCancel}
@@ -10644,12 +10577,13 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                    ? "绘图"
                    : responseMode === "fast"
                      ? "极速"
-                     : responseMode === "agentic"
+                     : effectiveAgentMode
                        ? "智能"
                        : thinkingLabels[thinkingMode] || "思考";
-               const thinkingSliderValue = thinkingStopIndex(responseMode, thinkingMode);
+               const thinkingStops = supportedThinkingStops(thinkingModes, thinkingRequired);
+               const thinkingSliderValue = thinkingStopIndex(responseMode, thinkingMode, thinkingStops);
                const handleThinkingSliderChange = (index: number) => {
-                 const stop = THINKING_STOPS[index];
+                 const stop = thinkingStops[index];
                  if (!stop) return;
                  setGenerationMode("text");
                  if (stop.responseMode === "fast") {
@@ -10701,7 +10635,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                          >
                            <span className="flex min-w-0 flex-col">
                              <span className="truncate font-mono">{model.id}</span>
-                             <span className="text-[10px] text-muted-foreground">
+                             <span className="text-xs text-muted-foreground">
                                {provider.display_name} ·{" "}
                                {modelProtocolLabel(provider.provider_type)}
                              </span>
@@ -10807,7 +10741,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                             >
                               <span className="flex min-w-0 flex-col">
                                 <span className="truncate font-mono">{model.id}</span>
-                                <span className="text-[10px] text-muted-foreground">
+                                <span className="text-xs text-muted-foreground">
                                   {provider.display_name} · 绘图
                                 </span>
                               </span>
@@ -10828,6 +10762,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                     <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
                     <div className="px-2 py-1">
                       <ThinkingSlider
+                        stops={thinkingStops}
                         value={thinkingSliderValue}
                         onChange={handleThinkingSliderChange}
                       />
@@ -10865,7 +10800,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                  ? createPortal(modelMenu, topbarModelSlot)
                  : modelMenu;
              })()}
-              {!voiceModeOpen && generationMode === "text" ? <StickerPicker disabled={sessionIsClosed || closeSessionMutation.isPending || goalFlow.busy || (goalMode && responseMode !== "agentic")} onSelect={addStickerToDraft} /> : null}
+              {!voiceModeOpen && generationMode === "text" ? <StickerPicker disabled={sessionIsClosed || closeSessionMutation.isPending || goalFlow.busy || (goalMode && !effectiveAgentMode)} onSelect={addStickerToDraft} onInsertText={insertComposerExpression} /> : null}
               {!voiceModeOpen ? <PromptInputButton
                 aria-label={isListening ? "停止语音输入" : "开始语音输入"}
                 aria-pressed={isListening}
@@ -10916,7 +10851,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               )}
               disabled={
                 composerShowsInterrupt
-                  ? false
+                  ? stopState.phase === "requesting"
                   : !activeGenerationProvider ||
                     !activeGenerationModelId ||
                     sessionIsClosed ||
@@ -10964,7 +10899,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           </InputGroupAddon>
          </PromptInput>
         </div>
-        {contextUsageEnabled && generationMode === "text" && sessionId !== "new" && contextUsage.data ? (
+        {composerNotice ? <ComposerFeedback id={`${mentionMenuId}-feedback`} notice={composerNotice} onDismiss={clearComposerNotice} /> : null}
+        {!showNewChatWelcome && contextUsageEnabled && generationMode === "text" && sessionId !== "new" && contextUsage.data ? (
           <ContextUsageStatus
             key={sessionId}
             usage={contextUsage.data}
@@ -10972,12 +10908,36 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             sessionId={sessionId}
             providerId={activeModelProvider?.id}
             modelId={selectedModel?.id}
-            agentMode={responseMode === "agentic"}
+            agentMode={effectiveAgentMode}
             hasMoreHistory={historyHasMoreBefore}
             onCompacted={() => void contextUsage.refetch()}
           />
         ) : null}
+        {showNewChatWelcome ? (
+          <MemoryOpeningSuggestions
+            workspaceId={workspaceId}
+            projectId={currentSession?.project_id ?? draftProjectId ?? undefined}
+            providerId={suggestedPromptsModel.provider_id ?? activeModelProvider?.id}
+            modelId={suggestedPromptsModel.model_id ?? selectedModel?.id}
+            enabled={settings.isSuccess && suggestedPromptsEnabled && !sessionIsClosed && Boolean(
+              (suggestedPromptsModel.provider_id && suggestedPromptsModel.model_id) || remoteSuggestionProviderAvailable
+            )}
+            disabled={(sessionId !== "new" && history.isPending) || status !== "ready" || sessionIsClosed}
+            onSelect={(content) => void send(content)}
+          />
+        ) : null}
       </div>
+      <Dialog open={Boolean(queueEditItem && queueEditItem.sessionId === sessionId)} onOpenChange={open => { if (!open) { setQueueEditItem(null); autoDispatchBlockedRef.current = false; } }}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>编辑待发送消息</DialogTitle><DialogDescription>附件和当前输入框草稿保持不变。</DialogDescription></DialogHeader>
+          <Textarea aria-label="编辑待发送消息正文" value={queueEditText} onChange={event => setQueueEditText(event.currentTarget.value)} />
+          {queueEditItem ? <p className="text-xs text-muted-foreground">{queueEditItem.files.length + queueEditItem.pendingFiles.length} 个附件，{queueEditItem.stickers.length} 张表情</p> : null}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => { setQueueEditItem(null); autoDispatchBlockedRef.current = false; }}>取消</Button>
+            <Button onClick={() => { const item = queueEditItem; if (!item || item.sessionId !== sessionId) return; setPendingSendQueue(current => current.map(entry => entry.id === item.id ? { ...entry, text: queueEditText } : entry)); setQueueEditItem(null); autoDispatchBlockedRef.current = false; }}>保存</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <Dialog
         onOpenChange={(open) => {
           if (!open) setImageRetryTarget(null);
@@ -11074,7 +11034,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               ) : (
                 <Check className="size-4" />
               )}
-              确认结束并复盘
+              {closeSessionMutation.isPending ? "正在结束…" : "确认结束并复盘"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -11235,7 +11195,7 @@ export function VersionsPage() {
                 <p className="text-sm font-semibold">v{version.version}</p>
                 <StatePill label={version.status} status={version.status} />
               </div>
-              <div className="mt-4 font-mono text-[11px] text-muted-foreground">
+              <div className="mt-4 font-mono text-xs text-muted-foreground">
                 {String(version.provider_trace.provider_id ?? "unknown")} ·{" "}
                 {version.id}
               </div>

@@ -158,13 +158,15 @@ export interface ProviderUpdateRequest {
   default_vision_model_id?: string | null;
   /** Custom HTTP headers for proxy / relay stations. Credentials are never accepted here. */
   extra_headers?: Record<string, string> | null;
-  /** Global template switch: on = template overrides every model, off = per-model configs apply. */
+  /** Group defaults apply below explicit per-model settings; disabled means catalogue/model defaults only. */
   model_defaults_enabled?: boolean;
   /** Higher values are preferred when multiple enabled providers can serve the role. */
   provider_priority?: number;
 }
 
 export interface Provider {
+  /** Backend catalogue role; optional for compatibility with older servers. */
+  role?: ProviderRole | null;
   id: string;
   workspace_id: string;
   display_name: string;
@@ -186,10 +188,8 @@ export interface Provider {
  * Provider types whose role is "model" in the backend catalog
  * (`MODEL_PROVIDER_TYPES` in backend/app/providers/catalog.py).
  *
- * Every one of them implements the structured function-call loop that Agent
- * mode drives, so this list doubles as the Agent-capable set. Keep it as the
- * single source of truth: copying the literal per call site is how the `qwen`
- * type was silently left out of the Agent gate while it worked everywhere else.
+ * Compatibility fallback for old servers without Provider.role. Model role
+ * does NOT imply Agent/structured-output support; those are model capabilities.
  */
 export const MODEL_PROVIDER_TYPES = [
   "openai_responses",
@@ -200,10 +200,16 @@ export const MODEL_PROVIDER_TYPES = [
   "anthropic_messages",
   "github_copilot",
   "ollama",
+  "ollama_cloud",
 ] as const;
 
 export function isModelProviderType(providerType: string): boolean {
   return (MODEL_PROVIDER_TYPES as readonly string[]).includes(providerType);
+}
+
+/** Prefer the server's role; the literal list is only an older-server fallback. */
+export function isModelProvider(provider: Pick<Provider, "provider_type" | "role">): boolean {
+  return provider.role != null ? provider.role === "model" : isModelProviderType(provider.provider_type);
 }
 
 /**
@@ -608,7 +614,7 @@ export interface ProviderModelsResponse {
   warnings?: ProviderDiscoveryWarning[];
 }
 
-export type ThinkingMode = "off" | "low" | "medium" | "high" | "xhigh";
+export type ThinkingMode = "off" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ReasoningParameter =
   | "reasoning_effort"
   | "reasoning.effort"
@@ -629,6 +635,9 @@ export type ModelCapabilitySource =
   | "runtime_observation";
 
 export interface ProviderModelCapabilities {
+  thinking_mapping_version?: number;
+  legacy_thinking_mapping?: Partial<Record<ThinkingMode, string | number | boolean | null>>;
+  reasoning_controls?: Array<{ type: string; values?: string[]; min?: number; max?: number }>;
   reasoning_efforts: Exclude<ThinkingMode, "off">[];
   thinking_mapping: Partial<Record<ThinkingMode, string | number | boolean | null>>;
   default_thinking_mode: ThinkingMode;

@@ -1,3 +1,4 @@
+import { webActivityLabel } from "@/lib/web-activity";
 import type { UnknownRecord } from "@/types/common";
 import type { MessagePart } from "@/types/sessions";
 
@@ -544,6 +545,8 @@ export function currentActivityLabel(
         (part.status === "streaming" || part.status === "pending"),
     );
   if (activeTool) {
+    const webLabel = webActivityLabel(activeTool);
+    if (webLabel) return webLabel;
     const toolName =
       typeof activeTool.data?.tool_name === "string"
         ? activeTool.data.tool_name
@@ -664,6 +667,8 @@ export function currentActivityChips(
     )
     .slice(0, 2);
   for (const tool of activeTools) {
+    const webLabel = webActivityLabel(tool);
+    if (webLabel) { chips.push(webLabel); continue; }
     const toolName =
       typeof tool.data?.tool_name === "string" ? tool.data.tool_name : "";
     const title =

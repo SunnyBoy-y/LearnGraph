@@ -1,4 +1,3 @@
-import { LearningBuildSettings } from '@/features/learning/node-learning-page';
 import {
   useCallback,
   useEffect,
@@ -56,7 +55,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   ApiError,
@@ -74,6 +73,7 @@ import {
   updateGraphNode,
   updateGraphCover,
 } from "@/api";
+import defaultGraphCover from "@/assets/graph-cover-default.webp";
 import { cn } from "@/lib/utils";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { saveBlobViaNative } from "@/lib/native-download";
@@ -228,13 +228,6 @@ const TEMPLATE_SWATCHES = {
   sunrise: "linear-gradient(135deg, #fff0df 0%, #ffd2ac 55%, #db754c 100%)",
 } as const;
 
-function generatedCover(title: string, progress: number) {
-  const hue = Math.abs([...title].reduce((sum, char) => sum + char.charCodeAt(0), 0)) % 360;
-  const safeTitle = title.slice(0, 8).replace(/[<&>"']/g, "");
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300"><rect width="640" height="300" fill="hsl(${hue} 18% 94%)"/><circle cx="500" cy="120" r="82" fill="hsl(${hue} 35% 78%)"/><path d="M80 230 Q180 90 280 210 T470 180" fill="none" stroke="hsl(${hue} 30% 35%)" stroke-width="8"/><circle cx="250" cy="130" r="28" fill="hsl(${hue} 30% 35%)"/><text x="36" y="52" font-family="sans-serif" font-size="24" fill="hsl(${hue} 30% 25%)">${safeTitle}</text><rect x="36" y="260" width="568" height="10" rx="5" fill="#d8dadd"/><rect x="36" y="260" width="${568 * Math.max(0, Math.min(1, progress))}" height="10" rx="5" fill="hsl(${hue} 30% 35%)"/></svg>`;
-  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
-}
-
 const graphStateLabels: Record<string, string> = {
   fresh: "掌握稳定",
   due_soon: "即将复习",
@@ -308,8 +301,6 @@ export type OpenLearningProjectDetail = {
   nodeLabel?: string;
   prompt?: string;
   graphAction?: "none" | "propose_create" | "propose_update";
-  learningPackage?: boolean;
-  openKey?: string;
 };
 
 function openLearningProject(detail: OpenLearningProjectDetail) {
@@ -363,7 +354,7 @@ function shelfBooks(
       isGoalBook: !graph,
       needsReview: graph?.status === "candidate",
       masteryProgress,
-      cover: graph?.cover_svg || generatedCover(book.title, masteryProgress),
+      cover: graph?.cover_svg || defaultGraphCover,
       coverAiActive: graph?.cover_ai_active,
     };
   });
@@ -386,7 +377,7 @@ function shelfBooks(
       icon: Database,
       isGoalBook: false,
       needsReview: graph.status === "candidate",
-      cover: graph.cover_svg || generatedCover(graph.title, graph.id === currentGraph?.id && currentGraph?.nodes.length ? currentGraph.nodes.filter((node) => node.mastery_stars >= 3).length / currentGraph.nodes.length : 0),
+      cover: graph.cover_svg || defaultGraphCover,
       coverAiActive: graph.cover_ai_active,
     }));
   return [...goalEntries, ...graphEntries];
@@ -470,7 +461,7 @@ function GraphCoverEditor({ book, onClose }: { book?: ShelfBook; onClose: () => 
       // 后端一直在回传 used_default，但此前前端从不读它：降级封面（生成失败退回默认
       // 封面）会伪装成"成功"。这里如实说明，用户才知道封面为什么不是定制的。
       if (view.used_default) {
-        toast.warning("本次未能生成定制封面，已使用默认封面。");
+        toast.warning("已使用默认封面", { description: "定制封面暂未生成，可稍后重新生成。", scope: `${workspaceId}:${book?.graphId}`, context: book?.title });
       } else {
         toast.success("封面已更新");
       }
@@ -494,9 +485,9 @@ function GraphCoverEditor({ book, onClose }: { book?: ShelfBook; onClose: () => 
       <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>替换「{book?.title}」的封面</DialogTitle>
-          <DialogDescription>选择模板、上传图片、按图谱内容绘制，或让模型生成一张。</DialogDescription>
+          <DialogDescription>选择模板、上传图片、恢复默认插画，或让模型生成一张。</DialogDescription>
         </DialogHeader>
-        {book ? <img className="mx-auto max-h-36 w-auto rounded-lg object-contain" src={book.cover} onError={(event) => { event.currentTarget.src = generatedCover(book.title, book.masteryProgress); }} alt={`${book.title} 当前封面`} /> : null}
+        {book ? <img className="mx-auto max-h-36 w-auto rounded-lg object-contain" src={book.cover} onError={(event) => { if (event.currentTarget.getAttribute("src") !== defaultGraphCover) event.currentTarget.src = defaultGraphCover; }} alt={`${book.title} 当前封面`} /> : null}
         <div className="grid grid-cols-4 gap-2">
           {([
             { id: "ancient", label: "古风", color: "text-white", image: "/graph-covers/ancient.jpg" },
@@ -514,12 +505,12 @@ function GraphCoverEditor({ book, onClose }: { book?: ShelfBook; onClose: () => 
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button disabled={save.isPending} onClick={() => save.mutate({ mode: "generated" })}><Sparkles className="size-4" />{save.isPending ? "处理中…" : "按图谱绘制"}</Button>
+          <Button disabled={save.isPending} onClick={() => save.mutate({ mode: "generated" })}><Sparkles className="size-4" />{save.isPending ? "处理中…" : "恢复默认封面"}</Button>
           <label className="inline-flex cursor-pointer items-center rounded-lg border px-3 py-2 text-sm">
             上传图片
             <input className="sr-only" type="file" accept="image/png,image/jpeg,image/webp,image/gif" disabled={save.isPending} onChange={(event) => { upload(event.target.files?.[0]); event.target.value = ""; }} />
           </label>
-          <span className="text-xs text-muted-foreground">「按图谱绘制」是按标题、节点数量和学习进度用代码画的，不调用模型；上传最大 2 MB</span>
+          <span className="text-xs text-muted-foreground">默认封面按标题主题匹配内置插画，不调用模型；上传最大 2 MB</span>
         </div>
         {book?.graphId ? <GraphCoverAIEditor busy={save.isPending} graphId={book.graphId} /> : null}
       </DialogContent>
@@ -691,7 +682,7 @@ function GraphBookshelf({
                   onClick={() => onOpen(entry)}
                   type="button"
                   >
-                  <span className="graph-library__spine" style={{ backgroundImage: `url("${entry.cover}"), url("${generatedCover(entry.title, entry.masteryProgress)}")`, backgroundSize: "cover", backgroundPosition: "center" }}>
+                  <span className="graph-library__spine" style={{ backgroundImage: `url("${entry.cover}"), url("${defaultGraphCover}")`, backgroundSize: "cover", backgroundPosition: "center" }}>
                     <Icon />
                     <span>{entry.title.slice(0, 1)}</span>
                   </span>
@@ -1827,7 +1818,6 @@ export function GraphWorkspacePage() {
           title: activeGraph.title,
           nodeId: node.id,
           nodeLabel: node.label,
-          learningPackage: true,
           prompt: `请围绕学习节点「${node.label}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
         },
       }),
@@ -1838,31 +1828,20 @@ export function GraphWorkspacePage() {
     startNodeLearning({ id: node.id, label: node.label });
   }
 
-  /**
-   * Learning, experiments and checkpoints share the versioned node page.
-   * Spaced review retains its existing practice-session workflow.
-   */
+  /** Lessons stay in chat; practice and assessment use the practice center. */
   function startPlanItem(item: PlanItemView) {
-    if (item.routing.kind !== "review" && item.nodeId) {
-      const tab = item.routing.kind === "assessment" ? "exam" : item.routing.kind === "practice" ? "lab" : "lesson";
-      if (tab === "exam") {
-        // Exam answers and grading remain in the dedicated, durable attempt
-        // page; the lesson and lab stay in the conversational canvas.
-        navigate(`${base}/learn/nodes/${item.nodeId}?tab=${tab}`);
-      } else {
-        window.dispatchEvent(
-          new CustomEvent("learngraph:open-learning-project", {
-            detail: {
-              graphId: item.graphId ?? activeGraph?.id,
-              title: activeGraph?.title ?? item.title,
-              nodeId: item.nodeId,
-              nodeLabel: item.title,
-              learningPackage: true,
-              prompt: `请围绕学习节点「${item.title}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
-            },
-          }),
-        );
-      }
+    if (!["review", "assessment", "practice"].includes(item.routing.kind) && item.nodeId) {
+      window.dispatchEvent(
+        new CustomEvent("learngraph:open-learning-project", {
+          detail: {
+            graphId: item.graphId ?? activeGraph?.id,
+            title: activeGraph?.title ?? item.title,
+            nodeId: item.nodeId,
+            nodeLabel: item.title,
+            prompt: `请围绕学习节点「${item.title}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+          },
+        }),
+      );
       return;
     }
     void startPlanPracticeSession(item)
@@ -2184,7 +2163,6 @@ export function GraphWorkspacePage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {activeGraph?.status === "published" && <LearningBuildSettings graphId={activeGraph.id} />}
             {activeGraph ? (
               <Button
                 aria-pressed={planPanelOpen}
@@ -2229,7 +2207,7 @@ export function GraphWorkspacePage() {
                       isGoalBook: false,
                       needsReview: false,
                       masteryProgress: 0,
-                      cover: generatedCover(activeGraph.title, 0),
+                      cover: defaultGraphCover,
                     })}
                   >
                     <BookOpen className="size-4" />

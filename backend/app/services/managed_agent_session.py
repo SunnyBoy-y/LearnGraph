@@ -67,6 +67,9 @@ def bind_chat_session(service, session_id):
         return
     if task.owner_user_id != service.actor_id:
         raise AppError(403, 'agent_session_forbidden', 'Delegated conversation belongs to another user')
+    inherited_web = ((task.spec_json or {}).get('input_snapshot') or {}).get('web_search_route')
+    if inherited_web in {'disabled', 'model_native', 'external', 'local'} and getattr(service.model_provider, 'search_route', None) != inherited_web:
+        raise AppError(403, 'delegated_search_route_locked', 'A delegated task cannot widen or replace its parent web-search route')
     parent = service.db.get(ChatSession, task.chat_session_id)
     if parent and (child.memory_enabled != parent.memory_enabled or child.writeback_policy != parent.writeback_policy):
         child.memory_enabled, child.writeback_policy = parent.memory_enabled, parent.writeback_policy
@@ -340,7 +343,7 @@ def execute_managed_session(settings, job, task, *, emit_event, save_checkpoint)
         parent_turn = db.scalar(select(Message).where(Message.session_id == task.chat_session_id,
             Message.role == 'assistant').order_by(Message.created_at.desc()).limit(1))
         parent_trace = (parent_turn.provider_trace or {}) if parent_turn else {}
-        search_route = parent_trace.get('search_route')
+        search_route = (control.spec.get('input_snapshot') or {}).get('web_search_route') or parent_trace.get('search_route')
         if search_route not in {'disabled', 'model_native', 'external', 'local', 'auto'}:
             search_route = None
         from app.services.agent_execution_profiles import fallback_thinking_modes

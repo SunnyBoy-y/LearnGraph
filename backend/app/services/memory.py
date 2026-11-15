@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
+from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import select, update as sql_update
@@ -3191,6 +3192,77 @@ class MemoryService:
                 for item in hits
             ],
             "relevance": 0.9 if hits else 0.0,
+        }
+
+    def create_conversation_link(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        label: str | None = None,
+    ) -> dict[str, str]:
+        """Validate a readable, completed chat target; never navigate or mutate it."""
+        from app.core.security import Principal
+        from app.services.authorization import AuthorizationService
+
+        for key, value in (("session_id", session_id), ("message_id", message_id)):
+            if not isinstance(value, str) or not value.strip():
+                raise AppError(422, "invalid_tool_arguments", f"{key} is required")
+        if label is not None and (not isinstance(label, str) or not label.strip()):
+            raise AppError(422, "invalid_tool_arguments", "label must be a non-empty string")
+
+        session = self.sessions.require(session_id, "session")
+        authorization = AuthorizationService(
+            self.db,
+            Principal(
+                user_id=self.actor_id,
+                username="",
+                tenant_id=self.workspace.tenant_id,
+                session_id="",
+            ),
+        )
+        if (
+            session.status == "deleted"
+            or "workspace.read" not in authorization.workspace_permissions(self.workspace)
+            or not authorization.can_access_resource(self.workspace, "session", session.id, "read")
+            or not authorization.can_access_bindings(
+                self.workspace, "read", project_id=session.project_id,
+                goal_id=session.goal_id, graph_id=session.graph_id,
+            )
+        ):
+            raise AppError(404, "session_not_found", "Session not found")
+        message = self.db.scalar(
+            select(Message).where(
+                Message.workspace_id == self.workspace_id,
+                Message.session_id == session.id,
+                Message.id == message_id,
+                Message.status == "completed",
+                Message.role.in_(("user", "assistant")),
+            )
+        )
+        if message is None:
+            raise AppError(404, "message_not_found", "Message not found in session")
+
+        url = (
+            f"/w/{quote(self.workspace_id, safe='')}/chat/{quote(session.id, safe='')}"
+            f"?message={quote(message.id, safe='')}"
+        )
+        title = session.title
+        link_label = " ".join((label or title or "Open conversation").split())
+        # Keep labels literal: titles are user-controlled, not Markdown syntax.
+        for character in "\\`*_{}[]<>()!#|":
+            link_label = link_label.replace(character, "\\" + character)
+        return {
+            "session_id": session.id,
+            "message_id": message.id,
+            "title": title,
+            "excerpt": " ".join((message.content or "").split())[:400],
+            "url": url,
+            "markdown_link": f"[{link_label}]({url})",
+            "instruction": (
+                "Include markdown_link verbatim in your final answer so the user can click "
+                "to open this exact message. Do not navigate automatically."
+            ),
         }
 
     def read_conversation_segment(

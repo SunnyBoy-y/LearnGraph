@@ -484,11 +484,15 @@ class SandboxToolkitMixin:
         }
 
     def toolkit_search_web(self, payload: SandboxAgentSearchRequest) -> dict[str, Any]:
+        route = getattr(self, "web_search_route", "auto")
+        if route in {"disabled", "model_native"}:
+            raise AppError(403, "web_search_route_denied", "Sandbox search cannot bypass this turn's native/off search route")
         if not self.settings.sandbox_network_tools_enabled:
             raise AppError(503, "sandbox_network_tools_disabled", "Sandbox network tools are disabled by configuration")
         from app.providers.factory import search_provider_for_workspace
 
-        provider = search_provider_for_workspace(self.db, self.workspace_id, self.settings)
+        provider = search_provider_for_workspace(self.db, self.workspace_id, self.settings, route=route)
+        from app.services.web_evidence import provider_label
         policy = self._effective_fetch_policy()
         domains = {item.strip().casefold() for item in policy["allowed_domains"] if item.strip()}
         try:
@@ -501,9 +505,11 @@ class SandboxToolkitMixin:
             "sandbox_session_id": payload.sandbox_session_id,
             "query": payload.query.strip(),
             "provider_id": provider.provider_id,
+            "provider_label": provider_label(provider),
+            "evidence_kind": "search_snippet", "page_read": False,
             "result_count": len(results),
             "results": [
-                {"title": item.title, "url": item.url, "snippet": item.snippet}
+                {"title": item.title, "url": item.url, "snippet": item.snippet, "evidence_kind": "search_snippet", "page_read": False}
                 for item in results
             ],
             "summary": {
@@ -881,6 +887,11 @@ class SandboxToolkitMixin:
             "requirement_group_id": requirement_group_id,
             "requirement_version": payload.requirement_version,
         }
+        # A model-supplied context may never widen the parent's web route.
+        context_snapshot.pop("web_search_route", None)
+        inherited_route = getattr(self, "web_search_route", None)
+        if inherited_route in {"disabled", "model_native", "external", "local", "auto"}:
+            context_snapshot["web_search_route"] = inherited_route
         task = SandboxAgentTask(
             workspace_id=self.workspace_id,
             owner_user_id=self.actor_id,

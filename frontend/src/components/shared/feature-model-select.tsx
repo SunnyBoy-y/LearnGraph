@@ -14,6 +14,7 @@ import {
 } from '@/components/ui/command'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import type { Provider, ProviderModel } from '@/types/providers'
+import { MODEL_PROVIDER_TYPES as FALLBACK_MODEL_PROVIDER_TYPES, isModelProvider } from '@/types/providers'
 
 /**
  * Shared "feature model" picker: one provider+model choice control for every
@@ -26,16 +27,7 @@ import type { Provider, ProviderModel } from '@/types/providers'
  */
 
 /** Provider types that can serve text-generation feature models. */
-export const MODEL_PROVIDER_TYPES = new Set([
-  'openai_responses',
-  'openai_compatible_chat',
-  'qwen',
-  'codex_chatgpt',
-  'github_copilot',
-  'deepseek_chat',
-  'anthropic_messages',
-  'ollama',
-])
+export const MODEL_PROVIDER_TYPES = new Set<string>(FALLBACK_MODEL_PROVIDER_TYPES)
 
 /** Sentinel value for "no explicit model" in a feature-model select. */
 export const FEATURE_MODEL_DEFAULT = 'default'
@@ -121,7 +113,7 @@ export function useFeatureModelChoices(): {
           provider.remote_capability &&
           (catalog.data
             ? catalog.data.some((spec) => spec.provider_type === provider.provider_type && spec.role === 'model')
-            : MODEL_PROVIDER_TYPES.has(provider.provider_type)),
+            : isModelProvider(provider)),
       ),
     [providersQuery.data, catalog.data],
   )
@@ -170,7 +162,7 @@ export function SearchableFeatureModelSelect({
   return (
     <Popover onOpenChange={(next) => { setOpen(next); if (!next) setQuery('') }} open={open}>
       <PopoverTrigger asChild>
-        <button aria-expanded={open} aria-label={ariaLabel} className="mt-3 flex h-9 w-full items-center justify-between rounded-md border bg-background px-3 text-left text-sm outline-none transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-50" disabled={disabled} type="button">
+        <button aria-expanded={open} aria-label={ariaLabel} className="mt-3 flex h-9 w-full items-center justify-between rounded-md border bg-background px-3 text-left text-sm outline-none focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-2 transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-50" disabled={disabled} type="button">
           <span className={selected ? 'truncate' : 'truncate text-muted-foreground'}>{selected?.label ?? placeholder}</span>
           <Search className="ml-2 size-4 shrink-0 text-muted-foreground" />
         </button>

@@ -3,7 +3,7 @@ import { lazy, Suspense } from 'react'
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { createBrowserRouter, RouterProvider, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { Network } from 'lucide-react'
-import { Toaster } from 'sonner'
+import { AppToaster } from '@/components/shared/app-toaster'
 
 import { WorkspaceShell } from '@/components/layout/workspace-shell'
 import { RouteErrorBoundary } from '@/components/shared/route-error-boundary'
@@ -30,7 +30,7 @@ const ChatCanvasPage = lazy(() => import('@/features/chat/chat-pages').then((mod
 const VersionsPage = lazy(() => import('@/features/chat/chat-pages').then((module) => ({ default: module.VersionsPage })))
 const EvidenceReviewPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.EvidenceReviewPage })))
 const ExerciseAnswerPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.ExerciseAnswerPage })))
-const NodeLearningPage = lazy(() => import('@/features/learning/node-learning-page').then((module) => ({ default: module.NodeLearningPage })))
+const NodeLearningPage = lazy(() => import('@/features/learning/retired-learning-redirect').then((module) => ({ default: module.NodeLearningPage })))
 const PracticeCenterPage = lazy(() => import('@/features/practice/practice-center-page').then((module) => ({ default: module.PracticeCenterPage })))
 const PracticeSessionPage = lazy(() => import('@/features/practice/practice-session-page').then((module) => ({ default: module.PracticeSessionPage })))
 const PracticeReportPage = lazy(() => import('@/features/practice/practice-report-page').then((module) => ({ default: module.PracticeReportPage })))
@@ -48,6 +48,7 @@ const MemorySettingsPage = lazy(() => import('@/features/settings/memory-setting
 const ConversationSettingsPage = lazy(() => import('@/features/settings/conversation-settings-page').then(m => ({ default: m.ConversationSettingsPage })))
 const AccountSettingsPage = lazy(() => import('@/features/settings/account-settings-page').then(m => ({ default: m.AccountSettingsPage })))
 const AboutPage = lazy(() => import('@/features/settings/settings-center-pages').then((module) => ({ default: module.AboutSettingsPage })))
+const SchedulesPage = lazy(() => import('@/features/schedules/schedules-page').then(m => ({ default: m.SchedulesPage })))
 const ArtifactsPage = lazy(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
 const SessionShareViewPage = lazy(() => import('@/features/chat/session-share-view').then((module) => ({ default: module.SessionShareViewPage })))
 
@@ -191,6 +192,7 @@ function AppRoutes() {
         {Object.entries(legacySettingsRoutes).map(([oldPath, target]) => <Route key={oldPath} path={`settings/${oldPath}`} element={<LegacySettingsRedirect target={target}/>} />)}
         <Route element={<AboutPage />} path="settings/about" />
         <Route element={<ArtifactsPage />} path="artifacts" />
+        <Route element={<SchedulesPage />} path="schedules" />
         <Route element={<Navigate replace to="../artifacts" />} path="settings/artifacts" />
       </Route>
       <Route element={<NotFound />} path="*" />
@@ -209,7 +211,7 @@ export default function App() {
           <VoiceSessionProvider>
             <RouterProvider router={router} />
           </VoiceSessionProvider>
-          <Toaster closeButton position="top-right" richColors />
+          <AppToaster />
         </AuthProvider>
       </TooltipProvider>
     </QueryClientProvider>

@@ -134,6 +134,10 @@ def projects(db: DB, context: CurrentWorkspace, include_archived: Annotated[bool
 @router.post("/projects", response_model=ProjectView, status_code=status.HTTP_201_CREATED)
 def create_project(payload: ProjectCreate, db: DB, context: CurrentWorkspace): return service(db, context).create_project(payload)
 
+@router.post("/graphs/{graph_id}/learning-folder", response_model=ProjectView)
+def open_graph_folder(graph_id: str, db: DB, context: CurrentWorkspace):
+    return service(db, context).open_graph_folder(graph_id)
+
 @router.patch("/projects/{project_id}", response_model=ProjectView)
 def update_project(project_id: str, payload: ProjectUpdate, db: DB, context: CurrentWorkspace): return service(db, context).update_project(project_id, payload)
 

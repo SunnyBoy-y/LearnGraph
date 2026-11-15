@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 import { authStore } from '@/api/auth-store'
 import { listProviders, discoverProviderModels } from '@/api/providers'
 import { listSettings } from '@/api/settings'
-import { getSessionSuggestedPrompts, generateSessionSuggestedPrompts, listMessageVersions, listSessions } from '@/api/sessions'
+import { getSessionSuggestedPrompts, generateSessionSuggestedPrompts, listMessageVersions } from '@/api/sessions'
 import { FollowUpPrompts } from '@/components/chat/suggested-prompts'
 import { providerModelOptions } from '@/lib/model-choices'
+import { useSessionDetail } from '@/lib/session-queries'
 import { workspaceQueryKey } from '@/lib/query-keys'
 import { shouldShowSuggestedPromptError } from '@/lib/suggested-prompts'
 import { areChatSuggestedPromptsEnabled, CHAT_SUGGESTED_PROMPTS_MODEL_SETTING_KEY, readChatFeatureModelSetting } from '@/lib/workspace-settings'
-import { isModelProviderType } from '@/types/providers'
+import { isModelProvider } from '@/types/providers'
 import type { SuggestedPromptBatch } from '@/types/sessions'
 import type { NativeSuggestionsPayload } from './protocol'
 
@@ -26,13 +27,13 @@ export function NativeSuggestedPrompts({ workspaceId, sessionId, anchor, native,
   const authorized = !!authStore.getAccessToken() && authStore.getWorkspaceId() === workspaceId
   const enabled = native && authorized && !!anchor && !!sessionId && sessionId !== 'new'
   const settings = useQuery({ queryKey: workspaceQueryKey(workspaceId, 'settings'), queryFn: ({ signal }) => listSettings({ signal }), enabled, retry: false })
-  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, 'sessions'), queryFn: listSessions, enabled, retry: false })
-  const currentSession = sessions.data?.find(session => session.id === sessionId)
+  const sessions = useSessionDetail(workspaceId, sessionId, enabled)
+  const currentSession = sessions.data
   const canPrepare = enabled && settings.isSuccess && areChatSuggestedPromptsEnabled(settings.data) &&
     sessions.isSuccess && !!currentSession && currentSession.status !== 'closed'
 
   const providers = useQuery({ queryKey: workspaceQueryKey(workspaceId, 'providers'), queryFn: ({ signal }) => listProviders({ signal }), enabled: canPrepare, retry: false })
-  const modelProviders = useMemo(() => (providers.data ?? []).filter(provider => provider.enabled && provider.remote_capability && isModelProviderType(provider.provider_type)), [providers.data])
+  const modelProviders = useMemo(() => (providers.data ?? []).filter(provider => provider.enabled && provider.remote_capability && isModelProvider(provider)), [providers.data])
   const activeModelProvider = modelProviders.find(provider => provider.id === anchor?.providerId) ?? modelProviders[0]
   const discoveredModels = useQuery({ queryKey: workspaceQueryKey(workspaceId, 'provider-models', activeModelProvider?.id ?? null),
     queryFn: () => discoverProviderModels(activeModelProvider!.id), enabled: canPrepare && !!activeModelProvider, retry: false })

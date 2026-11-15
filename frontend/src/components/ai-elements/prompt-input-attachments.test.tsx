@@ -25,6 +25,29 @@ function upload(name: string, type: string) {
 }
 
 describe("待发送附件预览", () => {
+  it.each([["image.png", "image/png"], ["notes.pdf", "application/pdf"]])(
+    "无文字时可以提交 %s，并同步附件数量",
+    async (name, type) => {
+      const onSubmit = vi.fn().mockResolvedValue(true);
+      const onAttachmentCountChange = vi.fn();
+      render(
+        <PromptInput onAttachmentCountChange={onAttachmentCountChange} onSubmit={onSubmit}>
+          <PromptInputAttachments />
+          <button type="submit">发送</button>
+        </PromptInput>,
+      );
+      const file = new File(["data"], name, { type });
+      fireEvent.change(screen.getByLabelText("Upload files"), { target: { files: [file] } });
+      expect(onAttachmentCountChange).toHaveBeenLastCalledWith(1);
+      fireEvent.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({ text: "", files: [expect.objectContaining({ filename: name, localFile: file })] }),
+        expect.anything(),
+      ));
+      await waitFor(() => expect(onAttachmentCountChange).toHaveBeenLastCalledWith(0));
+    },
+  );
+
   it("图片直接打开共享灯箱，支持按钮及滚轮缩放，关闭后重新打开恢复适配", () => {
     upload("image.png", "image/png");
     expect(screen.getByRole("dialog")).toHaveClass("chat-image-lightbox");

@@ -114,7 +114,7 @@ class MarketTranslationService:
         provider = model_provider_for_workspace(
             self.db, self.workspace_id, self.settings,
             provider_id=provider_id, model_id=model_id,
-            thinking_mode="off",
+            thinking_mode="off", prefer_fast=True, search_route="disabled",
         )
         if not getattr(provider, "available", False) or not getattr(provider, "remote_capability", False):
             raise AppError(503, "translator_unavailable", "请先在模型设置中配置并启用文本模型。")

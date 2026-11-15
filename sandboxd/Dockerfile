@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1.7
+# Use Docker's bundled BuildKit frontend; no external syntax image is required.
+# This avoids a bootstrap pull through registry mirrors before the build starts.
 # sandboxd image: the isolated sandbox control plane. This is the ONLY image
 # that mounts /var/run/docker.sock in the Compose stack; LearnGraph app never
 # talks to Docker Engine directly.
@@ -9,7 +10,10 @@
 # 网络抖动会以 `Head .../manifests/0.12: EOF` 失败；digest 引用优先命中
 # BuildKit 本地内容库，无需 registry 往返）。
 
-FROM python:3.12-slim-bookworm AS sandboxd-build
+# Match the application's Python base, including any explicit registry override.
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+
+FROM ${PYTHON_IMAGE} AS sandboxd-build
 
 COPY --from=ghcr.io/astral-sh/uv:0.12@sha256:e85be844203885286c60ffad8a858d48afb6c5a5c237ca0e67f12e74b8f174b1 /uv /bin/uv
 
@@ -28,7 +32,7 @@ COPY sandboxd/sandboxd ./sandboxd
 # image layout so the daemon finds them at its configured seccomp dir).
 COPY backend/sandbox ./sandbox-profiles
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 
 # 可选：国内构建时用 DEBIAN_MIRROR 覆盖 deb.debian.org（Fastly 线路偶发 502，
 # 例如 --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn）。默认不变。

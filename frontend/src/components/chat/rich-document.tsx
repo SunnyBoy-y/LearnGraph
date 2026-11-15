@@ -9,10 +9,10 @@ import { StreamUI } from "./stream-ui";
 import type { DocumentNode, UISnapshot } from "@/lib/stream-ui";
 import type { MessagePart } from "@/types/sessions";
 import { StreamUIStateScope, useStreamUIState } from "@/lib/stream-ui-local-state";
-import { documentMarkdown, downloadDocument } from "@/genui/document-export";
 import { simplifyDocument } from "@/genui/presentation-simplifier";
 import { DocumentTOC } from "@/genui/document-toc";
 import { RailList } from "@/genui/rail-list";
+import { AnswerIcon } from "./answer-icon";
 import "./rich-document.css";
 
 // Rich documents use the existing Markdown/math/code pipeline. Images are
@@ -33,7 +33,7 @@ const Markdown = memo(function Markdown({ text }: { text: string }) {
 function AccordionItem({ node, children }: {node: DocumentNode; children: ReactNode}) {
   const [open, setOpen] = useStreamUIState(`${node.id}:open`, false);
   return <details open={open} onToggle={event => { if (event.currentTarget.open !== open) setOpen(event.currentTarget.open); }}>
-    <summary>{node.label || "展开内容"}</summary>{children}
+    <summary>{node.icon && <AnswerIcon name={node.icon} />}{node.label || "展开内容"}</summary>{children}
   </details>;
 }
 
@@ -163,11 +163,11 @@ function Tabs({ node, nodes, render }: { node: DocumentNode; nodes: DocumentNode
         const index = nodes.findIndex(item => item.id === active);
         const next = event.key === "ArrowRight" ? (index + 1) % nodes.length : event.key === "ArrowLeft" ? (index + nodes.length - 1) % nodes.length : event.key === "Home" ? 0 : event.key === "End" ? nodes.length - 1 : -1;
         if (next >= 0) { event.preventDefault(); setSelected(nodes[next].id); event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("button")[next]?.focus(); }
-      }}>{child.label || "内容"}</button>)}
+      }}>{child.icon && <AnswerIcon name={child.icon} />}{child.label || "内容"}</button>)}
   </div>{nodes.map(child => <div key={child.id} role="tabpanel" id={`${domId}-${child.id}-panel`} aria-labelledby={`${domId}-${child.id}-tab`} hidden={active !== child.id}>{render(child)}</div>)}</div>;
 }
 
-const NodeView = memo(function NodeView({ node, childrenByParent, scope }: {
+const NodeContent = memo(function NodeContent({ node, childrenByParent, scope }: {
   node: DocumentNode; childrenByParent: Map<string | null, DocumentNode[]>; scope: string;
 }) {
   const onBlockExplain = useContext(BlockActionContext);
@@ -178,12 +178,13 @@ const NodeView = memo(function NodeView({ node, childrenByParent, scope }: {
   </div>;
   const body = children.map(render);
   if (node.state === "error") return <p role="alert">{node.label || node.alt || "此内容生成失败，请重试。"}</p>;
-  if (node.state === "pending" && !node.text && !body.length && !["feature_list", "step_list", "status_list"].includes(node.type)) return <p className={`rich-doc__resource rich-doc__resource--${node.type}`} role="status">{node.label || "正在准备内容…"}</p>;
+  if (node.state === "pending" && !node.text && !body.length && !["feature_list", "step_list", "status_list", "icon"].includes(node.type)) return <p className={`rich-doc__resource rich-doc__resource--${node.type}`} role="status">{node.label || "正在准备内容…"}</p>;
   switch (node.type) {
     case "feature_list": case "step_list": case "status_list":
       return <RailList node={node} items={children} interrupted={interrupted} renderText={text => <Markdown text={text} />} />;
-    case "heading": return createElement(`h${node.level}`, {id: `${scope}-${node.id}`, tabIndex: -1}, node.text || node.label);
-    case "paragraph": case "list": return <Markdown text={node.text} />;
+    case "icon": return <div className="rich-doc__standalone-icon" data-align={node.align}><AnswerIcon name={node.icon} size="large" label={node.alt || node.label} /></div>;
+    case "heading": return createElement(`h${node.level}`, {id: `${scope}-${node.id}`, tabIndex: -1}, node.icon && <AnswerIcon name={node.icon} />, node.text || node.label);
+    case "paragraph": case "list": return node.icon ? <div className="rich-doc__icon-copy"><AnswerIcon name={node.icon} /><div><Markdown text={node.text} /></div></div> : <Markdown text={node.text} />;
     case "quote": return <blockquote><Markdown text={node.text} /></blockquote>;
     case "code": {
       const fence = "`".repeat(Math.max(3, ...Array.from(node.text.matchAll(/`+/g), match => match[0].length + 1)));
@@ -204,15 +205,23 @@ const NodeView = memo(function NodeView({ node, childrenByParent, scope }: {
     }
     default: return <section className={`rich-doc__layout rich-doc__${node.type}`} data-align={node.align} data-width={node.width}
       style={{ "--rich-columns": Math.min(node.columns, Math.max(1, children.filter(child => child.width !== "full").length)) } as CSSProperties}>
-      {node.label && <h3 className="rich-doc__section-title">{node.label}</h3>}{node.text && <Markdown text={node.text} />}{body}
+      {node.label ? <h3 className="rich-doc__section-title">{node.icon && <AnswerIcon name={node.icon} />}{node.label}</h3> : node.icon && <AnswerIcon name={node.icon} />}{node.text && <Markdown text={node.text} />}{body}
     </section>;
   }
 });
 
+// Keep every node's explicit icon visible, including content without a title slot.
+// Stable node keys and the shared state scope preserve controls across patches.
+const fallbackIconTypes = new Set(["quote", "code", "math", "divider", "image", "image_group", "gallery", "simulation", "interactive", "chart", "table", "graph", "diagram", "timeline", "metric", "tabs", "accordion", "figure"]);
+const NodeView = memo(function NodeView(props: {node: DocumentNode; childrenByParent: Map<string | null, DocumentNode[]>; scope: string}) {
+  const content = <NodeContent {...props} />;
+  return <>{props.node.icon && fallbackIconTypes.has(props.node.type) &&
+    <div className="rich-doc__node-icon"><AnswerIcon name={props.node.icon} /></div>}{content}</>;
+});
+
 export default function RichDocument({ snapshot, siblingParts, failed = false, settled = false, onBlockExplain }: { snapshot: UISnapshot; siblingParts?: MessagePart[]; failed?: boolean; settled?: boolean; onBlockExplain?: (blockId: string, payload: Record<string, unknown>) => void }) {
   const scope = useContext(StreamUIStateScope);
-  const [copyStatus, setCopyStatus] = useState("");
-  const blocks = useMemo(() => simplifyDocument(snapshot), [snapshot]);
+  const blocks = useMemo(() => snapshot.blocks?.some(node => node.icon) ? snapshot.blocks : simplifyDocument(snapshot), [snapshot]);
   const headings = blocks.filter(node => node.type === "heading" && node.state !== "pending");
   const childrenByParent = useMemo(() => {
     const result = new Map<string | null, DocumentNode[]>();
@@ -225,6 +234,7 @@ export default function RichDocument({ snapshot, siblingParts, failed = false, s
   }, [blocks]);
   const roots = childrenByParent.get(null) ?? [];
   return <BlockActionContext.Provider value={onBlockExplain}><SiblingPartsContext.Provider value={siblingParts}><InterruptedContext.Provider value={failed || settled}><div className="rich-doc rich-doc__flow">
+    {snapshot.props.icon && <AnswerIcon name={snapshot.props.icon} size="small" label={snapshot.props.title} />}
     {(snapshot.props.toc || snapshot.props.density === "editorial") && <DocumentTOC headings={headings} scope={scope} />}
     {snapshot.props.description && <p>{snapshot.props.description}</p>}
     {roots.length ? roots.map(node => <div key={node.id} className="rich-doc__node" data-width={node.width}>
@@ -233,10 +243,5 @@ export default function RichDocument({ snapshot, siblingParts, failed = false, s
     <p className="rich-doc__resource" role="status">{snapshot.state === "streaming" && !failed && !settled ? "正在组织内容…" : "暂无可显示的内容"}</p>}
     {snapshot.props.source_note && <p className="rich-doc__caption">{snapshot.props.source_note}</p>}
     {snapshot.props.data_kind === "example" && <p className="rich-doc__caption">示例数据，仅用于说明</p>}
-    {roots.length > 0 && snapshot.state === "completed" && <footer className="rich-doc__tools" aria-label="文档操作">
-      <Button size="sm" variant="ghost" onClick={async () => { try { await navigator.clipboard.writeText(documentMarkdown(snapshot)); setCopyStatus("已复制"); } catch { setCopyStatus("复制失败，请使用导出"); } }}>复制文档</Button>
-      <Button size="sm" variant="ghost" onClick={() => downloadDocument(snapshot)}>导出 Markdown</Button>
-      <span role="status">{copyStatus}</span>
-    </footer>}
   </div></InterruptedContext.Provider></SiblingPartsContext.Provider></BlockActionContext.Provider>;
 }

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { AppearanceSettings } from './appearance-settings';
 import { useSettingsDirty } from '@/lib/settings-dirty';
 import { listSettings, updateSetting } from "@/api";
@@ -107,9 +107,9 @@ export function PersonalizationPage() {
           {CHARACTERISTIC_FIELDS.map((field) => (<div className="settings-row border-b last:border-b-0" key={field.key}>
               <div className="min-w-0">
                 <p className="text-sm font-medium">{field.label}</p>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                {field.description ? <p className="mt-1 text-xs leading-5 text-muted-foreground">
                   {field.description}
-                </p>
+                </p> : null}
               </div>
               <Select onValueChange={(value) => updateField(field.key, Number(value) as StyleLevel)} value={String(draft[field.key])}>
                 <SelectTrigger aria-label={field.label} className="w-full sm:w-44">
@@ -125,7 +125,7 @@ export function PersonalizationPage() {
         </div>
       </Surface>
 
-      <p className="text-xs leading-5 text-muted-foreground">保存后影响本工作区后续学习对话（含重试）；自动标题、问题建议与结构化 JSON 任务不受影响。当前对话明确的格式与语气要求优先。</p>
+
 
 
     </PageFrame>);

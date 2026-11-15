@@ -1016,6 +1016,10 @@ class DatabaseMigrationController:
                     if position == -1:
                         position = self._copy(snapshot, target, job["id"])
                     self._verify_baseline(snapshot, target)
+            # Baseline equality and search installation have independent durable
+            # gates. A crash after the baseline flag is saved must not skip an
+            # unfinished/failed search installation on the next resume.
+            if not job.get("search_verified"):
                 from app.core.postgresql_search import install_search
                 install_search(target)
                 self._phase("CATCHING_UP", search_verified=True)

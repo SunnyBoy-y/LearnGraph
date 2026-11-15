@@ -49,6 +49,7 @@ const item = z
   .object({
     id,
     label: z.string().min(1).max(120),
+    icon: railIconSchema.nullish(),
     value: scalar.default(null),
     description: z.string().max(2000).default(""),
     date: z.string().max(80).default(""),
@@ -72,7 +73,7 @@ export const documentNodeSchema = z.object({
   type: z.enum(["paragraph", "heading", "list", "quote", "code", "math", "table", "divider",
     "image", "image_group", "gallery", "figure", "chart", "diagram", "graph", "timeline",
     "metric", "simulation", "interactive", "section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion",
-    "feature_list", "step_list", "status_list", "rail_item"]),
+    "feature_list", "step_list", "status_list", "rail_item", "icon"]),
   text: z.string().max(16000).default(""), label: z.string().max(240).default(""),
   level: z.number().int().min(2).max(6).default(3), columns: z.number().int().min(1).max(3).default(2),
   align: z.enum(["start", "center", "end"]).default("start"), width: z.enum(["reading", "full"]).default("reading"),
@@ -90,7 +91,10 @@ export const documentNodeSchema = z.object({
     title: z.string().max(500).default(""), attribution: z.string().max(500).default("")}).strict()).max(6).default([]),
   resource_state: z.enum(["pending", "ready", "unavailable"]).default("pending"),
   resource_reason: z.enum(["", "ready", "no_results", "search_failed", "download_failed", "timeout", "disabled", "provider_unavailable", "capacity", "storage_failed"]).default(""),
-}).strict();
+}).strict().superRefine((node, ctx) => {
+  if (node.type === "icon" && node.icon == null) ctx.addIssue({code: "custom", message: "Standalone icon nodes require an icon"});
+  if (node.type !== "rail_item" && node.item_status != null) ctx.addIssue({code: "custom", message: "item_status belongs to rail items"});
+});
 export type DocumentNode = z.infer<typeof documentNodeSchema>;
 const layoutTypes = new Set(["section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure", ...railTypes]);
 
@@ -110,6 +114,7 @@ export const uiSnapshotSchema = z
     props: z
       .object({
         title: z.string().min(1).max(240),
+        icon: railIconSchema.nullish(),
         description: z.string().max(2000).default(""),
         chart_type: z.enum(["line", "bar"]).default("line"),
         columns: z.array(column).max(12).default([]),
@@ -146,7 +151,6 @@ export const uiSnapshotSchema = z
       if (node.type === "rail_item" && !node.label.trim()) bad("Rail items require a title");
       if (node.type === "rail_item" && (!parentNode || !railTypes.has(parentNode.type))) bad("Rail item requires a rail list parent");
       if (parentNode && railTypes.has(parentNode.type) && node.type !== "rail_item") bad("Rail lists only accept rail items");
-      if (node.type !== "rail_item" && (node.icon != null || node.item_status != null)) bad("Icon and item_status belong to rail items");
       if (node.fallback_svg && !["image", "image_group", "gallery"].includes(node.type)) bad("Illustration fallback requires image node");
       const parentId = node.parent_id ?? null;
       counts.set(parentId, (counts.get(parentId) ?? 0) + 1);

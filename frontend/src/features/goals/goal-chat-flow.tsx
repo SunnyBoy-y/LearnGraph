@@ -11,7 +11,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import "./goal-chat-flow.css";
 
@@ -93,7 +93,7 @@ type GoalSetupOptions = {
   /** Reuse the chat-selected model so the wizard and normal chat agree. */
   providerId?: string | null;
   modelId?: string | null;
-  thinkingMode?: "off" | "low" | "medium" | "high" | "xhigh" | null;
+  thinkingMode?: "off" | "low" | "medium" | "high" | "xhigh" | "max" | null;
   /**
    * Graph generation budget. `fast` keeps thinking off and streams the root
    * preview first, then one batch of children; `thinking` allows the provider

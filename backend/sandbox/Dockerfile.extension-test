@@ -1,0 +1,12 @@
+# Offline integration-test image. Production deployments use the full Dockerfile.
+ARG BASE=learngraph:voice-wss-20261022
+ARG NODE_BASE=public.ecr.aws/docker/library/node:22-bookworm-slim
+FROM ${NODE_BASE} AS node-runtime
+FROM ${BASE}
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+USER root
+LABEL com.learngraph.runner-abi="1"
+COPY runner.py mcp_session.py /opt/learngraph/
+RUN mkdir -p /workspace && chown 65532:65532 /workspace
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

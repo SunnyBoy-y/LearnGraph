@@ -12,7 +12,7 @@ import {
   LoaderCircle,
   Maximize2,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
 import { ImageLightbox } from "@/components/chat/image-lightbox";

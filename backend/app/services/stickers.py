@@ -48,6 +48,16 @@ def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
+def catalog_packs() -> dict[str, dict[str, dict[str, Any]]]:
+    packs = json.loads((ASSET_ROOT / "market.json").read_text(encoding="utf-8"))
+    return {
+        digest(sorted(entry["sha256"] for entry in pack["stickers"])): {
+            entry["sha256"]: entry for entry in pack["stickers"]
+        }
+        for pack in packs
+    }
+
+
 def normalized(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().strip()
 
@@ -432,6 +442,25 @@ class StickerService:
 
     def status(self) -> dict[str, Any]:
         self.ensure_builtin()
+        known = catalog_packs()
+        inventory = self.library_inventory()
+        changed = False
+        for entry in inventory:
+            annotations = known.get(entry["pack"].source_key, {})
+            if not annotations:
+                continue
+            assets = self.db.scalars(select(StickerAsset).where(StickerAsset.pack_id == entry["pack"].id, StickerAsset.workspace_id == self.workspace_id)).all()
+            for asset in assets:
+                if (asset.semantics or {}).get("description") or asset.content_hash not in annotations:
+                    continue
+                existing = asset.semantics or {}
+                preset = clean_semantics(annotations[asset.content_hash])
+                asset.semantics = {key: existing.get(key) or value for key, value in preset.items()}
+                asset.semantic_hash = digest([asset.name, asset.semantics])
+                changed = True
+        if changed:
+            self.db.flush()
+            self.reconcile()
         state = self.state()
         self.db.commit()
         desired = self.db.get(StickerIndexGeneration, state.desired_generation_id) if state.desired_generation_id else None
@@ -442,7 +471,7 @@ class StickerService:
         return {"mode": state.mode, "provider_id": state.provider_id, "model_id": state.model_id, "ai_enabled": state.ai_enabled,
                 "keyword_available": True, "index": {"status": desired.status if desired else "keyword", "completed": sum(indexed.get(asset.id) == asset.semantic_hash for asset in visible), "total": len(visible), "error": desired.error if desired else None, "model_id": desired.profile.get("model_id") if desired else None, "fingerprint": desired.fingerprint if desired else None, "active_model_id": active.profile.get("model_id") if active else None},
                 "active_count": len(visible), "active_limit": MAX_ACTIVE_STICKERS, "stored_count": sum(entry["count"] for entry in inventory),
-                "packs": [{"id": entry["pack"].id, "name": entry["pack"].name, "builtin": entry["pack"].builtin, "enabled": entry["enabled"], "license": entry["pack"].license, "source": entry["pack"].source, "count": entry["count"], "active_count": entry["active_count"]} for entry in inventory]}
+                "packs": [{"id": entry["pack"].id, "name": entry["pack"].name, "builtin": entry["pack"].builtin, "catalog": entry["pack"].builtin or entry["pack"].source_key in known, "enabled": entry["enabled"], "license": entry["pack"].license, "source": entry["pack"].source, "count": entry["count"], "active_count": entry["active_count"]} for entry in inventory]}
 
     def configure(self, values: dict[str, Any]) -> dict[str, Any]:
         state = self.state()

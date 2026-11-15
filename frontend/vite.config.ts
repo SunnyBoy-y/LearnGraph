@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 import { loadEnv } from 'vite'
+import { fluentEmojiAssets } from './scripts/fluent-emoji-assets.js'
 
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
@@ -27,7 +28,7 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [react(), tailwindcss(), fluentEmojiAssets()],
     // RNNoise's synchronous loader uses import.meta.url inside AudioWorklet.
     // IIFE worker output rewrites it to self.location.href, but AudioWorklet
     // has no location. ES output also makes Vite's ?worker constructors use
@@ -92,6 +93,19 @@ export default defineConfig(({ mode }) => {
                 name: 'delimited-text',
                 test: /node_modules[\\/]d3-dsv[\\/]/,
                 priority: 40,
+                entriesAware: false,
+                minSize: 0,
+                maxSize: Number.POSITIVE_INFINITY,
+              },
+              {
+                // Tiptap and ProseMirror share module-init-time constructors
+                // (PluginKey, Plugin, Selection). Splitting this cyclic graph
+                // by size leaves history's PluginKey undefined in production,
+                // crashing even a valid restored Markdown draft. Keep the
+                // complete editor family together, like React and motion below.
+                name: 'composer-editor',
+                test: /node_modules[\\/](@tiptap|prosemirror-[a-z0-9-]+|orderedmap|rope-sequence|w3c-keyname|crelt)[\\/]/,
+                priority: 30,
                 entriesAware: false,
                 minSize: 0,
                 maxSize: Number.POSITIVE_INFINITY,

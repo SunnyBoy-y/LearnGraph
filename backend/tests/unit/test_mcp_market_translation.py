@@ -57,7 +57,7 @@ def test_translates_descriptions_without_changing_registration_or_schema(transla
     assert all("API_KEY" not in text and "example.org" not in text and "ORIGINAL" not in text for text in calls)
     assert detail == original
     assert manager.db.scalar(select(MCPServer)) is None
-    assert targets[-1] == {"provider_id": "selected-provider", "model_id": "selected-model", "thinking_mode": "off"}
+    assert targets[-1] == {"provider_id": "selected-provider", "model_id": "selected-model", "thinking_mode": "off", "prefer_fast": True, "search_route": "disabled"}
 
 
 def test_cache_separates_catalog_and_invalidates_changed_text(translation):

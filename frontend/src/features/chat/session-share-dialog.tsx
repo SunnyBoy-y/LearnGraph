@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 import { Check, Copy, Link2, Trash2 } from "lucide-react";
 
 import {

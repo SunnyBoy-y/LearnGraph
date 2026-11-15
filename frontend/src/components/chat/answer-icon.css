@@ -1,0 +1,20 @@
+/* Keep inline artwork independent of Markdown's block image/lightbox rules. */
+.answer-icon.answer-icon {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 1.35em;
+  height: 1.35em;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  object-fit: contain;
+  vertical-align: -0.25em;
+  line-height: 1;
+  overflow: visible;
+}
+.answer-icon.answer-icon--leading { margin-inline-end: 0.35em; }
+.answer-icon.answer-icon--small { width: 24px; height: 24px; }
+.answer-icon.answer-icon--large { width: 48px; height: 48px; }

@@ -1,6 +1,6 @@
 import { useMutation } from '@tanstack/react-query'
 import { useState } from 'react'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 import { downloadFullBackup, restoreFullBackup } from '@/api/migrations'
 import { useAuth } from '@/features/auth/auth-context-value'
 import { SectionHeading, Surface } from '@/components/shared/page-elements'

@@ -11,7 +11,7 @@ from app.domain.schemas.management import MoneyInput
 
 
 AgentRoleKey = Literal["research", "reason", "tool", "generic"]
-ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
+ThinkingMode = Literal["off", "low", "medium", "high", "xhigh", "max"]
 NetworkCapabilityKey = Literal["OFFLINE", "FETCH", "BROWSER", "RESTRICTED_EGRESS"]
 AgentTaskStatus = Literal[
     "succeeded",

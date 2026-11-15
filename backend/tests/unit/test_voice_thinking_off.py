@@ -107,13 +107,23 @@ class TestOtherDialects:
         assert decision.fields == {"enable_thinking": False}
         assert decision.expressible
 
-    def test_relay_gateway_uses_disable_fallback(self) -> None:
-        # relay 式网关（非 DeepSeek 官方域名）：off 只能靠通用兜底字段表达。
+    def test_relay_gateway_does_not_invent_an_undeclared_private_field(self) -> None:
         decision = resolve_llm_thinking_off(
             provider_type="openai_compatible_chat",
             base_url="http://localhost:8080/v1",
             model_id="deepseek-flash",
             capabilities=DEEPSEEK_CAPS,
+        )
+        assert decision.fields == {}
+        assert not decision.expressible
+
+    def test_relay_can_explicitly_declare_its_supported_disable_switch(self) -> None:
+        decision = resolve_llm_thinking_off(
+            provider_type="openai_compatible_chat", base_url="http://localhost:8080/v1",
+            model_id="deepseek-flash", capabilities={**DEEPSEEK_CAPS, "models": {
+                "deepseek-flash": {"reasoning_parameter": "enable_thinking",
+                                   "thinking_mapping": {"off": False}, "thinking_required": False},
+            }},
         )
         assert decision.fields == {"enable_thinking": False}
         assert decision.expressible

@@ -231,7 +231,7 @@ export interface MessageCreateRequest {
   /** Exact workspace-scoped provider selected in the chat composer. */
   provider_id?: string
   model_id?: string
-  thinking_mode?: 'off' | 'low' | 'medium' | 'high' | 'xhigh'
+  thinking_mode?: 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   /** Enables the server-side, provider-native tool loop. */
   agent_mode?: boolean
   /** Activates the Goal-planning Agent Skill for this turn. Requires agent_mode. */

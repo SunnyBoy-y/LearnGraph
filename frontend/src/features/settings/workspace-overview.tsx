@@ -3,7 +3,7 @@ import { SettingsSection, SettingRow } from './settings-primitives';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Copy } from 'lucide-react';
-import { toast } from 'sonner';
+import { toast } from '@/lib/notifications';
 import { listWorkspaces } from "@/api";
 import { authStore } from "@/api/auth-store";
 import { Badge } from "@/components/ui/badge";

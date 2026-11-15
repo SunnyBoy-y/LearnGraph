@@ -24,7 +24,6 @@ from uuid import uuid4
 import httpx
 
 from app.providers.qwen_catalog import (
-    LEARNGRAPH_EFFORTS,
     proportional_budget_mapping,
     proportional_effort_mapping,
 )
@@ -326,56 +325,50 @@ def _thinking_overlay(record: dict[str, Any], base: dict[str, Any]) -> dict[str,
         }
     if reasoning is not True:
         return {}
+    raw_options = record.get("reasoning_options")
+    options = [item for item in raw_options if isinstance(item, dict)] if isinstance(raw_options, list) else []
+    metadata: dict[str, Any] = {"reasoning_controls": options, "thinking_mapping_version": 2}
     base_efforts = base.get("reasoning_efforts")
     if isinstance(base_efforts, list) and base_efforts:
-        # The reviewed catalogue already carries a provider-specific wire
-        # mapping; models.dev only confirms that thinking exists.
-        return {}
-    options = record.get("reasoning_options")
-    option = next(
-        (item for item in options if isinstance(item, dict)),
-        None,
-    ) if isinstance(options, list) else None
-    overlay: dict[str, Any] = {
-        "reasoning_efforts": list(LEARNGRAPH_EFFORTS),
-        "default_thinking_mode": "off",
-        "thinking_required": False,
-    }
-    option_type = str(option.get("type") or "") if option else ""
-    if option_type == "effort":
-        values = [
-            str(value)
-            for value in option.get("values") or []
-            if str(value).strip() and str(value).casefold() != "none"
-        ]
-        if values:
-            overlay["reasoning_parameter"] = "reasoning_effort"
-            overlay["thinking_mapping"] = {
-                "off": None,
-                **proportional_effort_mapping(values),
+        # Reviewed endpoint-specific mappings (e.g. DashScope high/max) remain
+        # authoritative. Retain all catalogue controls without mixing dialects.
+        return metadata
+    effort = next((item for item in options if item.get("type") == "effort"), None)
+    budget = next((item for item in options if item.get("type") == "budget_tokens"), None)
+    toggle = any(item.get("type") == "toggle" for item in options)
+    if effort:
+        values = [str(value).strip().casefold() for value in effort.get("values", [])]
+        mapping = proportional_effort_mapping(values)
+        if mapping:
+            supports_off = "none" in values or toggle or budget is not None
+            if str(record.get("id") or "").startswith("claude-") and not _is_always_thinking_claude(str(record.get("id") or "")):
+                supports_off = True
+            return {
+                **metadata,
+                "reasoning_efforts": list(mapping),
+                "reasoning_parameter": "reasoning_effort",
+                "thinking_mapping": {"off": "none" if "none" in values else None, **mapping},
+                "thinking_required": not supports_off,
+                "default_thinking_mode": "off" if supports_off else ("medium" if "medium" in mapping else next(iter(mapping))),
             }
-            return overlay
-    if option_type == "budget_tokens":
+    if budget:
         try:
-            maximum = int(option.get("max") or 0)
-            minimum = int(option.get("min") or 1)
+            maximum = int(budget.get("max") or 0)
+            minimum = int(budget.get("min") or 1)
         except (TypeError, ValueError):
             maximum, minimum = 0, 1
-        if maximum >= 1:
-            overlay["reasoning_parameter"] = "thinking_budget"
-            overlay["thinking_mapping"] = {
-                "off": None,
-                **proportional_budget_mapping(maximum, minimum=minimum),
-            }
-            return overlay
-    # Toggle-shaped (or undeclared) reasoning: any non-off level simply turns
-    # provider thinking on.
-    overlay["reasoning_parameter"] = "enable_thinking"
-    overlay["thinking_mapping"] = {
-        "off": False,
-        **{effort: True for effort in LEARNGRAPH_EFFORTS},
-    }
-    return overlay
+        if maximum >= minimum and maximum > 0:
+            mapping = proportional_budget_mapping(maximum, minimum=minimum)
+            return {**metadata, "reasoning_efforts": list(mapping),
+                    "default_thinking_mode": "off", "thinking_required": False,
+                    "reasoning_parameter": "thinking_budget",
+                    "thinking_mapping": {"off": None, **mapping}}
+    # A reasoning boolean/toggle confirms one enabled mode, not five
+    # independently controllable intensities. Endpoint gating happens later.
+    return {**metadata, "reasoning_efforts": ["medium"],
+            "default_thinking_mode": "off", "thinking_required": False,
+            "reasoning_parameter": "enable_thinking",
+            "thinking_mapping": {"off": False, "medium": True}}
 
 
 def _is_always_thinking_claude(model_id: str) -> bool:
@@ -384,34 +377,14 @@ def _is_always_thinking_claude(model_id: str) -> bool:
     return model.startswith(("claude-fable-", "claude-mythos-"))
 
 
-def _is_openai_undisablable_reasoning(model_id: str) -> bool:
-    """OpenAI reasoning models that cannot turn thinking off on the wire.
-
-    The Responses / Chat Completions protocols expose no ``disabled`` tier for
-    these — ``reasoning.effort`` only lowers depth.  The product therefore marks
-    them ``thinking_required`` so 极速 is disabled in the UI instead of silently
-    still reasoning.  DashScope-hosted reasoning models (qwen*, deepseek*, …)
-    never match these prefixes.
-    """
-    model = model_id.strip().casefold()
-    return model.startswith(("gpt-5", "o1", "o3", "o4", "gpt-oss"))
-
-
 def capability_overlay(model_id: str, base: dict[str, Any]) -> dict[str, Any]:
     """Project-shape defaults derived from the models.dev record, if any."""
 
     record = lookup_model(model_id)
     if record is None:
-        # Unknown models still need the thinking-only override so 极速 is
-        # disabled for protocols/models that cannot turn reasoning off.
-        overlay: dict[str, Any] = {}
-        if _is_always_thinking_claude(model_id) or _is_openai_undisablable_reasoning(
-            model_id
-        ):
-            overlay["thinking_required"] = True
-            overlay["reasoning_efforts"] = list(LEARNGRAPH_EFFORTS)
-            overlay["default_thinking_mode"] = "medium"
-        return overlay
+        # A name prefix is neither a catalogue match nor a wire-protocol claim.
+        # Private aliases must remain editable and must not become "known".
+        return {}
     overlay: dict[str, Any] = {}
     limit = record.get("limit") or {}
     context = limit.get("context")
@@ -460,19 +433,18 @@ def capability_overlay(model_id: str, base: dict[str, Any]) -> dict[str, Any]:
     if isinstance(record.get("structured_output"), bool):
         overlay["supports_structured_output"] = record["structured_output"]
     overlay.update(_thinking_overlay(record, base))
-    # Fast mode is unavailable on models the protocol cannot turn thinking off
-    # for.  Flag them so the UI disables 极速 and shows the reasoning normally
-    # instead of a silent no-op.  This is id-based (not provider-based) so
-    # DashScope-hosted reasoning models stay configurable.  A thinking-only
-    # model must carry a non-off default and at least one effort level to pass
-    # validate_model_capability_update.
-    if _is_always_thinking_claude(model_id) or _is_openai_undisablable_reasoning(
-        model_id
+    # Effort options (including an explicit none tier) are resolved above.
+    # Keep only the reviewed always-thinking Claude exception, and never let
+    # it overrule a catalogue record that explicitly says reasoning=false.
+    if (
+        record.get("reasoning") is True
+        and _is_always_thinking_claude(model_id)
+        and (overlay.get("thinking_mapping") or {}).get("off") != "none"
     ):
         overlay["thinking_required"] = True
         efforts = overlay.get("reasoning_efforts")
         if not isinstance(efforts, list) or not efforts:
-            overlay["reasoning_efforts"] = list(LEARNGRAPH_EFFORTS)
+            overlay["reasoning_efforts"] = ["medium"]
         if not overlay.get("default_thinking_mode") or overlay.get(
             "default_thinking_mode"
         ) == "off":

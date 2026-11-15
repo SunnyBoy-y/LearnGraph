@@ -113,7 +113,7 @@ export const CHARACTERISTIC_FIELDS: Array<{
   {
     key: "emoji",
     label: "表情符号",
-    description: "控制表情符号出现频率；正式与高风险内容会自动降低",
+    description: "",
   },
   {
     key: "verbosity",

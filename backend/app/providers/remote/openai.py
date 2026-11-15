@@ -385,15 +385,18 @@ class _StreamingHTTPProvider:
         self.last_sources: list[dict[str, str]] = []
         self.last_usage: dict[str, int] = {}
         self.last_request_id: str | None = None
-        # Set when an upstream rejection proves the declared output ceiling is
-        # wrong for this endpoint (see _apply_output_budget).
-        self.output_budget_disabled = False
         # This is a workspace-confirmed model capability, not an inference from
         # a provider family.  A provider can expose text-only and vision models
         # under the same endpoint.
         self.supports_image_input = supports_image_input
         self.image_input_mode = image_input_mode or "auto"
         self.capabilities = dict(capabilities or {})
+        # Protocol support is necessary but not sufficient: the selected model
+        # can explicitly lack tools even when its provider implements them.
+        self.supports_agent_tools = (
+            getattr(type(self), "supports_agent_tools", False)
+            and self.capabilities.get("supports_agent_tools") is not False
+        )
         self.supports_video_input = (
             self.capabilities.get("supports_video_input") is True
         )
@@ -459,6 +462,14 @@ class _StreamingHTTPProvider:
         return data
 
     def _apply_call_options(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
+        if not self.supports_agent_tools and any(
+            isinstance(tool, dict) and tool.get("type", "function") == "function"
+            for tool in payload.get("tools") or []
+        ):
+            raise ProviderResponseError("The selected model does not support Agent tools")
+        # All request constructors (including native DeepSeek's streaming path)
+        # pass here. Keep the output ceiling independent of thinking options.
+        payload = self._apply_output_budget(payload, responses=responses)
         options = self.call_options
         if options is None:
             return payload
@@ -470,9 +481,9 @@ class _StreamingHTTPProvider:
             # Alibaba Cloud Model Studio's Responses-compatible endpoint exposes
             # ``none`` as the lowest reasoning.effort tier and documents it as
             # the way to disable thinking (it also outranks ``enable_thinking``).
-            # Send it so 极速 really turns reasoning off. Native OpenAI's API has
-            # no ``none`` tier; its reasoning models are flagged thinking_required
-            # so fast mode never reaches here for them.
+            # Send the endpoint's explicit off tier for legacy snapshots that
+            # predate it. Other endpoints use their declared mapping below;
+            # models.dev may also declare none for individual OpenAI models.
             payload["reasoning"] = {"effort": "none"}
         elif actual is not None and options.reasoning_parameter in {
             "reasoning_effort",
@@ -482,6 +493,12 @@ class _StreamingHTTPProvider:
                 payload["reasoning"] = {"effort": actual}
             else:
                 payload["reasoning_effort"] = actual
+        elif responses and options.reasoning_parameter not in {"reasoning_effort", "reasoning.effort"} and (
+            actual is not None or options.provider_options
+        ):
+            raise ProviderResponseError(
+                "Responses requires a reasoning.effort mapping; the configured private thinking control cannot be silently omitted"
+            )
         if not responses:
             payload.update(options.provider_options)
         if responses and options.native_web_search:
@@ -547,10 +564,6 @@ class _StreamingHTTPProvider:
         takes ``max_tokens``. A caller that already chose a cap keeps it.
         """
         options = self.call_options
-        if getattr(self, "output_budget_disabled", False):
-            # Upstream rejected our declared ceiling: retry/continue without one
-            # rather than turning a configuration mismatch into a failed stage.
-            return payload
         if options is not None and any(
             key in options.provider_options
             for key in ("max_tokens", "max_completion_tokens", "max_output_tokens")
@@ -1103,7 +1116,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                 sanitize_tool_definitions(tools)
             )
         payload = self._apply_call_options(payload, responses=True)
-        if self.actual_reasoning_effort is not None:
+        if self.actual_reasoning_effort is not None and self.thinking_mode != "off":
             reasoning = payload.get("reasoning")
             if not isinstance(reasoning, dict):
                 reasoning = {}
@@ -1126,6 +1139,10 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                     self.last_request_id = response.headers.get("x-request-id")
                     for event in self._sse_payloads(response):
                         event_type = event.get("type")
+                        from app.providers.web_activity import native_web_activity
+                        activity = native_web_activity(event, self)
+                        if activity is not None:
+                            yield ProviderStreamEvent("web_activity", web_activity=activity)
                         if event_type in {
                             "response.output_text.delta",
                             "response.refusal.delta",
@@ -1170,6 +1187,10 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                                 event,
                                 require_output=True,
                             )
+                            for item in response_items:
+                                activity = native_web_activity({"type": "response.output_item.done", "item": item}, self)
+                                if activity is not None:
+                                    yield ProviderStreamEvent("web_activity", web_activity=activity)
                             tool_calls = self._tool_calls_from_response_items(
                                 response_items
                             )
@@ -1571,7 +1592,14 @@ class OpenAICompatibleChatProvider(_StreamingHTTPProvider):
                             raise ProviderHTTPError(
                                 self._chat_stream_error_message(event.get("error"))
                             )
+                        previous_sources = list(self.last_sources)
                         self._capture_chat_sources(event)
+                        if self.last_sources and self.last_sources != previous_sources:
+                            from app.services.web_evidence import provider_label
+                            yield ProviderStreamEvent("web_activity", web_activity={
+                                "id": "hosted-search", "status": "completed", "operation": "search",
+                                "provider_label": provider_label(self), "provider_id": self.provider_id, "native": True,
+                            })
                         usage = self._usage_from_chat_chunk(event.get("usage"))
                         if usage is not None:
                             self.last_usage = usage
@@ -1769,8 +1797,10 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
             not responses
             and self.call_options is not None
             and self.call_options.thinking_mode == "off"
+            and is_dashscope_origin(self.base_url)
+            and self.call_options.actual_reasoning_effort is None
         ):
-            payload["enable_thinking"] = False
+            payload.setdefault("enable_thinking", False)
         # DashScope's built-in search is a whole-turn alternative to function
         # calling, not an additional tool: compatible mode rejects the request
         # when ``enable_search`` accompanies ``tools``.  An Agent turn always
@@ -1849,6 +1879,14 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
             return False
         if not is_dashscope_origin(self.base_url):
             return False
+        # Native search is an optional transport optimization, not permission
+        # to discard a user's wire controls. Effort and state preservation use
+        # the compatible endpoint unless a native mapping is verified.
+        if self.preserve_thinking or (
+            self.call_options.actual_reasoning_effort is not None
+            and self.call_options.reasoning_parameter in {"reasoning_effort", "reasoning.effort", "thinking"}
+        ):
+            return False
         # 原生工具调用使用参数化 tools（与 OpenAI 兼容结构不同）；Agent 回合
         # 总是携带函数工具，保持兼容模式。多模态 content_parts 同样保持兼容。
         if any(getattr(message, "content_parts", None) for message in messages):
@@ -1873,6 +1911,11 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
             {"model": self.model_id, "messages": wire_messages, "stream": True},
             responses=False,
         )
+        wire = self._apply_output_budget(wire, responses=False)
+        if "reasoning_effort" in wire or "reasoning" in wire or "preserve_thinking" in wire:
+            raise ProviderResponseError(
+                "These thinking controls require the DashScope compatible endpoint"
+            )
         search_options = wire.get("search_options")
         parameters: dict[str, Any] = {
             "enable_search": True,
@@ -1951,6 +1994,11 @@ class QwenChatProvider(OpenAICompatibleChatProvider):
                     if isinstance(search_info, dict):
                         # 复用兼容适配器的来源提取（url/title/index 去重）。
                         self._capture_chat_sources({"search_info": search_info})
+                        if self.last_sources:
+                            yield ProviderStreamEvent("web_activity", web_activity={
+                                "id": "hosted-search", "status": "completed", "operation": "search",
+                                "provider_label": "百炼", "provider_id": self.provider_id, "native": True,
+                            })
                     choices = output.get("choices")
                     if not isinstance(choices, list) or not choices:
                         continue

@@ -25,7 +25,10 @@ from app.providers.remote.codex import (
     CodexCredentials,
     codex_request_headers,
 )
-from app.providers.remote.openai import OpenAIResponsesProvider, _ReusableHTTPClient
+from app.providers.remote.openai import (
+    OpenAIResponsesProvider, _ReusableHTTPClient, ProviderHTTPError,
+    ProviderResponseError, ProviderTimeoutError,
+)
 
 # The backend rejects turns that arrive without operating instructions.  This
 # is a neutral LearnGraph system preamble, not a copy of Codex's agent prompt.
@@ -55,6 +58,41 @@ class CodexResponsesProvider(OpenAIResponsesProvider):
         # Rate-limit headers ride along with every inference response, so the
         # usage display can refresh without a separate request.
         self.last_rate_limits: dict[str, float | int | None] = {}
+        # The ChatGPT login endpoint follows the Codex client contract, not
+        # every field of the public Responses API. Expose the budget exception
+        # instead of claiming a server-side output ceiling that is not sent.
+        self.capabilities["output_budget_enforcement"] = "upstream_default"
+        self.capabilities["output_budget_notice"] = (
+            "Codex 登录通道由上游控制单次输出额度，不支持通用 max_output_tokens 字段。"
+        )
+
+    def _apply_output_budget(self, payload: dict[str, Any], *, responses: bool) -> dict[str, Any]:
+        # Keep the configured ceiling for context/billing estimates, but do not
+        # send unsupported public-API fields to the ChatGPT backend.
+        for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            payload.pop(field, None)
+        return payload
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        # generate_json also goes through the streaming-only login contract;
+        # return the terminal response object to the shared JSON validator.
+        self.last_usage = {}
+        self.last_request_id = None
+        payload["stream"] = True
+        try:
+            with self._client() as client:
+                with client.stream("POST", f"{self.base_url}/{path.lstrip('/')}", json=payload) as response:
+                    self._raise_for_status(response)
+                    self.last_request_id = response.headers.get("x-request-id")
+                    for event in self._sse_payloads(response):
+                        kind = event.get("type")
+                        if kind == "response.completed" and isinstance(event.get("response"), dict):
+                            return event["response"]
+                        if kind in {"error", "response.failed", "response.incomplete"}:
+                            raise ProviderResponseError("Codex structured generation did not complete")
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeoutError("Codex structured generation timed out") from exc
+        raise ProviderHTTPError("Codex stream ended without response.completed")
 
     def _client(self) -> httpx.Client:
         if self._http_client is None:
@@ -111,6 +149,19 @@ class CodexResponsesProvider(OpenAIResponsesProvider):
     ) -> dict[str, Any]:
         payload = super()._apply_call_options(payload, responses=responses)
         if responses:
+            # Match Codex's live-search contract rather than relying on an
+            # upstream cache-only default. Search still requires explicit opt-in
+            # through call_options; never add a tool on offline turns.
+            if isinstance(payload.get("tools"), list):
+                payload["tools"] = [
+                    {"external_web_access": True, **tool}
+                    if isinstance(tool, dict) and tool.get("type") == "web_search"
+                    else tool
+                    for tool in payload["tools"]
+                ]
+            payload["stream"] = True
+            if isinstance(payload.get("input"), str):
+                payload["input"] = [{"role": "user", "content": [{"type": "input_text", "text": payload["input"]}]}]
             payload.setdefault("prompt_cache_key", f"lg-{self.session_id}")
             payload.setdefault("instructions", self.instructions)
             # Nothing is stored server-side on this path, so reasoning has to

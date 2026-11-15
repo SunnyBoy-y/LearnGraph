@@ -1,0 +1,67 @@
+/* Graph sidebar: navigation, readable local canvas, then one action surface. */
+.context-rail .bound-graph-rail {
+  grid-template-rows: auto minmax(220px, 1fr) auto;
+  border-top: 0.5px solid var(--border);
+}
+.context-rail .bound-graph-rail__canvas.graph-canvas { min-height: 220px !important; }
+.graph-rail-navigation { position: relative; min-width: 0; padding: 10px 0; display: grid; gap: 8px; }
+.graph-rail-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.graph-rail-heading > strong, .graph-rail-heading__identity { min-width: 0; }
+.graph-rail-heading__identity { display: grid; gap: 2px; }
+.graph-rail-heading__identity strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.graph-rail-heading__identity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); font-size: 12px; }
+.graph-rail-heading > button { flex-shrink: 0; }
+.graph-rail-navigation__tools { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.graph-rail-navigation__tools input { min-width: 0; flex: 1; height: 30px; font-size: 12px; }
+.graph-rail-navigation__tools > :not(input) { flex-shrink: 0; }
+.graph-rail-search { max-height: 220px; overflow-y: auto; display: grid; gap: 2px; padding: 4px 0; }
+.graph-rail-search > span { padding: 4px 8px; color: var(--muted-foreground); font-size: 12px; }
+.graph-rail-search button { text-align: start; padding: 6px 8px; font-size: 12px; border-radius: 4px; overflow-wrap: anywhere; }
+.graph-rail-search button:hover, .graph-rail-search button:focus-visible { background: var(--muted); }
+.graph-rail-search button:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+.context-rail .bound-graph-rail__inspector { border-top: 0.5px solid var(--border); padding: 10px 0; gap: 8px; }
+.graph-rail-selection { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+.graph-rail-selection strong { font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+.graph-rail-context-badge { flex-shrink: 0; border: 0.5px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--muted-foreground); font-size: 12px; }
+.graph-rail-selection__current { width: 100%; color: var(--muted-foreground); }
+.graph-rail-definition { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted-foreground); }
+/* Keep workspace tools visible; only the tab strip scrolls in a narrow rail. */
+.context-rail .chat-graph-rail__switch { width: 100%; flex-shrink: 0; overflow: visible; gap: 4px; border-bottom-width: 0.5px; backdrop-filter: none; }
+.context-rail .chat-graph-rail__tabs { flex: 1 1 0; min-width: 0; gap: 2px; padding: 3px 0; overscroll-behavior-x: contain; }
+.context-rail .chat-graph-rail__tabs button { min-height: 28px; padding-inline: 8px; }
+/* The selected pill is the sole indicator, without a second underline. */
+.context-rail .chat-graph-rail__tabs button::after { display: none; }
+.context-rail .chat-graph-rail__switch > button { width: 28px; height: 28px; margin-inline-start: 0; }
+
+.context-rail .project-bookshelf { min-width: 0; gap: 12px; border-top: 0; padding-top: 12px; }
+.project-bookshelf__heading { flex-shrink: 0; min-height: 28px; }
+.project-bookshelf__identity { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; min-width: 0; }
+.project-bookshelf__identity > strong { color: var(--foreground); font-size: 13px; font-weight: 600; }
+.project-bookshelf__identity > span { color: var(--muted-foreground); font-size: 12px; font-variant-numeric: tabular-nums; }
+.project-bookshelf__search { position: relative; flex-shrink: 0; }
+.project-bookshelf__search > svg { position: absolute; inset-inline-start: 10px; top: 10px; width: 16px; height: 16px; color: var(--muted-foreground); pointer-events: none; }
+.project-bookshelf__search > input { width: 100%; height: 36px; padding-inline: 34px; border: 0.5px solid var(--border); border-radius: 8px; background: var(--background); box-shadow: none; font-size: 13px; }
+.project-bookshelf__search > input:focus-visible { border-color: var(--ring); outline: 2px solid var(--ring); outline-offset: 2px; box-shadow: none; }
+.project-bookshelf__search > button { position: absolute; inset-inline-end: 4px; top: 4px; width: 28px; height: 28px; color: var(--muted-foreground); }
+.context-rail .project-bookshelf__list { min-height: 0; gap: 2px; overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; padding: 2px; }
+.context-rail .project-bookshelf__list > button { grid-template-columns: 34px minmax(0, 1fr) 16px; min-height: 64px; gap: 10px; padding: 10px 8px; border: 0.5px solid transparent; border-radius: 8px; background: transparent; box-shadow: none; text-align: start; transition: background-color 150ms ease, border-color 150ms ease; }
+.context-rail .project-bookshelf__list > button:not(:disabled):hover { border-color: transparent; background: var(--muted); transform: none; }
+.context-rail .project-bookshelf__list > button:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; background: var(--muted); }
+.project-bookshelf__icon { display: grid; place-items: center; width: 34px; height: 34px; border: 0.5px solid var(--primary); border-radius: 8px; background: var(--primary); color: var(--primary-foreground); }
+.project-bookshelf__icon > svg { width: 18px; height: 18px; stroke-width: 1.75; }
+.project-bookshelf__content { min-width: 0; }
+.context-rail .project-bookshelf__list strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; white-space: normal; overflow-wrap: anywhere; text-wrap: balance; font-size: 13px; font-weight: 500; line-height: 1.5; }
+.dark .project-bookshelf__identity > strong { font-weight: 500; }
+.dark .context-rail .project-bookshelf__list strong { font-weight: 400; }
+.context-rail .project-bookshelf__list small { margin-top: 2px; color: var(--muted-foreground); font-size: 12px; line-height: 1.5; }
+.context-rail .project-bookshelf__chevron { color: var(--muted-foreground); }
+.context-rail .project-bookshelf__list > button:is(:hover, :focus-visible) .project-bookshelf__chevron { color: var(--foreground); }
+.project-bookshelf__message { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 12px 0; color: var(--muted-foreground); font-size: 12px; line-height: 1.5; }
+.project-bookshelf__more { flex-shrink: 0; align-self: stretch; min-height: 32px; color: var(--muted-foreground); }
+@media (prefers-reduced-motion: reduce) {
+  .context-rail .project-bookshelf__list > button { transition: none; }
+}
+@media (forced-colors: active) {
+  .context-rail .project-bookshelf__list > button { border-color: ButtonBorder; }
+  .project-bookshelf__icon { color: ButtonText; background: ButtonFace; }
+}

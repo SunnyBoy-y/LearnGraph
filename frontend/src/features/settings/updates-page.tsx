@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDownToLine, History, RefreshCw } from 'lucide-react'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 import { getCurrentUser } from '@/api/control'
 import { checkUpdates, getAppVersion, getUpdateStatus, isUpdateRunning, setUpdatePolicy, startUpdate, type UpdateJob } from '@/api/updates'
 import { ApiError } from '@/api/client'

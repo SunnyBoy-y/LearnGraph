@@ -22,7 +22,7 @@ import {
   X,
   Image as ImageIcon,
 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 import {
   Conversation,
@@ -41,9 +41,10 @@ import {
 } from "@/components/chat/question-set-pager";
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
+import { migrateThinkingPreference } from "@/lib/thinking-effort-migration";
 import {
   ThinkingSlider,
-  THINKING_STOPS,
+  supportedThinkingStops,
   thinkingStopIndex,
 } from "@/components/chat/thinking-slider";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
@@ -76,6 +77,7 @@ import {
   modelProtocolLabel,
   parseModelChoiceValue,
   providerModelOptions,
+  modelSupportsAgent,
   thinkingLabels,
 } from "@/lib/model-choices";
 import {
@@ -86,18 +88,18 @@ import {
   type ThinkingMode,
 } from "@/lib/session-composer-prefs";
 import { getAgentSandboxReadiness } from "@/api/control";
-import { isDeepSeekProvider, isModelProviderType } from "@/types/providers";
+import { isDeepSeekProvider, isModelProvider } from "@/types/providers";
 import {
   cancelSessionMessage,
   createSession,
   listSessionMessages,
-  listSessions,
   streamSessionMessage,
 } from "@/api/sessions";
 import { lookupFile, uploadFile } from "@/api/files";
 import { ApiError } from "@/api/client";
 import { hashFileSha256 } from "@/lib/file-hash";
 import { requiresLearningIndex } from "@/lib/file-preview";
+import { useSessionDetail } from "@/lib/session-queries";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { FileRecord } from "@/types/files";
 import type {
@@ -270,7 +272,7 @@ export function DocumentChatPanel({
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
 
   const providers = useQuery({ queryKey: workspaceQueryKey(workspaceId, "providers"), queryFn: listProviders });
-  const sessions = useQuery({ queryKey: workspaceQueryKey(workspaceId, "sessions"), queryFn: listSessions });
+  const sessions = useSessionDetail(workspaceId, sessionId);
   const history = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
     queryFn: () => listSessionMessages(sessionId, { limit: 50, compact: false }),
@@ -283,7 +285,7 @@ export function DocumentChatPanel({
         (provider) =>
           provider.enabled &&
           provider.remote_capability &&
-          isModelProviderType(provider.provider_type),
+          isModelProvider(provider),
       ),
     [providers.data],
   );
@@ -310,6 +312,8 @@ export function DocumentChatPanel({
   );
   const selectedModel =
     modelOptions.find((model) => model.id === selectedModelId) ?? modelOptions[0];
+  const supportsAgentMode = modelSupportsAgent(activeProvider, selectedModel);
+  const effectiveAgentMode = responseMode === "agentic" && supportsAgentMode;
   const availableModelChoices = useMemo(
     () =>
       modelProviders.flatMap((provider, index) =>
@@ -336,14 +340,14 @@ export function DocumentChatPanel({
         selectedModel?.capabilities?.reasoning_efforts ??
           activeProvider?.capabilities.reasoning_efforts ??
           (activeProvider && isDeepSeekProvider(activeProvider)
-            ? ["low", "medium", "high", "xhigh"]
+            ? ["low", "high", "max"]
             : undefined),
       ),
     [activeProvider, selectedModel?.capabilities?.reasoning_efforts],
   );
   const thinkingRequired =
     selectedModel?.capabilities?.thinking_required === true;
-  const activeSession = sessions.data?.find((item) => item.id === sessionId);
+  const activeSession = sessions.data;
   const indexRequired = requiresLearningIndex(
     file.original_name,
     file.mime_type,
@@ -366,23 +370,27 @@ export function DocumentChatPanel({
   }, [sessionId]);
 
   useEffect(() => {
+    if (providers.isPending) return;
     setSelectedProviderId((current) =>
       modelProviders.some((provider) => provider.id === current)
         ? current
         : (modelProviders[0]?.id ?? ""),
     );
-  }, [modelProviders]);
+  }, [modelProviders, providers.isPending]);
 
   useEffect(() => {
+    if (providers.isPending || discoveredModels?.isPending) return;
     setSelectedModelId((current) =>
       modelOptions.some((model) => model.id === current)
         ? current
         : (modelOptions[0]?.id ?? ""),
     );
-  }, [modelOptions]);
+  }, [modelOptions, providers.isPending, discoveredModels?.isPending]);
 
   useEffect(() => {
-    if (!activeProvider) return;
+    if (!activeProvider || providers.isPending || discoveredModels?.isPending) return;
+    const migrated = migrateThinkingPreference(sessionId, activeProvider.id, selectedModel?.id, selectedModel?.capabilities, thinkingMode);
+    if (migrated !== thinkingMode) { setThinkingMode(migrated); return; }
     setThinkingMode((current) => {
       if (responseMode === "fast" && !thinkingRequired) return "off";
       if (current === "off") {
@@ -394,7 +402,7 @@ export function DocumentChatPanel({
         ? current
         : (thinkingModes[0] ?? "off");
     });
-  }, [activeProvider, responseMode, thinkingModes, thinkingRequired]);
+  }, [activeProvider, responseMode, thinkingModes, thinkingRequired, providers.isPending, discoveredModels?.isPending, sessionId, selectedModel?.id, selectedModel?.capabilities, thinkingMode]);
 
   function persistComposerPrefs(
     targetSessionId: string,
@@ -440,8 +448,9 @@ export function DocumentChatPanel({
   }
 
   /** 「响应与思考力度」滑块：档位 0 = 极速，其后每档 = 智能体 + 一个思考力度。 */
+  const thinkingStops = useMemo(() => supportedThinkingStops(thinkingModes, thinkingRequired), [thinkingModes, thinkingRequired]);
   function handleThinkingSliderChange(index: number) {
-    const stop = THINKING_STOPS[index];
+    const stop = thinkingStops[index];
     if (!stop) return;
     if (stop.responseMode === "fast") {
       setMode("fast");
@@ -528,7 +537,7 @@ export function DocumentChatPanel({
       return;
     }
     // 智能体模式：沙箱不可用时降级提示，不阻断文档问答本身。
-    if (responseMode === "agentic") {
+    if (effectiveAgentMode) {
       try {
         const readiness = await getAgentSandboxReadiness();
         if (!readiness.available) {
@@ -702,7 +711,7 @@ export function DocumentChatPanel({
           : responseMode !== "fast" && thinkingModes.length
             ? thinkingMode
             : undefined,
-      agent_mode: responseMode === "agentic",
+      agent_mode: effectiveAgentMode,
       document_selection: documentSelection,
     };
     const idempotencyKey = `document-chat-${createUuid()}`;
@@ -924,7 +933,8 @@ export function DocumentChatPanel({
         <div className="px-2 py-1">
           <ThinkingSlider
             onChange={handleThinkingSliderChange}
-            value={thinkingStopIndex(responseMode, thinkingMode)}
+            stops={thinkingStops}
+            value={thinkingStopIndex(responseMode, thinkingMode, thinkingStops)}
           />
         </div>
         {!thinkingModes.length ? (

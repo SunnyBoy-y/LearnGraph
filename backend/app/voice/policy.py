@@ -17,8 +17,8 @@ from app.providers.thinking_policy import (
     resolve_thinking_off,
 )
 
-ThinkingMode = Literal["off", "low", "medium", "high", "xhigh"]
-_ORDER: tuple[str, ...] = ("off", "low", "medium", "high", "xhigh")
+ThinkingMode = Literal["off", "low", "medium", "high", "xhigh", "max"]
+_ORDER: tuple[str, ...] = ("off", "low", "medium", "high", "xhigh", "max")
 
 #: 兼容旧名（``LlmThinkingOff.settings_extra`` 的文档与调用点仍按这个名字引用）。
 LlmThinkingOff = ThinkingOff

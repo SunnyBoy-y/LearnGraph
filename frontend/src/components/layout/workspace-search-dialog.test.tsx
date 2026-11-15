@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
@@ -14,11 +14,11 @@ function Location() {
   const location = useLocation();
   return <output data-testid="location">{location.pathname}:{JSON.stringify(location.state)}</output>;
 }
-function mount(open = true) {
+function mount(open = true, onNavigate?: () => void) {
   const close = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(<QueryClientProvider client={client}><MemoryRouter>
-    <WorkspaceSearchDialog open={open} workspaceId="test-ws" onOpenChange={close} /><Location />
+    <WorkspaceSearchDialog open={open} workspaceId="test-ws" onOpenChange={close} onNavigate={onNavigate} /><Location />
   </MemoryRouter></QueryClientProvider>);
   return close;
 }
@@ -65,6 +65,35 @@ describe("工作区搜索", () => {
     await screen.findByText("没有找到相关结果");
     fireEvent.click(screen.getByRole("button", { name: "关闭搜索" }));
     expect(close).toHaveBeenCalledWith(false);
+  });
+  it('中文组词期间不请求拼音，确认后只搜索最终文字', async () => {
+    vi.mocked(searchWorkspace).mockResolvedValue({ items: [hit('session', 'session-1')], has_more: false, next_offset: 1 });
+    mount();
+    await screen.findByText('操作系统复习');
+    vi.mocked(searchWorkspace).mockClear();
+    vi.useFakeTimers();
+    try {
+      const input = screen.getByRole('textbox');
+      fireEvent.compositionStart(input);
+      fireEvent.change(input, { target: { value: 'zhong' } });
+      await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+      expect(searchWorkspace).not.toHaveBeenCalled();
+      fireEvent.change(input, { target: { value: '中文' } });
+      fireEvent.compositionEnd(input);
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      expect(searchWorkspace).toHaveBeenCalledExactlyOnceWith('中文', 'all', 0, expect.any(AbortSignal));
+    } finally { vi.useRealTimers(); }
+  });
+  it("选择结果后关闭手机抽屉，取消搜索则不触发导航回调", async () => {
+    vi.mocked(searchWorkspace).mockResolvedValue({ items: [hit("session", "session-1")], has_more: false, next_offset: 1 });
+    const onNavigate = vi.fn();
+    mount(true, onNavigate);
+    await screen.findByText("操作系统复习");
+    expect(onNavigate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "关闭搜索" }));
+    expect(onNavigate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getAllByRole("button").find(button => button.hasAttribute("data-search-result"))!);
+    expect(onNavigate).toHaveBeenCalledOnce();
   });
   it("方向键选择结果并通过回车打开", async () => {
     vi.mocked(searchWorkspace).mockResolvedValue({ items: [hit("session", "session-1"), hit("message", "message-2")], has_more: false, next_offset: 2 });

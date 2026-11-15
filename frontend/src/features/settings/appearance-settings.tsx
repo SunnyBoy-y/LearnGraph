@@ -7,7 +7,7 @@ import { applyAppearance, COLOR_THEMES, normalizeAppearance, readLocalAppearance
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Monitor, Moon, Sun } from 'lucide-react'
 import { useEffect, useId, useState, type CSSProperties } from 'react'
-import { toast } from 'sonner'
+import { toast } from '@/lib/notifications'
 import type { WorkspaceSetting } from '@/types/settings'
 import { SettingsSection } from './settings-primitives'
 import './appearance-settings.css'
@@ -65,7 +65,7 @@ export function AppearanceSettings() {
 
   if (settings.isPending) return <LoadingState/>
   if (settings.error) return <ErrorState message={settings.error.message}/>
-  return <SettingsSection title="外观" description="选择适合自己的明暗与配色，立即应用并保存到当前工作区。">
+  return <SettingsSection title="外观">
     <fieldset className="appearance-fieldset" disabled={save.isPending}>
       <legend>显示模式</legend>
       <div className="appearance-modes">
@@ -96,6 +96,6 @@ export function AppearanceSettings() {
       </div>
       {customError && <p id={errorId} role="alert" className="text-xs text-destructive">请输入六位十六进制颜色，例如 #2563eb。</p>}
     </fieldset>
-    <div className="appearance-note" role="status">{save.isPending ? '正在保存外观…' : '按钮、选中状态与重点标记会随配色更新。正文保持清晰，过亮或过暗的主题色会自动调整对比度。'}</div>
+    {save.isPending && <div className="appearance-note" role="status">正在保存外观…</div>}
   </SettingsSection>
 }

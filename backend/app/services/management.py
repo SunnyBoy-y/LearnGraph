@@ -404,14 +404,8 @@ class ProviderService:
             )
         ):
             deepseek_defaults = {
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-                "thinking_mapping": {
-                    "off": None,
-                    "low": "high",
-                    "medium": "high",
-                    "high": "high",
-                    "xhigh": "max",
-                },
+                "reasoning_efforts": [],
+                "thinking_mapping": {"off": None},
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "reasoning_effort",
                 "hosted_web_search": False,
@@ -424,14 +418,8 @@ class ProviderService:
         anthropic_defaults: dict[str, object] = {}
         if payload.provider_type == "anthropic_messages":
             anthropic_defaults = {
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-                "thinking_mapping": {
-                    "off": None,
-                    "low": "low",
-                    "medium": "medium",
-                    "high": "high",
-                    "xhigh": "high",
-                },
+                "reasoning_efforts": [],
+                "thinking_mapping": {"off": None},
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "reasoning_effort",
                 "hosted_web_search": False,
@@ -482,14 +470,8 @@ class ProviderService:
                 "structured_output_mode": "json_object",
                 # Thinking models (DeepSeek-R1, Qwen3, GPT-OSS, …) can opt in via
                 # the capability editor; default keeps fast mode available.
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-                "thinking_mapping": {
-                    "off": False,
-                    "low": "low",
-                    "medium": "medium",
-                    "high": "high",
-                    "xhigh": "max",
-                },
+                "reasoning_efforts": [],
+                "thinking_mapping": {"off": False},
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "thinking",
                 "hosted_web_search": False,
@@ -512,14 +494,8 @@ class ProviderService:
                 "supports_agent_tools": True,
                 # Ollama Cloud currently does not support structured outputs.
                 "supports_structured_output": False,
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-                "thinking_mapping": {
-                    "off": False,
-                    "low": "low",
-                    "medium": "medium",
-                    "high": "high",
-                    "xhigh": "max",
-                },
+                "reasoning_efforts": [],
+                "thinking_mapping": {"off": False},
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "thinking",
                 "hosted_web_search": False,
@@ -534,8 +510,8 @@ class ProviderService:
                 "capability_source": "official_catalog",
                 "supports_agent_tools": True,
                 "structured_output_mode": "json_schema",
-                "reasoning_efforts": ["low", "medium", "high", "xhigh"],
-                "thinking_mapping": {"off": None, "low": "low", "medium": "medium", "high": "high", "xhigh": "high"},
+                "reasoning_efforts": [],
+                "thinking_mapping": {"off": None},
                 "default_thinking_mode": "off",
                 "reasoning_parameter": "reasoning_effort",
                 "hosted_web_search": False,
@@ -1825,9 +1801,14 @@ class ProviderService:
         try:
             raw_payload = payload.model_dump()
             raw_payload.pop("apply_to_all", None)
+            if raw_payload.get("capability_source") not in {"provider_probe", "runtime_observation"}:
+                raw_payload.update(capability_source="user_declared", context_window_source="user_declared", context_window_confidence="confirmed")
             validated = validate_model_capability_update(raw_payload)
         except ModelCapabilityError as exc:
             raise AppError(422, "invalid_model_capabilities", str(exc)) from exc
+        # An edit API save is explicit, even when initialized from the catalog.
+        if validated.get("capability_source") not in {"provider_probe", "runtime_observation"}:
+            validated["capability_source"] = "user_declared"
         capabilities = dict(provider.capabilities or {})
         models = dict(capabilities.get("models") or {})
         models[model_id] = validated
@@ -1873,6 +1854,7 @@ class ProviderService:
         try:
             raw_payload = payload.model_dump()
             apply_to_all = raw_payload.pop("apply_to_all", False)
+            raw_payload.update(capability_source="user_declared", context_window_source="user_declared", context_window_confidence="confirmed")
             validated = validate_model_capability_update(raw_payload)
         except ModelCapabilityError as exc:
             raise AppError(422, "invalid_model_capabilities", str(exc)) from exc
@@ -1882,7 +1864,15 @@ class ProviderService:
         # has explicitly switched it off.
         capabilities.setdefault("model_defaults_enabled", True)
         if apply_to_all:
-            capabilities.pop("models", None)
+            # Apply the explicit bulk edit in place; do not delete snapshots.
+            models = dict(capabilities.get("models") or {})
+            known_ids = set(models) | set(capabilities.get("discovered_model_ids") or [])
+            default_model = str(capabilities.get("default_model") or "").strip()
+            if default_model:
+                known_ids.add(default_model)
+            for model_id in known_ids:
+                models[model_id] = {**models.get(model_id, {}), **validated, "capability_source": "user_declared"}
+            capabilities["models"] = models
         provider.capabilities = capabilities
         self.audit.record(
             actor_id=self.actor_id,
@@ -1971,6 +1961,8 @@ class ProviderService:
             # snapshot, a later probe/discovery must not silently restore the
             # models.dev values over that explicit configuration.
             existing = models.get(model_id)
+            from app.providers.thinking_metadata import automatic_thinking_metadata
+            validated.update(automatic_thinking_metadata(snapshot, existing))
             if not (
                 isinstance(existing, dict)
                 and existing.get("capability_source")
@@ -1992,7 +1984,7 @@ class ProviderService:
                 {
                     "provider_id": provider.id,
                     "model_id": model_id,
-                    "capabilities": validated,
+                    "capabilities": models[model_id],
                 }
             )
         if not synced:
@@ -2718,16 +2710,9 @@ class ProviderService:
                 "Model capabilities can only be read from a Provider that exposes a model discovery endpoint",
             )
         capabilities = dict(provider.capabilities or {})
-        models = dict(capabilities.get("models") or {})
-        configured = models.get(model_id)
-        if not isinstance(configured, dict) and is_deepseek_chat_configuration(
-            provider.provider_type,
-            provider.base_url,
-        ):
-            configured = self._deepseek_capabilities(capabilities)
+        capabilities["provider_family"] = provider.provider_type
+        capabilities["protocol_family"] = protocol_family_for(provider.provider_type, provider.base_url)
         effective = model_capabilities_for_model(capabilities, model_id)
-        if isinstance(configured, dict):
-            effective.update(configured)
         return {
             "provider_id": provider.id,
             "model_id": model_id,
@@ -3475,31 +3460,8 @@ class ProviderService:
                     "capabilities": model_capabilities_for_model(
                         {
                             **capabilities,
-                            # Injected DeepSeek defaults are built-in behavior,
-                            # not the user template, so they stay active even
-                            # when the global-override switch is off.
-                            **(
-                                {
-                                    "model_defaults": self._deepseek_capabilities(
-                                        capabilities
-                                    ),
-                                    "model_defaults_enabled": True,
-                                }
-                                if (
-                                    is_deepseek
-                                    or model_id.casefold().startswith("deepseek")
-                                    or "deepseek"
-                                    in model_id.casefold().split("/")[-1]
-                                )
-                                and not isinstance(
-                                    capabilities.get("model_defaults"), dict
-                                )
-                                else {
-                                    "model_defaults": capabilities.get(
-                                        "model_defaults", {}
-                                    )
-                                }
-                            ),
+                            "provider_family": provider.provider_type,
+                            "protocol_family": protocol_family_for(provider.provider_type, provider.base_url),
                         },
                         model_id,
                     ),
@@ -3513,16 +3475,15 @@ class ProviderService:
         return {
             "reasoning_efforts": list(
                 capabilities.get("reasoning_efforts")
-                or ["low", "medium", "high", "xhigh"]
+                or ["low", "high", "max"]
             ),
             "thinking_mapping": dict(
                 capabilities.get("thinking_mapping")
                 or {
                     "off": None,
-                    "low": "high",
-                    "medium": "high",
+                    "low": "low",
                     "high": "high",
-                    "xhigh": "max",
+                    "max": "max",
                 }
             ),
             "default_thinking_mode": capabilities.get("default_thinking_mode", "off"),

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { toast } from "sonner";
+import { toast } from '@/lib/notifications';
 
 /**
  * 中间截断 + 长按复制的文本（手机窄屏 ID 用）：
