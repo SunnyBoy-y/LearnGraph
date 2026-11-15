@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClock,
   CalendarDays,
@@ -8,11 +8,12 @@ import {
   MessageSquare,
 } from "lucide-react";
 
-import { listActions, listSessions, renderSessionActivitySummary } from "@/api";
+import { listActions, renderSessionActivitySummary } from "@/api";
 import { SectionHeading } from "@/components/shared/page-elements";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
-import type { Session } from "@/types/sessions";
+import { getSessionActivityDays, listSessionPage, type SessionSummary, type SessionPage, type SessionPageParam } from '@/api/session-browser'
+import type { InfiniteData } from '@tanstack/react-query';
 
 const HEATMAP_WEEKS = 53;
 const HEATMAP_GAP = 3;
@@ -52,7 +53,7 @@ export function isPlaceholderSessionTitle(title: string | null | undefined) {
 }
 
 /** Choose the label text a day's activity row should display. */
-function sessionActivityText(session: Session) {
+function sessionActivityText(session: Pick<SessionSummary, "activity_summary" | "title">) {
   // Prefer the LLM-generated learning-event description; fall back to the
   // (possibly mechanical) title when no summary exists yet.
   return session.activity_summary?.trim() || session.title;
@@ -74,10 +75,6 @@ export function ActivityHeatmap({
   variant?: "rail" | "panel";
 }) {
   const { workspaceId } = useAuth();
-  const sessions = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "sessions"),
-    queryFn: listSessions,
-  });
   const actions = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "actions"),
     queryFn: listActions,
@@ -121,6 +118,28 @@ export function ActivityHeatmap({
   }, []);
 
   const [selectedKey, setSelectedKey] = useState(() => formatDayKey(today));
+  const range = useMemo(() => {
+    const end = new Date(today); end.setDate(end.getDate() + 1);
+    return { start: weeks[0][0].toISOString(), end: end.toISOString() };
+  }, [today, weeks]);
+  const days = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, 'sessions', 'activity-days', range),
+    queryFn: ({ signal }) => getSessionActivityDays(range.start, range.end, { signal }), staleTime: 30_000,
+  });
+  const selectedRange = useMemo(() => {
+    const [year, month, day] = selectedKey.split('-').map(Number);
+    return { created_after: new Date(year, month - 1, day).toISOString(), created_before: new Date(year, month - 1, day + 1).toISOString() };
+  }, [selectedKey]);
+  const dayQueryKey = workspaceQueryKey(workspaceId, 'sessions', 'activity-day', selectedKey);
+  const daySessions = useInfiniteQuery({
+    queryKey: dayQueryKey,
+    queryFn: ({ pageParam, signal }) => listSessionPage({ ...selectedRange, roots_only: false, include_archived: true }, pageParam, { signal }),
+    initialPageParam: {} as SessionPageParam,
+    getNextPageParam: page => page.has_more && page.next_cursor ? { cursor: page.next_cursor, direction: 'next' as const } : undefined,
+    getPreviousPageParam: page => page.has_previous && page.previous_cursor ? { cursor: page.previous_cursor, direction: 'previous' as const } : undefined,
+    maxPages: 5, staleTime: 30_000,
+  });
+  const sessions = { data: useMemo(() => daySessions.data?.pages.flatMap(page => page.items), [daySessions.data]) };
 
   // Lazily enrich mechanical placeholder titles into real learning-event
   // descriptions. Only sessions shown on the currently-selected day and only
@@ -142,22 +161,12 @@ export function ActivityHeatmap({
         expected_title: session.title,
       })
         .then((updated) => {
-          queryClient.setQueryData<Session[]>(
-            workspaceQueryKey(workspaceId, "sessions"),
-            (current) => {
-            if (!current) return [updated];
-            return current.map((item) =>
-              item.id === updated.id
-                ? { ...item, activity_summary: updated.activity_summary }
-                : item,
-            );
-          });
+          queryClient.setQueryData<InfiniteData<SessionPage>>(dayQueryKey, current => current ? ({
+            ...current, pages: current.pages.map(page => ({ ...page, items: page.items.map(item => item.id === updated.id ? { ...item, activity_summary: updated.activity_summary } : item) })),
+          }) : current);
         })
         .catch(() => {
           // Degrade gracefully; the existing title-based label stays.
-        })
-        .finally(() => {
-          inflightSummaries.current.delete(session.id);
         });
     }
   }, [queryClient, selectedKey, sessions.data, workspaceId]);
@@ -182,24 +191,25 @@ export function ActivityHeatmap({
     return result;
   }, [actions.data, sessions.data]);
 
+  const dayCount = (key: string) => (dayActivity[key]?.filter(item => item.kind !== 'session').length ?? 0) + (days.data?.[key] ?? 0);
   const { totalCount, streak } = useMemo(() => {
     let total = 0;
     weeks.forEach((week) =>
       week.forEach((date) => {
         if (date <= today)
-          total += dayActivity[formatDayKey(date)]?.length ?? 0;
+          total += dayCount(formatDayKey(date));
       }),
     );
     let streakDays = 0;
     const cursor = new Date(today);
-    if (!dayActivity[formatDayKey(cursor)])
+    if (!dayCount(formatDayKey(cursor)))
       cursor.setDate(cursor.getDate() - 1);
-    while (dayActivity[formatDayKey(cursor)]) {
+    while (dayCount(formatDayKey(cursor))) {
       streakDays += 1;
       cursor.setDate(cursor.getDate() - 1);
     }
     return { totalCount: total, streak: streakDays };
-  }, [dayActivity, today, weeks]);
+  }, [dayActivity, days.data, today, weeks]);
 
   const overview = useMemo(() => {
     const months: Array<{ key: string; label: string; count: number }> = [];
@@ -225,13 +235,21 @@ export function ActivityHeatmap({
       const date = new Date(year, month - 1, day);
       if (date < rangeStart || date > today) return;
       const bucket = byMonth.get(`${year}-${month - 1}`);
-      if (bucket) bucket.count += items.length;
+      if (bucket) bucket.count += items.filter(item => item.kind !== 'session').length;
       items.forEach((item) => {
         if (item.kind === "completed") completedCount += 1;
         else if (item.kind === "planned") plannedCount += 1;
-        else sessionCount += 1;
+
       });
     });
+    for (const [key, count] of Object.entries(days.data ?? {})) {
+      const [year, month, day] = key.split('-').map(Number);
+      const date = new Date(year, month - 1, day);
+      if (date < rangeStart || date > today) continue;
+      sessionCount += count;
+      const bucket = byMonth.get(`${year}-${month - 1}`);
+      if (bucket) bucket.count += count;
+    }
     const typeTotal = sessionCount + completedCount + plannedCount;
     const percent = (count: number) =>
       typeTotal ? Math.round((count / typeTotal) * 100) : 0;
@@ -244,7 +262,7 @@ export function ActivityHeatmap({
         { label: "计划行动", count: plannedCount, pct: percent(plannedCount) },
       ],
     };
-  }, [dayActivity, today, weeks]);
+  }, [dayActivity, days.data, today, weeks]);
 
   const [cellSize, setCellSize] = useState(MIN_CELL);
 
@@ -275,15 +293,23 @@ export function ActivityHeatmap({
   const visibleActivities = dayExpanded
     ? activities
     : activities.slice(0, DAY_VISIBLE_LIMIT);
-  const hiddenCount = activities.length - visibleActivities.length;
-  const showDayToggle = activities.length > DAY_VISIBLE_LIMIT;
-  const dayToggleButton = showDayToggle ? (
+  const hiddenCount = Math.max(0, dayCount(selectedKey) - visibleActivities.length);
+  const showDayToggle = activities.length > DAY_VISIBLE_LIMIT || daySessions.hasNextPage;
+  const moreDayPages = (direction: 'next' | 'previous') => direction === 'next' ? daySessions.fetchNextPage({ cancelRefetch: false }) : daySessions.fetchPreviousPage({ cancelRefetch: false });
+  const dayToggleButton = showDayToggle || daySessions.isPending || daySessions.isError ? (
     <button
       className="mt-4 w-full rounded-lg border py-2 text-xs font-medium text-foreground transition-colors hover:bg-muted/60"
-      onClick={() => setExpandedDayKey(dayExpanded ? null : selectedKey)}
+      disabled={daySessions.isFetching}
+      onClick={() => {
+        if (daySessions.isError) { void daySessions.refetch(); return; }
+        if (!dayExpanded) setExpandedDayKey(selectedKey);
+        else if (daySessions.hasNextPage) void moreDayPages('next');
+        else if (daySessions.hasPreviousPage) void moreDayPages('previous');
+        else setExpandedDayKey(null);
+      }}
       type="button"
     >
-      {dayExpanded ? "收起活动" : `显示更多活动（还有 ${hiddenCount} 条）`}
+      {daySessions.isError ? '活动加载失败，点击重试' : daySessions.isFetching ? '加载中…' : dayExpanded && daySessions.hasNextPage ? '加载更多活动' : dayExpanded && daySessions.hasPreviousPage ? '加载较新的活动' : dayExpanded ? '收起活动' : `显示更多活动（还有 ${hiddenCount} 条）`}
     </button>
   ) : null;
   const [selectedYear, selectedMonth, selectedDay] = selectedKey
@@ -293,7 +319,7 @@ export function ActivityHeatmap({
     selectedYear === today.getFullYear()
       ? `${selectedMonth}月${selectedDay}日`
       : `${selectedYear}年${selectedMonth}月${selectedDay}日`;
-  const summary = `过去一年 ${totalCount} 次学习活动`;
+  const summary = days.isPending ? '正在读取学习活动…' : days.isError ? '学习活动统计暂不可用' : `过去一年 ${totalCount} 次学习活动`;
 
   const heatmapGrid = (
     <div
@@ -338,7 +364,7 @@ export function ActivityHeatmap({
                       key={key}
                     />
                   );
-                const count = dayActivity[key]?.length ?? 0;
+                const count = dayCount(key);
                 const dateLabel = `${date.getMonth() + 1}月${date.getDate()}日`;
                 return (
                   <button
@@ -482,7 +508,8 @@ export function ActivityHeatmap({
             </>
           ) : (
             <p className="mt-3 text-sm leading-6 text-muted-foreground">
-              当天没有记录的学习活动。
+              {daySessions.isPending ? '正在读取当天活动…' : daySessions.isError ? '当天活动暂时无法读取。' : '当天没有记录的学习活动。'}
+              {dayToggleButton}
             </p>
           )}
         </div>
@@ -513,7 +540,7 @@ export function ActivityHeatmap({
         <ul>
           {(visibleActivities.length
             ? visibleActivities
-            : [{ text: "当天没有记录的学习活动", kind: "session" as const }]
+            : [{ text: daySessions.isPending ? '正在读取当天活动…' : daySessions.isError ? '当天活动暂时无法读取。' : '当天没有记录的学习活动', kind: "session" as const }]
           ).map((activity, index) => (
             <li key={`${activity.kind}-${index}-${activity.text}`}>
               {activity.text}

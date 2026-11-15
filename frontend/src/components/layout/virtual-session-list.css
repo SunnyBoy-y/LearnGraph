@@ -1,0 +1,9 @@
+.sidebar-virtual-list { position: relative; overflow-anchor: none; }
+.sidebar-virtual-row { position: absolute; top: 0; left: 0; width: 100%; min-height: 32px; }
+.sidebar-page-sentinel { display: flex; align-items: center; justify-content: center; min-height: 32px; padding: 4px 12px; color: var(--muted-foreground); font-size: 12px; }
+.sidebar-page-sentinel button { min-height: 28px; padding: 4px 8px; color: inherit; }
+.sidebar-page-sentinel[aria-busy="true"] { animation: session-load-reveal 180ms step-end; }
+@keyframes session-load-reveal { from { visibility: hidden; } to { visibility: visible; } }
+.sidebar-virtual-row .sidebar-project__session { min-height: 32px; }
+.sidebar-virtual-row .sidebar-sessions__recent-heading { margin-top: 6px; }
+@media (prefers-reduced-motion: reduce) { .sidebar-page-sentinel[aria-busy="true"] { animation: none; } }

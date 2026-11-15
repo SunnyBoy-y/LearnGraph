@@ -33,21 +33,30 @@ export function listSessions(): Promise<Session[]> {
   return apiClient.get<Session[]>('/sessions')
 }
 
-export function createSession(
+export async function createSession(
   payload: SessionCreateRequest = {},
   options: ApiRequestOptions = {},
 ): Promise<Session> {
-  return apiClient.post<Session, SessionCreateRequest>('/sessions', payload, options)
+  const session = await apiClient.post<Session, SessionCreateRequest>('/sessions', payload, options)
+  window.dispatchEvent(new CustomEvent('learngraph:session-created', { detail: { session } }))
+  return session
+}
+
+function notifySessionUpdated(pending: Promise<Session>): Promise<Session> {
+  return pending.then(session => {
+    window.dispatchEvent(new CustomEvent('learngraph:session-updated', { detail: { session } }))
+    return session
+  })
 }
 
 export function autoTitleSession(
   sessionId: string,
   payload: SessionAutoTitleRequest,
 ): Promise<Session> {
-  return apiClient.post<Session, SessionAutoTitleRequest>(
+  return notifySessionUpdated(apiClient.post<Session, SessionAutoTitleRequest>(
     `/sessions/${encodeURIComponent(sessionId)}/auto-title`,
     payload,
-  )
+  ))
 }
 
 /**
@@ -112,10 +121,10 @@ export function updateSession(
   sessionId: string,
   payload: SessionUpdateRequest,
 ): Promise<Session> {
-  return apiClient.patch<Session, SessionUpdateRequest>(
+  return notifySessionUpdated(apiClient.patch<Session, SessionUpdateRequest>(
     `/sessions/${encodeURIComponent(sessionId)}`,
     payload,
-  )
+  ))
 }
 
 export function getSessionBatchDeleteImpact(

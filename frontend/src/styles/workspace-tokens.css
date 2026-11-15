@@ -1,0 +1,10 @@
+/* Workspace aliases inherit the existing theme instead of defining a second design system. */
+:root {
+  --lg-font-meta: 12px;
+  --lg-font-body: 14px;
+  --lg-font-heading: 16px;
+  --lg-workspace-focus: var(--ring);
+  --lg-workspace-surface: var(--background);
+  --lg-workspace-muted: var(--muted-foreground);
+  --lg-workspace-border: var(--border);
+}
