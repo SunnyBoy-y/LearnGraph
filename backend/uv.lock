@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -695,6 +695,18 @@ wheels = [
 [package.optional-dependencies]
 toml = [
     { name = "tomli", marker = "python_full_version <= '3.11'" },
+]
+
+[[package]]
+name = "croniter"
+version = "6.2.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/57/2e2a65aee2a70483cb28e2b7e15a072d00a523207593b44400d4717bb100/croniter-6.2.4.tar.gz", hash = "sha256:fc124f751b1b04805c2a04b061898b436b45ab2320b045e1e052ea895de65189", size = 166267, upload-time = "2026-07-10T09:52:59.955Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/ba/d678e5bd329646ca51d3c92addbc77804e86d21f4b6b6a027218e6abb010/croniter-6.2.4-py3-none-any.whl", hash = "sha256:8ef3d544107a5c05a150a2d78f8bf5a8eb9c5c4d93405a736b824109574e3f4d", size = 46677, upload-time = "2026-07-10T09:52:58.425Z" },
 ]
 
 [[package]]
@@ -1408,9 +1420,11 @@ version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "argon2-cffi" },
+    { name = "croniter" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "firecrawl-py" },
+    { name = "httpcore" },
     { name = "httpx" },
     { name = "jsonschema" },
     { name = "keyring" },
@@ -1422,6 +1436,7 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "trafilatura" },
     { name = "tzdata" },
+    { name = "uri-template" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "xlrd" },
 ]
@@ -1452,11 +1467,13 @@ voice = [
 [package.metadata]
 requires-dist = [
     { name = "argon2-cffi", specifier = ">=23,<25" },
+    { name = "croniter", specifier = ">=6,<7" },
     { name = "cryptography", specifier = ">=43,<47" },
     { name = "docker", marker = "extra == 'database-migration'", specifier = ">=7.1,<8" },
     { name = "docker", marker = "extra == 'legacy-docker'", specifier = ">=7.1,<8" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "firecrawl-py", specifier = ">=4.34,<5" },
+    { name = "httpcore", specifier = ">=1,<2" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
     { name = "keyring", specifier = ">=25.6,<26" },
@@ -1476,6 +1493,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "trafilatura", specifier = ">=1.12,<3" },
     { name = "tzdata", specifier = ">=2024.1" },
+    { name = "uri-template", specifier = ">=1.3,<2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
     { name = "websockets", marker = "extra == 'voice'", specifier = ">=13.1,<18" },
     { name = "xlrd", specifier = ">=2.0.2,<3" },
@@ -3472,6 +3490,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/81/5b/879b2f932adfa7a053c360d50bc896c977fa6426109185f7c12ebdd0cb9d/tzlocal-5.4.4.tar.gz", hash = "sha256:8dbb8660838688a7b6ba4fed31d18dedf842afb4d47ca050d6d891c2c15f3be4", size = 31170, upload-time = "2026-06-29T08:03:40.026Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9e/a4/017a7a6cbe387d961a688ec31364ae60a5c4e22c96ae9921b79a947c855d/tzlocal-5.4.4-py3-none-any.whl", hash = "sha256:aae09f0126a8a86fa736be266eb4a471380d26a0de3bc14844e7821fee3e2a15", size = 18115, upload-time = "2026-06-29T08:03:38.666Z" },
+]
+
+[[package]]
+name = "uri-template"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/31/c7/0336f2bd0bcbada6ccef7aaa25e443c118a704f828a0620c6fa0207c1b64/uri-template-1.3.0.tar.gz", hash = "sha256:0e00f8eb65e18c7de20d595a14336e9f337ead580c70934141624b6d1ffdacc7", size = 21678, upload-time = "2023-06-21T01:49:05.374Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/00/3fca040d7cf8a32776d3d81a00c8ee7457e00f80c649f1e4a863c8321ae9/uri_template-1.3.0-py3-none-any.whl", hash = "sha256:a44a133ea12d44a0c0f06d7d42a52d71282e77e2f937d8abd5655b8d56fc1363", size = 11140, upload-time = "2023-06-21T01:49:03.467Z" },
 ]
 
 [[package]]

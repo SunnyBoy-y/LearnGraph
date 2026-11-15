@@ -1,0 +1,140 @@
+{
+  "cases": [
+    {
+      "name": "empty-light",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "filter-menu-open",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "recommendation-hover",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "editor-open",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "create-edit-pause-resume-run-cancel-history-delete",
+      "passed": true
+    },
+    {
+      "name": "populated-list",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "actions-menu-open",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "populated-dark",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "narrow-long-draft",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "small-mobile",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "small-editor-open",
+      "clip": {
+        "ok": true,
+        "cut": 0,
+        "hidden": 0,
+        "issues": []
+      },
+      "horizontalOverflow": false
+    },
+    {
+      "name": "failed-draft-retry-agent-handoff-reload-result-session",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "C:\\Users\\13600\\Desktop\\66\\LearnGraph\\docs\\schedules-light.png",
+    "C:\\Users\\13600\\Desktop\\66\\LearnGraph\\docs\\schedules-dark.png",
+    "C:\\Users\\13600\\Desktop\\66\\LearnGraph\\docs\\schedules-mobile.png"
+  ],
+  "errors": [],
+  "writes": [
+    "POST /scheduled-tasks/suggestions",
+    "POST /scheduled-tasks",
+    "POST /scheduled-tasks/suggestions",
+    "PATCH /scheduled-tasks/manual-task",
+    "POST /scheduled-tasks/suggestions",
+    "PATCH /scheduled-tasks/manual-task",
+    "POST /scheduled-tasks/suggestions",
+    "PATCH /scheduled-tasks/manual-task",
+    "POST /scheduled-tasks/suggestions",
+    "POST /scheduled-tasks/manual-task/run",
+    "POST /scheduled-tasks/suggestions",
+    "POST /scheduled-tasks/manual-task/cancel",
+    "POST /scheduled-tasks/suggestions",
+    "DELETE /scheduled-tasks/manual-task",
+    "POST /scheduled-tasks/suggestions",
+    "POST /sessions",
+    "POST /sessions",
+    "POST /sessions/opening-prompts",
+    "POST /sessions/schedule-chat/messages/stream"
+  ],
+  "passed": true
+}

@@ -1,0 +1,151 @@
+.schedules-page {
+  max-width: 960px;
+  gap: 0;
+  padding-top: clamp(32px, 5vh, 64px);
+  padding-bottom: 64px;
+}
+
+.schedules-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.schedules-header h1 {
+  font-size: 32px;
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: -0.035em;
+  text-wrap: balance;
+}
+
+.schedules-header p {
+  margin-top: 6px;
+  color: var(--muted-foreground);
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.schedule-filter {
+  position: relative;
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 7px;
+  margin-top: 4px;
+  height: 40px;
+  min-width: 124px;
+  padding: 9px 14px;
+  border-color: transparent;
+  box-shadow: none;
+  cursor: pointer;
+  border-radius: 999px;
+  background: var(--muted);
+  font-size: 14px;
+}
+
+.schedule-filter:hover, .schedule-filter[data-state="open"] { background: var(--accent); }
+.schedule-filter [data-slot="select-value"] { flex: 1; text-align: start; }
+.schedule-filter-menu { min-width: 160px; border-radius: 14px; }
+.schedule-filter-menu [data-slot="select-item"] { min-height: 38px; padding-inline-start: 12px; border-radius: 10px; cursor: pointer; }
+
+.schedule-discovery { margin-top: 44px; }
+
+.schedule-composer > [data-slot="input-group"] {
+  height: auto;
+  min-height: 64px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  overflow: visible;
+  border: 0.5px solid var(--border);
+  border-radius: 32px;
+  background: var(--background);
+  box-shadow: none;
+}
+
+.schedule-composer > [data-slot="input-group"]:focus-within {
+  border-color: var(--ring);
+  outline: 2px solid color-mix(in srgb, var(--ring) 18%, transparent);
+  outline-offset: 2px;
+}
+
+.schedule-composer textarea[data-slot="input-group-control"] {
+  min-height: 24px;
+  max-height: 192px;
+  padding: 6px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 16px;
+  line-height: 1.5;
+  resize: none;
+  scrollbar-width: none;
+}
+
+.schedule-composer textarea::-webkit-scrollbar { display: none; }
+.schedule-composer .schedule-composer__add { flex-shrink: 0; border-radius: 50%; color: var(--foreground); }
+.schedule-composer .schedule-composer__send { width: 42px; height: 42px; flex-shrink: 0; border-radius: 50%; }
+
+.schedule-suggestions { margin-top: 30px; }
+.schedule-section-toggle { gap: 8px; padding: 8px 12px; background: transparent; color: var(--muted-foreground); font-size: 16px; font-weight: 400; }
+.schedule-section-toggle:hover { background: var(--muted); }
+.schedule-suggestions__list { margin-top: 8px; padding-inline: 12px; }
+.schedule-suggestions__list > li + li { border-top: 0.5px solid var(--border); }
+
+.schedule-suggestion {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 20px;
+  width: 100%;
+  padding: 21px 4px;
+  border-radius: 6px;
+  text-align: start;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.schedule-suggestion:hover { background: var(--accent); }
+.schedule-suggestion:focus-visible, .schedule-task__name:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.schedule-suggestion:disabled { cursor: default; opacity: 0.5; }
+.schedule-suggestion__icon { display: flex; align-items: center; justify-content: center; color: var(--primary); }
+.schedule-suggestion__name { display: block; font-size: 16px; font-weight: 500; line-height: 1.5; text-wrap: balance; }
+.schedule-suggestion__description { display: block; margin-top: 5px; color: var(--muted-foreground); font-size: 16px; line-height: 1.6; overflow-wrap: anywhere; }
+.schedule-suggestion__add { justify-self: center; color: var(--muted-foreground); }
+
+.schedule-tasks { margin-top: 32px; padding-inline: 12px; }
+.schedule-tasks h2 { display: flex; align-items: center; gap: 10px; padding-bottom: 10px; font-size: 16px; font-weight: 500; }
+.schedule-tasks h2 > span { color: var(--muted-foreground); font-size: 12px; font-weight: 400; }
+.schedule-task { display: flex; align-items: flex-start; gap: 16px; padding-block: 20px; border-bottom: 0.5px solid var(--border); }
+.schedule-task__icon { flex-shrink: 0; margin-top: 3px; color: var(--muted-foreground); }
+.schedule-task__body { flex: 1; min-width: 0; }
+.schedule-task__name { max-width: 100%; font-size: 16px; font-weight: 500; line-height: 1.5; text-align: start; overflow-wrap: anywhere; cursor: pointer; }
+.schedule-task__name:disabled { cursor: default; }
+.schedule-task__description { display: -webkit-box; margin-top: 5px; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; color: var(--muted-foreground); font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.schedule-task__meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 7px; color: var(--muted-foreground); font-size: 12px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.schedule-task__actions { display: flex; flex-shrink: 0; align-items: center; gap: 2px; color: var(--muted-foreground); }
+.schedule-task__actions > button { width: 32px; height: 32px; }
+.schedule-empty { margin: 28px 12px 0; color: var(--muted-foreground); font-size: 14px; }
+
+.dark .schedules-header h1, .dark .schedule-suggestion__name, .dark .schedule-task__name, .dark .schedule-tasks h2 { font-weight: 400; }
+
+@media (max-width: 640px) {
+  .schedules-page { padding-top: 72px; }
+  .schedules-header { gap: 12px; }
+  .schedules-header p { max-width: 22em; font-size: 14px; }
+  .schedule-filter { gap: 5px; padding: 8px 10px; }
+  .schedule-filter > svg:last-child { display: none; }
+  .schedule-discovery { margin-top: 28px; }
+  .schedule-composer > [data-slot="input-group"] { gap: 6px; }
+  .schedule-suggestions__list, .schedule-tasks { padding-inline: 0; }
+  .schedule-suggestion { gap: 12px; padding-block: 18px; }
+  .schedule-suggestion__description { font-size: 14px; }
+  .schedule-task { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 10px 12px; }
+  .schedule-task__actions { grid-column: 2; justify-self: end; }
+}
+
+@media (prefers-reduced-motion: reduce) { .schedule-suggestion { transition: none; } }
+[data-reduce-motion="true"] .schedule-suggestion { transition: none; }
