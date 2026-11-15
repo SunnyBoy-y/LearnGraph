@@ -15,6 +15,7 @@ import {
 import { StatePill } from "@/components/shared/page-elements";
 import { SourceAssociationDialog } from "@/components/resources/source-association-dialog";
 import type { SourceRecord } from "@/types/workflow";
+import { PaperBibtexButton, PaperSavedBody } from "@/features/resources/paper-panels";
 
 type SourceDetailDialogProps = {
   onOpenChange: (open: boolean) => void;
@@ -50,6 +51,7 @@ export function SourceDetailDialog({
     enabled: open,
   });
   const record = detail.data ?? source;
+  const isPaper = record.metadata_json.kind === "paper";
   const destination = externalUrl(record.final_url);
 
   return (
@@ -63,7 +65,7 @@ export function SourceDetailDialog({
       >
       <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
-          <DialogTitle>网页来源详情与关联</DialogTitle>
+          <DialogTitle>{isPaper ? "论文资料与关联" : "网页来源详情与关联"}</DialogTitle>
           <DialogDescription>
             来源正文、抓取元数据和关联关系均来自当前工作区服务端记录；查看不会改写图谱或掌握度。
           </DialogDescription>
@@ -110,8 +112,8 @@ export function SourceDetailDialog({
           <p className="mt-3 break-all font-mono text-[11px] text-muted-foreground">内容哈希：{record.content_hash}</p>
           <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">原始 URL：{record.source_url}</p>
           <details className="mt-4 rounded-lg border bg-muted/20 p-3">
-            <summary className="cursor-pointer text-sm font-medium">查看已持久化的网页正文（{record.content.length} 个字符）</summary>
-            <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{record.content}</p>
+            <summary className="cursor-pointer text-sm font-medium">{isPaper ? record.metadata_json.page_read ? "查看已保存的正文片段与页码" : "查看已保存的摘要或元数据（未读取正文）" : `查看已持久化的网页正文（${record.content.length} 个字符）`}</summary>
+            {isPaper ? <PaperSavedBody source={record} /> : <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">{record.content}</p>}
           </details>
           {Object.keys(record.metadata_json).length ? (
             <details className="mt-3 text-xs text-muted-foreground">
@@ -122,6 +124,7 @@ export function SourceDetailDialog({
             </details>
           ) : null}
           <div className="mt-4 flex flex-wrap gap-2">
+            {isPaper ? <PaperBibtexButton sourceId={record.id} /> : null}
             <Button
               onClick={() => setAssociationOpen(true)}
               size="sm"

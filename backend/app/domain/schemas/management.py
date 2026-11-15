@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Annotated
 
-from pydantic import BeforeValidator, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BeforeValidator, BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator, computed_field
 
 from app.domain.schemas.common import ORMModel
 from app.core.money import amount_text, decimal_amount, input_amount_text
@@ -664,6 +664,14 @@ class ProviderView(ORMModel):
     secret_key_version: int | None = None
     created_at: datetime
 
+    @computed_field
+    @property
+    def role(self) -> str | None:
+        # Additive API metadata: clients no longer need a second provider list.
+        from app.providers.catalog import PROVIDER_TYPE_BY_ID
+        spec = PROVIDER_TYPE_BY_ID.get(self.provider_type)
+        return spec.role if spec else None
+
 
 class ProviderBalanceInfoView(BaseModel):
     currency: Literal["CNY", "USD"]
@@ -864,8 +872,8 @@ class ProviderUpdateRequest(BaseModel):
         default=None, min_length=1, max_length=160
     )
     extra_headers: dict[str, str] | None = None
-    # Global template switch: on = the group template overrides every model,
-    # off = each model uses its own saved snapshot or catalog defaults.
+    # Group defaults apply below explicit per-model settings. The separate
+    # apply_to_all action writes an intentional bulk edit to existing models.
     model_defaults_enabled: bool | None = None
     provider_priority: int | None = Field(default=None, ge=0, le=10_000)
 
@@ -877,17 +885,17 @@ class ProviderUpdateRequest(BaseModel):
 
 
 class ProviderModelCapabilityUpdateRequest(BaseModel):
-    # Only meaningful for the group endpoint: removes per-model overrides so
-    # every discovered model inherits the group configuration again.
+    # Only meaningful for the group endpoint: updates every known snapshot in
+    # place, preserving unrelated metadata instead of deleting configuration.
     apply_to_all: bool = False
-    reasoning_efforts: list[Literal["low", "medium", "high", "xhigh"]] = Field(
+    reasoning_efforts: list[Literal["low", "medium", "high", "xhigh", "max"]] = Field(
         default_factory=list
     )
     thinking_mapping: dict[
-        Literal["off", "low", "medium", "high", "xhigh"],
+        Literal["off", "low", "medium", "high", "xhigh", "max"],
         str | int | bool | None,
     ] = Field(default_factory=dict)
-    default_thinking_mode: Literal["off", "low", "medium", "high", "xhigh"] = "off"
+    default_thinking_mode: Literal["off", "low", "medium", "high", "xhigh", "max"] = "off"
     reasoning_parameter: Literal[
         "reasoning_effort",
         "reasoning.effort",

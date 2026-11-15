@@ -1,6 +1,7 @@
 """Cover persistence and failure contracts against the isolated API test DB."""
 import base64
 from io import BytesIO
+from urllib.parse import quote
 
 import pytest
 from PIL import Image
@@ -83,6 +84,33 @@ def test_renderer_failure_falls_back_and_can_still_save(client, cover_graph, mon
     assert response.status_code == 200, response.text
     assert response.json()["used_default"]
     assert response.json()["cover_svg"] == graph_cover.default_graph_cover("补测图谱")
+
+
+def test_legacy_automatic_cover_is_upgraded_consistently_without_rewriting_graph(client, cover_graph):
+    graph_id, headers = cover_graph
+    legacy = "data:image/svg+xml," + quote('''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300">
+<rect width="640" height="300" fill="hsl(120 18% 94%)"/>
+<circle cx="510" cy="120" r="82" fill="hsl(120 35% 78%)"/>
+<path d="M70 230 Q170 90 280 210 T480 180" fill="none" stroke="hsl(120 30% 35%)" stroke-width="8"/>
+<rect x="40" y="260" width="560" height="10" rx="5" fill="#d8dadd"/>
+</svg>''')
+    with SessionLocal() as db:
+        graph = db.get(Graph, graph_id)
+        graph.cover_svg = legacy
+        revision = graph.revision
+        db.commit()
+    url = f"/api/v1/graphs/{graph_id}"
+    detail = client.get(url, headers=headers).json()
+    editor = client.get(url + "/cover", headers=headers).json()
+    listed = client.get("/api/v1/graphs", headers=headers).json()
+    shelf = next(item for item in listed if item["id"] == graph_id)
+    expected = graph_cover.generate_graph_cover(detail["title"])
+    assert detail["cover_svg"] == editor["cover_svg"] == shelf["cover_svg"] == expected
+    assert not editor["used_default"]
+    with SessionLocal() as db:
+        graph = db.get(Graph, graph_id)
+        assert graph.cover_svg == legacy
+        assert graph.revision == revision
 
 
 def test_other_workspace_cannot_read_or_change_cover(client, cover_graph, register_user, auth_headers):

@@ -398,7 +398,7 @@ def isolated_text_document(
     )
 
 
-def _parse_pdf(payload: bytes) -> ParsedDocument:
+def _parse_pdf(payload: bytes, *, max_pages: int | None = None) -> ParsedDocument:
     try:
         import pypdf
         from pypdf import PdfReader
@@ -406,6 +406,8 @@ def _parse_pdf(payload: bytes) -> ParsedDocument:
         raise ProcessorUnavailable("PDF parsing requires the optional pypdf processor") from exc
     try:
         reader = PdfReader(io.BytesIO(payload), strict=False)
+        if max_pages is not None and len(reader.pages) > max_pages:
+            raise DocumentParseError("PDF exceeds this reader's page limit")
         chunks = [
             ParsedChunk(f"page:{index}", text)
             for index, page in enumerate(reader.pages, start=1)
