@@ -90,6 +90,14 @@ export interface PrimaryDatabaseCheck {
   key: string
   passed: boolean
   detail?: string
+  unmapped_indexes?: string[]
+  unknown_tables?: string[]
+  missing_tables?: string[]
+  tables?: string[]
+  unmapped_triggers?: string[]
+  unmapped_views?: string[]
+  unmapped_checks?: string[]
+  active_locks?: number
 }
 
 export interface PrimaryDatabasePreflight {

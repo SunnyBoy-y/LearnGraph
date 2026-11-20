@@ -18,6 +18,7 @@ import {
 } from "@/components/chat/html-code-preview";
 import { ExpandableContent } from "@/components/shared/expandable-content";
 import { fetchSharedSession, type SessionSharePublicView } from "@/api/session-sharing";
+import { stripRawWebCitations } from "@/lib/document-citations";
 
 type Part = Record<string, unknown>;
 
@@ -50,7 +51,7 @@ function PartRenderer({ part }: { part: Part }) {
               pre: (props: MarkdownPreProps) => <PreviewableMarkdownPre {...props} />,
             }}
           >
-            {content}
+            {stripRawWebCitations(content)}
           </LazyStreamdown>
         </ExpandableContent>
       </div>
@@ -179,7 +180,7 @@ export function SessionShareViewPage() {
             .filter((part) => TEXT_KINDS.has(String(part.type)))
             .map((part) => String(part.content ?? ""))
             .join("\n"));
-        return `【${role}】\n${body}`;
+        return `【${role}】\n${message.role === "assistant" ? stripRawWebCitations(body) : body}`;
       })
       .join("\n\n---\n\n");
     try {
@@ -274,7 +275,7 @@ export function SessionShareViewPage() {
                         ),
                       }}
                     >
-                      {message.content}
+                      {message.role === "assistant" ? stripRawWebCitations(message.content) : message.content}
                     </LazyStreamdown>
                   </ExpandableContent>
                 </div>

@@ -38,6 +38,10 @@ function setup() {
   })
   const post = vi.spyOn(apiClient, 'post').mockImplementation(async path => {
     if (path.endsWith('/cancel')) throw new Error('取消接口离线')
+    if (path === `/sessions/${a}/goal`) return {
+      id: 'goal-a', objective: '整理研究资料', status: 'queued', rounds_used: 0, max_rounds: 8,
+      summary: '', last_message_id: null, updated_at: new Date().toISOString(),
+    }
     return records[0]
   })
   const send = vi.spyOn(apiClient, 'postSse').mockImplementation((path, _body, options) => (async function* () {
@@ -63,6 +67,17 @@ function setup() {
 }
 
 describe('real chat composer safety', () => {
+  it('starts /goal in the current session without sending an ordinary chat message', async () => {
+    const view = setup()
+    await screen.findByText('极速')
+    await view.submit('/goal --rounds 8 整理研究资料')
+    expect(await screen.findByRole('region', { name: '长程任务' })).toHaveTextContent('0/8 轮')
+    expect(view.post).toHaveBeenCalledWith(`/sessions/${view.a}/goal`, expect.objectContaining({
+      objective: '整理研究资料', max_rounds: 8, provider_id: 'provider-1', model_id: 'model-1',
+    }))
+    expect(view.send).not.toHaveBeenCalled()
+    expect(view.input()).toHaveValue('')
+  })
   it('preserves raw Markdown drafts without preview when switching sessions', async () => {
     const view = setup()
     await waitFor(() => expect(view.input()).not.toBeDisabled())

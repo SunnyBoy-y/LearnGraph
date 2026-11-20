@@ -15,7 +15,7 @@ from pipecat.processors.aggregators.llm_response_universal import LLMUserAggrega
 from loguru import logger
 from pipecat.turns.user_stop.base_user_turn_stop_strategy import UserTurnStoppedParams
 
-from app.voice.embedded_turn_intent import is_asr_filler
+from app.voice.embedded_turn_intent import is_asr_filler, is_noise_utterance
 
 
 class ReviewedUserAggregator(LLMUserAggregator):
@@ -77,7 +77,7 @@ class ReviewedUserAggregator(LLMUserAggregator):
     def _remember(self, frame):
         sequence = (frame.result or {}).get('audio_turn')
         text = str(frame.text or '').strip()
-        if sequence == self._audio_sequence and text and not is_asr_filler(text):
+        if sequence == self._audio_sequence and text and not is_asr_filler(text) and not is_noise_utterance(text):
             self._drafts.setdefault(sequence, []).append(text)
 
     async def _handle_transcription(self, frame):
@@ -135,7 +135,7 @@ class ReviewedUserAggregator(LLMUserAggregator):
             valid = isinstance(result, dict) and result.get('sequence') == sequence and result.get('status') == 'ok'
             review_ready = time.perf_counter()
             reviewed = str(result.get('text') or '').strip() if valid else ''
-            if reviewed and is_asr_filler(reviewed):
+            if reviewed and (is_asr_filler(reviewed) or is_noise_utterance(reviewed)):
                 reviewed = ''
             # The weak-audio experiment must not turn a late/failed review into
             # an authoritative command from the known-unreliable realtime ASR.

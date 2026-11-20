@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   rewriteAllCitations,
   rewriteWebCitations,
+  stripRawWebCitations,
   parseWebCitationHref,
 } from '@/lib/document-citations'
 
@@ -80,6 +81,31 @@ describe('rewriteWebCitations', () => {
   it('keeps escaped literal citation-like text intact', () => {
     expect(rewriteWebCitations('保留 \\[1] 和 \\[ref_5]', known).markdown)
       .toBe('保留 \\[1] 和 \\[ref_5]')
+  })
+})
+
+describe('raw provider citations', () => {
+  const raw = '\uE200cite\uE202turn923153search3\uE202turn306212search1\uE201'
+
+  it('removes unresolvable IDs without guessing from known source indexes', () => {
+    expect(rewriteAllCitations(`甲${raw}，乙。`, [1, 2, 3])).toEqual({
+      markdown: '甲，乙。', documentCitations: [], webCitations: [],
+    })
+    expect(rewriteAllCitations(`甲${raw}（网页引用：2）。`, [2]).markdown)
+      .toBe('甲[2](/__lgwebcite__/2)。')
+  })
+
+  it('hides every prefix of a streaming marker and preserves later prose', () => {
+    for (let i = 1; i <= raw.length; i++) {
+      expect(rewriteAllCitations(`结论${raw.slice(0, i)}`, [], true).markdown).toBe('结论')
+    }
+    expect(stripRawWebCitations(`结论${raw.slice(0, -1)}`)).toBe('结论')
+    expect(stripRawWebCitations(`结论${raw}。续文`)).toBe('结论。续文')
+  })
+
+  it('keeps literal markers in code and preserves ordinary Markdown links', () => {
+    const text = `结论${raw}。[官网](https://example.org) \`${raw}\`\n\n\`\`\`text\n${raw}\n\`\`\``
+    expect(stripRawWebCitations(text)).toBe(text.replace(raw, ''))
   })
 })
 

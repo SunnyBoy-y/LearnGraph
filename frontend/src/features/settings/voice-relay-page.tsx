@@ -24,7 +24,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 
 /**
- * Deployment-wide voice relay (Cloudflare TURN).
+ * Deployment-wide voice relay (Cloudflare or generic TURN).
  *
  * Two things make this page different from the workspace-scoped settings pages:
  *
@@ -96,7 +96,10 @@ export function VoiceRelayPage() {
 
   const [edited, setEdited] = useState(false);
   useSettingsDirty("voice-relay", edited);
-  const [mode, setMode] = useState<"cloudflare" | "manual">("cloudflare");
+  const [mode, setMode] = useState<"cloudflare" | "turn" | "manual">("cloudflare");
+  const [turnText, setTurnText] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [stunText, setStunText] = useState("");
   const [stunFallback, setStunFallback] = useState(false);
   const [savedUrls, setSavedUrls] = useState<string[]>([]);
@@ -113,14 +116,17 @@ export function VoiceRelayPage() {
   useEffect(() => {
     const data = relay.data;
     if (!data || edited) return;
-    setMode(data.mode === "manual" ? "manual" : "cloudflare");
+    setMode(data.mode);
+    const storedKind = data.secret_mode ?? (data.mode === "turn" ? "turn" : "cloudflare");
+    setTurnText(storedKind === "turn" ? data.urls.join("\n") : "");
+    setUsername(data.username ?? "");
     setStunText((data.stun_urls?.length ? data.stun_urls : data.defaults.stun_urls ?? []).join("\n"));
     setStunFallback(Boolean(data.stun_fallback_enabled));
-    setSavedUrls(data.urls?.length ? data.urls : data.defaults.urls);
+    const urls = storedKind === "turn" ? data.defaults.urls : data.urls?.length ? data.urls : data.defaults.urls;
+    setSavedUrls(urls);
     setKeyId(data.key_id ?? "");
     setApiBase(data.api_base || data.defaults.api_base);
     setTtlHours(Math.max(1, Math.round((data.credential_ttl_seconds || 86400) / 3600)));
-    const urls = data.urls?.length ? data.urls : data.defaults.urls;
     setUseStun(urls.some((url) => url.startsWith("stun:") || url.startsWith("stuns:")));
     const found = urls
       .map(transportOf)
@@ -131,6 +137,9 @@ export function VoiceRelayPage() {
   }, [relay.data, edited]);
 
   const stunUrls = useMemo(() => parseStunText(stunText), [stunText]);
+  const turnUrls = useMemo(() => parseStunText(turnText), [turnText]);
+  const storedKind = relay.data?.secret_mode ?? relay.data?.mode;
+  const savedSecretForMode = Boolean(relay.data?.secret_configured && storedKind === mode);
   const payload = useMemo<VoiceRelaySaveWire>(
     () => ({
       mode,
@@ -142,17 +151,25 @@ export function VoiceRelayPage() {
         urls: buildUrls(useStun, transports, preferred, savedUrls),
         credential_ttl_seconds: Math.round(ttlHours * 3600),
         ...(token.trim() ? { secret: token.trim() } : {}),
+      } : mode === "turn" ? {
+        urls: turnUrls,
+        username: username.trim(),
+        ...(password ? { secret: password } : {}),
       } : {}),
     }),
-    [apiBase, keyId, preferred, token, transports, ttlHours, useStun, mode, stunUrls, stunFallback, savedUrls],
+    [apiBase, keyId, preferred, token, transports, ttlHours, useStun, mode, stunUrls, stunFallback, savedUrls, turnUrls, username, password],
   );
 
   const validStunPool = stunUrls.length > 0 && stunUrls.length <= 16 && stunUrls.every((url) => url.startsWith("stun:"));
-  const canSubmit = mode === "manual" ? validStunPool : (
+  const validTurnUrls = turnUrls.length > 0 && turnUrls.length <= 16 && turnUrls.every((url) => /^turns?:[^\s]+$/.test(url));
+  const canSubmit = mode === "manual" ? validStunPool : mode === "turn" ? (
+    validTurnUrls && username.trim().length > 0 && username.trim().length <= 512 &&
+    (!stunFallback || validStunPool) && (password.length > 0 || savedSecretForMode)
+  ) : (
     keyId.trim().length > 0 &&
     transports.length > 0 &&
     (!stunFallback || validStunPool) &&
-    (token.trim().length > 0 || Boolean(relay.data?.secret_configured))
+    (token.trim().length > 0 || savedSecretForMode)
   );
 
   const saveAndTest = useMutation({
@@ -161,6 +178,7 @@ export function VoiceRelayPage() {
       queryClient.setQueryData(["voice-relay"], saved);
       setEdited(false);
       setToken("");
+      setPassword("");
       setResult(null);
       try {
         return await testVoiceRelay({ ...payload, secret: undefined });
@@ -172,6 +190,7 @@ export function VoiceRelayPage() {
       setEdited(false);
       setResult(tested);
       setToken("");
+      setPassword("");
       void queryClient.invalidateQueries({ queryKey: ["voice-relay"] });
       if (tested.ok) {
         toast.success("连接配置已保存并通过测试，后续新通话使用新配置（当前通话不断开）");
@@ -206,6 +225,7 @@ export function VoiceRelayPage() {
     onSuccess: () => {
       setEdited(false);
       setToken("");
+      setPassword("");
       setConfirmClear(false);
       setResult(null);
       void queryClient.invalidateQueries({ queryKey: ["voice-relay"] });
@@ -242,8 +262,8 @@ export function VoiceRelayPage() {
           {data ? statusBadge(data.status, data.enabled) : null}
         </div>
         <p className="text-sm text-muted-foreground">
-          配置一次，全系统所有用户的语音通话都使用它。未配置时通话只能尝试直连（`host`
-          候选），跨网络通常无法接通。
+          配置一次，全系统所有用户的 WebRTC 语音通话都使用它。未配置时仅尝试直连，跨网络可能无法接通。
+          WebSocket 语音通道不使用 TURN 配置。
         </p>
       </div>
 
@@ -260,10 +280,14 @@ export function VoiceRelayPage() {
       <fieldset disabled={busy} className="min-w-0 space-y-4 rounded-md border p-4">
         <div className="space-y-2">
           <Label>连接配置模式</Label>
-          <RadioGroup value={mode} onValueChange={(value) => { setMode(value as typeof mode); setResult(null); }}>
+          <RadioGroup value={mode} onValueChange={(value) => { setMode(value as typeof mode); setToken(""); setPassword(""); setResult(null); }}>
             <div className="flex items-center gap-2">
               <RadioGroupItem id="voice-relay-mode-cloudflare" value="cloudflare" />
               <Label htmlFor="voice-relay-mode-cloudflare">Cloudflare TURN（可启用独立 STUN 兜底）</Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <RadioGroupItem id="voice-relay-mode-turn" value="turn" />
+              <Label htmlFor="voice-relay-mode-turn">通用 TURN（自建或第三方，用户名与密码）</Label>
             </div>
             <div className="flex items-center gap-2">
               <RadioGroupItem id="voice-relay-mode-manual" value="manual" />
@@ -272,12 +296,14 @@ export function VoiceRelayPage() {
           </RadioGroup>
         </div>
 
-        {mode === "cloudflare" ? (
+        {mode !== "manual" ? (
           <div className="flex items-center justify-between gap-4">
             <div>
               <Label htmlFor="voice-relay-stun-fallback">启用独立 STUN 备选与兜底</Label>
               <p className="text-xs text-muted-foreground">
-                正常时同时下发地址池；Cloudflare 签发失败时继续使用它，并保留仍有效的旧 TURN 凭据。
+                {mode === "turn"
+                  ? "同时向浏览器下发独立 STUN 地址池；密码读取失败时可继续提供 STUN，STUN 不转发媒体。"
+                  : "正常时同时下发地址池；Cloudflare 签发失败时继续使用它，并保留仍有效的旧 TURN 凭据。"}
               </p>
             </div>
             <Switch id="voice-relay-stun-fallback" checked={stunFallback} onCheckedChange={setStunFallback} />
@@ -305,6 +331,45 @@ export function VoiceRelayPage() {
           </div>
         ) : null}
 
+        {mode === "turn" ? (
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="voice-relay-turn-urls">TURN 服务地址</Label>
+              <textarea
+                id="voice-relay-turn-urls"
+                className="min-h-28 w-full rounded-md border bg-transparent px-3 py-2 font-mono text-xs"
+                rows={4}
+                value={turnText}
+                onChange={(event) => setTurnText(event.target.value)}
+                placeholder={"turn:relay.example.com:3478?transport=udp\nturn:relay.example.com:3478?transport=tcp\nturns:relay.example.com:5349?transport=tcp"}
+              />
+              <p className="text-xs text-muted-foreground">
+                每行一个 turn: 或 turns: 地址，最多 16 个。按填写顺序保留并去重；服务端使用首个 TURN 地址，浏览器收到全部地址。
+                测试后可将适合当前部署网络的地址移到第一行。
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="voice-relay-username">TURN 用户名</Label>
+              <Input id="voice-relay-username" autoComplete="off" maxLength={512} value={username} onChange={(event) => setUsername(event.target.value)} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="voice-relay-password">TURN 密码</Label>
+              <Input
+                id="voice-relay-password"
+                type="password"
+                autoComplete="new-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder={savedSecretForMode ? "已配置（••••）— 留空表示不修改" : "填写 TURN 服务密码"}
+              />
+              <p className="text-xs text-muted-foreground">
+                密码由系统主密钥加密入库，配置接口仅回显掩码。语音连接时会将 TURN 凭据下发给已登录客户端。
+                切换凭据类型需重新填写密码或 Token。
+              </p>
+            </div>
+          </div>
+        ) : null}
+
         {mode === "cloudflare" ? <div className="space-y-4">
         <div className="space-y-2">
           <Label htmlFor="voice-relay-key-id">Cloudflare TURN Key ID</Label>
@@ -322,8 +387,8 @@ export function VoiceRelayPage() {
             id="voice-relay-token"
             onChange={(event) => setToken(event.target.value)}
             placeholder={
-              data?.secret_configured
-                ? `已配置（${data.secret_masked ?? "••••"}）— 留空表示不修改`
+              savedSecretForMode
+                ? `已配置（${data?.secret_masked ?? "••••"}）— 留空表示不修改`
                 : "粘贴 Cloudflare 生成的 TURN API Token"
             }
             type="password"
@@ -522,7 +587,7 @@ export function VoiceRelayPage() {
         </section>
       ) : null}
 
-      <details className="rounded-md border p-4">
+      {mode === "cloudflare" ? <details className="rounded-md border p-4">
         <summary className="cursor-pointer text-sm font-medium">
           如何获取 Cloudflare TURN（首次配置请看这里）
         </summary>
@@ -551,7 +616,7 @@ export function VoiceRelayPage() {
           说明：Cloudflare 的 TURN 凭据是短期有效的，本系统保存的是长期凭据（Key ID + API
           Token），短期凭据由服务端按需签发并缓存，到期自动续期——因此不需要人工定期更换。
         </p>
-      </details>
+      </details> : null}
     </div>
   );
 }

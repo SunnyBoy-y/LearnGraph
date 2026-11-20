@@ -94,16 +94,17 @@ async def lifespan(app: FastAPI):
     mark_interrupted_message_streams()
     _prune_dead_egress_policy_snapshots()
     durable_queue_stop: asyncio.Event | None = None
-    durable_queue_task: asyncio.Task[None] | None = None
+    durable_queue_tasks: list[asyncio.Task[None]] = []
     if settings.durable_queue_enabled:
         # Reschedule interrupted chat streams that reached a checkpoint so the
         # worker can perform an audited resume attempt (provider continuation
         # gated by adapter capability; otherwise parked with retry path intact).
         enqueue_interrupted_chat_resumes()
         durable_queue_stop = asyncio.Event()
-        durable_queue_task = asyncio.create_task(
-            durable_queue_worker(durable_queue_stop, f"api-{uuid4()}")
-        )
+        durable_queue_tasks = [
+            asyncio.create_task(durable_queue_worker(durable_queue_stop, f"api-{uuid4()}", goal_lane=False)),
+            asyncio.create_task(durable_queue_worker(durable_queue_stop, f"goal-{uuid4()}", goal_lane=True)),
+        ]
     scheduler_stop: asyncio.Event | None = None
     scheduler_task: asyncio.Task[None] | None = None
     retention_stop: asyncio.Event | None = None
@@ -200,9 +201,9 @@ async def lifespan(app: FastAPI):
         balance_stop.set()
         await balance_task
         await close_embedded_runtime(app)
-        if durable_queue_stop is not None and durable_queue_task is not None:
+        if durable_queue_stop is not None:
             durable_queue_stop.set()
-            await durable_queue_task
+            await asyncio.gather(*durable_queue_tasks)
         if scheduler_stop is not None and scheduler_task is not None:
             scheduler_stop.set()
             await scheduler_task

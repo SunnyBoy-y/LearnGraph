@@ -19,6 +19,9 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+CHAT_GOAL_JOB_KIND = "chat.goal_round"
+
+
 class DurableQueue:
     """Database-backed queue with lease-token fencing for every state change.
 
@@ -93,7 +96,10 @@ class DurableQueue:
         self.db.refresh(job)
         return job
 
-    def claim_next(self, *, now: datetime | None = None, kind: str | None = None) -> DurableJob | None:
+    def claim_next(
+        self, *, now: datetime | None = None, kind: str | None = None,
+        exclude_kind: str | None = None,
+    ) -> DurableJob | None:
         now = now or utc_now()
         eligible = or_(
             (DurableJob.status == "queued") & (DurableJob.available_at <= now),
@@ -102,6 +108,8 @@ class DurableQueue:
         statement = select(DurableJob.id).where(eligible)
         if kind:
             statement = statement.where(DurableJob.kind == kind)
+        if exclude_kind:
+            statement = statement.where(DurableJob.kind != exclude_kind)
         if self._last_claimed_workspace is not None:
             # Tenant fairness: false (0) sorts before true (1) in SQLite, so a
             # workspace that was just served is moved behind other workspaces.
@@ -312,7 +320,9 @@ def enqueue_memory_extraction(
 
 
 
-def run_one_durable_job(worker_id: str) -> bool:
+def run_one_durable_job(
+    worker_id: str, *, kind: str | None = None, exclude_kind: str | None = None,
+) -> bool:
     """Claim and execute a single closed-registry queue job in a worker thread."""
 
     settings = get_settings()
@@ -323,7 +333,7 @@ def run_one_durable_job(worker_id: str) -> bool:
             lease_seconds=settings.durable_queue_lease_seconds,
             max_attempts=settings.durable_queue_max_attempts,
         )
-        job = queue.claim_next()
+        job = queue.claim_next(kind=kind, exclude_kind=exclude_kind)
         if job is None:
             return False
         try:
@@ -345,6 +355,10 @@ def run_one_durable_job(worker_id: str) -> bool:
                     str(job.payload["execution_token"]),
                 )
                 queue.complete(job)
+            elif job.kind == CHAT_GOAL_JOB_KIND:
+                from app.services.chat_goals import run_goal_round
+
+                run_goal_round(job, worker_id)
             elif job.kind == "chat.continue_stream":
                 from app.services.chat_durable import run_chat_continue_once
 
@@ -410,14 +424,16 @@ def run_one_durable_job(worker_id: str) -> bool:
 
 
 
-async def durable_queue_worker(stop: asyncio.Event, worker_id: str) -> None:
-    """Poll the durable queue without blocking FastAPI's event loop."""
+async def durable_queue_worker(
+    stop: asyncio.Event, worker_id: str, *, goal_lane: bool | None = None,
+) -> None:
+    """Poll the queue; the API reserves its own lane for long goal rounds."""
 
     settings = get_settings()
     import time
     next_sticker_sweep = 0.0
     while not stop.is_set():
-        if time.monotonic() >= next_sticker_sweep:
+        if goal_lane is not True and time.monotonic() >= next_sticker_sweep:
             import logging
             try:
                 from app.services.stickers import reconcile_sticker_indexes
@@ -425,7 +441,12 @@ async def durable_queue_worker(stop: asyncio.Event, worker_id: str) -> None:
             except Exception:
                 logging.getLogger(__name__).exception("Sticker index reconciliation failed")
             next_sticker_sweep = time.monotonic() + 15
-        claimed = await asyncio.to_thread(run_one_durable_job, worker_id)
+        if goal_lane is True:
+            claimed = await asyncio.to_thread(run_one_durable_job, worker_id, kind=CHAT_GOAL_JOB_KIND)
+        elif goal_lane is False:
+            claimed = await asyncio.to_thread(run_one_durable_job, worker_id, exclude_kind=CHAT_GOAL_JOB_KIND)
+        else:
+            claimed = await asyncio.to_thread(run_one_durable_job, worker_id)
         if claimed:
             continue
         try:

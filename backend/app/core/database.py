@@ -1222,8 +1222,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.19.0"
-CURRENT_SCHEMA_DESCRIPTION = "Private opening prompt pools and generation budgets"
+CURRENT_SCHEMA_REVISION = "v1.20.0"
+CURRENT_SCHEMA_DESCRIPTION = "Generic TURN username and isolated credential kind"
 
 
 def _compute_schema_checksum() -> str:

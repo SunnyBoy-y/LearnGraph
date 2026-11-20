@@ -55,3 +55,20 @@ def test_voice_preference_is_owned_and_accepts_only_booleans(client, register_us
     assert client.patch(path, headers=auth_headers(other_token, other_workspace),
                         json={"low_latency_mode": True}).status_code in (403, 404)
     assert client.get(f"/api/v1/voice/sessions/{voice['id']}", headers=headers).json()["low_latency_mode"] is False
+
+
+def test_voice_web_search_preference_defaults_on_and_toggles_cleanly(client, register_user, auth_headers):
+    token, workspace, *_ = register_user("voice_web_search_pref")
+    headers = auth_headers(token, workspace)
+    voice = create_voice(client, headers)
+    assert voice["web_search_enabled"] is True
+    path = f"/api/v1/voice/sessions/{voice['id']}/preferences"
+    disabled = client.patch(path, headers=headers, json={"web_search_enabled": False})
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["web_search_enabled"] is False
+    assert disabled.json()["low_latency_mode"] is False
+    fetched = client.get(f"/api/v1/voice/sessions/{voice['id']}", headers=headers)
+    assert fetched.json()["context_snapshot"]["web_search_enabled"] is False
+    enabled = client.patch(path, headers=headers, json={"web_search_enabled": True})
+    assert enabled.status_code == 200
+    assert enabled.json()["web_search_enabled"] is True

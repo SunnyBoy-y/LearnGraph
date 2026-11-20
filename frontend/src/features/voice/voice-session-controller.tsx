@@ -1908,6 +1908,14 @@ export const voiceSessionController = {
     void loadVoiceCapabilities();
   },
   setThinkingLimit(value: ThinkingLimit) { persistLimit(value); update({ thinkingLimit: value }); },
+  async setWebSearchEnabled(enabled: boolean) {
+    if (!snapshot.sessionIdRemote || snapshot.transport !== "connected") return;
+    try {
+      await apiClient.patch(`/voice/sessions/${snapshot.sessionIdRemote}/preferences`, { web_search_enabled: enabled });
+    } catch {
+      // Ignore transient preference sync failures; the next turn or reconnect will resync.
+    }
+  },
   async setLowLatencyMode(enabled: boolean) {
     if (snapshot.lowLatencySaving) return;
     const current = captureVoiceOwner();

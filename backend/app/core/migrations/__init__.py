@@ -390,6 +390,22 @@ def _voice_relay_stun_pool(connection: Connection) -> None:
             connection.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
 
 
+def _voice_relay_generic_turn(connection: Connection) -> None:
+    """Add generic TURN identity while labelling all legacy tokens Cloudflare."""
+
+    from app.domain.models import VoiceRelayConfig
+
+    table = VoiceRelayConfig.__table__
+    if not inspect(connection).has_table(table.name):
+        table.create(bind=connection, checkfirst=True)
+        return
+    existing = {str(column["name"]) for column in inspect(connection).get_columns(table.name)}
+    for name in ("username", "secret_mode"):
+        if name not in existing:
+            ddl = str(CreateColumn(table.c[name]).compile(dialect=connection.dialect))
+            connection.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
+
+
 def _user_avatar(connection: Connection) -> None:
     columns = {column["name"] for column in inspect(connection).get_columns("users")}
     if "avatar_url" not in columns:
@@ -513,6 +529,10 @@ MIGRATIONS = (
     SchemaMigration(
         "v1.19.0", "Private opening prompt pools and generation budgets",
         _opening_prompt_cache,
+    ),
+    SchemaMigration(
+        "v1.20.0", "Generic TURN username and isolated credential kind",
+        _voice_relay_generic_turn,
     ),
 )
 

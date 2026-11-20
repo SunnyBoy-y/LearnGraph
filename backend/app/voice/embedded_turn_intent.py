@@ -133,6 +133,151 @@ def is_asr_filler(text: str) -> bool:
     return bool(_ASR_FILLER_RE.fullmatch(unicodedata.normalize("NFKC", text or "")))
 
 
+_NOISE_INTERJECTIONS = frozenset(
+    {
+        "那个",
+        "这个",
+        "就是",
+        "然后",
+        "啊这",
+        "呃那个",
+        "嗯那个",
+        "那个啥",
+        "就是说",
+        "哎呀",
+        "哎哟",
+        "哎",
+        "唉",
+        "哼",
+        "哈",
+        "哈哈",
+        "哈哈哈",
+        "呵呵",
+        "嘿",
+        "嘿嘿",
+        "嘶",
+        "咳",
+        "呸",
+        "哇",
+        "呀",
+        "啦",
+        "嘛",
+        "喂",
+        "喂喂",
+        "卧槽",
+        "我靠",
+        "我擦",
+        "妈呀",
+        "天哪",
+        "我的天",
+        "我的妈",
+        "um",
+        "uh",
+        "er",
+        "ah",
+        "oh",
+        "hmm",
+        "hm",
+        "mm",
+        "mmm",
+        "shh",
+        "tsk",
+        "ha",
+        "haha",
+        "hey",
+        "wow",
+        "oops",
+        "ugh",
+    }
+)
+_BYSTANDER_FRAGMENT_RE = re.compile(
+    r"^(?:"
+    r"(?:我|你|他|她|咱|老)?(?:爸|妈|爹|娘|爷|奶|哥|姐|弟|妹|婆|公)"
+    r"|(?:爸爸|妈妈|老爸|老妈|爷爷|奶奶|外公|外婆|姥爷|姥姥|哥哥|姐姐|弟弟|妹妹|老婆|老公|儿子|女儿|宝贝|宝宝)"
+    r")$"
+)
+_BROKEN_TWO_CHAR_FRAGMENTS = frozenset(
+    {
+        "我的",
+        "你的",
+        "他的",
+        "她的",
+        "它的",
+        "这是",
+        "那是",
+        "因为",
+        "所以",
+        "虽然",
+        "如果",
+        "或者",
+        "而且",
+        "并且",
+        "了的",
+        "的了",
+        "吧的",
+        "啊的",
+        "我这",
+        "你这",
+        "他这",
+        "我也",
+        "你也",
+        "我都",
+        "你都",
+        "我有",
+        "你有",
+        "我就",
+        "你就",
+        "我在",
+        "你在",
+        "他在",
+    }
+)
+_VALID_SINGLE_CJK = frozenset("好对是行不没停换查搜写做看听讲说读画算试懂会能要啥谁哪几")
+_INTERIM_ALLOW_SHORT_CJK = _VALID_SINGLE_CJK | frozenset("吗呢")
+
+
+def _is_cjk_char(ch: str) -> bool:
+    return "\u3400" <= ch <= "\u9fff"
+
+
+def classify_noise_utterance(text: str, *, is_interim: bool = False) -> str | None:
+    """判定是否为应静默丢弃的噪音/旁人插话/残片；合法语句返回 None。"""
+    raw = unicodedata.normalize("NFKC", str(text or "")).strip()
+    compact = _compact(raw)
+    if not compact:
+        return "empty"
+    if is_asr_filler(raw):
+        return "asr_filler"
+    intent = DEFAULT_TURN_INTENT_CLASSIFIER.classify(raw)
+    if intent is TurnIntent.INTERRUPTION or intent is TurnIntent.BACKCHANNEL:
+        return None
+    if any(ch.isdigit() for ch in compact):
+        return None
+    if compact in _NOISE_INTERJECTIONS:
+        return "hesitation_or_interjection"
+    if _BYSTANDER_FRAGMENT_RE.fullmatch(compact):
+        return "bystander_fragment"
+    if len(compact) >= 2 and len(set(compact)) == 1 and compact[0] not in {"好", "对", "是", "行"}:
+        return "repeated_char"
+    if compact in _BROKEN_TWO_CHAR_FRAGMENTS:
+        return "broken_fragment"
+    if len(compact) == 1 and _is_cjk_char(compact[0]) and compact[0] not in _VALID_SINGLE_CJK:
+        return "isolated_char"
+    if (
+        is_interim
+        and len(compact) <= 2
+        and all(_is_cjk_char(ch) for ch in compact)
+        and not any(ch in _INTERIM_ALLOW_SHORT_CJK for ch in compact)
+    ):
+        return "pending_short_interim"
+    return None
+
+
+def is_noise_utterance(text: str, *, is_interim: bool = False) -> bool:
+    """是否应静默丢弃该语音识别片段。"""
+    return classify_noise_utterance(text, is_interim=is_interim) is not None
+
+
 class TurnIntentClassifier:
     def __init__(self, profiles: Iterable[LanguageProfile] | None = None) -> None:
         self._profiles: list[LanguageProfile] = list(

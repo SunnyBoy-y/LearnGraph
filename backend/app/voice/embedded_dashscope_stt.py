@@ -114,7 +114,7 @@ from app.voice.embedded_input_frames import (
     RealtimeTranscriptionFrame as TranscriptionFrame,
     RealtimeInterimTranscriptionFrame as InterimTranscriptionFrame,
 )
-from app.voice.embedded_turn_intent import is_asr_filler, is_backchannel
+from app.voice.embedded_turn_intent import classify_noise_utterance, is_asr_filler, is_backchannel
 from app.voice.embedded_asr_review import TurnAudioBuffer, WholeTurnASRReviewer, review_url, pcm_peak_dbfs
 
 
@@ -1194,27 +1194,32 @@ class DashScopeSTTService(STTService):
             logger.debug(f"{self}: assistant reply query failed", exc_info=True)
             return False
 
-    def _is_backchannel_filler(self, text: str) -> bool:
-        """在转录进入账本、字幕和回合管线前过滤整句背声词。
+    def _is_backchannel_filler(self, text: str, *, is_interim: bool = False) -> bool:
+        """在转录进入账本、字幕和回合管线前过滤背声词与噪音残片。
 
-        正则全文匹配的纯语气词（「嗯。」「哦……」「嗯，啊。」等）无条件
-        丢弃，避免云端幻觉在助手未出声时开启新回合。包含实义内容的句子
-        （「嗯，我想问一下」）不会匹配，后续增长的 partial 仍可正常通过。
+        正则全文匹配的纯语气词（「嗯。」「哦……」「嗯，啊。」等）与噪音/旁人
+        插话残片（「我爸。」「那个。」等）无条件静默丢弃，避免在前端上屏并
+        触发无意义回复。包含实义内容的句子（「嗯，我想问一下」）不会匹配，
+        后续增长的 partial 仍可正常通过。
         「好的」「是的」等确认回复沿用原策略：只在助手正在作答时过滤。
         """
         if not text:
             return False
-        pure_filler = is_asr_filler(text)
-        if not pure_filler and not (
-            is_backchannel(text) and self._assistant_reply_in_flight()
-        ):
+        noise_reason = classify_noise_utterance(text, is_interim=is_interim)
+        backchannel_blocked = (
+            noise_reason is None
+            and is_backchannel(text)
+            and self._assistant_reply_in_flight()
+        )
+        if noise_reason is None and not backchannel_blocked:
             return False
         self._suppressed_backchannels += 1
+        reason_label = noise_reason or "backchannel_while_replying"
         logger.debug(
-            f"{self}: suppressed {'ASR filler' if pure_filler else 'backchannel while assistant is replying'}"
+            f"{self}: suppressed utterance ({reason_label})"
             f" (text_len={len(text)}, total={self._suppressed_backchannels})"
         )
-        timeline_mark("stt", "背声词滤除", f"text_len={len(text)}")
+        timeline_mark("stt", "噪音/背声滤除", f"reason={reason_label} text_len={len(text)}")
         return True
 
     async def _finish_segment(self, trigger: str) -> None:
@@ -1474,7 +1479,7 @@ class DashScopeSTTService(STTService):
                             # 4964+ 且逐字增长），interim 只用于实时字幕，
                             # 截断到尾部即可，权威文本以 final 为准。
                             display = text[-_INTERIM_MAX_CHARS:] if len(text) > _INTERIM_MAX_CHARS else text
-                            if not self._is_backchannel_filler(display):
+                            if not self._is_backchannel_filler(display, is_interim=True):
                                 await self.push_frame(
                                     InterimTranscriptionFrame(
                                         display, self._user_id, time_now_iso8601()

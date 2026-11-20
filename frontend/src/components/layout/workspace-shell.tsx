@@ -218,7 +218,7 @@ const primaryNav: NavItem[] = [
   {
     label: "图谱",
     icon: Network,
-    path: "chat/new?mode=goal",
+    path: "graphs",
     aliases: ["/graphs/", "/capabilities"],
   },
   // 「路线」不再是一级入口：Roadmap 收敛为图谱内的「学习计划」时间行动层
@@ -544,21 +544,7 @@ function SidebarNav({
   const [deleteImpactLoading, setDeleteImpactLoading] = useState(false);
   const [deleteConfirming, setDeleteConfirming] = useState(false);
   const base = `/w/${workspaceId}`;
-  const runtimePrimaryNav = primaryNav.map((item) =>
-    item.label === "新对话"
-      ? {
-          ...item,
-          path: "chat/new",
-        }
-      : item.label === "图谱"
-        ? {
-            ...item,
-            // 图谱工作台默认进入书架；单开某本图谱后再进入画布。
-            path: "graphs",
-          }
-          : item,
-  );
-  const nav = runtimePrimaryNav.slice(0, 5);
+  const nav = primaryNav.slice(0, 5);
   const moreNav = primaryMoreNav;
   const moreActive = moreNav.some((item) => isNavActive(pathname, item));
   const publishProjectContext = useCallback(
@@ -3597,7 +3583,7 @@ function GoalGraphPreviewRail() {
         </Badge>
       </div>
       {graph.nodes.length ? (
-        <Suspense fallback={null}><KnowledgeGraph
+        <Suspense fallback={<div className="grid min-h-48 place-items-center text-xs text-muted-foreground" role="status">正在加载目标图谱…</div>}><KnowledgeGraph
           className="chat-graph-rail__canvas"
           compact
           edges={graph.edges}
@@ -3751,11 +3737,30 @@ function GraphWorkspaceRail() {
  * 当前页面不该跟着重渲染（首页 dashboard 的图表重渲染一次就是几十毫秒）。
  * 路由变化仍会经 RouteContext 让这里重新渲染。
  */
+function ShellOutletFallback() {
+  return (
+    <div
+      aria-busy="true"
+      aria-label="正在加载页面"
+      className="mx-auto flex w-full max-w-[1180px] flex-col gap-5 px-5 pb-16 pt-14 sm:px-7 lg:pt-6"
+    >
+      <div className="h-7 w-48 animate-pulse rounded-md bg-muted" />
+      <div className="h-32 animate-pulse rounded-2xl border bg-muted/35" />
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div className="h-40 animate-pulse rounded-2xl border bg-muted/35" />
+        <div className="h-40 animate-pulse rounded-2xl border bg-muted/35" />
+      </div>
+    </div>
+  );
+}
+
 const ShellOutlet = memo(function ShellOutlet() {
   return (
-    <RouteMotion>
-      <Outlet />
-    </RouteMotion>
+    <Suspense fallback={<ShellOutletFallback />}>
+      <RouteMotion>
+        <Outlet />
+      </RouteMotion>
+    </Suspense>
   );
 });
 
@@ -3818,13 +3823,35 @@ export function WorkspaceShell() {
   const isDocumentReader = pathname.includes("/documents/");
   const isSettings = pathname.includes("/settings/");
   const isMemory = pathname.includes("/memory");
-  // Remember the last non-settings location so closing the modal can restore it.
+  // Remember the last non-settings location so closing the modal can restore it,
+  // even across a full page refresh while the settings modal is open.
+  const settingsOriginStorageKey = workspaceId
+    ? `learngraph:settings-origin:${workspaceId}`
+    : null;
   const settingsOriginRef = useRef<string | null>(null);
+  if (settingsOriginRef.current === null && settingsOriginStorageKey) {
+    try {
+      const stored = window.sessionStorage.getItem(settingsOriginStorageKey);
+      if (stored && !stored.includes("/settings/")) {
+        settingsOriginRef.current = stored;
+      }
+    } catch {
+      // Ignore storage access errors.
+    }
+  }
   useEffect(() => {
     if (!pathname.includes("/settings/")) {
-      settingsOriginRef.current = `${pathname}${search}`;
+      const target = `${pathname}${search}`;
+      settingsOriginRef.current = target;
+      if (settingsOriginStorageKey) {
+        try {
+          window.sessionStorage.setItem(settingsOriginStorageKey, target);
+        } catch {
+          // Ignore storage access errors.
+        }
+      }
     }
-  }, [pathname, search]);
+  }, [pathname, search, settingsOriginStorageKey]);
   const isGoalClarify =
     pathname.includes("/goals/new/clarify") ||
     (isChat && new URLSearchParams(search).get("mode") === "goal");

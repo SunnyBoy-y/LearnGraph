@@ -56,7 +56,7 @@ COPY backend/sandbox ./sandbox
 
 FROM ${PYTHON_IMAGE} AS runtime
 
-ARG APP_VERSION=v0.5
+ARG APP_VERSION=v0.6
 ARG UPDATE_COMPATIBILITY=1
 ARG SOURCE_REPOSITORY=https://github.com/SunnyBoy-y/LearnGraph
 LABEL org.opencontainers.image.version=$APP_VERSION \

@@ -1,10 +1,11 @@
-"""Deployment-wide voice relay (Cloudflare TURN) API.
+"""Deployment-wide voice relay (Cloudflare or generic TURN) API.
 
 Two very different audiences share these routes:
 
 * ``GET /voice/ice-servers`` is read by **every** signed-in user: the browser
-  needs ICE servers before it can build a peer connection, and the credential
-  Cloudflare hands out is short-lived and designed to be held by clients.
+  needs ICE servers before it can build a peer connection. Cloudflare supplies
+  short-lived credentials; generic TURN supplies the configured static password.
+  Both are required by the browser for TURN authentication.
 * every other route is **deployment-administrator only** and never returns the
   stored secret -- a mask and a fingerprint only, mirroring the provider pages.
 """
@@ -13,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 from app.api.deps import AppSettings, CurrentPrincipal, DB, SystemAdminContext
 from app.repositories.audit import AuditRepository
@@ -51,13 +52,14 @@ def _audit(
 
 
 @router.get("/ice-servers")
-def voice_ice_servers(principal: CurrentPrincipal, db: DB, settings: AppSettings):
+def voice_ice_servers(response: Response, principal: CurrentPrincipal, db: DB, settings: AppSettings):
     """ICE servers for the calling browser (empty list when unconfigured).
 
     Never fails: a broken relay configuration degrades to "no ICE servers",
     which is exactly the behaviour of a deployment that never configured one.
     """
 
+    response.headers["Cache-Control"] = "no-store"
     resolved = VoiceRelayService(db, settings).resolve()
     return {
         "iceServers": [resolved.as_client_config()] if resolved.configured else [],
@@ -115,11 +117,10 @@ async def test_voice_relay(
     db: DB,
     settings: AppSettings,
 ):
-    """Mint a credential and probe every URL from this machine.
+    """Resolve configured credentials and probe every URL from this machine.
 
-    Returns Cloudflare's own URL set alongside the configured one: the first
-    real run is what confirms the response shape and which transport actually
-    works from inside the deployment.
+    Cloudflare mode mints temporary credentials and reports its returned URL set;
+    generic TURN mode authenticates directly with the configured username/password.
     """
 
     service = VoiceRelayService(db, settings)

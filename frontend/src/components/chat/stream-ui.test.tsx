@@ -155,7 +155,7 @@ describe("stream UI", () => {
     const { container, rerender } = render(
       <StreamUI data={data} partId={`graph-footer-${embedded}`} embedded={embedded} onAction={onAction} />,
     );
-    expect(screen.getByText("函数概念与基本性质")).toBeInTheDocument();
+    expect(screen.queryByText("函数概念与基本性质")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "函数概念" })).toBeInTheDocument();
     expect(screen.queryByText(/拖动画布移动/)).not.toBeInTheDocument();
     expect(screen.queryByText(sourceNote)).not.toBeInTheDocument();

@@ -1623,6 +1623,24 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                  state="BUSY", idle_since=None).execution_options(synchronize_session=False))
         if claimed.rowcount != 1:
             self.db.rollback()
+            # Reclaim stale BUSY slots left behind by crashed/restarted workers.
+            stale_cutoff = utc_now() - timedelta(minutes=15)
+            reclaimed = self.db.execute(
+                update(SandboxInstance)
+                .where(
+                    SandboxInstance.id == instance.id,
+                    SandboxInstance.state == "BUSY",
+                    SandboxInstance.updated_at < stale_cutoff,
+                )
+                .values(active_executions=1, state="BUSY", idle_since=None)
+                .execution_options(synchronize_session=False)
+            )
+            if reclaimed.rowcount == 1:
+                if command is not None:
+                    command.instance_id = instance.id
+                self.db.commit()
+                return
+            self.db.rollback()
             raise AppError(429, "sandbox_instance_saturated", "All execution slots are busy")
         if command is not None:
             command.instance_id = instance.id

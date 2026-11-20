@@ -132,6 +132,7 @@ class VoiceTaskRevisionRequest(BaseModel):
 
 class VoiceSession(BaseModel):
     low_latency_mode: bool = False
+    web_search_enabled: bool = True
     id: str
     session_id: str | None = None
     chat_session_id: str
@@ -163,6 +164,7 @@ from app.providers.realtime_information import ClientEnvironment
 
 class VoiceSessionCreateRequest(BaseModel):
     low_latency_mode: bool | None = Field(default=None, strict=True)
+    web_search_enabled: bool | None = Field(default=None, strict=True)
     client_environment: ClientEnvironment | None = None
     chat_session_id: str | None = Field(default=None, min_length=1, max_length=36)
     session_id: str | None = Field(default=None, min_length=1, max_length=36)
@@ -184,7 +186,18 @@ class VoiceSessionCreateRequest(BaseModel):
         return self
 
 class VoiceSessionPreferencesRequest(BaseModel):
-    low_latency_mode: bool = Field(strict=True)
+    low_latency_mode: bool | None = Field(default=None, strict=True)
+    web_search_enabled: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def validate_fields(self) -> "VoiceSessionPreferencesRequest":
+        if "low_latency_mode" in self.model_fields_set and self.low_latency_mode is None:
+            raise ValueError("low_latency_mode must be a boolean")
+        if "web_search_enabled" in self.model_fields_set and self.web_search_enabled is None:
+            raise ValueError("web_search_enabled must be a boolean")
+        if not self.model_fields_set:
+            raise ValueError("at least one preference field is required")
+        return self
 
 
 class VoiceTaskStartRequest(BaseModel):

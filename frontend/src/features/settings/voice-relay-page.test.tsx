@@ -27,8 +27,15 @@ function config(mode: "manual" | "cloudflare" = "manual"): VoiceRelayConfigWire 
 }
 
 function mount(data = config(), registerDirty = (_id: string, _dirty: boolean) => {}) {
-  vi.mocked(getVoiceRelay).mockResolvedValue(data);
-  vi.mocked(saveVoiceRelay).mockImplementation(async (payload) => ({ ...data, ...payload } as VoiceRelayConfigWire));
+  let persisted = data;
+  vi.mocked(getVoiceRelay).mockImplementation(async () => persisted);
+  vi.mocked(saveVoiceRelay).mockImplementation(async ({ secret, ...payload }) => {
+    persisted = {
+      ...persisted, ...payload,
+      ...(secret && payload.mode !== "manual" ? { secret_mode: payload.mode, secret_configured: true } : {}),
+    } as VoiceRelayConfigWire;
+    return persisted;
+  });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   render(<QueryClientProvider client={client}><SettingsDirtyContext.Provider value={registerDirty}><VoiceRelayPage /></SettingsDirtyContext.Provider></QueryClientProvider>);
 }
@@ -91,6 +98,73 @@ describe("voice relay settings", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存并测试连接" }));
     await waitFor(() => expect(saveVoiceRelay).toHaveBeenCalledTimes(1));
     expect(vi.mocked(saveVoiceRelay).mock.calls[0][0].stun_fallback_enabled).toBe(true);
+  });
+
+  it("saves generic UDP/TCP TURN credentials and omits the password from the saved-config probe", async () => {
+    mount(config("cloudflare"));
+    await screen.findByLabelText("Cloudflare TURN Key ID");
+    fireEvent.click(screen.getByRole("radio", { name: "通用 TURN（自建或第三方，用户名与密码）" }));
+    const addresses = screen.getByLabelText("TURN 服务地址");
+    expect(addresses).toHaveValue("");
+    expect(screen.queryByLabelText("Cloudflare API Token")).toBeNull();
+    const turnUrls = ["turn:relay.example.com:3478?transport=udp", "turn:relay.example.com:3478?transport=tcp"];
+    fireEvent.change(addresses, { target: { value: [...turnUrls, turnUrls[0]].join("\n") } });
+    fireEvent.change(screen.getByLabelText("TURN 用户名"), { target: { value: "test-user" } });
+    expect(screen.getByRole("button", { name: "保存并测试连接" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("TURN 密码"), { target: { value: " test-only-password " } });
+    fireEvent.click(screen.getByRole("button", { name: "保存并测试连接" }));
+    await waitFor(() => expect(saveVoiceRelay).toHaveBeenCalledOnce());
+    expect(vi.mocked(saveVoiceRelay).mock.calls[0][0]).toEqual({
+      mode: "turn", urls: turnUrls, username: "test-user", secret: " test-only-password ",
+      stun_urls: pool, stun_fallback_enabled: false,
+    });
+    await waitFor(() => expect(testVoiceRelay).toHaveBeenCalledOnce());
+    expect(vi.mocked(testVoiceRelay).mock.calls[0][0].secret).toBeUndefined();
+    expect(screen.getByLabelText("TURN 密码")).toHaveValue("");
+  });
+
+  it("loads saved generic TURN and keeps a blank password while editing URL order", async () => {
+    const turnUrls = ["turn:relay.example.com:3478?transport=udp", "turn:relay.example.com:3478?transport=tcp"];
+    mount({ ...config(), mode: "turn", secret_mode: "turn", urls: turnUrls, username: "saved-user", secret_configured: true, secret_masked: "••••" });
+    const addresses = await screen.findByLabelText("TURN 服务地址");
+    await waitFor(() => expect(addresses).toHaveValue(turnUrls.join("\n")));
+    expect(screen.getByLabelText("TURN 用户名")).toHaveValue("saved-user");
+    expect(screen.getByLabelText("TURN 密码")).toHaveValue("");
+    fireEvent.change(addresses, { target: { value: [...turnUrls].reverse().join("\n") } });
+    fireEvent.click(screen.getByRole("button", { name: "保存并测试连接" }));
+    await waitFor(() => expect(saveVoiceRelay).toHaveBeenCalledOnce());
+    const saved = vi.mocked(saveVoiceRelay).mock.calls[0][0];
+    expect(saved.urls).toEqual([...turnUrls].reverse());
+    expect(saved.secret).toBeUndefined();
+    expect(saved.key_id).toBeUndefined();
+  });
+
+  it("restores a retained generic credential from manual STUN without asking for the password again", async () => {
+    const turnUrls = ["turns:relay.example.com:5349?transport=tcp"];
+    mount({ ...config(), secret_mode: "turn", urls: turnUrls, username: "retained-user", secret_configured: true });
+    await screen.findByLabelText("手动 STUN 地址池");
+    fireEvent.click(screen.getByRole("radio", { name: "通用 TURN（自建或第三方，用户名与密码）" }));
+    expect(screen.getByLabelText("TURN 服务地址")).toHaveValue(turnUrls[0]);
+    expect(screen.getByRole("button", { name: "保存并测试连接" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "保存并测试连接" }));
+    await waitFor(() => expect(saveVoiceRelay).toHaveBeenCalledOnce());
+    expect(vi.mocked(saveVoiceRelay).mock.calls[0][0].secret).toBeUndefined();
+  });
+
+  it("requires a fresh Cloudflare token when switching from generic TURN and clears draft passwords", async () => {
+    mount({ ...config("cloudflare"), mode: "turn", secret_mode: "turn", urls: ["turn:relay.example.com:3478"], username: "saved-user" });
+    await screen.findByLabelText("TURN 密码");
+    fireEvent.change(screen.getByLabelText("TURN 密码"), { target: { value: "draft-only-password" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Cloudflare TURN（可启用独立 STUN 兜底）" }));
+    expect(screen.getByRole("button", { name: "保存并测试连接" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Cloudflare API Token"), { target: { value: "new-test-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存并测试连接" }));
+    await waitFor(() => expect(saveVoiceRelay).toHaveBeenCalledOnce());
+    expect(vi.mocked(saveVoiceRelay).mock.calls[0][0].urls).toEqual(urls);
+    expect(vi.mocked(saveVoiceRelay).mock.calls[0][0].secret).toBe("new-test-token");
+    await waitFor(() => expect(testVoiceRelay).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("radio", { name: "通用 TURN（自建或第三方，用户名与密码）" }));
+    expect(screen.getByLabelText("TURN 密码")).toHaveValue("");
   });
 
   it("does not request deployment config for a non-admin", async () => {

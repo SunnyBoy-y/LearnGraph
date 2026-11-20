@@ -114,6 +114,8 @@ def test_authorized_personalized_json_billing_and_no_side_effects(env):
     assert result.metadata["memory_used"] is True
     assert "我喜欢Python编程" in env.prompts[0] and "Python基础学习" in env.prompts[0]
     assert "不可信数据" in env.prompts[0] and "allowed_effect" in env.prompts[0]
+    assert "每日新闻" in env.prompts[0] and "严禁推荐没有时间安排或周期意义的一次性普通对话问题" in env.prompts[0]
+    assert "必须明确包含触发时间或周期频率" in env.prompts[0]
     assert env.calls[0]["thinking_mode"] == "off"
     assert env.calls[0]["search_route"] == "disabled"
     assert env.calls[0]["prefer_fast"] is True

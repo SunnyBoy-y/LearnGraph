@@ -46,6 +46,20 @@ describe("citation Markdown integration", () => {
     expect(screen.getByText("array[1]")).toBeInTheDocument();
   });
 
+  it("hides legacy provider IDs and only opens the URL supplied by a verified source", async () => {
+    const raw = "\uE200cite\uE202turn923153search3\uE201";
+    const legacy = { ...textPart, content: `旧结论${raw}。` };
+    const { container, rerender } = renderWithProviders(<MessagePartRenderer part={legacy} siblingParts={[legacy, sourcePart]} />);
+    await screen.findByText("旧结论。");
+    expect(container).toHaveTextContent("旧结论。");
+    expect(container).not.toHaveTextContent("turn923153search3");
+    expect(container.querySelector("[data-citation-ids]")).toBeNull();
+    const fresh = { ...textPart, content: `新结论${raw}（网页引用：3）。` };
+    rerender(<MessagePartRenderer part={fresh} siblingParts={[fresh, sourcePart]} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Third source/ }));
+    expect(await screen.findByRole("link", { name: /Third source/ })).toHaveAttribute("href", "https://three.example/paper");
+  });
+
   it("preserves document locator and chunk navigation in the source card", async () => {
     const fileId = "12345678-1234-1234-1234-123456789012";
     const part: MessagePart = { ...textPart, content: `依据（依据文件：${fileId}，位置：paragraph:7）` };

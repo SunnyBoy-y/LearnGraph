@@ -235,6 +235,7 @@ class VoiceSessionService:
             websocket_url=websocket_runtime_url(self.settings),
             context_snapshot=row.context_snapshot or {},
             low_latency_mode=(row.context_snapshot or {}).get("low_latency_mode") is True,
+            web_search_enabled=(row.context_snapshot or {}).get("web_search_enabled", True) is not False,
             scene_presentation=presentation,
             tasks=[
                 VoiceTaskLink(
@@ -335,16 +336,29 @@ class VoiceSessionService:
         self.db.commit()
         return self.get_session(voice_session_id)
 
-    def update_preferences(self, voice_session_id: str, *, low_latency_mode: bool) -> VoiceSession:
+    def update_preferences(
+        self,
+        voice_session_id: str,
+        *,
+        low_latency_mode: bool | None = None,
+        web_search_enabled: bool | None = None,
+    ) -> VoiceSession:
         session = self.get_session(voice_session_id, write=True)
-        if session.low_latency_mode == low_latency_mode:
+        next_low_latency = session.low_latency_mode if low_latency_mode is None else low_latency_mode
+        next_web_search = session.web_search_enabled if web_search_enabled is None else web_search_enabled
+        if session.low_latency_mode == next_low_latency and session.web_search_enabled == next_web_search:
             return session
         row = self.db.get(VoiceSessionRecord, voice_session_id)
-        row.context_snapshot = {**(row.context_snapshot or {}), "low_latency_mode": low_latency_mode}
+        row.context_snapshot = {
+            **(row.context_snapshot or {}),
+            "low_latency_mode": next_low_latency,
+            "web_search_enabled": next_web_search,
+        }
         self.db.commit()
         self.envelope(voice_session_id, "context.updated", {
             "reason": "voice_preferences",
-            "low_latency_mode": low_latency_mode,
+            "low_latency_mode": next_low_latency,
+            "web_search_enabled": next_web_search,
             "applies_to": "next_turn",
         })
         return self.get_session(voice_session_id)
@@ -366,8 +380,13 @@ class VoiceSessionService:
         # safe JSON before writing the JSON column.
         environment = (row.context_snapshot or {}).get("client_environment")
         low_latency_mode = (row.context_snapshot or {}).get("low_latency_mode") is True
+        web_search_enabled = (row.context_snapshot or {}).get("web_search_enabled", True) is not False
         row.context_snapshot = json.loads(json.dumps(snapshot or {}, default=str, ensure_ascii=False))
-        row.context_snapshot = {**row.context_snapshot, "low_latency_mode": low_latency_mode}
+        row.context_snapshot = {
+            **row.context_snapshot,
+            "low_latency_mode": low_latency_mode,
+            "web_search_enabled": web_search_enabled,
+        }
         if environment is not None:
             row.context_snapshot = {**row.context_snapshot, "client_environment": environment}
         row.session_epoch += 1

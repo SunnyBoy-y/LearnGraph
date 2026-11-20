@@ -572,7 +572,7 @@ function ValidatedUI({
       {snapshot.component !== "document" && <header className="stream-ui__heading">
         <div className="stream-ui__heading-copy">
           <h3 className="stream-ui__title">{snapshot.props.icon && <AnswerIcon name={snapshot.props.icon} />}{snapshot.props.title}</h3>
-          {snapshot.props.description && <p>{snapshot.props.description}</p>}
+          {snapshot.component !== "graph" && snapshot.props.description && <p>{snapshot.props.description}</p>}
         </div>
         {(snapshot.state === "streaming" || failed) && (
           <Badge

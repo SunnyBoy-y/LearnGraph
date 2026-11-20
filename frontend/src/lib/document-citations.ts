@@ -54,10 +54,13 @@ const WEB_CITATION_PATTERN =
   /(?<!\\)(?:（\s*网页引用[:：]?\s*(\d{1,3})\s*）|\[ref_(\d{1,3})\]|\[(\d{1,3})\](?!\())/giu;
 
 const citationParser = unified().use(remarkParse);
+const RAW_CITATION_PREFIX = "\uE200cite\uE202";
+const RAW_CITATION = /\uE200cite\uE202[^\uE200\uE201\r\n]+\uE201/g;
+const RAW_CITATION_TAIL = /\uE200cite\uE202[A-Za-z0-9_-]*(?:\uE202[A-Za-z0-9_-]*)*$/;
 
 /** Rewrite prose only: code, real links, images and reference definitions keep
  * their original Markdown bytes. Slice by source offsets rather than serialize. */
-function rewriteCitationProse(text: string, rewrite: (prose: string) => string): string {
+function rewriteCitationProse(text: string, rewrite: (prose: string, atEnd: boolean) => string): string {
   const ranges: Array<[number, number]> = [];
   const visit = (node: RootContent) => {
     if (node.type === "text") {
@@ -72,7 +75,7 @@ function rewriteCitationProse(text: string, rewrite: (prose: string) => string):
   let cursor = 0;
   let result = "";
   for (const [start, end] of ranges) {
-    result += text.slice(cursor, start) + rewrite(text.slice(start, end));
+    result += text.slice(cursor, start) + rewrite(text.slice(start, end), end === text.length);
     cursor = end;
   }
   return result + text.slice(cursor);
@@ -213,6 +216,22 @@ export function rewriteWebCitations(
   return { markdown, citations };
 }
 
+export function stripRawWebCitations(text: string, streaming = false): string {
+  if (!text.includes("\uE200")) return text;
+  return rewriteCitationProse(text, (prose, atEnd) => {
+    const clean = prose.replace(RAW_CITATION, "");
+    if (!atEnd) return clean;
+    const tail = clean.replace(RAW_CITATION_TAIL, "");
+    if (streaming) {
+      const start = tail.lastIndexOf("\uE200");
+      if (start >= 0 && RAW_CITATION_PREFIX.startsWith(tail.slice(start))) {
+        return tail.slice(0, start);
+      }
+    }
+    return tail;
+  });
+}
+
 /**
  * Apply document then web citation rewrites. Document markers take precedence
  * because they are rewritten first into links that web patterns will not rematch.
@@ -220,12 +239,13 @@ export function rewriteWebCitations(
 export function rewriteAllCitations(
   text: string,
   webSourceIndexes?: Set<number> | number[],
+  streaming = false,
 ): {
   markdown: string;
   documentCitations: DocumentCitation[];
   webCitations: WebCitation[];
 } {
-  const docs = rewriteDocumentCitations(text);
+  const docs = rewriteDocumentCitations(stripRawWebCitations(text, streaming));
   const webs = rewriteWebCitations(docs.markdown, webSourceIndexes);
   return {
     markdown: webs.markdown,

@@ -267,18 +267,91 @@ def test_postgresql_search_installation_is_atomic_and_retryable(target_url):
         engine.dispose()
 
 
-def test_unmapped_unique_index_cannot_silently_disappear(tmp_path):
+@pytest.mark.parametrize("definition", ["(lower(value))", "(value COLLATE NOCASE)", "(value) WHERE value <> ''"])
+def test_unmapped_unique_index_cannot_silently_disappear(tmp_path, definition):
     metadata = MetaData()
     Table("items", metadata, Column("id", Integer, primary_key=True), Column("value", String))
     settings, router, capture = source(tmp_path, metadata)
     with router.begin() as connection:
-        connection.exec_driver_sql("CREATE UNIQUE INDEX custom_unique_value ON items(value)")
+        connection.exec_driver_sql(f"CREATE UNIQUE INDEX custom_unique_value ON items{definition}")
     controller = DatabaseMigrationController(settings, router, capture, metadata)
-    report = controller.preflight()
-    assert not report["ready"]
-    assert next(check for check in report["checks"] if check["key"] == "source_indexes")["unmapped_indexes"] == ["items.custom_unique_value"]
-    assert not (controller.root / "active.json").exists()
-    router.dispose()
+    try:
+        report = controller.preflight()
+        assert not report["ready"]
+        assert next(check for check in report["checks"] if check["key"] == "source_indexes")["unmapped_indexes"] == ["items.custom_unique_value"]
+        with closing(sqlite3.connect(router.url.database)) as snapshot:
+            with pytest.raises(ValueError, match="items.custom_unique_value"):
+                controller._prepare_target(None, snapshot, "unsupported")
+        assert not (controller.root / "active.json").exists()
+    finally:
+        router.dispose()
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_legacy_plain_unique_index_is_preserved_in_target(tmp_path, monkeypatch, composite):
+    from sqlalchemy import inspect
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.schema import CreateIndex
+    from app.services import database_migration
+
+    metadata = MetaData()
+    Table("items", metadata, Column("id", Integer, primary_key=True), Column("value", String), Column("scope", String))
+    settings, router, capture = source(tmp_path, metadata)
+    with router.begin() as connection:
+        connection.exec_driver_sql("CREATE UNIQUE INDEX legacy_unique_value ON items(" + ("scope,value" if composite else "value") + ")")
+    controller = DatabaseMigrationController(settings, router, capture, metadata)
+    target = create_engine("sqlite://")
+    # Exercise real DDL and constraint enforcement in an isolated target. Only
+    # PostgreSQL-specific catalogue queries need an adapter for this unit test.
+    inspector = inspect(target)
+    monkeypatch.setattr(inspector, "get_materialized_view_names", lambda: [])
+    monkeypatch.setattr(inspector, "get_sequence_names", lambda: [])
+    monkeypatch.setattr(database_migration, "inspect", lambda _target: inspector)
+    try:
+        report = controller.preflight()
+        assert report["ready"], report
+        with closing(sqlite3.connect(router.url.database)) as snapshot:
+            controller._prepare_target(target, snapshot, "legacy-index")
+            resumed_metadata, resumed_columns = controller._target_schema(snapshot)
+        resumed_index = next(index for index in resumed_metadata.tables["items"].indexes if index.name == "legacy_unique_value")
+        assert resumed_index.unique and resumed_columns["items"] == ["id", "value", "scope"]
+        table = controller._tables["items"]
+        index = next(index for index in table.indexes if index.name == "legacy_unique_value")
+        assert index.unique
+        assert tuple(column.name for column in index.columns) == (("scope", "value") if composite else ("value",))
+        assert str(CreateIndex(index).compile(dialect=postgresql.dialect())).startswith("CREATE UNIQUE INDEX legacy_unique_value ON items")
+        with target.begin() as connection:
+            connection.execute(table.insert(), [{"id": 1, "value": "same", "scope": "same"}, {"id": 2, "value": None, "scope": "same"}, {"id": 3, "value": None, "scope": "same"}])
+        with pytest.raises(IntegrityError):
+            with target.begin() as connection:
+                connection.execute(table.insert().values(id=4, value="same", scope="same"))
+        assert "legacy_unique_value" not in {index.name for index in metadata.tables["items"].indexes}
+        assert not (controller.root / "active.json").exists()
+    finally:
+        target.dispose()
+        router.dispose()
+
+
+def test_legacy_table_unique_constraint_is_mapped_to_a_target_index(tmp_path):
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateIndex
+
+    legacy = MetaData()
+    Table("items", legacy, Column("id", Integer, primary_key=True), Column("value", String, unique=True))
+    metadata = MetaData()
+    Table("items", metadata, Column("id", Integer, primary_key=True), Column("value", String))
+    settings, router, capture = source(tmp_path, legacy)
+    controller = DatabaseMigrationController(settings, router, capture, metadata)
+    try:
+        assert controller.preflight()["ready"]
+        with closing(sqlite3.connect(router.url.database)) as snapshot:
+            target_schema, _columns = controller._target_schema(snapshot)
+        index = next(iter(target_schema.tables["items"].indexes))
+        assert index.unique and [column.name for column in index.columns] == ["value"]
+        assert str(CreateIndex(index).compile(dialect=postgresql.dialect())).startswith("CREATE UNIQUE INDEX")
+    finally:
+        router.dispose()
 
 
 def test_resume_after_search_failure_completes_real_postgresql_activation(tmp_path, target_url, monkeypatch):

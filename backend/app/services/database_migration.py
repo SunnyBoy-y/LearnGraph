@@ -72,15 +72,28 @@ def _predicate(value: Any) -> str:
     return re.sub(r'\s+|"', '', str('' if value is None else value)).casefold().strip('()')
 
 
+def _unique_index_keys(table: Table) -> set[tuple[tuple[str, ...], str]]:
+    keys = {(tuple(c.name for c in table.primary_key), '')}
+    keys.update((tuple(c.name for c in constraint.columns), '') for constraint in table.constraints if isinstance(constraint, UniqueConstraint))
+    keys.update((tuple(c.name for c in index.columns), _predicate(index.dialect_options['sqlite'].get('where'))) for index in table.indexes if index.unique)
+    return keys
+
+
+def _portable_unique_index(connection: sqlite3.Connection, index_name: str, names: tuple, partial: bool) -> bool:
+    # Plain column UNIQUE indexes can be recreated in PostgreSQL. Expressions,
+    # partial predicates and SQLite-specific collations need explicit mappings.
+    if partial or not names or None in names:
+        return False
+    return all(str(row[4]).casefold() == 'binary' for row in connection.execute(f"PRAGMA index_xinfo({quoted(index_name)})") if row[5])
+
+
 def _unmapped_indexes(connection: sqlite3.Connection, metadata: MetaData, columns: dict) -> list[str]:
     issues = []
     for name in columns:
         if name not in metadata.tables:
             continue
         table = metadata.tables[name]
-        unique = {(tuple(c.name for c in table.primary_key), '')}
-        unique.update((tuple(c.name for c in constraint.columns), '') for constraint in table.constraints if isinstance(constraint, UniqueConstraint))
-        unique.update((tuple(c.name for c in index.columns), _predicate(index.dialect_options['sqlite'].get('where'))) for index in table.indexes if index.unique)
+        unique = _unique_index_keys(table)
         declared = {index.name for index in table.indexes}
         for _seq, index_name, is_unique, _origin, partial in connection.execute(f"PRAGMA index_list({quoted(name)})"):
             names = tuple(row[2] for row in connection.execute(f"PRAGMA index_info({quoted(index_name)})"))
@@ -92,7 +105,8 @@ def _unmapped_indexes(connection: sqlite3.Connection, metadata: MetaData, column
             guard_pattern = '(?:' + '|'.join(re.escape(str(c).casefold()) + 'isnotnull' for c in names) + ')'
             null_guard = bool(predicate) and bool(re.fullmatch(guard_pattern + '(?:and' + guard_pattern + ')*', predicate.replace('(', '').replace(')', '')))
             mapped_unique = (names, predicate) in unique or null_guard and (names, '') in unique
-            if is_unique and not mapped_unique or not is_unique and index_name not in declared and (partial or None in names):
+            portable_unique = is_unique and index_name not in declared and _portable_unique_index(connection, index_name, names, partial)
+            if is_unique and not mapped_unique and not portable_unique or not is_unique and index_name not in declared and (partial or None in names):
                 issues.append(name + '.' + index_name)
     return issues
 
@@ -530,8 +544,11 @@ class DatabaseMigrationController:
                 self._phase("STARTING_POSTGRESQL" if value.get("state") == "starting" else "PULLING_IMAGE", image_progress=value.get("progress", {}))
                 self._cancel.wait(0.5)
 
-    def _prepare_target(self, target: Engine, snapshot: sqlite3.Connection, job_id: str) -> None:
+    def _target_schema(self, snapshot: sqlite3.Connection) -> tuple[MetaData, dict[str, list[str]]]:
         columns = _source_tables(snapshot)
+        unmapped_indexes = _unmapped_indexes(snapshot, self.metadata, columns)
+        if unmapped_indexes:
+            raise ValueError("Unsupported source indexes: " + ", ".join(unmapped_indexes))
         metadata = MetaData()
         for name in columns:
             if name in self.metadata.tables:
@@ -549,13 +566,20 @@ class DatabaseMigrationController:
                 Table(name, metadata, *(Column(c, source.c[c].type.copy(), nullable=True) for c in columns[name]))
             table = metadata.tables[name]
             declared = {index.name for index in table.indexes}
+            unique_keys = _unique_index_keys(table)
             for _seq, index_name, unique, origin, partial in snapshot.execute(f"PRAGMA index_list({quoted(name)})"):
-                if origin != 'c' or unique or partial or index_name in declared:
+                if origin == 'pk' or partial or index_name in declared:
                     continue
-                names = [row[2] for row in snapshot.execute(f"PRAGMA index_info({quoted(index_name)})")]
+                names = tuple(row[2] for row in snapshot.execute(f"PRAGMA index_info({quoted(index_name)})"))
+                if unique and (names, '') in unique_keys:
+                    continue
                 if not names or any(c is None or c not in table.c for c in names):
                     raise ValueError(f"{name}: unsupported source index")
-                Index(index_name, *(table.c[c] for c in names))
+                Index(index_name, *(table.c[c] for c in names), unique=bool(unique))
+        return metadata, columns
+
+    def _prepare_target(self, target: Engine, snapshot: sqlite3.Connection, job_id: str) -> None:
+        metadata, columns = self._target_schema(snapshot)
         inspector = inspect(target)
         existing = inspector.get_table_names() + inspector.get_view_names() + inspector.get_materialized_view_names() + inspector.get_sequence_names()
         if existing:
@@ -999,15 +1023,7 @@ class DatabaseMigrationController:
             self._verify_saved_backup(job)
             target = self._target = postgres_engine(decrypt_url(self.settings, job["target_secret"]), settings=self.settings)
             with closing(sqlite3.connect(snapshot_path.as_uri() + "?mode=ro", uri=True)) as snapshot:
-                self._columns = _source_tables(snapshot)
-                metadata = MetaData()
-                for name in self._columns:
-                    if name in self.metadata.tables:
-                        self.metadata.tables[name].to_metadata(metadata)
-                    else:
-                        from sqlalchemy import Column
-                        parent = self.metadata.tables[_ARCHIVES[name]]
-                        Table(name, metadata, *(Column(c, parent.c[c].type.copy(), nullable=True) for c in self._columns[name]))
+                metadata, self._columns = self._target_schema(snapshot)
                 self._tables = dict(metadata.tables)
             with target.connect() as connection:
                 position = connection.execute(text("SELECT applied_commit FROM _lg_database_copy WHERE job_id=:job"), {"job": job["id"]}).scalar_one()

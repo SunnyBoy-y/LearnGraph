@@ -15,6 +15,7 @@ from app.providers.dialects import thinking_off_verdict
 from app.providers.model_options import ModelCallOptions
 from app.providers.qwen_catalog import is_dashscope_origin
 from app.providers.ports.model import ProviderChatMessage, ProviderStreamEvent
+from app.providers.remote.response_citations import ResponseCitations
 from app.providers.remote.schema_compat import sanitize_tool_definitions
 
 
@@ -580,72 +581,6 @@ class _StreamingHTTPProvider:
             payload.setdefault("max_tokens", budget)
         return payload
 
-    def _capture_response_sources(self, response_payload: dict[str, Any]) -> None:
-        sources: list[dict[str, Any]] = []
-        response = response_payload.get("response")
-        if not isinstance(response, dict):
-            response = response_payload
-        for item in response.get("output") or []:
-            if not isinstance(item, dict):
-                continue
-            for content in item.get("content") or []:
-                if not isinstance(content, dict):
-                    continue
-                for annotation in content.get("annotations") or []:
-                    if not isinstance(annotation, dict):
-                        continue
-                    annotation_type = str(annotation.get("type") or "")
-                    url = annotation.get("url")
-                    if not isinstance(url, str) or not url.startswith(
-                        ("http://", "https://")
-                    ):
-                        # Some Responses payloads nest the URL under url_citation.
-                        nested = annotation.get("url_citation")
-                        if isinstance(nested, dict):
-                            url = nested.get("url")
-                            title_fallback = nested.get("title")
-                            start_index = nested.get("start_index")
-                            end_index = nested.get("end_index")
-                        else:
-                            continue
-                    else:
-                        title_fallback = annotation.get("title")
-                        start_index = annotation.get("start_index")
-                        end_index = annotation.get("end_index")
-                    if not isinstance(url, str) or not url.startswith(
-                        ("http://", "https://")
-                    ):
-                        continue
-                    if annotation_type and annotation_type not in {
-                        "url_citation",
-                        "citation",
-                        "",
-                    }:
-                        # Keep unknown annotation types that still carry a URL.
-                        pass
-                    entry: dict[str, Any] = {
-                        "url": url,
-                        "title": str(title_fallback or url)[:1_000],
-                    }
-                    if isinstance(start_index, int) and not isinstance(start_index, bool):
-                        entry["start_index"] = start_index
-                    if isinstance(end_index, int) and not isinstance(end_index, bool):
-                        entry["end_index"] = end_index
-                    sources.append(entry)
-        # Deduplicate by URL while preserving first-seen order and assign 1-based
-        # citation indices used by the chat UI for inline badges.
-        deduped: list[dict[str, Any]] = []
-        seen_urls: set[str] = set()
-        for item in sources:
-            url = item["url"]
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            item = dict(item)
-            item["index"] = len(deduped) + 1
-            deduped.append(item)
-        self.last_sources = deduped
-
     @staticmethod
     def _validate_structured_result(
         result: object,
@@ -1017,6 +952,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
     def _complete_response_metadata(
         self,
         event: dict[str, Any],
+        citations: ResponseCitations,
         *,
         require_output: bool = False,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1038,7 +974,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
             raise ProviderResponseError(
                 f"Responses stream completed with unexpected status '{status}'"
             )
-        self._capture_response_sources(event)
+        self.last_citation_text, self.last_sources = citations.collect()
         self.last_usage = self._usage_from_response(response)
         return response, self._response_items(response)
 
@@ -1056,7 +992,9 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                 self._raise_for_status(response)
                 self.last_request_id = response.headers.get("x-request-id")
                 completed = False
+                citations = ResponseCitations()
                 for event in self._sse_payloads(response):
+                    citations.observe(event)
                     event_type = event.get("type")
                     if event_type in {
                         "response.output_text.delta",
@@ -1067,7 +1005,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                             yield delta
                     elif event_type == "response.completed":
                         completed = True
-                        self._complete_response_metadata(event)
+                        self._complete_response_metadata(event, citations)
                     elif event_type in {
                         "response.failed",
                         "response.incomplete",
@@ -1084,6 +1022,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
         self.last_usage = {}
         self.last_request_id = None
         self.last_sources = []
+        self.last_citation_text = ""
         try:
             yield from self._stream_answer(prompt)
         except httpx.TimeoutException as exc:
@@ -1102,6 +1041,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
         self.last_usage = {}
         self.last_request_id = None
         self.last_sources = []
+        self.last_citation_text = ""
         payload: dict[str, Any] = {
             "model": self.model_id,
             "input": self._response_input_from_messages(messages),
@@ -1127,6 +1067,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
             payload["reasoning"] = reasoning
 
         function_call_aggregates: dict[str, dict[str, Any]] = {}
+        citations = ResponseCitations()
         completed = False
         try:
             with self._client() as client:
@@ -1138,6 +1079,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                     self._raise_for_status(response)
                     self.last_request_id = response.headers.get("x-request-id")
                     for event in self._sse_payloads(response):
+                        citations.observe(event)
                         event_type = event.get("type")
                         from app.providers.web_activity import native_web_activity
                         activity = native_web_activity(event, self)
@@ -1185,6 +1127,7 @@ class OpenAIResponsesProvider(_StreamingHTTPProvider):
                             completed = True
                             response_payload, response_items = self._complete_response_metadata(
                                 event,
+                                citations,
                                 require_output=True,
                             )
                             for item in response_items:

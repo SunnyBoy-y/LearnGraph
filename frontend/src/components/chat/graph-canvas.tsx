@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { Maximize2, Minimize2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { UISnapshot } from "@/lib/stream-ui";
@@ -22,6 +23,24 @@ export function GraphCanvas({ snapshot: s, selected, onSelect }: {
   const mode = layoutChoice ?? s.props.graph_layout ?? "flow";
   const [frozenBounds, setFrozenBounds] = useState<Bounds | null>(null);
   const container = useRef<HTMLDivElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [fullscreenError, setFullscreenError] = useState("");
+  useEffect(() => {
+    const onFullscreenChange = () => setFullscreen(document.fullscreenElement === container.current);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
+  async function toggleFullscreen() {
+    const element = container.current;
+    if (!element) return;
+    setFullscreenError("");
+    try {
+      if (document.fullscreenElement === element) await document.exitFullscreen();
+      else await element.requestFullscreen();
+    } catch {
+      setFullscreenError("无法切换全屏，请检查浏览器是否允许全屏后重试。");
+    }
+  }
   const [direction, setDirection] = useState<"LR" | "TB">("LR");
   useEffect(() => {
     const element = container.current;
@@ -122,7 +141,13 @@ export function GraphCanvas({ snapshot: s, selected, onSelect }: {
       <label>缩放<input aria-label="图谱缩放" type="range" min="0.2" max="4" step="0.05" value={zoom} onChange={e => {setFrozenBounds(bounds); zoomAt(Number(e.target.value), {x: (bounds.x + bounds.width) / 2, y: (bounds.y + bounds.height) / 2});}} /><output>{Math.round(zoom * 100)}%</output></label>
       <Button size="sm" variant="outline" type="button" onClick={() => {setPositions({}); updateCamera(1, {x: 0, y: 0}); setQuery(""); setFrozenBounds(null);}}>自动布局 / 适应画布</Button>
     </div>
+    {fullscreenError && <p role="alert">{fullscreenError}</p>}
     <div className="stream-ui__graph-scroll">
+      <Button className="stream-ui__graph-fullscreen" size="icon-sm" variant="outline" type="button"
+        aria-label={fullscreen ? "退出全屏" : "全屏查看"} title={fullscreen ? "退出全屏（Esc）" : "全屏查看"}
+        aria-pressed={fullscreen} onClick={() => { void toggleFullscreen(); }}>
+        {fullscreen ? <Minimize2 aria-hidden="true" /> : <Maximize2 aria-hidden="true" />}
+      </Button>
       <svg ref={svg} viewBox={`${bounds.x} ${bounds.y} ${bounds.width - bounds.x} ${bounds.height - bounds.y}`} role="group" aria-label={s.props.title} tabIndex={0}
         onPointerDown={down} onPointerMove={move} onPointerUp={e => up(e)} onPointerCancel={e => up(e, true)} onLostPointerCapture={e => up(e, true)}
         onDoubleClick={event => {

@@ -1225,6 +1225,25 @@ class DurableJob(Base, TimestampMixin, WorkspaceScopedMixin):
     last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
+class ChatGoalRun(Base, TimestampMixin, WorkspaceScopedMixin):
+    """Current long-running objective for a chat, separate from learning Goals."""
+
+    __tablename__ = "chat_goal_runs"
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True
+    )
+    id: Mapped[str] = mapped_column(String(36), default=new_id)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    objective: Mapped[str] = mapped_column(Text)
+    options: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    job_id: Mapped[str] = mapped_column(String(36))
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    max_rounds: Mapped[int] = mapped_column(Integer)
+    rounds_used: Mapped[int] = mapped_column(Integer, default=0)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    last_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
 class DocumentJobEvent(Base, WorkspaceScopedMixin):
     __tablename__ = "document_job_events"
     __table_args__ = (
@@ -3743,9 +3762,14 @@ class VoiceRelayConfig(Base, TimestampMixin):
     # Reserved for a future per-workspace override; today only "deployment".
     scope: Mapped[str] = mapped_column(String(32), default="deployment")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    # cloudflare: dynamic TURN credentials; manual: credential-free STUN only.
+    # cloudflare: dynamic TURN credentials; turn: static TURN; manual: STUN only.
     mode: Mapped[str] = mapped_column(String(24), default="cloudflare")
-    # Ordered Cloudflare ICE URLs; the first TURN is the server preference.
+    # Credential kind survives manual mode; never reuse tokens as passwords.
+    secret_mode: Mapped[str] = mapped_column(
+        String(24), default="cloudflare", server_default="cloudflare"
+    )
+    username: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Ordered ICE URLs; the first TURN is the server preference.
     # The runtime deliberately excludes STUN from aiortc candidate gathering.
     urls: Mapped[list[Any]] = mapped_column(JSON, default=list)
     # Independent browser STUN pool, retained when switching modes. Existing

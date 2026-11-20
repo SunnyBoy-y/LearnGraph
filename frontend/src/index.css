@@ -76,54 +76,39 @@
   --card-foreground: var(--foreground);
   --popover: oklch(1 0 0);
   --popover-foreground: var(--foreground);
-  --primary: oklch(.49 .12 165);
+  --primary: oklch(.19 0 0);
   --primary-foreground: oklch(.99 0 0);
   --secondary: oklch(.965 .005 140);
   --secondary-foreground: oklch(.23 .012 165);
   --muted: oklch(.965 .004 100);
   --muted-foreground: oklch(.52 .01 150);
-  --accent: oklch(.94 .025 160);
-  --accent-foreground: oklch(.32 .07 165);
+  --accent: oklch(.95 0 0);
+  --accent-foreground: oklch(.18 0 0);
   --destructive: oklch(.58 .2 28);
   --border: oklch(.89 .006 100);
   --input: oklch(.89 .006 100);
-  --ring: oklch(.49 .12 165);
+  --ring: oklch(.32 0 0);
   --chart-1: oklch(.49 .12 165);
   --chart-2: oklch(.65 .13 165);
   --chart-3: oklch(.72 .1 75);
   --chart-4: oklch(.62 .15 35);
   --chart-5: oklch(.56 .12 250);
   --radius: .75rem;
-  --sidebar: oklch(.985 .002 100);
+  --sidebar: oklch(.975 0 0);
   --sidebar-foreground: var(--foreground);
   --sidebar-primary: var(--primary);
   --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: oklch(.945 .004 100);
+  --sidebar-accent: oklch(.925 0 0);
   --sidebar-accent-foreground: var(--foreground);
   --sidebar-border: var(--border);
   --sidebar-ring: var(--ring);
-  --lg-green: #0b8f70;
-  --lg-green-dark: #087057;
-  --lg-green-soft: #e8f5f1;
-  --lg-paper: #fbfbfa;
-  --lg-warm: #fffaf0;
-  --lg-blue: #f5f8ff;
-  --lg-danger: #df4d4d;
-}
-
-/* 2026 monochrome workspace refresh */
-:root {
-  --primary: oklch(.19 0 0);
-  --primary-foreground: oklch(.99 0 0);
-  --ring: oklch(.32 0 0);
-  --accent: oklch(.95 0 0);
-  --accent-foreground: oklch(.18 0 0);
-  --sidebar: oklch(.975 0 0);
-  --sidebar-accent: oklch(.925 0 0);
-  --lg-paper: #f7f7f7;
   --lg-green: #171717;
   --lg-green-dark: #111;
   --lg-green-soft: #ededed;
+  --lg-paper: #f7f7f7;
+  --lg-warm: #fffaf0;
+  --lg-blue: #f5f8ff;
+  --lg-danger: #df4d4d;
   --lg-panel-bg: #fcfcfc;
   --lg-panel-border: transparent;
   /* LearnGraph Reading Typography v1 — 中间画布 Agent 长回答阅读层 */

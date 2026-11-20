@@ -297,63 +297,60 @@ def _normalize_web_sources(raw_sources: list) -> list[dict]:
             value = candidate.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 entry[key] = value
+        end_indexes = candidate.get("end_indexes")
+        if isinstance(end_indexes, list):
+            entry["end_indexes"] = [value for value in end_indexes if type(value) is int and value >= 0]
         seen.add(url)
         entry["index"] = len(merged) + 1
         merged.append(entry)
     return merged
 
 
+_RAW_CITATION_MARKER = re.compile(r"\ue200cite\ue202[^\ue200\ue201\r\n]+\ue201")
+
+
 def _inject_web_citation_markers(text: str, sources: list[dict]) -> str:
-    """Insert full-width citation markers at provider annotation offsets.
-
-    Markers use the form ``（网页引用：N）`` so the chat UI can rewrite them into
-    hoverable badges without colliding with document file citations.
-    When the provider does not return character offsets, append a compact
-    citation footer so the answer still surfaces 1..N source badges.
-    """
-
+    """Insert citation markers at verified offsets or collect sources at the end."""
     if not text or not sources:
         return text
-    anchors: list[tuple[int, int]] = []
+    raw_markers = list(_RAW_CITATION_MARKER.finditer(text))
+    anchors: dict[int, set[int]] = {}
     for source in sources:
         index = source.get("index")
-        end_index = source.get("end_index")
-        if (
-            isinstance(index, int)
-            and not isinstance(index, bool)
-            and index >= 1
-            and isinstance(end_index, int)
-            and not isinstance(end_index, bool)
-            and end_index >= 0
-        ):
-            anchors.append((end_index, index))
-    if anchors:
-        # Insert from the end so earlier offsets stay valid.
-        anchors.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        result = text
-        for end_index, index in anchors:
+        if type(index) is not int or index < 1:
+            continue
+        offsets = source.get("end_indexes", [source.get("end_index")])
+        for end in offsets:
+            if type(end) is not int or not 0 < end <= len(text):
+                continue
+            # A provider may count the raw marker as part of the citation span.
+            # Never split that token before the Markdown renderer removes it.
+            end = next((match.end() for match in raw_markers if match.start() < end < match.end()), end)
             marker = f"（网页引用：{index}）"
-            if end_index > len(result):
-                continue
-            # Skip if this index is already present near the insertion point.
-            window_start = max(0, end_index - 24)
-            window_end = min(len(result), end_index + 24)
-            if f"网页引用：{index}" in result[window_start:window_end]:
-                continue
-            result = result[:end_index] + marker + result[end_index:]
+            if not text.startswith(marker, end) and not text[:end].endswith(marker):
+                anchors.setdefault(end, set()).add(index)
+    if anchors:
+        result = text
+        for end, indexes in sorted(anchors.items(), reverse=True):
+            markers = "".join(f"（网页引用：{index}）" for index in sorted(indexes))
+            result = result[:end] + markers + result[end:]
         return result
-    # Fallback: append numbered markers once when offsets are unavailable.
-    if "网页引用：" in text:
-        return text
-    # DashScope 原生联网（enable_search + enable_citation）会把角标直接写在
-    # 正文里（citation_format 默认 [N]，或自定义如 [ref_N]）。此时来源编号
-    # 已内联在正文，追加尾部列表只会产生重复徽章噪音，直接保留原样。
-    if re.search(r"\[ref_\d{1,3}\]|\[\d{1,3}\](?!\()", text):
+    # DashScope may already have written its [N] or [ref_N] labels.
+    if "网页引用：" in text or re.search(r"\[ref_\d{1,3}\]|\[\d{1,3}\](?!\()", text):
         return text
     markers = "".join(f"（网页引用：{source['index']}）" for source in sources if "index" in source)
-    if not markers:
-        return text
-    return f"{text.rstrip()}\n\n{markers}"
+    return f"{text.rstrip()}\n\n{markers}" if markers else text
+
+
+def _render_native_web_citations(text: str, native: list[dict], merged: list[dict], provider) -> str:
+    """Use only the current response's positions, with message-wide URL indices."""
+    index_by_url = {source["url"]: source["index"] for source in merged}
+    same_text = getattr(provider, "last_citation_text", text) == text
+    sources = [
+        {**source, "index": index_by_url[source["url"]], **({} if same_text else {"end_indexes": []})}
+        for source in native
+    ]
+    return _inject_web_citation_markers(text, sources)
 
 
 @dataclass(frozen=True)
@@ -12993,8 +12990,8 @@ class ChatService:
                                 "results": merged_sources,
                             }
                             if final_text:
-                                marked = _inject_web_citation_markers(
-                                    final_text, merged_sources
+                                marked = _render_native_web_citations(
+                                    final_text, native_sources, merged_sources, self.model_provider
                                 )
                                 if marked != final_text:
                                     final_text = marked
@@ -16565,8 +16562,8 @@ class ChatService:
                             # Persist inline citation markers into the final text
                             # so the UI can render numbered hover badges.
                             if final_text:
-                                marked = _inject_web_citation_markers(
-                                    final_text, merged_sources
+                                marked = _render_native_web_citations(
+                                    final_text, native_sources, merged_sources, self.model_provider
                                 )
                                 if marked != final_text:
                                     final_text = marked

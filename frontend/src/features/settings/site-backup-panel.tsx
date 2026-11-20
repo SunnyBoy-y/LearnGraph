@@ -1,5 +1,5 @@
 import { useMutation } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useId, useState, type FormEvent } from 'react'
 import { toast } from '@/lib/notifications'
 import { downloadFullBackup, restoreFullBackup } from '@/api/migrations'
 import { useAuth } from '@/features/auth/auth-context-value'
@@ -9,12 +9,31 @@ import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import type { BackupRestoreResult } from '@/types/migrations'
 
+type BackupCredentials = { currentPassword: string; backupPassword: string }
+
+function validateForm(operation: 'backup' | 'restore', credentials: BackupCredentials, confirmation: string, file: File | null) {
+  return {
+    currentPassword: !credentials.currentPassword ? '请输入当前管理员密码。' : '',
+    backupPassword: !credentials.backupPassword
+      ? '请输入备份密码。'
+      : operation === 'backup' && credentials.backupPassword.length < 12
+        ? `备份密码至少需要 12 位，当前为 ${credentials.backupPassword.length} 位。`
+        : '',
+    confirmation: operation === 'backup' && (!confirmation || credentials.backupPassword !== confirmation)
+      ? !confirmation ? '请再次输入备份密码。' : '两次输入的备份密码不一致，请重新输入。'
+      : '',
+    file: operation === 'restore' && !file ? '请选择全站备份 ZIP 文件。' : '',
+  }
+}
+
 export function SiteBackupPanel() {
   const { isSystemAdmin } = useAuth()
+  const errorId = useId()
   const [operation, setOperation] = useState<'backup' | 'restore' | null>(null)
   const [currentPassword, setCurrentPassword] = useState('')
   const [backupPassword, setBackupPassword] = useState('')
   const [confirmation, setConfirmation] = useState('')
+  const [submitted, setSubmitted] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [result, setResult] = useState<BackupRestoreResult | null>(null)
   const close = () => {
@@ -22,26 +41,48 @@ export function SiteBackupPanel() {
     setCurrentPassword('')
     setBackupPassword('')
     setConfirmation('')
+    setFile(null)
+    setSubmitted(false)
   }
   const backup = useMutation({
-    mutationFn: async () => {
-      await downloadFullBackup(currentPassword, backupPassword)
-    },
+    mutationFn: ({ currentPassword, backupPassword }: BackupCredentials) => downloadFullBackup(currentPassword, backupPassword),
     onSuccess: () => { close(); toast.success('加密全站备份已交给浏览器下载') },
     onError: (error) => toast.error(error.message),
     onSettled: () => setCurrentPassword(''),
   })
   const restore = useMutation({
-    mutationFn: () => {
-      if (!file) throw new Error('请选择备份文件')
-      return restoreFullBackup(file, currentPassword, backupPassword)
-    },
+    mutationFn: ({ file, currentPassword, backupPassword }: BackupCredentials & { file: File }) => restoreFullBackup(file, currentPassword, backupPassword),
     onSuccess: (value) => { setResult(value); close(); toast.success('全站备份校验通过并已暂存，尚未覆盖数据') },
     onError: (error) => toast.error(error.message),
     onSettled: () => setCurrentPassword(''),
   })
-  if (!isSystemAdmin) return <p className="text-sm text-muted-foreground">全站备份与恢复仅系统管理员可操作。</p>
   const busy = backup.isPending || restore.isPending
+  const errors = validateForm(operation ?? 'backup', { currentPassword, backupPassword }, confirmation, file)
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (busy || !operation) return
+    // Read the inputs as well as React state so password-manager autofill can be submitted.
+    const form = event.currentTarget
+    const data = new FormData(form)
+    const credentials = {
+      currentPassword: String(data.get('currentPassword') ?? ''),
+      backupPassword: String(data.get('backupPassword') ?? ''),
+    }
+    const actualConfirmation = String(data.get('confirmation') ?? '')
+    setCurrentPassword(credentials.currentPassword)
+    setBackupPassword(credentials.backupPassword)
+    setConfirmation(actualConfirmation)
+    setSubmitted(true)
+    const validation = validateForm(operation, credentials, actualConfirmation, file)
+    const invalidField = (Object.keys(validation) as Array<keyof typeof validation>).find((field) => validation[field])
+    if (invalidField) {
+      form.querySelector<HTMLInputElement>(`[name="${invalidField}"]`)?.focus()
+      return
+    }
+    if (operation === 'backup') backup.mutate(credentials)
+    else if (file) restore.mutate({ ...credentials, file })
+  }
+  if (!isSystemAdmin) return <p className="text-sm text-muted-foreground">全站备份与恢复仅系统管理员可操作。</p>
   return <Surface className="p-5">
     <SectionHeading title="全站备份与数据恢复" description="仅系统管理员可操作，每次都需验证当前密码。包含所有用户、工作区、模型 API Key、实际生效配置、上传文件与 Memory，整个备份使用独立备份密码加密。" />
     <p className="mt-3 text-xs leading-5 text-muted-foreground">支持 SQLite、PostgreSQL 与默认本地文件存储。迁移后会自动备份实际生效的 PostgreSQL，恢复也保持 PostgreSQL，禁止回退 SQLite。MinIO、运行中的沙箱磁盘、程序源码与镜像须单独备份；存在活动外部文件存储时会拒绝生成不完整备份。全站恢复先校验并暂存，停服后用恢复工具应用。</p>
@@ -61,14 +102,26 @@ export function SiteBackupPanel() {
           <DialogTitle>{operation === 'backup' ? '验证管理员密码并备份全站' : '验证管理员密码并校验全站备份'}</DialogTitle>
           <DialogDescription>{operation === 'backup' ? '设置至少 12 位的独立备份密码。API Key 和实际配置只存在于加密内容内；恢复时必须提供此密码。' : '当前管理员密码用于授权；备份密码用于解密。此步骤只校验和暂存，全站覆盖恢复须停服执行。'}</DialogDescription>
         </DialogHeader>
-        <form className="space-y-4" onSubmit={(event) => { event.preventDefault(); if (busy) return; if (operation === 'backup') { if (backupPassword !== confirmation) return; backup.mutate() } else restore.mutate() }}>
-          {operation === 'restore' && <label className="block text-sm">全站备份 ZIP<Input required type="file" accept=".zip,application/zip" disabled={busy} onChange={(event) => { setFile(event.target.files?.[0] ?? null); setResult(null) }} /></label>}
-          <label className="block text-sm">当前管理员密码<Input required autoComplete="current-password" type="password" value={currentPassword} disabled={busy} onChange={(event) => setCurrentPassword(event.target.value)} /></label>
-          <label className="block text-sm">备份密码<Input required autoComplete={operation === 'backup' ? 'new-password' : 'off'} type="password" minLength={operation === 'backup' ? 12 : 1} value={backupPassword} disabled={busy} onChange={(event) => setBackupPassword(event.target.value)} /></label>
-          {operation === 'backup' && <label className="block text-sm">再次输入备份密码<Input required autoComplete="new-password" type="password" value={confirmation} disabled={busy} onChange={(event) => setConfirmation(event.target.value)} /></label>}
+        <form noValidate className="space-y-4" onSubmit={handleSubmit}>
+          {operation === 'restore' && <div>
+            <label className="block text-sm">全站备份 ZIP<Input name="file" required type="file" accept=".zip,application/zip" disabled={busy} aria-invalid={submitted && !!errors.file} aria-describedby={submitted && errors.file ? `${errorId}-file` : undefined} onChange={(event) => { setFile(event.target.files?.[0] ?? null); setResult(null) }} /></label>
+            {submitted && errors.file && <p id={`${errorId}-file`} role="alert" className="mt-1 text-xs text-destructive">{errors.file}</p>}
+          </div>}
+          <div>
+            <label className="block text-sm">当前管理员密码<Input name="currentPassword" required autoComplete="current-password" type="password" value={currentPassword} disabled={busy} aria-invalid={submitted && !!errors.currentPassword} aria-describedby={submitted && errors.currentPassword ? `${errorId}-currentPassword` : undefined} onChange={(event) => setCurrentPassword(event.target.value)} /></label>
+            {submitted && errors.currentPassword && <p id={`${errorId}-currentPassword`} role="alert" className="mt-1 text-xs text-destructive">{errors.currentPassword}</p>}
+          </div>
+          <div>
+            <label className="block text-sm">备份密码<Input name="backupPassword" required autoComplete={operation === 'backup' ? 'new-password' : 'off'} type="password" minLength={operation === 'backup' ? 12 : 1} value={backupPassword} disabled={busy} aria-invalid={submitted && !!errors.backupPassword} aria-describedby={submitted && errors.backupPassword ? `${errorId}-backupPassword` : undefined} onChange={(event) => setBackupPassword(event.target.value)} /></label>
+            {submitted && errors.backupPassword && <p id={`${errorId}-backupPassword`} role="alert" className="mt-1 text-xs text-destructive">{errors.backupPassword}</p>}
+          </div>
+          {operation === 'backup' && <div>
+            <label className="block text-sm">再次输入备份密码<Input name="confirmation" required autoComplete="new-password" type="password" value={confirmation} disabled={busy} aria-invalid={submitted && !!errors.confirmation} aria-describedby={submitted && errors.confirmation ? `${errorId}-confirmation` : undefined} onChange={(event) => setConfirmation(event.target.value)} /></label>
+            {submitted && errors.confirmation && <p id={`${errorId}-confirmation`} role="alert" className="mt-1 text-xs text-destructive">{errors.confirmation}</p>}
+          </div>}
           <div className="flex justify-end gap-2">
             <Button type="button" variant="outline" disabled={busy} onClick={close}>取消</Button>
-            <Button type="submit" disabled={busy || !currentPassword || !backupPassword || (operation === 'backup' ? backupPassword.length < 12 || backupPassword !== confirmation : !file)}>{busy ? '处理中…' : operation === 'backup' ? '验证并下载' : '验证并暂存'}</Button>
+            <Button type="submit" disabled={busy}>{busy ? '处理中…' : operation === 'backup' ? '验证并下载' : '验证并暂存'}</Button>
           </div>
         </form>
       </DialogContent>

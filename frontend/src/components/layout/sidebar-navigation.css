@@ -40,10 +40,10 @@
 .sidebar-nav .sidebar-project__header > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-nav .sidebar-project__header small { flex: none; }
 .sidebar-nav .sidebar-project__new-session,
-.sidebar-nav .sidebar-project__delete-project { width: 0; min-width: 0; height: 28px; margin: 0; padding: 0; overflow: hidden; opacity: 0; pointer-events: none; }
+.sidebar-nav .sidebar-project__delete-project { width: 24px; min-width: 24px; height: 28px; margin: 0; padding: 0; opacity: 0; pointer-events: none; transition: opacity .16s ease, color .16s ease; }
 .sidebar-nav .sidebar-project__heading:hover :is(.sidebar-project__new-session, .sidebar-project__delete-project),
 .sidebar-nav .sidebar-project__heading:focus-within :is(.sidebar-project__new-session, .sidebar-project__delete-project),
-.sidebar-nav .sidebar-project__heading:has([data-state='open']) :is(.sidebar-project__new-session, .sidebar-project__delete-project) { width: 26px; min-width: 26px; opacity: 1; overflow: visible; pointer-events: auto; }
+.sidebar-nav .sidebar-project__heading:has([data-state='open']) :is(.sidebar-project__new-session, .sidebar-project__delete-project) { opacity: 1; pointer-events: auto; }
 .sidebar-nav .sidebar-project__session.is-active { background: color-mix(in srgb, var(--foreground) 8%, var(--sidebar)); color: var(--sidebar-accent-foreground); }
 .dark .sidebar-nav .sidebar-project__heading,
 .dark .sidebar-nav .sidebar-project__heading:is(:hover, :focus-within, .is-current) { background: transparent; box-shadow: none; }

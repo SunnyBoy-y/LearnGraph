@@ -147,7 +147,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        APP_VERSION: ${LEARNGRAPH_APP_VERSION:-v0.5}
+        APP_VERSION: ${LEARNGRAPH_APP_VERSION:-v0.6}
         # Full references allow explicit registry access if a host mirror returns 401.
         NODE_IMAGE: ${LEARNGRAPH_NODE_IMAGE:-node:22-bookworm-slim}
         PYTHON_IMAGE: ${LEARNGRAPH_PYTHON_IMAGE:-python:3.12-slim-bookworm}

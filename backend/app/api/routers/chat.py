@@ -66,6 +66,8 @@ from app.domain.schemas.chat import (
     SuggestedPromptGenerateRequest,
 )
 from app.domain.schemas.common import ActionResponse
+from app.domain.schemas.chat_goals import ChatGoalControl, ChatGoalStart, ChatGoalView
+from app.services import chat_goals
 from app.domain.schemas.opening_prompts import OpeningPromptRequest, OpeningPromptResponse
 from app.domain.schemas.stream_ui import UIAction
 from app.domain.schemas.graphs import GraphChangeSetView, RejectGraphChangeSetRequest
@@ -449,6 +451,32 @@ def require_session_access(
         permission,
     ):
         raise AppError(404, "not_found", "Resource not found in this workspace")
+
+
+@router.get("/{session_id}/goal", response_model=ChatGoalView | None)
+def get_chat_goal(session_id: str, db: DB, context: CurrentWorkspace) -> ChatGoalView | None:
+    require_session_access(session_id, "read", db, context)
+    return chat_goals.get_goal(db, context, session_id)
+
+
+@router.post("/{session_id}/goal", response_model=ChatGoalView, status_code=202)
+def start_chat_goal(
+    session_id: str, payload: ChatGoalStart, db: DB, context: CurrentWorkspace, settings: AppSettings,
+) -> ChatGoalView:
+    require_session_access(session_id, "write", db, context)
+    if not settings.durable_queue_enabled:
+        raise AppError(503, "chat_goal_worker_disabled", "长程任务需要启用后台任务队列。")
+    return chat_goals.start_goal(db, context, session_id, payload)
+
+
+@router.post("/{session_id}/goal/control", response_model=ChatGoalView | None)
+def control_chat_goal(
+    session_id: str, payload: ChatGoalControl, db: DB, context: CurrentWorkspace, settings: AppSettings,
+) -> ChatGoalView | None:
+    require_session_access(session_id, "write", db, context)
+    if payload.action == "resume" and not settings.durable_queue_enabled:
+        raise AppError(503, "chat_goal_worker_disabled", "长程任务需要启用后台任务队列。")
+    return chat_goals.control_goal(db, context, session_id, payload)
 
 
 @router.post("/{session_id}/ui/actions")

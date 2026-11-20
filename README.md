@@ -463,7 +463,7 @@ LearnGraph/
 | 领域 | 已接入的产品与代码能力 |
 | --- | --- |
 | **目标与图谱** | Goal 澄清与确认、候选图谱审核、目标图谱、能力图谱与图谱工作台；图谱生成支持极速/思考模式与流式根预览；封面支持模板、上传与 AI 生成（先出草案由用户确认、再后台出图；矢量引擎走文本模型，位图引擎走图片 Provider）；节点上直接标出「已生成交互页」与通关分数 |
-| **学习对话** | Session、Message/MessagePart、SSE 事件溯源流、断线恢复与重试、消息版本和分支、结构化消息渲染 |
+| **学习对话** | Session、Message/MessagePart、SSE 事件溯源流、断线恢复与重试、消息版本和分支、结构化消息渲染；[`/goal` 长程任务](docs/chat-goals.md)支持后台续跑、逐轮验收、暂停、继续和轮次上限 |
 | **实时语音** | 全双工语音对话：边说边听、可随时打断，字幕按朗读逐句点亮；语音回合与文字会话同源，共用记忆、证据与会话命名；音频由所选 Provider 识别与合成（当前适配阿里 DashScope 实时 ASR 与火山引擎 TTS，需在工作区配置或由环境变量兜底，缺哪一环都会给出可读原因）；语音 Tutor 可委派研究、学习读取、练习生成和 Evidence 记录，后台任务直接受理并把进度与文件结果放回对话画布；Android 端通过 WebView 权限桥申请录音权限 |
 | **交互式学习页** | 从图谱节点生成教学包（教材 / 互动实验 / 小剧场 / 闯关测评）：进度可见、失败分类重试、中断可续做、节点内容变更后自动失效重建；按图谱开启（默认关闭），学习内容在受限环境里运行且不加载远程资源 |
 | **移动端** | Android 原生客户端（Kotlin / Jetpack Compose + GeckoView 139 + WebExtension Bridge）：拍照与系统文件选择、原生文件下载、系统分享收件箱、扫码连接、生物识别、回复通知、TTS 朗读、震动反馈、断线恢复与登录态持久化 |
@@ -547,7 +547,7 @@ Linux 均可使用。应用容器不持有 Docker socket。已有部署需要先
 
 ```sh
 python -m updater --init-only
-# 使用 VERSION 中的原始 Release tag 构建基线版本（当前为 v0.5）。
+# 使用 VERSION 中的原始 Release tag 构建基线版本（当前为 v0.6）。
 node scripts/compose.mjs up -d --build
 # 独立运行，生产环境交给 systemd / Windows 任务计划程序保持运行。
 python -m updater --project-dir .
@@ -571,7 +571,7 @@ Linux 可使用 [systemd 服务示例](updater/learngraph-updater.service)，修
 根目录 `VERSION` 是应用版本的唯一发布源，保留 Release tag 原文（包含 `v`）。
 健康接口、公开 `/api/v1/version`、OpenAPI 版本、页面与镜像 OCI 版本标签使用相同值。
 发布前先修改 `VERSION`，然后创建名称完全相同的 GitHub Release tag；workflow 与
-Dockerfile 都会拒绝版本不匹配的构建。`npm` / Python 包使用的 `0.5.0` 是包元数据，
+Dockerfile 都会拒绝版本不匹配的构建。`npm` / Python 包使用的 `0.6.0` 是包元数据，
 不用于推断应用发布版本。本地构建请使用 Compose 脚本，它自动将 `VERSION` 注入 build args；
 直接使用 `docker build` 时显式传入 `--build-arg APP_VERSION=<VERSION 原文>`。
 

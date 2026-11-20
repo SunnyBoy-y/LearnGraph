@@ -89,6 +89,7 @@ from app.voice.speech_floor import VoiceSpeechFloor, VoiceInputFloorProcessor
 from app.voice.conversation_control import VoiceConversationPolicy, VoiceConversationProcessor, load_conversation_policy
 from app.voice.embedded_timeline import insert_timeline_probes, timeline_enabled
 from app.voice.embedded_turn_strategy import AdaptiveUserTurnStartStrategy
+from app.voice.embedded_noise_filter import VoiceNoiseFilterProcessor
 from app.voice.embedded_turn_stop import GuardedSmartTurnStopStrategy
 from app.voice.embedded_volcengine_tts import VolcengineTTSService
 from app.voice.journal import (
@@ -147,16 +148,14 @@ ThinkingOffReporter = Callable[[ThinkingOffVerdict], Awaitable[None]]
 
 
 def speech_budget_instruction() -> str:
-    """口语表达准则：按信息传达有效性决定详略，不设句数或时长预算。"""
+    """口语表达准则：干脆直接，先给结论，减少确认与铺垫。"""
     return (
-        "\n\n表达标准：以用户能否理解结论、作出判断或继续行动为准，不以句数或时长控制回答。"
-        "先说重点；只补充会影响理解、判断或行动的信息，必要信息讲清楚后就停止。"
-        "不要复述用户原话、重复结论或计划，也不要用客套话和无关背景填充。"
-        "任务受理后说明真实状态和预期产物即可；仅在影响用户判断时说明所用假设或限制。"
-        "解释、教学或复杂问题按理解所需展开，不必等用户明确要求详细；避免堆砌用户已知的信息。"
-        "澄清只围绕阻碍执行的信息，不重复确认已明确的需求，不为延长对话强加追问或下一步。"
-        "不得为了简短而省略影响结论的事实、数字、风险、限制或真实完成状态。"
-        "代码、文件和完整过程在画布展示；语音仍须讲清用户所问的结论及必要依据，不能只让用户去看画布。"
+        "\n\n表达标准：回答会被直接朗读，必须简短、口语化、直奔主题。"
+        "普通问答先用 2 到 3 句讲清核心结论；工具受理、状态播报或失败提示控制在 1 到 2 句内，"
+        "不展开长串举例，不复述用户问题，不解释思考或检索过程。"
+        "仅在用户明确要求详细讲解或展开说明时，才做完整展开。"
+        "不得为了简短而省略影响结论的关键数字、风险或真实完成状态；"
+        "代码、文件和完整过程留在画布展示，语音只讲关键结论。"
     )
 
 
@@ -171,14 +170,14 @@ _BASE_SYSTEM_INSTRUCTION = (
     "新闻的标题、事实、来源和发布时间必须来自同一条检索结果；摘要不够就用 fetch_web_page 阅读该来源。检索日期不等于新闻发布日期，不能把旧闻当作今日新闻；查不到符合日期的结果就明确说明。"
     "\n\n意图一，直接回答：适用于简单事实、解释、建议和闲聊。先给结论，只补充理解结论所必需的信息。"
     "不要复述问题，不要先声明准备怎么回答，不要主动扩展用户未要求的背景。"
-    "\n\n意图二，立即委派：适用于需要联网研究、深度分析、读取工作区、写代码、修改文件、执行命令、"
-    "制作练习、图谱、产物或其他后台工作的请求。只要目标、对象和期望结果足以启动，就立即调用对应工具创建任务，"
-    "不得先反复询问风格、格式、细节或让用户重新描述。未指定的次要细节采用安全、常见、可修改的默认值，"
-    "并写入任务说明；创建后只简短告知任务已受理和将产出什么。复杂联网研究用 delegate_research，深度分析用"
-    "delegate_reasoning；其余学习或工作区任务用 delegate_tool_task 和对应 capability。"
-    "\n\n意图三，必要澄清：只有缺少的信息会改变任务对象、核心目标、数据来源、权限边界，"
-    "或使任务无法安全启动时才提问。一次只问一个最关键问题，给出具体选项；得到答案后立即创建任务。"
-    "不要询问可由合理默认值解决的偏好，不要连续确认已经明确的内容。"
+    "\n\n意图二，立即委派与直接执行：适用于需要联网研究、深度分析、读取工作区、写代码、修改文件、执行命令、"
+    "制作练习、图谱、产物或其他后台工作的请求。只要能用上下文或常见安全默认值推断出可执行目标，就立即调用工具执行或创建任务，"
+    "严禁先询问风格、格式、方向或让用户确认。未指定的细节直接采用合理默认值并在后台推进；"
+    "创建后只用一句话告知已受理和预期产物，不铺垫检索思路。"
+    "复杂联网研究用 delegate_research，深度分析用 delegate_reasoning；其余学习或工作区任务用 delegate_tool_task 和对应 capability。"
+    "若某次工具或后台调用失败，优先自行换用可用工具或合理默认值重试；确实无法继续时再如实说明卡点，不要把多个补救方案抛给用户做选择题。"
+    "\n\n意图三，必要澄清：尽量不提问。只有缺少的信息会导致完全无法安全启动（如缺少必须的目标对象或权限边界）时才提问。"
+    "一次只问 1 个最关键的问题，不附带长串举例，得到答案后立即执行。"
     "\n\n意图四，任务控制：查询状态用 get_background_task，取消用 cancel_background_task，"
     "修改需求用 revise_background_task，自动播报用 set_background_delivery，用户明确要求听取完成结果时"
     "才用 get_ready_results。不要反复轮询。"
@@ -351,11 +350,26 @@ def _foreground_text_tool_schemas(
                         settings=settings,
                     )
                     information_context = {}
-                    if name in {"get_weather", "get_news", "get_current_time"} and getattr(session, "id", None):
+                    if name in {"get_weather", "get_news", "get_current_time", "search_web", "fetch_web_page"} and getattr(session, "id", None):
                         from app.domain.models import VoiceSessionRecord
                         fresh_session = db.get(VoiceSessionRecord, session.id)
                         if fresh_session is not None:
-                            information_context = (fresh_session.context_snapshot or {}).get("client_environment", {})
+                            snapshot = fresh_session.context_snapshot or {}
+                            if name in {"search_web", "fetch_web_page"} and snapshot.get("web_search_enabled", True) is False:
+                                db.commit()
+                                return (
+                                    json.dumps(
+                                        {
+                                            "ok": False,
+                                            "error": "web_search_disabled",
+                                            "message": "联网搜索当前已关闭，请先开启联网开关后再试。",
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    {},
+                                    [],
+                                )
+                            information_context = snapshot.get("client_environment", {})
                         # Release the read transaction before network I/O.
                         db.commit()
                     return runtime.execute(
@@ -720,6 +734,21 @@ class TutorAgent(LLMWorker):
         context: str = "",
     ) -> None:
         """Queue a web research task and return immediately with a task receipt."""
+        if getattr(self._session, "id", None):
+            from app.core.database import SessionLocal
+            from app.domain.models import VoiceSessionRecord
+
+            with SessionLocal() as db:
+                fresh_session = db.get(VoiceSessionRecord, self._session.id)
+                if fresh_session is not None and (fresh_session.context_snapshot or {}).get("web_search_enabled", True) is False:
+                    await params.result_callback(
+                        {
+                            "ok": False,
+                            "error": "web_search_disabled",
+                            "message": "联网搜索当前已关闭，请先开启联网开关后再试。",
+                        }
+                    )
+                    return
         await self._delegate(
             params,
             kind=DelegationKind.RESEARCH,
@@ -1002,9 +1031,12 @@ def build_pipeline_steps(
     conversation_input: FrameProcessor | None = None,
     conversation_context: FrameProcessor | None = None,
     conversation_output: FrameProcessor | None = None,
+    noise_filter: FrameProcessor | None = None,
 ) -> list[FrameProcessor]:
     """Assemble the main worker's pipeline in one testable place."""
     steps: list[FrameProcessor] = [transport_input, stt]
+    if noise_filter is not None:
+        steps.append(noise_filter)
     if input_floor is not None:
         steps.append(input_floor)
     if conversation_input is not None:
@@ -1804,9 +1836,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             tts.content_guard.observe_released(turn_id, text)
         journal.set_playback_context_hook(update_playback_context)
 
+    noise_filter = VoiceNoiseFilterProcessor()
     pipeline_steps = build_pipeline_steps(
         transport_input=transport.input(),
         stt=stt,
+        noise_filter=noise_filter,
         user_journal=user_journal,
         user_aggregator=user_aggregator,
         bridge=bridge,

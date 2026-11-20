@@ -203,7 +203,10 @@ export interface VoiceIceServersWire {
 export interface VoiceRelayConfigWire {
   configured: boolean;
   enabled: boolean;
-  mode: "cloudflare" | "manual";
+  mode: "cloudflare" | "turn" | "manual";
+  /** Kind of retained credential, including while manual STUN is active. */
+  secret_mode?: "cloudflare" | "turn";
+  username?: string | null;
   urls: string[];
   stun_urls: string[];
   stun_fallback_enabled: boolean;
@@ -245,14 +248,15 @@ export interface VoiceRelayTestWire {
 }
 
 export interface VoiceRelaySaveWire {
-  mode?: "cloudflare" | "manual";
+  mode?: "cloudflare" | "turn" | "manual";
   stun_urls?: string[];
   stun_fallback_enabled?: boolean;
   key_id?: string;
   api_base?: string;
   urls?: string[];
   credential_ttl_seconds?: number;
-  /** Leave empty to keep the stored token. */
+  username?: string;
+  /** Password or Cloudflare API token. Leave empty to retain the same credential kind. */
   secret?: string;
 }
 

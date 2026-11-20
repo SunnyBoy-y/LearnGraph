@@ -33,9 +33,13 @@
 .stream-ui__graph[data-background=warm] { --graph-background:#f5f0e5; --graph-node:#fffdf7; --graph-foreground:#3c3429; --graph-edge:#76664f; --graph-border:#d3c5ac; }
 .stream-ui__graph[data-background=cool] { --graph-background:#edf4fc; --graph-node:#fff; --graph-foreground:#213b55; --graph-edge:#526d89; --graph-border:#becfe2; }
 .stream-ui__graph[data-background=dark] { --graph-background:#18212e; --graph-node:#243246; --graph-foreground:#f0f5ff; --graph-edge:#a2b4cc; --graph-border:#52647e; }
-.stream-ui__graph-scroll { overflow:hidden; height:clamp(260px,45vw,420px); border:1px solid var(--graph-border); border-radius:10px; background:var(--graph-background); overscroll-behavior:contain; }
-.stream-ui__graph-scroll svg { display:block; width:100%; height:100%; min-width:0; touch-action:none; user-select:none; cursor:grab; }
-.stream-ui__graph-scroll svg:active { cursor:grabbing; }
+.stream-ui__graph-scroll { position:relative; overflow:hidden; height:clamp(260px,45vw,420px); border:1px solid var(--graph-border); border-radius:10px; background:var(--graph-background); overscroll-behavior:contain; }
+.stream-ui__graph-fullscreen { position:absolute; top:8px; right:8px; z-index:1; color:var(--graph-foreground); background:var(--graph-node); border-color:var(--graph-border); }
+.stream-ui__graph:fullscreen { display:flex; flex-direction:column; gap:0; width:100%; height:100%; padding:16px; box-sizing:border-box; overflow:auto; background:var(--background); color:var(--foreground); }
+.stream-ui__graph:fullscreen .stream-ui__toolbar { flex-shrink:0; padding:0 0 12px; }
+.stream-ui__graph:fullscreen .stream-ui__graph-scroll { flex:1; min-height:0; height:auto; }
+.stream-ui__graph-scroll > svg { display:block; width:100%; height:100%; min-width:0; touch-action:none; user-select:none; cursor:grab; }
+.stream-ui__graph-scroll > svg:active { cursor:grabbing; }
 .stream-ui__graph .stream-ui__edge path { fill:none; stroke:var(--graph-edge); stroke-width:1.5; opacity:.8; }
 .stream-ui__graph .stream-ui__edge text { fill:var(--graph-edge); paint-order:stroke; stroke:var(--graph-background); stroke-width:5px; stroke-linejoin:round; }
 .stream-ui__graph .stream-ui__node rect { fill:var(--graph-node); stroke:var(--graph-border); }

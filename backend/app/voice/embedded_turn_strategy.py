@@ -33,6 +33,7 @@ from app.voice.embedded_turn_intent import (
     TurnIntent,
     TurnIntentClassifier,
     is_asr_filler,
+    is_noise_utterance,
     normalize_transcript,
 )
 
@@ -171,7 +172,7 @@ class AdaptiveUserTurnStartStrategy(BaseUserTurnStartStrategy):
                 # Retain text in aggregation/journal, but an old commit cannot
                 # open another turn or interrupt the replacement generation.
                 return ProcessFrameResult.STOP
-            if not normalize_transcript(text) or is_asr_filler(text):
+            if not normalize_transcript(text) or is_asr_filler(text) or is_noise_utterance(text):
                 await self._cancel_decision()
                 await self._suppress_backchannel()
                 return ProcessFrameResult.STOP

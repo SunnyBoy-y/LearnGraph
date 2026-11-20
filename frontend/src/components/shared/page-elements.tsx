@@ -22,8 +22,8 @@ export function PageFrame({ children, className }: { children: ReactNode; classN
 
 export function PageIntro({
   title,
-  description,
-  eyebrow,
+  description: _description,
+  eyebrow: _eyebrow,
   actions,
 }: {
   title: string
@@ -33,11 +33,9 @@ export function PageIntro({
 }) {
   const Heading = useContext(PageHeadingLevelContext) === 2 ? 'h2' : 'h1'
   return (
-    <header className="flex flex-col gap-4 border-b pb-5 lg:flex-row lg:items-end lg:justify-between">
+    <header className="flex flex-col gap-3 border-b pb-4 lg:flex-row lg:items-center lg:justify-between">
       <div className="min-w-0">
-        {eyebrow ? <p data-page-eyebrow className="mb-1 text-xs font-semibold uppercase tracking-[0.18em] text-primary">{eyebrow}</p> : null}
-        <Heading data-page-title className="break-words text-balance text-2xl font-semibold tracking-tight sm:text-[1.7rem]">{title}</Heading>
-        {description ? <p className="mt-1.5 max-w-3xl text-sm leading-6 text-muted-foreground">{description}</p> : null}
+        <Heading data-page-title className="break-words text-balance text-xl font-semibold tracking-tight sm:text-2xl">{title}</Heading>
       </div>
       {actions ? <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
     </header>

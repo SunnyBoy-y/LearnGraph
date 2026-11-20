@@ -19,6 +19,9 @@ import { ComposerStickers } from "@/components/chat/composer-stickers";
 import type { Sticker } from "@/api/stickers";
 import { useNativeComposerContract } from "@/lib/native-composer-contract";
 import { useLatestCallback } from "@/hooks/use-latest-callback";
+import { controlChatGoal, startChatGoal } from "@/api/chat-goals";
+import { parseGoalCommand } from "./chat-goal-command";
+import { ChatGoalPanel, chatGoalIsActive, chatGoalKey, useChatGoal } from "./chat-goal-panel";
 import { useLiveChatMessages } from "./use-live-chat-messages";
 import { useComposerField, promoteComposerScope } from "./composer-session-state";
 import { requestConfirmedStop, type StopState } from "./confirmed-cancellation";
@@ -266,6 +269,7 @@ import {
 import { ExpandableContent } from "@/components/shared/expandable-content";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -877,6 +881,7 @@ function ConversationJumpNav({
 
 type ComposerCommandId =
   | "goal"
+  | "long-goal"
   | "image"
   | "search"
   | "agentic"
@@ -3116,6 +3121,14 @@ export function ChatCanvasPage() {
   const HISTORY_COLLAPSE_THRESHOLD = 120;
   const HISTORY_REVEAL_STEP = 100;
 
+  const longGoal = useChatGoal(workspaceId, sessionId);
+  const longGoalActive = chatGoalIsActive(longGoal.data);
+  const sendingLongGoal = useRef(false);
+  const goalCheckpoint = longGoal.data?.last_message_id;
+  useEffect(() => {
+    if (!goalCheckpoint) return;
+    void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
+  }, [goalCheckpoint, queryClient, sessionId, workspaceId]);
   const conditionalTimeline = useRef(new ConditionalSessionTimeline())
   const history = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
@@ -3144,7 +3157,9 @@ export function ChatCanvasPage() {
     refetchOnMount: true,
     // No session-wide push channel exists. Check only the visible idle window;
     // discovered remote streams use the existing cursor-based event replay.
-    refetchInterval: () => timelinePollInterval(sessionId, isSessionStreaming(sessionId), status),
+    refetchInterval: () => longGoalActive && !isSessionStreaming(sessionId)
+      ? 2_000
+      : timelinePollInterval(sessionId, isSessionStreaming(sessionId), status),
     refetchIntervalInBackground: false,
     // Evict inactive session histories quickly; active eviction below is the
     // primary bound, this is the safety net for unobserved caches.
@@ -5693,6 +5708,10 @@ export function ChatCanvasPage() {
         toast.message("语音模式下无法发起普通对话请求，请先退出语音模式。");
         return;
       }
+      if (longGoalActive) {
+        showComposerNotice("请先暂停长程任务，再发送新的消息。");
+        return;
+      }
       // Concurrent sessions: only block while THIS session is generating.
       if (isSessionStreaming(sessionId)) return;
       if (
@@ -6407,6 +6426,7 @@ export function ChatCanvasPage() {
     [
       queryClient,
       conversationResetKey,
+      longGoalActive,
       stopState.phase,
       activeModelProvider,
       setLocalMessages,
@@ -6620,6 +6640,75 @@ export function ChatCanvasPage() {
         activeStreamSessionId.current === sessionId ||
         isSessionStreaming(sessionId);
       const trimmedText = message.text.trim();
+      const goalCommand = parseGoalCommand(trimmedText);
+      if (goalCommand) {
+        if (voiceModeOpen && !voiceTextFallback) {
+          showComposerNotice("请先退出语音通话，再使用长程任务命令。");
+          return false;
+        }
+        if (goalCommand.type === "invalid") {
+          showComposerNotice(goalCommand.reason);
+          return false;
+        }
+        if (effectiveFiles.length || effectivePendingFiles.length || effectiveStickers.length || effectiveLongPaste !== null) {
+          showComposerNotice("长程任务命令只接收文本，附件草稿已保留。");
+          return false;
+        }
+        if (sendingLongGoal.current) return false;
+        sendingLongGoal.current = true;
+        try {
+          if (goalCommand.type !== "start") {
+            const current = sessionId === "new" ? null : await longGoal.refetch({ throwOnError: true }).then(result => result.data);
+            if (current && goalCommand.type === "control") {
+              const result = await controlChatGoal(sessionId, current.id, goalCommand.action);
+              queryClient.setQueryData(chatGoalKey(workspaceId, sessionId), result);
+            } else if (!current) {
+              toast.message("此会话没有长程任务");
+            }
+            clearSubmittedDraft();
+            return true;
+          }
+          if (goalMode || effectiveGenerationMode !== "text") {
+            showComposerNotice("请先退出目标设定或绘图模式，再启动长程任务。");
+            return false;
+          }
+          if (!supportsAgentMode || !activeModelProvider || !selectedModel) {
+            showComposerNotice("长程任务需要支持工具调用的远程模型。");
+            return false;
+          }
+          if (generatingNow || longGoalActive) {
+            showComposerNotice("请先等待当前回复结束，或清除已有长程任务。");
+            return false;
+          }
+          const created = sessionId === "new" ? await ensureDraftSession() : null;
+          const targetId = created?.id ?? sessionId;
+          const result = await startChatGoal(targetId, {
+            objective: goalCommand.objective, max_rounds: goalCommand.maxRounds,
+            model_id: selectedModel.id, provider_id: activeModelProvider.id,
+            thinking_mode: effectiveThinkingMode,
+            search_route: resolveNetworkSearchRoute(searchRoute, Boolean(selectedModel.capabilities?.hosted_web_search ??
+              activeModelProvider.capabilities.hosted_web_search), hasAuthorizedAgentSearchProvider),
+          });
+          queryClient.setQueryData(chatGoalKey(workspaceId, targetId), result);
+          clearSubmittedDraft();
+          if (created) {
+            rememberCreatedSession(created);
+            if (viewingComposerScopeRef.current === conversationResetKey) {
+              navigate(`/w/${workspaceId}/chat/${targetId}`, { replace: true });
+            }
+          }
+          return true;
+        } catch (error) {
+          showComposerNotice(error instanceof Error ? error.message : "长程任务命令未能执行。");
+          return false;
+        } finally {
+          sendingLongGoal.current = false;
+        }
+      }
+      if (longGoalActive) {
+        showComposerNotice("请先暂停长程任务，再发送新的消息。草稿已保留。");
+        return false;
+      }
       // Voice mode is a live call: typed text must become the same turn the ASR
       // transcript produces, not a second chat request that answers in parallel.
       // Anything with attachments / long-paste still falls through to the normal
@@ -6919,6 +7008,9 @@ export function ChatCanvasPage() {
     [
       activeImageProvider,
       activeModelProvider,
+      longGoal.refetch, longGoalActive, supportsAgentMode, ensureDraftSession,
+      effectiveThinkingMode, searchRoute, hasAuthorizedAgentSearchProvider,
+      queryClient, rememberCreatedSession, navigate,
       showComposerNotice,
       clearComposerNotice,
       configureModels,
@@ -7107,7 +7199,7 @@ export function ChatCanvasPage() {
 
   // 当前会话空闲时自动发送队列中的下一条消息。
   useEffect(() => {
-    if (dispatchInFlightRef.current) return;
+    if (longGoalActive || dispatchInFlightRef.current) return;
     if (autoDispatchBlockedRef.current || stopState.phase !== "idle" || queueEditItem?.sessionId === sessionId) return;
     if (!pendingSendQueue.length) return;
     if (sessionId === "new" || !history.isSuccess || history.data?.some(message => message.role === "assistant" && IN_FLIGHT_MESSAGE_STATUSES.includes(message.status as (typeof IN_FLIGHT_MESSAGE_STATUSES)[number]))) return;
@@ -7128,6 +7220,7 @@ export function ChatCanvasPage() {
     })();
   }, [
     closeSessionMutation.isPending,
+    longGoalActive,
     dispatchQueuedSend,
     goalFlow.busy,
     pendingSendQueue,
@@ -8715,7 +8808,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   //
   // 目标流程（`goalFlow.busy`）没有取消 API，期间不给中断键，语音入口维持
   // 渲染但置灰 —— 否则那一格会空掉。
-  const voiceDialBlocked = streamOrSubmitted || goalFlow.busy || stopState.phase !== "idle";
+  const voiceDialBlocked = streamOrSubmitted || goalFlow.busy || longGoalActive || stopState.phase !== "idle";
   const composerShowsInterrupt =
     !voiceModeOpen && !composerHasDraft && streamOrSubmitted && !goalFlow.busy;
   const goalStageLabel =
@@ -8845,8 +8938,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       { agent: true },
     );
   }, [currentSession?.graph_id, graphCommandAvailable, prepareTaskPrompt, voiceModeOpen, voiceBlocksComposer]);
+  useEffect(() => {
+    if (!voiceModeOpen) return;
+    void voiceSessionController.setWebSearchEnabled(searchRoute !== "disabled");
+  }, [voiceModeOpen, searchRoute]);
+
   const toggleNetworkSearch = useCallback(() => {
-    if (voiceBlocksComposer) return;
     setGenerationMode("text");
     setSearchRoute((current) => {
       if (current !== "disabled") return "disabled";
@@ -8891,6 +8988,14 @@ ${detail.text!.trim()}` : detail.text!.trim(),
     focusComposer();
   }, [focusComposer, voiceModeOpen, voiceBlocksComposer, setGenerationMode]);
   const composerCommands = [
+    {
+      id: "long-goal" as const,
+      label: "长程任务",
+      description: "围绕可验收的目标持续执行",
+      keywords: "goal 长程 自动任务",
+      disabled: sessionIsClosed || !supportsAgentMode || goalMode || voiceBlocksComposer,
+      Icon: Target,
+    },
     {
       id: "goal" as const,
       label: "设定学习目标",
@@ -9073,6 +9178,16 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   const activateComposerCommand = useCallback(
     (action: ComposerCommandId) => {
       if (voiceBlocksComposer) return;
+      if (action === "long-goal") {
+        setComposerText((current) => {
+          const objective = current.replace(/(^|\s)@[^\s@]*$/u, "$1").trim();
+          return parseGoalCommand(objective) ? current : `/goal ${objective}`;
+        });
+        setGenerationMode("text");
+        setDismissedMention("");
+        focusComposer();
+        return;
+      }
       if (action === "goal") {
         enterGoalMode();
         return;
@@ -9337,7 +9452,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   );
   };
 
-  const showNewChatWelcome = isEmptySession && !roundTasks.length && !goalMode && !voiceModeOpen;
+  const showNewChatWelcome = isEmptySession && !roundTasks.length && !goalMode && !longGoal.data && !voiceModeOpen;
 
   return (
     <div className={cn("chat-canvas-page relative flex h-full min-h-0 flex-col bg-background", showNewChatWelcome && "is-new-chat-welcome")} data-session-id={sessionId}>
@@ -9885,6 +10000,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             </Button>
           </div>
         ) : null}
+        {longGoal.data ? (
+          <ChatGoalPanel key={longGoal.data.id} workspaceId={workspaceId} sessionId={sessionId} goal={longGoal.data} readOnly={sessionIsClosed} />
+        ) : null}
         {goalMode ? (
           <div className="chat-goal-mode" role="status">
             <Target className="size-3.5" />
@@ -10199,7 +10317,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           }
           searchActive={searchRoute !== "disabled"}
           searchDisabled={
-            sessionIsClosed || voiceBlocksComposer ||
+            sessionIsClosed ||
             goalFlow.busy ||
             !canUseNetworkSearch
           }
@@ -10395,7 +10513,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 })}
                 <DropdownMenuSeparator />
                 <DropdownMenuLabel>模式与工具</DropdownMenuLabel>
-                {(["search", "agentic", "image"] as const).map((id) => {
+                {(["long-goal", "search", "agentic", "image"] as const).map((id) => {
                   const command = composerCommands.find(
                     (item) => item.id === id,
                   );
@@ -11181,16 +11299,15 @@ export function VersionsPage() {
           {versions.data?.map((version) => (
             <label className="rounded-xl border p-4" key={version.id}>
               <div className="flex items-center gap-3">
-                <input
+                <Checkbox
                   checked={selected.includes(version.id)}
-                  onChange={(event) =>
+                  onCheckedChange={(checked) =>
                     setSelected((current) =>
-                      event.target.checked
+                      checked === true
                         ? [...current, version.id]
                         : current.filter((id) => id !== version.id),
                     )
                   }
-                  type="checkbox"
                 />
                 <p className="text-sm font-semibold">v{version.version}</p>
                 <StatePill label={version.status} status={version.status} />

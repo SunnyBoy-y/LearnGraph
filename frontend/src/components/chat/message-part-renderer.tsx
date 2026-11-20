@@ -924,8 +924,8 @@ export function TextWithCitations({
   const { workspaceId } = useAuth();
   const lookup = useCitationLookup(siblingParts, workspaceId);
   const { markdown } = useMemo(
-    () => rewriteAllCitations(content, lookup.webIndexes),
-    [content, lookup.webIndexes],
+    () => rewriteAllCitations(content, lookup.webIndexes, streaming),
+    [content, lookup.webIndexes, streaming],
   );
 
   const components = useMemo<ComponentProps<typeof MessageResponse>["components"]>(

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Circle, Database, LoaderCircle, RefreshCcw, ShieldCheck } from 'lucide-react'
 import { toast } from '@/lib/notifications'
@@ -11,7 +11,7 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useAuth } from '@/features/auth/auth-context-value'
 import { DatabaseConfigurationSheet } from './database-configuration-sheet'
-import type { PrimaryDatabaseMigration } from '@/types/migrations'
+import type { PrimaryDatabaseCheck, PrimaryDatabaseMigration } from '@/types/migrations'
 
 const labels: Record<string, string> = {
   QUEUED: '等待执行', BACKING_UP: '备份主业务库', VERIFYING_BACKUP: '验证备份与恢复', BACKUP_VERIFIED: '备份验证通过',
@@ -30,6 +30,20 @@ const checkLabels: Record<string, string> = {
   source_indexes: '索引与唯一约束均可保留',
 }
 
+function CheckFailureDetails({ check }: { check: PrimaryDatabaseCheck }) {
+  const groups = [
+    ['无法保留的索引', check.unmapped_indexes], ['未识别的表', check.unknown_tables],
+    ['缺少的表', check.missing_tables], ['字段不匹配的表', check.tables],
+    ['未识别的触发器', check.unmapped_triggers], ['未识别的视图', check.unmapped_views],
+    ['未映射的约束', check.unmapped_checks],
+  ] as const
+  return <div className="mt-1 space-y-1 break-all text-xs text-destructive">
+    {check.detail && <p>{check.detail}</p>}
+    {groups.map(([label, names]) => names?.length ? <p key={label}>{label}：{names.join('、')}</p> : null)}
+    {!!check.active_locks && <p>仍有 {check.active_locks} 个维护锁，请等待相关操作完成后重试。</p>}
+  </div>
+}
+
 function CounterProgress({ label, current = 0, total = 0 }: { label: string; current?: number; total?: number }) {
   return <div className="space-y-1.5"><div className="flex justify-between gap-3 text-xs"><span>{label}</span><span className="tabular-nums text-muted-foreground">{current.toLocaleString()} / {total.toLocaleString()}</span></div>
     <div aria-label={label} role="progressbar" aria-valuemin={0} aria-valuemax={total || 1} aria-valuenow={current} className="h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full bg-primary transition-[width]" style={{ width: `${total ? Math.min(100, current / total * 100) : 0}%` }} /></div></div>
@@ -43,23 +57,49 @@ export function PrimaryDatabaseMigrationPanel() {
   const [autoActivate, setAutoActivate] = useState(true)
   const [acknowledged, setAcknowledged] = useState(false)
   const [password, setPassword] = useState('')
+  const [passwordError, setPasswordError] = useState('')
   const [configurationOpen, setConfigurationOpen] = useState(false)
-  useEffect(() => { setPassword(''); setAcknowledged(false); setConfigurationOpen(false) }, [userId, isSystemAdmin])
+  useEffect(() => { setPassword(''); setPasswordError(''); setAcknowledged(false); setConfigurationOpen(false) }, [userId, isSystemAdmin])
   const status = useQuery({ queryKey: key, queryFn: getPrimaryDatabaseMigration, enabled: isSystemAdmin,
     refetchInterval: query => query.state.data?.active_database === 'postgresql' ? false : 1500 })
   const accept = (value: PrimaryDatabaseMigration) => { queryClient.setQueryData(key, value); void queryClient.invalidateQueries({ queryKey: key }) }
   const preflight = useMutation({ mutationFn: preflightPrimaryDatabaseMigration, onError: error => toast.error(error.message) })
-  const start = useMutation({ mutationFn: () => startPrimaryDatabaseMigration({ confirm: true, current_password: password, managed, auto_activate: autoActivate }),
+  const start = useMutation({ mutationFn: (currentPassword: string) => startPrimaryDatabaseMigration({ confirm: true, current_password: currentPassword, managed, auto_activate: autoActivate }),
     onSuccess: value => { accept(value); setPassword('') }, onError: error => toast.error(error.message) })
-  const activate = useMutation({ mutationFn: () => activatePrimaryDatabaseMigration(password), onSuccess: value => { accept(value); setPassword('') }, onError: error => toast.error(error.message) })
+  const activate = useMutation({ mutationFn: (currentPassword: string) => activatePrimaryDatabaseMigration(currentPassword), onSuccess: value => { accept(value); setPassword('') }, onError: error => toast.error(error.message) })
   const cancel = useMutation({ mutationFn: cancelPrimaryDatabaseMigration, onSuccess: accept, onError: error => toast.error(error.message) })
   const resume = useMutation({ mutationFn: resumePrimaryDatabaseMigration, onSuccess: accept, onError: error => toast.error(error.message) })
   if (!isSystemAdmin) return null
   const job = status.data
   const complete = job?.active_database === 'postgresql' && job.state !== 'RECOVERING'
   const terminal = !job?.id || ['FAILED', 'CANCELLED'].includes(job.state ?? '')
-  const canStart = !!preflight.data?.ready && !!password && acknowledged && !start.isPending && !job?.running && !complete && terminal && (!managed || !!job?.agent_configured)
   const busy = start.isPending || activate.isPending || cancel.isPending || resume.isPending
+  const startBlockedReason = status.isPending ? '正在读取主库状态，请稍候。'
+    : status.isError ? '无法读取主库状态，请先刷新重试。'
+    : job?.running ? '已有迁移任务正在执行，请等待完成。'
+    : !terminal ? '请先继续或取消已有迁移任务。'
+    : preflight.isPending ? '迁移预检正在执行，请稍候。'
+    : preflight.isError ? `迁移预检失败：${preflight.error.message}。请重新执行预检。`
+    : !preflight.data ? '请先执行迁移预检。'
+    : !preflight.data.ready || preflight.data.checks.some(check => !check.passed) ? '预检未通过，请先处理上方未通过的项目，再重新执行迁移预检。'
+    : managed && !job?.agent_configured ? '请先启用数据库迁移代理，或选择已有 PostgreSQL 空库。'
+    : !acknowledged ? '请先勾选单向迁移确认。' : ''
+  const canStart = !startBlockedReason && !busy && !complete
+  const canActivate = !!job?.all_checks_passed && acknowledged && !busy && !complete
+  const submitMigration = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (terminal ? !canStart : !canActivate) return
+    const currentPassword = String(new FormData(event.currentTarget).get('currentPassword') ?? '')
+    setPassword(currentPassword)
+    if (!currentPassword) {
+      setPasswordError('请输入当前管理员密码。')
+      event.currentTarget.querySelector<HTMLInputElement>('[name="currentPassword"]')?.focus()
+      return
+    }
+    setPasswordError('')
+    if (terminal) start.mutate(currentPassword)
+    else activate.mutate(currentPassword)
+  }
   const gates = [['备份与恢复验证', job?.backup_verified], ['全量逐表校验', job?.baseline_verified], ['检索兼容检查', job?.search_verified], ['目标读写与持久性', job?.target_verified], ['切换前检查', job?.all_checks_passed]] as const
   return <Surface className="space-y-5 p-5" data-testid="primary-database-migration">
     <SectionHeading title="主业务数据库" description="仅系统管理员可将 SQLite 单向迁移至 PostgreSQL。新安装继续默认使用 SQLite。" action={<Button aria-label="刷新主库迁移状态" variant="ghost" size="icon-sm" onClick={() => void status.refetch()}><RefreshCcw className={status.isFetching ? 'size-4 animate-spin' : 'size-4'} /></Button>} />
@@ -71,8 +111,16 @@ export function PrimaryDatabaseMigrationPanel() {
       {managed && job?.agent_auto_start && <p className="text-sm leading-6 text-muted-foreground">迁移服务将在需要时自动启动，PostgreSQL 准备就绪后自动停止；数据库继续独立运行。</p>}
       <p className="text-sm leading-6 text-muted-foreground">迁移期间服务继续运行，后台持续同步新增事务。系统先备份并验证恢复，再复制、逐表核对和检查检索能力；全部通过后协调现有事务，切换期间新请求短暂等待。</p>
       <div className="flex flex-wrap gap-2"><Button variant="outline" onClick={() => preflight.mutate()} disabled={preflight.isPending || !terminal || !!job?.running}>{preflight.isPending ? '预检中…' : '执行迁移预检'}</Button>{job?.id && !job.irreversible && job.state !== 'CANCELLED' && <Button variant="outline" disabled={busy} onClick={() => cancel.mutate()}>取消本次迁移</Button>}{job?.id && job.state !== 'CANCELLED' && !job.running && !job.irreversible && <Button variant="outline" disabled={busy} onClick={() => resume.mutate()}>继续本次迁移</Button>}</div>
-      {preflight.data && <ul className="grid gap-2 text-sm sm:grid-cols-2">{preflight.data.checks.map(check => <li key={check.key} className="flex items-center gap-2">{check.passed ? <Check className="size-4 text-primary" /> : <Circle className="size-4 text-destructive" />}<span>{checkLabels[check.key] ?? check.key}：{check.passed ? '通过' : '未通过'}</span></li>)}</ul>}
-      {(terminal || job?.state === 'READY_TO_ACTIVATE') && <div className="space-y-3 rounded-xl border p-4"><div className="flex items-start gap-2"><Checkbox id="primary-db-irreversible" checked={acknowledged} onCheckedChange={value => setAcknowledged(value === true)} /><Label htmlFor="primary-db-irreversible" className="leading-5">我确认仅迁移主业务库，成功后永久使用 PostgreSQL，不支持迁回 SQLite。</Label></div><div className="flex items-center gap-2"><Checkbox id="primary-db-auto" checked={autoActivate} onCheckedChange={value => setAutoActivate(value === true)} disabled={!terminal} /><Label htmlFor="primary-db-auto">全部检查通过后自动切换</Label></div><div className="flex flex-wrap items-end gap-3"><div className="space-y-1.5"><Label htmlFor="primary-db-password">当前管理员密码</Label><Input id="primary-db-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} className="w-64" /></div>{terminal ? <Button disabled={!canStart} onClick={() => start.mutate()}>{start.isPending ? '提交中…' : '强制备份并开始迁移'}</Button> : <Button disabled={!job?.all_checks_passed || !acknowledged || !password || busy} onClick={() => activate.mutate()}>确认切换至 PostgreSQL</Button>}</div></div>}
+      {preflight.data && <ul className="grid gap-2 text-sm sm:grid-cols-2">{preflight.data.checks.map(check => <li key={check.key} className="flex items-start gap-2">{check.passed ? <Check className="mt-0.5 size-4 shrink-0 text-primary" /> : <Circle className="mt-0.5 size-4 shrink-0 text-destructive" />}<div><p>{checkLabels[check.key] ?? check.key}：{check.passed ? '通过' : '未通过'}</p>{!check.passed && <CheckFailureDetails check={check} />}</div></li>)}</ul>}
+      {(terminal || job?.state === 'READY_TO_ACTIVATE') && <form noValidate className="space-y-3 rounded-xl border p-4" onSubmit={submitMigration}>
+        <div className="flex items-start gap-2"><Checkbox id="primary-db-irreversible" checked={acknowledged} onCheckedChange={value => setAcknowledged(value === true)} disabled={busy} /><Label htmlFor="primary-db-irreversible" className="leading-5">我确认仅迁移主业务库，成功后永久使用 PostgreSQL，不支持迁回 SQLite。</Label></div>
+        <div className="flex items-center gap-2"><Checkbox id="primary-db-auto" checked={autoActivate} onCheckedChange={value => setAutoActivate(value === true)} disabled={!terminal || busy} /><Label htmlFor="primary-db-auto">全部检查通过后自动切换</Label></div>
+        <div className="flex flex-wrap items-end gap-3"><div className="space-y-1.5"><Label htmlFor="primary-db-password">当前管理员密码</Label><Input id="primary-db-password" name="currentPassword" required type="password" autoComplete="current-password" value={password} disabled={busy} aria-invalid={!!passwordError} aria-describedby={passwordError ? 'primary-db-password-error' : undefined} onChange={event => { setPassword(event.target.value); setPasswordError('') }} className="w-64" /></div>
+          {terminal ? <Button type="submit" disabled={!canStart} aria-describedby={startBlockedReason ? 'primary-db-start-blocked' : undefined}>{start.isPending ? '提交中…' : '强制备份并开始迁移'}</Button> : <Button type="submit" disabled={!canActivate}>确认切换至 PostgreSQL</Button>}
+        </div>
+        {passwordError && <p id="primary-db-password-error" role="alert" className="text-xs text-destructive">{passwordError}</p>}
+        {terminal && startBlockedReason && <p id="primary-db-start-blocked" aria-live="polite" className="text-xs text-muted-foreground">{startBlockedReason}</p>}
+      </form>}
     </>}
     {job?.id && <div className="space-y-4 border-t pt-4"><div className="grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">{gates.map(([label, passed]) => <div key={label} className="flex items-center gap-2">{passed ? <Check className="size-4 text-primary" /> : <Circle className="size-4 text-muted-foreground" />}{label}<span className="text-xs text-muted-foreground">{passed ? '通过' : '待完成'}</span></div>)}</div>
       {job.agent_state === 'stopped' && <p className="text-xs text-muted-foreground">临时迁移服务已停止，不影响 PostgreSQL 运行。</p>}

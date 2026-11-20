@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 
 
@@ -90,3 +91,53 @@ def test_native_turn_with_page_sources_and_no_external_search_provider(
     assert response.status_code == 200, response.text
     assert "message.failed" not in [e.get("type") for e in frames(response)], response.text[-5000:]
     assert "message.completed" in [e.get("type") for e in frames(response)]
+
+
+def test_responses_stream_annotation_survives_send_retry_and_reload(
+    client, register_user, auth_headers, stub_chat_service, monkeypatch,
+):
+    from app.api.routers import chat as router
+    from app.providers.remote.openai import OpenAIResponsesProvider
+
+    text = "来源已经核对。"
+    url = "https://example.org/verified"
+    events = [
+        {"type": "response.output_text.delta", "delta": text},
+        {"type": "response.output_text.annotation.added", "annotation": {
+            "type": "url_citation", "url": url, "title": "Verified", "start_index": 0, "end_index": len(text),
+        }},
+        {"type": "response.completed", "response": {"status": "completed", "output": [{
+            "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }]}},
+    ]
+
+    def factory(*args, **kwargs):
+        service = stub_chat_service(*args, **kwargs)
+        service.model_provider = OpenAIResponsesProvider(
+            provider_id=service.model_provider.provider_id, provider_type="openai_responses",
+            model_id=service.model_provider.model_id, base_url="https://example.org/v1", api_key="test-key",
+            transport=httpx.MockTransport(lambda _: httpx.Response(
+                200, text="".join(f"data: {json.dumps(event)}\n\n" for event in events),
+            )),
+        )
+        return service
+
+    monkeypatch.setattr(router, "service", factory)
+    token, workspace, _, _ = register_user()
+    headers = auth_headers(token, workspace)
+    sid = client.post("/api/v1/sessions", headers=headers, json={"title": "Stream annotations"}).json()["id"]
+    path = f"/api/v1/sessions/{sid}/messages"
+
+    def assert_citation(response):
+        assert response.status_code == 200, response.text
+        stream = frames(response)
+        assert "message.completed" in [event.get("type") for event in stream], response.text[-5000:]
+        assert any(event["type"] == "part.replaced" and event["payload"].get("reason") == "native_web_citations" for event in stream)
+        answer = next(row for row in client.get(path, headers=headers).json()["items"] if row["role"] == "assistant")
+        assert answer["content"] == text + "（网页引用：1）"
+        source_part = next(part for part in answer["parts"] if part["type"] == "source_list")
+        assert [(source["index"], source["url"]) for source in source_part["data"]["results"]] == [(1, url)]
+        return answer["id"]
+
+    answer_id = assert_citation(client.post(f"{path}/stream", headers=headers, json={"content": "检索来源"}))
+    assert_citation(client.post(f"{path}/{answer_id}/retry", headers=headers, json={}))

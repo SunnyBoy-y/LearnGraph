@@ -63,15 +63,21 @@ def create_voice_session(payload: VoiceSessionCreateRequest, db: DB, context: Cu
         pass
     if payload.client_environment is not None:
         session = service.update_client_environment(session.id, payload.client_environment)
-    if payload.low_latency_mode is not None:
-        session = service.update_preferences(session.id, low_latency_mode=payload.low_latency_mode)
+    if payload.low_latency_mode is not None or payload.web_search_enabled is not None:
+        session = service.update_preferences(
+            session.id,
+            low_latency_mode=payload.low_latency_mode,
+            web_search_enabled=payload.web_search_enabled,
+        )
     return session
 
 @router.patch("/sessions/{voice_session_id}/preferences", response_model=VoiceSession)
 def update_voice_preferences(voice_session_id: str, payload: VoiceSessionPreferencesRequest,
                              db: DB, context: CurrentWorkspace, settings: AppSettings):
     return svc(db, context, settings).update_preferences(
-        voice_session_id, low_latency_mode=payload.low_latency_mode,
+        voice_session_id,
+        low_latency_mode=payload.low_latency_mode,
+        web_search_enabled=payload.web_search_enabled,
     )
 
 @router.patch("/sessions/{voice_session_id}/environment", response_model=VoiceSession)
