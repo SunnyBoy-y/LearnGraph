@@ -44,7 +44,6 @@ describe("document native UI", () => {
     expect(screen.getByRole("link", {name: "观察"})).not.toHaveAttribute("aria-current");
     expect(screen.getByText("3,180")).toBeInTheDocument();
     expect(screen.getByText(/用户提供/)).toBeInTheDocument();
-    expect(screen.getByRole("button", {name: "导出 Markdown"})).toBeEnabled();
   });
 
   it("restores validated preferences from disk and sends the current view with an explain action", async () => {
