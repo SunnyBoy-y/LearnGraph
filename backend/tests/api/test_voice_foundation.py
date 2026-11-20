@@ -34,7 +34,22 @@ def _make_chat_session(client, headers) -> str:
         json={"title": "voice foundation"},
     )
     assert resp.status_code in (200, 201), resp.text
-    return resp.json()["id"]
+    session_id = resp.json()["id"]
+    # These voice tests exercise memory eligibility, including interrupted turns.
+    # Memory is opt-in at both workspace and conversation scope.
+    from app.domain.models import ChatSession, WorkspaceSetting
+    with SessionLocal() as db:
+        session = db.get(ChatSession, session_id)
+        session.memory_enabled = True
+        policy = db.query(WorkspaceSetting).filter_by(
+            workspace_id=session.workspace_id, key="memory.shared_policy"
+        ).one_or_none()
+        if policy is None:
+            db.add(WorkspaceSetting(workspace_id=session.workspace_id, key="memory.shared_policy", value={"workspace_enabled": True}))
+        else:
+            policy.value = {**(policy.value or {}), "workspace_enabled": True, "workspace_learning_enabled": True}
+        db.commit()
+    return session_id
 
 
 def _create_voice_session(client, headers, chat_session_id: str) -> dict:

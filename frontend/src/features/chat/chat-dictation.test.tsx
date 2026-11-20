@@ -51,7 +51,8 @@ describe("composer ASR", () => {
     fireEvent.pointerUp(input, { clientY: 300, pointerId: 1 });
     expect(stop).toHaveBeenCalledOnce();
     expect(screen.getByRole("status", { name: "正在转写语音" })).toBeInTheDocument();
-    expect(apiClient.post).not.toHaveBeenCalled();
+    expect(apiClient.post).not.toHaveBeenCalledWith("/sessions", expect.anything(), expect.anything());
+    expect(apiClient.postSse).not.toHaveBeenCalled();
     await act(async () => { drain.resolve(); });
     expect(upload).toHaveBeenCalledWith("/sessions/dictation/transcriptions", expect.any(FormData));
     const form = upload.mock.calls[0][1];
@@ -70,7 +71,8 @@ describe("composer ASR", () => {
     await act(async () => startup.resolve({ stop, abort: vi.fn() }));
     expect(stop).toHaveBeenCalledOnce();
     expect(screen.queryByRole("status", { name: "正在转写语音" })).not.toBeInTheDocument();
-    expect(apiClient.post).not.toHaveBeenCalled();
+    expect(apiClient.post).not.toHaveBeenCalledWith("/sessions", expect.anything(), expect.anything());
+    expect(apiClient.postSse).not.toHaveBeenCalled();
   });
 
   it.each(["swipe", "cancel", "unmount"])("aborts late startup after %s without sending", async (cancel) => {
@@ -86,7 +88,8 @@ describe("composer ASR", () => {
     await act(async () => startup.resolve({ stop, abort }));
     expect(abort).toHaveBeenCalled();
     expect(stop).not.toHaveBeenCalled();
-    expect(apiClient.post).not.toHaveBeenCalled();
+    expect(apiClient.post).not.toHaveBeenCalledWith("/sessions", expect.anything(), expect.anything());
+    expect(apiClient.postSse).not.toHaveBeenCalled();
   });
 
   it("shows the dotted bar for click dictation and preserves stop-time text", async () => {

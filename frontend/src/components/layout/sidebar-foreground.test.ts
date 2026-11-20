@@ -24,9 +24,9 @@ describe('neutral sidebar palette', () => {
     }
   })
 
-  it('keeps a black brand with a white glyph across themes', () => {
+  it('uses the active theme colors for the brand and glyph', () => {
     expect(declarations(sidebarCss, 'html[data-color-mode] .sidebar-nav .sidebar-brand .sidebar-brand__mark'))
-      .toMatchObject({ background: '#191919', color: '#fff' })
+      .toMatchObject({ background: 'var(--primary)', color: 'var(--primary-foreground)' })
   })
 
   it('emphasizes section labels and preserves session selection styling', () => {

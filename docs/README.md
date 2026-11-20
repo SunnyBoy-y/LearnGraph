@@ -8,7 +8,9 @@
 
 ## 内容
 
-- 基于当前 main 历史（起点 `ddf3a1c` v0.1 首发，HEAD `57fd37f`）的版本演进与设计原则；旧设计文档中的 `c173b36` 基线来自 rebase 前分支，不在 main 历史
+- 版本演进、设计原则与代码地图
+- 长程任务、定时任务、论文检索、联网研究与 Android 客户端
+- Docker 部署、数据备份和应用内更新
 - 系统架构与 FastAPI 应用网关
 - Provider Port / Adapter 边界、能力快照与按供应商门控（Qwen 原生搜索通道、DashScope ASR）
 - Agent Runtime、渐进式披露与原子工具模型

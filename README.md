@@ -5,9 +5,9 @@
 <h1 align="center">LearnGraph</h1>
 
 <p align="center">
-  <strong>让人从 AI 学习，高效进入并掌握陌生领域。</strong><br>
-  <span>从一个真实目标出发，让 <strong>图谱、Agent、Sandbox、Memory 与交互式学习环境</strong> 一起随学习持续生长。</span><br>
-  <span>Web + Android · Self-hosted · Agent-native Learning Workspace</span>
+  <strong>从一个目标出发，和 AI 一起学习、实践与成长。</strong><br>
+  <span>知识图谱 · 学习 Agent · 长期记忆 · 实时语音</span><br>
+  <span>Web + Android · Self-hosted</span>
 </p>
 
 <p align="center">
@@ -15,44 +15,41 @@
   <img alt="React 19" src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white">
   <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white">
-  <img alt="SQLite WAL" src="https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white">
   <a href="https://sunnyboy-y.github.io/LearnGraph/"><img alt="Developer Docs" src="https://img.shields.io/badge/docs-developer_guide-08745C"></a>
   <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-2EA44F"></a>
 </p>
 
 <p align="center">
-  <a href="#-核心亮点">核心亮点</a> ·
+  <a href="#-核心功能">核心功能</a> ·
   <a href="#-产品截图">产品截图</a> ·
-  <a href="#-一次完整的学习旅程">学习旅程</a> ·
-  <a href="#-g-r-e-m-a-学习闭环">G-R-E-M-A 闭环</a> ·
   <a href="#-快速开始">快速开始</a> ·
   <a href="#-技术架构">技术架构</a> ·
-  <a href="#-当前能力">当前能力</a> ·
-  <a href="https://sunnyboy-y.github.io/LearnGraph/">开发者文档</a> ·
-  <a href="https://github.com/SunnyBoy-y/LearnGraph">GitHub</a>
+  <a href="#-开发与检查">开发与检查</a> ·
+  <a href="https://sunnyboy-y.github.io/LearnGraph/">开发者文档</a>
 </p>
 
 > [!IMPORTANT]
-> LearnGraph 目前处于早期开发阶段，适合本地体验、研究和共同开发，请勿用于生产环境。
+> 项目处于早期开发阶段，适合体验、研究和共同开发。请勿用于生产环境。
 
----
+## ⚡ 核心功能
 
-## ⚡ 核心亮点
+| 功能 | 能做什么 |
+| --- | --- |
+| 🌱 **学习图谱** | 描述目标后生成知识路线，审核和调整节点；练习、对话与实践产生的证据持续更新能力状态和下一步建议。 |
+| 🤖 **学习 Agent** | 结合资料、工具和记忆讲解知识、设计练习、执行代码与整理研究成果。支持多种模型、Skills、MCP 和子任务。 |
+| 🎙 **全双工语音** | 边说边听、随时打断；字幕随朗读逐句点亮。语音和文字共用会话、记忆与学习证据，Android 端也可使用。 |
+| 🧩 **交互式学习** | 从图谱节点生成教材、互动实验、小剧场和闯关测评；交互组件和子应用中的操作可反馈给 Agent。 |
+| 🔎 **资料与研究** | 阅读上传的文档和媒体，联网搜索并引用来源；通过 OpenAlex 或 arXiv 检索论文、读取公开 PDF、保存引用并导出 BibTeX。 |
+| ⏱ **长程与定时任务** | 用 `/goal` 在会话中启动可暂停、继续的多轮任务；定时任务可按计划执行已授权的 Skill 或 MCP 工具。 |
+| 🧠 **长期记忆** | 学习过程和来源形成可追溯记录，按当前任务检索并装配到上下文；支持记忆治理。 |
+| 🛡 **隔离沙箱** | Agent 在 Docker 沙箱中执行代码和处理文件；默认断网，联网需经过授权。 |
+| 📱 **Android 客户端** | 用手机连接自己的工作区，支持拍照、分享、扫码、文件下载、通知和语音。 |
 
-| | 亮点 | 一句话说明 |
-| --- | --- | --- |
-| 🌱 | **可生长的知识路线图** | 从一句真实目标出发，生成可审核、可修订的知识图谱；随着学习进展持续调整，用户始终掌握决定权。 |
-| 🤖 | **Agent 级学习智能** | Agent 会主动规划执行：找资料、组织解释、设计练习、调用工具；能力采用**渐进式披露**，效率高，成本可控。 |
-| 🎙 | **全双工实时语音导师** | 张口就能学：边说边听、随时打断，字幕随朗读逐句点亮；语音与文字共用同一个会话、记忆与证据，Android 端同样可用。 |
-| 🛡 | **Docker 隔离沙箱** | Agent 执行代码、处理文件、构建预览都在 Docker-only 的隔离工作区：**默认断网 + 审批制出网**。 |
-| 📱 | **Android 原生移动端** | Kotlin / Jetpack Compose + GeckoView 客户端，将 LearnGraph 完整工作台带到手机，并打通拍照、分享、扫码、下载、通知、TTS 等原生能力。 |
-| 🧠 | **事件溯源长期记忆** | 记忆不是"摘要 + 向量库"，而是**事件溯源底座 + 分层投影 + 混合检索 + Context Builder 动态装配**：可重放、可溯源、可治理、防注入。 |
-| 🧩 | **节点交互式学习页** | 给图谱上任意节点生成一整页学习环境：教材、互动实验、小剧场与闯关测评；生成进度可见、失败可重试、中断可续做。 |
-| 🃏 | **Magic Card 可信组件** | AI 生成的不只是文字，还有可交互、有状态、可收集数据的页面组件。 |
-| 🔎 | **人在回路的可信成长** | 每次对话、作答、解释、实践都沉淀为带来源的证据；重要判断（图谱、联网、付费操作）永远由用户审核确认，结论可溯源、可复盘。 |
-| 🔌 | **多模型 Provider 支持** | 支持接入 OpenAI / Anthropic / Qwen(DashScope) / DeepSeek / Ollama / Copilot 等多种协议模型；供应商私有能力也被支持。 |
+### 一次学习流程
 
----
+1. 说出学习目标，审核生成的知识图谱。
+2. 围绕图谱节点与 Agent 对话，阅读资料、完成练习或动手实践。
+3. 系统记录学习证据，更新能力状态并推荐下一步行动。
 
 ## 🖼 产品截图
 
@@ -62,8 +59,8 @@
     <th width="50%">双向交互子应用</th>
   </tr>
   <tr>
-    <td><img src=".github/assets/chat.jpg" alt="LearnGraph 主对话工作台：知识图谱、智能体、主交互页面"></td>
-    <td><img src=".github/assets/product-artifact-preview.png" alt="LearnGraph 双向交互子应用：用户在子应用中的操作可回流为 Agent 输入"></td>
+    <td><img src=".github/assets/chat.jpg" alt="LearnGraph 主对话工作台"></td>
+    <td><img src=".github/assets/product-artifact-preview.png" alt="LearnGraph 双向交互子应用"></td>
   </tr>
   <tr>
     <th>Android 移动端</th>
@@ -83,50 +80,11 @@
   </tr>
 </table>
 
----
-
-## 🧭 一次完整的学习旅程
-
-1. **说出目标**：用自然语言描述想学什么、为什么学以及时间约束，系统动态澄清真正影响路线的关键信息。
-
-2. **审核路线**：LearnGraph 生成初始目标图谱，由用户确认节点、前置关系、范围和优先级后发布。
-
-3. **与 Agent 一起学习**：围绕单个或多个节点展开对话，结合个人文件、来源检索、练习与工具执行完成学习任务。
-
-4. **让证据推动成长**：对话、作答、解释和实践产出沉淀为带来源的证据，持续更新能力状态、置信度与复习风险。
-
-5. **获得下一步行动**：系统结合目标权重、知识前置关系、能力缺口和时间安排，推荐当前最值得投入的学习行动。
-
-```text
-真实目标与资料 → 目标澄清 → 初始目标图谱 → 用户审核
-       ↑                                      ↓
-用户审核路线更新 ← 下一步行动 ← 能力图谱变化 ← Agent 学习与证据
-```
-
-## 🔄 G-R-E-M-A 学习闭环
-
-| 阶段 | 产出 | LearnGraph 如何处理 |
-| --- | --- | --- |
-| **G · Goal** | 结构化目标 | 澄清真实学习目标，保留用户确认与约束 |
-| **R · Representation** | 目标图谱 | 生成可审核、可修订、带版本的知识结构 |
-| **E · Evidence** | 证据记录 | 将学习行为与产出转换为带来源的可追溯证据 |
-| **M · Mastery** | 能力状态 | 基于证据解释掌握状态、置信度与复习风险 |
-| **A · Action** | 下一步行动 | 综合目标权重、前置关系、能力缺口和时间形成推荐 |
-
-目标图谱和能力图谱是 LearnGraph 的两个长期视图：
-
-- **目标图谱**记录为了目标需要学习的知识结构，重要更新经过用户审核；
-- **能力图谱**记录用户实际形成的能力，由练习、解释和实践等可追溯证据持续驱动。
-
----
-
 ## 🚀 快速开始
 
-### 方式一：Docker Compose（推荐）
+### Docker Compose（推荐）
 
-无需安装 Node / Python，适合快速体验与自托管。镜像同时包含前端生产构建与 FastAPI，**单入口**：浏览器访问一个地址即可拿到页面和同源 `/api/v1`。
-
-**前置**：安装 [Docker](https://www.docker.com/)（Docker Desktop 或 Linux Docker Engine）。
+安装 [Docker](https://www.docker.com/) 后执行：
 
 ```bash
 git clone https://github.com/SunnyBoy-y/LearnGraph.git
@@ -134,493 +92,82 @@ cd LearnGraph
 docker compose up -d --build
 ```
 
-启动后访问 **http://127.0.0.1:18000**，使用容器日志中首次打印的管理员临时密码登录（用户名为 `admin`），登录后请立即修改密码。
+访问 **http://127.0.0.1:18000**，使用容器日志中首次打印的管理员临时密码登录，用户名为 `admin`。首次登录后请修改密码。
 
-> 默认 Demo 账户为**禁用的普通用户**，不具备系统管理员权限。需要体验时，在宿主机根目录 `.env` 中显式设置 `LEARNGRAPH_ENABLE_DEMO_LOGIN=true`（仅开发/本地环境有效），再执行 `docker compose up -d --force-recreate app`。网页不能开启 Demo；账号密码只由服务端读取，前端不内置凭据。改回 `false` 并重建应用容器后，普通登录、快捷登录和已有 Demo 会话都会失效。
-
-| 服务 | 默认地址 | 说明 |
-| --- | --- | --- |
-| Web + API（单入口） | `http://127.0.0.1:18000` | 页面与 `/api/v1` 同源；API 内部端口 8000 不单独发布 |
-| 子应用 Preview | `http://127.0.0.1:18001` | 独立 origin，浏览器 iframe 按 capability token 加载 |
-| Health | `http://127.0.0.1:18000/api/v1/health` | |
-
-Compose 默认只启动 **3 个常驻容器**：`app`（主站与只读预览双进程，分别映射 18000/18001）、`sandboxd`、`egress-proxy`。主站与预览仍为不同 origin，双向子应用协议不变；任一进程退出会停止其同伴并使容器失败，由 Docker 重启。
-
-Compose 栈**开箱即含沙箱执行能力**：内置 `sandboxd` 控制面 + 审批制出网（`egress-proxy`），沙箱默认断网、出网逐请求重授权并审计，无需额外部署。主站与代理不挂载 Docker socket。
-
-数据库迁移代理不再常驻，也不阻塞主站启动。系统管理员在设置页完成预检、密码确认并点击迁移后，后台通过 `sandboxd` 的独立管理通道自动创建或启动固定代理；PostgreSQL 准备就绪后立即停止代理。代理采用 `restart: "no"`，后台每 15 秒续租，应用异常中断且租约过期时由 `sandboxd` 自动回收。已创建的 PostgreSQL 独立运行，不受停止代理影响；使用外部 PostgreSQL 无需代理。主站不接触 Docker socket，也不能指定任意镜像、命令或宿主挂载。旧部署与手动排障步骤见 [容器拓扑迁移](docs/container-topology.md)。
-
-<details>
-<summary><strong>Docker 运维细节（自定义端口 / 升级备份 / 公网访问 / 加固…）</strong></summary>
-
-**配置与数据**
-
-- 首次启动自动生成仓库根目录 `.env`（模板来自 `.env.example`，全部为注释掉的默认值；文件已存在时**绝不覆盖**）。
-- 未设置 `LEARNGRAPH_MASTER_KEY` 时，入口脚本生成一把主密钥保存在数据卷，页面保存的 Provider Secret 重启后仍可解密。
-- 默认 SQLite 库、上传文件、主密钥、迁移状态、egress 策略与审计在数据卷 `learngraph_learngraph-data`（容器内 `/data`），与镜像/容器解耦。管理员迁移后 PostgreSQL 使用独立数据库卷；需要同时保留该卷和 `/data`。升级镜像不删除这些卷；`docker compose down -v` 或手动删除数据库卷会丢失数据。
-
-**自定义端口与 LAN 暴露**
-
-```bash
-export LEARNGRAPH_LISTEN_HOST=0.0.0.0   # 等价于 npm run dev -- --lan
-export LEARNGRAPH_PORT=18000            # 自行选端口
-export LEARNGRAPH_PREVIEW_PORT=18001
-# LAN 部署时 Preview 必须能被浏览器直接访问：
-export LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN=http://<你的IP或域名>:18001
-docker compose up -d --build
-```
-
-默认只绑定 `127.0.0.1` 且使用高位端口（18000/18001）以避免与常用开发端口冲突。
-
-**基础镜像拉取失败（`401 Unauthorized`）**
-
-如果构建在 `load metadata for ... node/python` 处失败，且错误 URL 指向 `docker.m.daocloud.io`，说明失败发生在宿主机配置的 Docker Hub 镜像代理。可在根目录 `.env` 中设置完整基础镜像地址，显式使用代理仓库路径：
-
-```dotenv
-LEARNGRAPH_NODE_IMAGE=m.daocloud.io/docker.io/library/node:22-bookworm-slim
-LEARNGRAPH_PYTHON_IMAGE=m.daocloud.io/docker.io/library/python:3.12-slim-bookworm
-```
-
-然后重新执行 `docker compose up -d --build`。Python 地址同时用于 `app` 和 `sandboxd` 的构建与运行阶段；这两个配置只影响构建，不会传入应用容器环境。其他网络环境可换成自己可访问的完整镜像地址，保留对应的 Node 22 / Python 3.12 与 Debian bookworm 版本；删除覆盖即可恢复默认 Docker Hub 地址。`LEARNGRAPH_DEBIAN_MIRROR` 只控制容器内的 apt 源，不影响 `FROM` 镜像拉取。
-
-**原生 `docker compose` 命令自动生成 `.env`（可选）**
-
-想让原生命令也自动生成 `.env`，装一次 shell 级 hook（幂等，且只对 LearnGraph 项目生效）：
-
-```bash
-# Git Bash（写入 ~/.bashrc）
-bash scripts/install-docker-env-hook.sh
-# 或 Windows PowerShell（写入 $PROFILE）
-powershell -ExecutionPolicy Bypass -File scripts/install-docker-env-hook.ps1
-```
-
-卸载用 `--uninstall` / `-Uninstall`。不用 hook 时，也可用 npm 入口 `npm run docker:up`（等价 `docker compose up -d --build`，同样幂等确保 `.env` 就绪）。
-
-**升级与数据安全（一键脚本）**
-
-```bash
-./scripts/docker-update.sh --check                      # 检查当前版本与栈状态（只读）
-LEARNGRAPH_EXPECTED_PROJECT=learngraph ./scripts/docker-update.sh ghcr.io/<owner>/learngraph:v1.2.0   # 备份 → 拉新镜像 → 替换 → 健康检查 → 失败自动回滚
-LEARNGRAPH_EXPECTED_PROJECT=learngraph ./scripts/docker-update.sh --backup-only                # 只做数据备份（可入定时任务）
-```
-
-`LEARNGRAPH_EXPECTED_PROJECT` 必须填写实际 Compose 项目名。写操作会固定该项目，核对容器工作目录和数据卷归属；缺少或不匹配时在业务入口执行前拒绝。`--check` 保持只读且不要求该参数。Docker 验收脚本另需隔离清单与资源所有权标签，不接受未标记的旧测试栈或正式项目。
-
-升级脚本保证：升级前对实际主业务库做一致性备份（SQLite 或 PostgreSQL）+ 数据卷整体打包 + 当前栈 sandboxd 状态卷备份；新容器通过健康检查才算成功，失败自动回滚旧镜像，保持当前数据库及升级后数据。PostgreSQL 目标镜像必须声明兼容能力，禁止切回 SQLite。备份保留最近 10 份（`BACKUP_KEEP` 可调），输出到 `backups/`（⚠️ 备份含恢复密钥，等同敏感数据，请妥善保管）。升级前先执行 `--check` 并手动跑一次 `--backup-only` 验证备份可用。
-
-**加固形态（可选，仅 Linux）**
-
-默认 compose 使用 sandboxd 首启自举的凭据。需要人工评审的文件式凭据 + 内部管理网络时可叠加 override：
-
-```bash
-mkdir -p secrets
-openssl rand -hex 32 > secrets/sandboxd-token
-openssl rand -hex 32 > secrets/sandboxd-admin-token   # Bootstrap 管理面（拉取+digest+冒烟）
-# export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # 可选：数据落宿主机路径（默认命名卷，见下）
-export DOCKER_GID="$(stat -c %g /var/run/docker.sock)"
-docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up -d --build
-```
-
-**数据存储位置与备份**
-
-默认全部数据落在 Docker 命名卷 `learngraph-data`（Docker 管理，`docker volume ls` 可见；Linux 上物理路径约在 `/var/lib/docker/volumes/learngraph_learngraph-data/_data`），不在项目目录里。备份/升级用一键脚本：
-
-```bash
-LEARNGRAPH_EXPECTED_PROJECT=learngraph ./scripts/docker-update.sh --backup-only   # 当前主库（SQLite/PostgreSQL）+ 数据卷 + 当前栈 sandboxd 状态卷
-```
-
-如需数据落在宿主机指定目录（NFS / 外部备份 / 迁移服务器），在首次 `up` 前设置（仅 Linux 宿主）：
-
-```bash
-export LEARNGRAPH_DATA_DIR=/var/lib/learngraph   # 设为宿主机绝对路径即启用 bind mount
-```
-
-⚠️ 从命名卷切到 bind 目录前务必先迁移数据（数据含 `.master-key` 主密钥，漏迁会导致 provider 密钥无法解密）：`docker compose down`（**不要 `-v`**）→ `docker run --rm -v <旧卷>:/src:ro -v /var/lib/learngraph:/dst alpine sh -c 'tar cf - -C /src . | tar xf - -C /dst'` → 设好变量再 `up`，验证通过后才可删旧卷。任何形态下都不要执行 `docker compose down -v` 或 `docker volume prune`，除非已确认备份。
-
-**访问宿主机本机服务（Ollama / LM Studio / 本地 MCP）**
-
-容器内 `127.0.0.1` 是容器自己，无法直接访问宿主机回环服务。默认方案是 **Host Service Bridge**：运行在真实机器上的授权反向代理，只转发注册表里显式放行的服务（默认 DENY、目标默认仅 loopback、逐请求 Bearer token 认证、JSONL 审计）。
-
-```bash
-# 在真实机器上、仓库根目录执行（幂等）
-node scripts/host-bridge.mjs
-```
-
-脚本自动完成：① 生成/复用 `data/host-bridge/token`（已被 git 忽略）；② 写入 `data/host-bridge/host-services/` 注册表模板（`ollama.json` / `lm-studio.json`，默认 `enabled: false`，服务就绪后改成 `true` 即放行）；③ 启动 bridge（默认端口 `34115`）。容器侧零配置：compose 已内置 `extra_hosts: host.docker.internal:host-gateway`，自动推导 bridge 地址并挂载 token；未启动 bridge 时后端自动跳过认证头，Provider 管理页会显示实时状态与操作指引。
-
-个人可信环境（Windows/macOS Docker Desktop）可设置 `LEARNGRAPH_HOST_ACCESS_MODE=direct` 改为**可信桌面直连**：loopback 地址直接改写为 `host.docker.internal:同端口`，无需注册/token/审计。代价是失去白名单与审计边界，仅建议单用户可信电脑使用。取值：`auto`（默认，容器化 profile 走 bridge）/ `bridge` / `direct` / `off`。**沙箱容器绝不继承直连能力**——沙箱内的 `localhost` 始终只表示沙箱自己。
-
-更完整的变量说明见仓库根目录 `.env.example` 与 `backend/.env.example`。
-
-</details>
-
----
-
-### 📱 Android 客户端
-
-LearnGraph 提供 Android 原生客户端，可以连接自己部署的 LearnGraph 服务。
-
-当前客户端采用：
-
-**Kotlin + Jetpack Compose + GeckoView + WebExtension Bridge**
-
-移动端并不是独立的一套 LearnGraph 后端，而是作为个人 LearnGraph 工作区的移动入口。
-
-支持：
-
-* 📷 拍照并直接交给 Agent
-* 📂 系统文件选择
-* 📥 原生文件下载与管理
-* 📤 Android 分享到 LearnGraph
-* 📱 扫码连接服务
-* 🔐 生物识别
-* 🔔 回复通知
-* 🔊 TTS 朗读
-* 📳 原生震动反馈
-* 📴 网络异常与恢复处理
-
-在局域网使用时，请确保 LearnGraph 服务允许其他设备访问：
-
-```bash
-export LEARNGRAPH_LISTEN_HOST=0.0.0.0
-docker compose up -d
-```
-
-然后在 Android 客户端输入电脑的局域网地址进行连接，例如：
-
-```text
-http://192.168.x.x:18000
-```
-
-> Android 客户端目前仍处于快速迭代阶段。
-
----
-
-### 方式二：源码开发模式（`npm run dev`）
-
-适合参与开发或调试源码。需要本机环境：Node.js 20+、npm 10+、Python 3.11+、[uv](https://docs.astral.sh/uv/)（最新稳定版）；Docker 可选（仅沙箱能力需要）。
-
-```bash
-git clone https://github.com/SunnyBoy-y/LearnGraph.git
-cd LearnGraph
-npm run dev:install   # 首次：自动生成 .env + 按锁文件安装依赖 + 联合启动
-npm run dev           # 后续直接启动
-```
-
-| 服务 | 默认地址 |
+| 地址 | 用途 |
 | --- | --- |
-| Web | `http://127.0.0.1:5173` |
-| API | `http://127.0.0.1:8000` |
-| OpenAPI | `http://127.0.0.1:8000/docs` |
-| Health | `http://127.0.0.1:8000/api/v1/health` |
+| `http://127.0.0.1:18000` | Web 与 API |
+| `http://127.0.0.1:18001` | 交互式子应用预览 |
+| `http://127.0.0.1:18000/api/v1/health` | 健康检查 |
 
-<details>
-<summary><strong>源码模式细节（端口自定义 / 本地配置 / 沙箱与出网）</strong></summary>
+默认 Demo 账户处于禁用状态。本地体验需要时，在根目录 `.env` 设置 `LEARNGRAPH_ENABLE_DEMO_LOGIN=true`，再执行 `docker compose up -d --force-recreate app`。
 
-**端口自定义**
+默认数据保存在 Docker 数据卷。备份、局域网和公网访问、宿主机服务连接及应用内更新见 [部署与更新](docs/deployment-and-updates.md)；环境变量见根目录 `.env.example`。
 
-```bash
-npm run dev -- --frontend-port 5174 --backend-port 8021
-```
+### 源码开发
 
-**本地配置文件**
-
-`npm run dev` / `dev:install` 每次启动会检查 `frontend/.env` 与 `backend/.env`，缺失时从同目录 `.env.example` 自动创建，已存在的文件不会被修改或覆盖。Provider API Key 默认由操作系统安全凭据库保护：首次在页面保存 API Key 时自动生成版本化主密钥，无需在 `.env` 中配置 `LEARNGRAPH_MASTER_KEY`（托管部署可显式选择 `environment` 兼容模式并注入高熵主密钥）。
-
-**沙箱与出网**
-
-dev 脚本自动拉起本地 sandboxd 进程（token 与 state 生成在忽略的 `backend/data/.sandboxd/` 下）。本地开发同样可启用审批制出网（与 Docker 部署同款代理）：
+需要 Node.js 20+、npm 10+、Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)。沙箱功能需要 Docker。
 
 ```bash
-docker network create learngraph-egress
-# 沙箱容器通过 host.docker.internal 解析到宿主机上的代理
-LEARNGRAPH_SANDBOX_EGRESS_PROXY_URL=http://host.docker.internal:8888 \
-  uv run python -m app.services.egress_proxy_main
+git clone https://github.com/SunnyBoy-y/LearnGraph.git
+cd LearnGraph
+npm run dev:install   # 首次安装依赖并启动
+npm run dev           # 后续启动
 ```
 
-</details>
+前端默认地址为 `http://127.0.0.1:5173`，API 为 `http://127.0.0.1:8000`，接口文档为 `http://127.0.0.1:8000/docs`。启动脚本会在配置文件缺失时从 `.env.example` 创建。
 
----
+### Android 客户端
 
-### 公网访问（内网穿透，可选）
+Android 客户端采用 Kotlin、Jetpack Compose 和 GeckoView，连接已部署的 LearnGraph 服务。局域网使用时，服务需监听 `0.0.0.0`，并在手机端输入电脑的局域网地址，例如 `http://192.168.x.x:18000`。构建与安装见 [Android 客户端说明](mobile/native/README.md)。
 
-项目不内置内网穿透配置，需要从公网访问时请自行运行 FRP / 端口转发等工具，并手动配置环境变量：
+### 配置语音
 
-| 部署方式 | 需要映射的端口 | 用途 |
-| --- | --- | --- |
-| 源码模式 | `5173` 必需；`8001` 使用交互式子应用时；`8000` 可选 | Vite 前端同源 `/api`、SSE、实时听写 WS |
-| Docker 模式 | `18000` 必需；`18001` 使用交互式子应用时 | Web + API 单入口、子应用 Preview |
+在工作区配置实时语音识别、语音合成和对话模型。目前语音识别适配阿里 DashScope，语音合成适配火山引擎 TTS 2.0。语音数据会发送给对应的云端服务商。
 
-配置要点：
-
-1. `frontend/.env` 填 `LEARNGRAPH_PUBLIC_ORIGIN=<你的公网入口>`（Vite 自动加入 allowedHosts 并作为公网 origin）；
-2. 使用交互式子应用/卡片时，`backend/.env` 再填 `LEARNGRAPH_SUBAPP_PREVIEW_ORIGIN=<你的 preview 公网入口>`（Docker 模式则在根 `.env` 配置）；
-3. 服务不在运行穿透工具的同一台机器上时，加 `--lan` 或设 `LEARNGRAPH_LISTEN_HOST=0.0.0.0` 让服务监听外部地址；
-4. 需要浏览器直连后端（不走 Vite 代理）时，自行配置 `LEARNGRAPH_CORS_ORIGINS`。
-
----
-
-### 🎙 试用语音（可选）
-
-语音是对话页里的一个入口。用之前先备好两件事：
-
-1. **Provider**：在工作区里配置实时语音识别与语音合成（当前适配阿里 DashScope 的实时 ASR、火山引擎的 TTS 2.0），并保证有一个可用的对话模型——语音回合复用工作区对话模型（代码里另有环境变量兜底）。缺哪一环不会静默失败，通话界面会直接说出可读的原因，文字对话始终不受影响。
-2. **麦克风**：浏览器只在 `http://localhost` 或 HTTPS 下给麦克风；用局域网 IP 或公网地址访问时请上 HTTPS，否则拿不到。Android 原生客户端会在首次使用语音时通过 WebView 权限桥申请系统录音权限，并校验当前服务地址。
-
-进去之后：说话即开始识别，屏幕上先出现整段灰度文本（已拿到、还没读到），朗读到哪一句，哪一句才变成正常颜色；任何时候插话都会打断当前回答，打断后不会留下继续说下去的残句。
-
-语音 Agent 能力按服务端能力包开放：后台任务和工作区写入会直接受理，仍受服务端 capability、权限和沙箱隔离约束；进度、来源和已发布文件直接显示在当前对话画布。任务失败时会显示权限、Provider、沙箱或具体任务原因，避免只看到“任务失败”。
-
-练习流程会创建持久化 `Exercise`，用户可以继续用语音回答；Tutor 会调用统一的练习判分路径，写入 `AnswerRecord`，并沿用 Evidence、Mastery 和 LearningState 的现有流程。
-
-当前验收边界：后台任务的 `played` 表示服务端输出传输边界已经放行音频，不承诺用户设备已经听到；跨进程 WebRTC 恢复仍需要部署侧粘性路由与多 worker/真实媒体验证。DashScope ASR、火山 TTS、浏览器 WebRTC 和 Android 真机链路需要在目标环境单独验收。
-
----
+浏览器使用麦克风需要 `localhost` 或 HTTPS；通过局域网 IP 或公网地址访问时请配置 HTTPS。Android 客户端会申请系统录音权限。语音可用于对话、练习和委派后台任务，具体能力取决于工作区配置与授权。
 
 ## 🏗 技术架构
 
 ```text
-Clients
-├─ Web
-│  └─ React 19 + TypeScript + Vite
-│     ├─ React Router · TanStack Query · React Flow
-│     ├─ Streamdown / AI Elements · trusted-renderer · subapp-bridge
-│     ├─ 全双工语音：WebRTC(SmallWebRTC) · 句级字幕 · 语音球
-│     └─ ApiClient: Bearer + X-Workspace-ID + JSON/SSE
-│
-└─ Android
-   └─ Kotlin + Jetpack Compose
-      ├─ GeckoView 139
-      ├─ WebExtension Bridge
-      ├─ Camera / Share / Download / Notification
-      └─ Native ↔ Web capability bridge
-
+Web: React + TypeScript              Android: Kotlin + Compose + GeckoView
                          │
-                         ▼
-
-LearnGraph API / FastAPI
-├─ routers: HTTP/SSE 契约、认证、权限与错误边界
-├─ services
-│  ├─ 学习闭环: Goal · Graph · Chat · Evidence · Mastery · Action
-│  ├─ 语音:     实时管线 · 回合策略 · ASR/TTS 适配 · 句级字幕账本
-│  ├─ 记忆:     Event Store · Projection · Retrieval · Context Builder
-│  ├─ 运行时:   Agent · Tools · Skills · MCP · SubAgent · 可信组件 · 子应用事件
-│  ├─ 沙箱:     Agent Workspace · Egress 审批 · 热容器池 · ASR 桥
-│  └─ 产物:     Artifact Gateway · 分享令牌 · 卡片索引
-├─ repositories: 工作区作用域的数据访问
-└─ provider ports
-   ├─ local:  文件存储
-   └─ remote: 模型(Chat/Embedding/ASR/Image) · 搜索 · 抓取 · 研究 · 沙箱
-
-                         │
-                         ▼
-
-Sandbox Control Plane
-├─ sandboxd
-├─ Docker isolated runtime
-├─ egress-proxy
-└─ capability / approval / audit
+                  FastAPI 后端
+       ┌─────────────────┼──────────────────┐
+   学习图谱与证据     Agent / 语音 / 记忆     Provider / MCP / Skills
+       └─────────────────┼──────────────────┘
+                Docker 沙箱与受控出网
 ```
 
-新安装默认以 SQLite(WAL) 保存业务事实；仅系统管理员可发起主业务库到 PostgreSQL 的单向迁移，成功后全部主业务读写使用 PostgreSQL，禁止回退 SQLite。SSE 负责传输，Session、Message、MessageVersion、MessagePart、流事件和记忆事件仍会持久化（支持断线恢复、重放与审计）。前端统一访问 LearnGraph 后端，由服务端完成认证、工作区授权、Provider 调用和事实写入。
+业务数据默认存储在 SQLite（WAL），系统管理员可迁移至 PostgreSQL。会话消息、流事件和记忆事件持久化保存。后端负责身份认证、工作区授权和 Provider 调用。
 
-<details>
-<summary><strong>查看仓库结构</strong></summary>
-
-```text
-LearnGraph/
-├─ frontend/             React + TypeScript + Vite
-│  └─ src/
-│     ├─ api/            领域 API 与统一客户端
-│     ├─ features/       页面和业务交互（auth/chat/goals/graph/memory/artifacts…）
-│     ├─ components/     UI、图谱与消息渲染
-│     └─ lib/            trusted-renderer · sandboxed-html-preview · subapp-bridge…
-├─ backend/
-│  └─ app/
-│     ├─ api/routers/    HTTP/SSE 路由
-│     ├─ services/       业务用例（chat/agent_runtime/memory_*/sandbox_*/artifact_*…）
-│     ├─ repositories/   数据访问
-│     ├─ providers/      Ports 与适配器（ports/ remote/ local/ catalog）
-│     ├─ skills/         沙箱能力 Skill 包（pdf/docx/表格/PPT/媒体/生图/抓取…）
-│     └─ domain/         模型与 Schema（含记忆事件模型）
-├─ sandboxd/             沙箱控制面守护进程（唯一接触 Docker Engine 的组件）
-├─ mobile/
-│  ├─ native/            Android 原生客户端（Kotlin / Compose、本地缓存、系统 WebView 兼容）
-│  └─ android/           早期 Capacitor Android 实现
-├─ docs/                 可公开部署的开发者 HTML 文档（GitHub Pages）
-├─ scripts/              跨平台启动、检查与运维脚本
-├─ Dockerfile            应用镜像（前端生产构建 + FastAPI）
-├─ docker-compose.yml    自托管编排（app 含 preview / egress-proxy / sandboxd；迁移代理按需）
-└─ .github/assets/       README 公共素材
-```
-
-</details>
-
----
-
-## ✅ 当前能力
-
-| 领域 | 已接入的产品与代码能力 |
+| 目录 | 内容 |
 | --- | --- |
-| **目标与图谱** | Goal 澄清与确认、候选图谱审核、目标图谱、能力图谱与图谱工作台；图谱生成支持极速/思考模式与流式根预览；封面支持模板、上传与 AI 生成（先出草案由用户确认、再后台出图；矢量引擎走文本模型，位图引擎走图片 Provider）；节点上直接标出「已生成交互页」与通关分数 |
-| **学习对话** | Session、Message/MessagePart、SSE 事件溯源流、断线恢复与重试、消息版本和分支、结构化消息渲染；[`/goal` 长程任务](docs/chat-goals.md)支持后台续跑、逐轮验收、暂停、继续和轮次上限 |
-| **实时语音** | 全双工语音对话：边说边听、可随时打断，字幕按朗读逐句点亮；语音回合与文字会话同源，共用记忆、证据与会话命名；音频由所选 Provider 识别与合成（当前适配阿里 DashScope 实时 ASR 与火山引擎 TTS，需在工作区配置或由环境变量兜底，缺哪一环都会给出可读原因）；语音 Tutor 可委派研究、学习读取、练习生成和 Evidence 记录，后台任务直接受理并把进度与文件结果放回对话画布；Android 端通过 WebView 权限桥申请录音权限 |
-| **交互式学习页** | 从图谱节点生成教学包（教材 / 互动实验 / 小剧场 / 闯关测评）：进度可见、失败分类重试、中断可续做、节点内容变更后自动失效重建；按图谱开启（默认关闭），学习内容在受限环境里运行且不加载远程资源 |
-| **移动端** | Android 原生客户端（Kotlin / Jetpack Compose + GeckoView 139 + WebExtension Bridge）：拍照与系统文件选择、原生文件下载、系统分享收件箱、扫码连接、生物识别、回复通知、TTS 朗读、震动反馈、断线恢复与登录态持久化 |
-| **资料与来源** | 文件上传、解析状态、本地对象存储、文档学习、联网来源与引用（Qwen 原生搜索来源 + 角标）；文搜图/图搜图链接可经可信宿主下载器完成图片净化、来源固化并注入无网沙箱（多图支持 `urls` 并行下载），GitHub 文件/目录/仓库按固定 commit 生成哈希清单后注入 |
-| **证据与行动** | Evidence、Mastery、练习、作答反馈、复习风险和下一步行动相关流程 |
-| **长期记忆** | 事件溯源记忆（加密事件流、分层投影、混合检索、Context Builder 预算装配）、学习状态衰减、文件修订失效、记忆治理 |
-| **Agent 与扩展** | 模型、搜索、研究、MCP、Storage 等 Provider 边界；渐进式工具披露；沙箱能力探测与受控执行；Skill 市场与本机导入；可关闭模型思考并按厂商方言发送关闭字段，真机实测结论（推理 token、首字耗时）回写能力快照，无法关闭时明确提示代价 |
-| **可信组件** | 8 类内置交互组件（选择题/填空/表格/天气卡/指标卡…）+ 第三方组件 Manifest 注册授权 + 双向交互子应用（interaction contract + 事件驱动 Agent） |
-| **产物与分享** | Artifact 不可变版本快照、只读分享令牌（可撤销）、软删除、会话卡片自动索引 |
-| **沙箱执行** | Docker-only 隔离的 Agent Workspace，默认断网、Egress 审批制出网、热容器池复用；受限文件读写、命令执行、宿主侧 ASR 桥和产物发布；配额、超时、幂等、审计与 SSE 状态回传；预构建镜像（ACR）与真实进度 |
-| **工作区治理** | 登录（首次强制改密）、Membership、RBAC/ACL、用量、审计、迁移预检、部署 Profile（个人/团队/云）；对话生成有并发准入，满员时立刻返回可重试的「稍后再试」，而不是卡住后报连接池超限，占用与拒绝次数可在健康检查与日志里看到 |
+| `frontend/` | Web 界面 |
+| `backend/` | API、学习服务、Agent 和 Provider 适配 |
+| `sandboxd/` | 沙箱控制服务 |
+| `mobile/native/` | Android 原生客户端 |
+| `docs/` | 功能与开发文档 |
 
----
-
-资料页、会话文件和待发送附件共用阅读器。PDF 使用字节分段读取，EPUB 2/3 按目录和章节读取，超大文本与 CSV/TSV 按片段阅读，音视频交给浏览器流式播放。DOC/XLS/PPT，以及超过 16 MiB 的 DOCX/XLSX/PPTX/RTF，在禁网沙箱中转换为 PDF 后阅读；部署时须重建并切换包含 LibreOffice 的 `backend/sandbox/Dockerfile` 镜像，旧镜像会返回明确的转换服务错误。本地待发送 Office 文件须点击「上传并阅读」后转换。转换源文件受 `max_document_parse_bytes` 限制（默认 200 MiB）；EPUB 单个章节/资源上限 4 MiB，单章附加资源合计上限 16 MiB，不支持 DRM 加密书籍。
-
-## 🔐 安全与可信边界
-
-- `X-Workspace-ID` 是作用域提示；后端会重新校验 Membership、权限与资源范围。
-- 沙箱默认拒绝网络；联网必须通过 Egress 审批链（域名白名单、连接时地址重分类、审计）。
-- 完整的任务级网络能力、Fetch/Browser/Download Broker、Restricted Egress 与残余风险说明见 [Sandbox Network Security Model](docs/README.md#sandbox-network-security-model)。
-- 外部图片和 GitHub 源码由宿主侧可信下载器获取，沙箱不会临时联网；下载逐主机审批、逐次 DNS 公网分类，图片重编码净化，GitHub ref 固定为 commit，并持久化 SHA-256 与来源凭据。
-- 语音不是本机离线能力：识别与合成走所选云端 Provider（当前为阿里 DashScope 与火山引擎），麦克风音频与转写文本会发送给对应供应商；是否启用请按自己的合规要求决定。
-- Provider Secret 由后端版本化加密保存，不进入浏览器、日志、SSE、审计或导出。
-- 模型、搜索、研究和沙箱能力均采用显式可用性状态，调用结果与失败边界可以追踪。
-- Docker 沙箱不可用时返回明确状态，宿主机不会成为隐式执行环境。
-- 数据库、上传内容、缓存、构建产物与真实凭据均由 Git 排除。
-- 学习资产面向 Markdown、JSON 等开放格式导出，支持长期持有和迁移。
-
----
-
-## 🗺 后续规划
-
-- **更多主流模型适配**：持续扩展文本、视觉、推理、图片生成和语音模型，让不同学习任务可以匹配更合适的模型能力；语音的识别与合成目前适配 DashScope 与火山引擎，后续扩展更多供应商。
-- **可更换的 Agent 内核**：在统一的 Goal、Graph、Evidence、Mastery 和 Action 契约之上接入不同 Agent Runtime，支持按场景选择和演进智能体内核。
-- **移动端持续演进**：Android 客户端已可用，继续打磨跨设备连续学习体验（路线、资料、对话、练习与复习衔接），并扩展更多原生能力与平台。
-- **更丰富的学习工具生态**：继续完善 Skills、MCP、可信组件、文档学习和研究能力，让 Agent 可以组合更多专业工具完成真实学习任务。
-- **更完整的端到端验收**：持续覆盖跨模块浏览器场景、真实远程 Provider、权限边界和完整 Agent 学习闭环。
-
----
+沙箱默认隔离网络，外部资源和工具调用遵循授权范围。更多细节见 [开发者文档](https://sunnyboy-y.github.io/LearnGraph/)、[联网研究](docs/web-tool-supplements.md)、[论文检索](docs/paper-search-and-library.md)、[长程任务](docs/chat-goals.md)和[定时任务](docs/skill-mcp-schedules-verification.md#定时任务)。
 
 ## 🧪 开发与检查
 
 | 命令 | 作用 |
 | --- | --- |
-| `npm run dev` | 使用已有依赖联合启动前后端 |
-| `npm run dev:install` | 从锁文件安装依赖并启动 |
-| `npm run check` | 前端 lint/测试/类型检查/构建 + 后端完整离线测试 + sandboxd 单元与契约测试 |
-| `npm run check:install` | 从锁文件安装依赖后执行全部检查 |
-| `npm run check:frontend` | 仅执行前端检查 |
-| `npm run check:backend` | 仅执行后端检查 |
-| `npm run build:frontend` | 构建前端生产产物 |
-| `npm run docker:up` | compose 一键启动（自动生成根目录 .env，等价 `docker compose up -d --build`） |
-| `npm run docker -- <args>` | 任意 compose 子命令透传（如 `npm run docker -- down` / `logs -f app`） |
-| `node scripts/host-bridge.mjs` | 宿主机一键启动 Host Service Bridge（Docker 部署访问本机服务，可选） |
+| `npm run dev` | 启动前后端 |
+| `npm run dev:install` | 安装依赖并启动 |
+| `npm run check` | 执行前端、后端和 sandboxd 检查 |
+| `npm run check:frontend` | 执行前端检查 |
+| `npm run check:backend` | 执行后端检查 |
+| `npm run build:frontend` | 构建前端 |
+| `npm run docker:up` | 生成配置并启动 Compose |
 
-测试源码和夹具随仓库分发。前端在 `frontend` 执行 `npm ci && npm test`；
-后端在 `backend` 执行 `uv run --locked --extra test --extra voice pytest tests -q -m "not integration"`；
-sandboxd 在 `sandboxd` 执行 `uv run --locked --extra test pytest tests -q`。
-GitHub Actions 在 Pull Request、推送到 `main` 或手动触发时执行上述三组测试，并上传 JUnit 报告；
-Android 任务同时验证早期 Capacitor 壳与 `mobile/native` 原生客户端；原生版需 Java 21 和 Android SDK 35，
-在 `mobile` 执行 `npm run test:native` 和 `npm run apk:compact`，无需构建或同步网页壳。
-原生迁移范围、缓存行为和安装包说明见 [Android 客户端说明](mobile/native/README.md)。
-后端的 `voice` 依赖用于离线语音管线测试，无需真实云端 Provider 凭据。
-真实 Docker 往返测试也已入库，需配置隔离的 sandboxd 服务后单独执行
-`uv run --locked --extra test --extra voice pytest tests/integration/test_sandboxd_roundtrip.py -q`。
-已移除模块的历史用例 `frontend/tests-orphaned`、本机浏览器诊断 `frontend/e2e`、界面预览与验收截图仅保留在本地并由 Git 忽略；正式测试及其夹具正常入库并参与 CI。
-
-## 应用内版本更新与回退
-
-「设置 → 关于 → 版本与更新」支持 GitHub 正式 Release 检测、更新日志、一键升级、
-部署进度、失败自动回滚、历史部署回退以及可选的自动安装。单实例 Compose
-替换有短暂停机，正在进行的对话/语音可能断开，页面会自动重连。
-
-更新器是运行在 **Docker 宿主机** 上的独立 Python 3.10+ 进程，仅使用标准库，
-需要 Docker CLI 和支持 `up --wait` 的 Compose v2。Windows Docker Desktop 和
-Linux 均可使用。应用容器不持有 Docker socket。已有部署需要先安装一次此功能的
-基线镜像，之后在网页内更新。仅系统管理员可访问版本接口。
-
-在原部署目录执行：
-
-```sh
-python -m updater --init-only
-# 使用 VERSION 中的原始 Release tag 构建基线版本（当前为 v0.6）。
-node scripts/compose.mjs up -d --build
-# 独立运行，生产环境交给 systemd / Windows 任务计划程序保持运行。
-python -m updater --project-dir .
-```
-
-如果原部署使用了额外 Compose 文件，启动和更新器都必须携带同一组文件：
-
-```sh
-python -m updater --compose-file docker-compose.yml --compose-file docker-compose.sandbox.yml --compose-file docker-compose.updater.yml
-```
-
-Windows 在仓库根目录运行 `pwsh -File updater/install-windows.ps1` 即可隐藏启动更新器，
-并为当前账户安装登录启动快捷方式（无需修改用户密码或发布远端 Release）。
-Linux 可使用 [systemd 服务示例](updater/learngraph-updater.service)，修改其中的
-目录与运行用户后安装；Windows 可将 `python -m updater --project-dir <部署绝对路径>`
-设为任务计划程序的开机任务，运行账户需有 Docker 访问权限。更新器默认监听
-`0.0.0.0:34116`，供容器通过 `host.docker.internal` 访问；用宿主机防火墙限制
-端口到 Docker 网络。请求需服务 token，且拒绝浏览器 Origin，不提供任意命令接口。
-凭据在 `data/updater/token`，只读挂载给应用；不要公开此文件或整个部署目录。
-
-根目录 `VERSION` 是应用版本的唯一发布源，保留 Release tag 原文（包含 `v`）。
-健康接口、公开 `/api/v1/version`、OpenAPI 版本、页面与镜像 OCI 版本标签使用相同值。
-发布前先修改 `VERSION`，然后创建名称完全相同的 GitHub Release tag；workflow 与
-Dockerfile 都会拒绝版本不匹配的构建。`npm` / Python 包使用的 `0.6.0` 是包元数据，
-不用于推断应用发布版本。本地构建请使用 Compose 脚本，它自动将 `VERSION` 注入 build args；
-直接使用 `docker build` 时显式传入 `--build-arg APP_VERSION=<VERSION 原文>`。
-
-默认每小时检查 `SunnyBoy-y/LearnGraph` 的稳定 `vX.Y` / `vX.Y.Z` Release（也支持无 `v`），
-所以现有 `v0.5` / `v0.4` / `v0.3` 无需重命名即可被检测。数字比较时将缺省 patch
-视为 0，显示、请求与镜像 tag 始终保留原文。
-支持 ETag 条件请求。Fork 可通过 `--repository OWNER/REPO --image ghcr.io/owner/learngraph`
-指定来源。私有仓库在更新器环境设置 `LEARNGRAPH_UPDATE_GITHUB_TOKEN`；
-私有镜像先以运行更新器的账户执行 `docker login ghcr.io`。
-
-发布正式 Release 会触发现有 Docker workflow，先构建与冒烟检查，再向 GHCR 推送
-与 Release **完整 tag 相同**的镜像。镜像必须允许部署账户拉取（公开项目首次发布后
-检查 GHCR package 可见性）。Release 比镜像先可见时，下载失败的任务不会修改容器；
-镜像发布完成后可在网页手动重试。自动安装默认关闭，失败版本不会反复自动安装；
-手动回退会关闭自动安装，避免下次检查立即升回去。
-
-更新器按实际拓扑同步切换 `app`（含预览）和 `egress-proxy`；兼容旧部署中独立的 `preview`。不替换 `sandboxd`、按需迁移代理或沙箱 runner，
-也不自动更新 Compose/宿主机脚本；需要改变这些部署协议的版本应采用人工迁移。
-切换前保留旧/新镜像的本地标签及不可变 image ID，备份实际 SQLite/PostgreSQL 主库并校验，
-切换后验证全部容器健康状态与数据库就绪接口。失败时恢复原镜像；更新器若在
-切换中重启，也会依据落盘任务恢复原部署。回滚失败会明确显示「需要人工处理」。
-
-`docker/update-compatibility` 是发布者维护的兼容代号。只有新旧镜像的
-`io.learngraph.update-compatibility` 标签相同才允许在线切换/回退；不兼容的
-数据库、部署配置、sandboxd 协议变更必须增加此代号，并走人工迁移流程。
-此标记是发布契约，不会自动证明数据库兼容。更新器不自动还原数据库，
-以免丢弃更新后的数据；新更新器的数据库备份位于 `data/updater/private/<任务ID>.zip`，旧 SQLite 基线为 `.db`。
-数据库备份、校验与拷贝默认各允许 900 秒，大库可通过 `--backup-timeout` 调整。
-这是宿主私有数据库备份，包含敏感恢复材料；附件仍需备份整个数据卷。用户可在设置中下载加密全站备份，SQLite 与 PostgreSQL 均支持，详见 [全站备份与恢复](backend/SITE_BACKUP.md)。PostgreSQL 更新及版本回退还要求镜像声明 `io.learngraph.primary-database=sqlite-postgresql-v1`，并在更新/回滚后验证主库身份，禁止回退 SQLite。
-
-当前镜像选择持久化为根目录的 `docker-compose.update.json`，普通重启和
-`npm run docker -- ...` 会保持该选择。直接使用 Docker Compose 时必须追加该文件：
-
-```sh
-docker compose -f docker-compose.yml -f docker-compose.updater.yml -f docker-compose.update.json up -d --no-build --pull never
-```
-
-首次更新前该文件尚不存在，无需追加。不要使用旧的 `scripts/docker-update.sh`
-与网页更新器同时更新；新流程使用共享数据库维护互锁，未完成操作需要先恢复或结束。任务、备份和镜像暂不自动清理，管理员
-可按实际磁盘预算清理已不再需要回退的历史；删除保留镜像后对应回退将安全失败。
-手动操作 Compose 同样应避开网页更新任务。
-
-## 📚 开发者文档
-
-完整的技术细节（架构、API 网关、Agent Runtime、渐进式工具披露、Skills、MCP、记忆系统、Docker 沙箱、可信组件、安全边界与验收规范）见[开发者文档](https://sunnyboy-y.github.io/LearnGraph/)。
+Android 原生客户端测试和构建命令见 [Android 客户端说明](mobile/native/README.md)。
 
 ## 🤝 参与贡献
 
-欢迎在 [SunnyBoy-y/LearnGraph](https://github.com/SunnyBoy-y/LearnGraph) 提交 [Issue](https://github.com/SunnyBoy-y/LearnGraph/issues) 或 Pull Request。
+欢迎提交 [Issue](https://github.com/SunnyBoy-y/LearnGraph/issues) 或 Pull Request。技术细节见[开发者文档](https://sunnyboy-y.github.io/LearnGraph/)。
 
 ## 📄 License
 
@@ -628,10 +175,8 @@ LearnGraph 基于 [MIT License](./LICENSE) 开源。
 
 ## 🙏 鸣谢
 
-感谢 [CC-Switch](https://github.com/farion1231/cc-switch) 的开源贡献。本项目的 GitHub Copilot 接入，以及 Baidu Qianfan Coding Plan、火山 Agentplan、OpenRouter、Longcat、Kimi、Kimi For Coding、ModelScope 和 Xiaomi MiMo 快捷配置参考了 CC-Switch 的供应商预设与适配工作。
+感谢 [CC-Switch](https://github.com/farion1231/cc-switch) 的开源贡献。GitHub Copilot 接入及部分供应商快捷配置参考了其预设与适配工作。
 
 ## 友情链接
-
 学AI上L站！
-
-https://linux.do/
+[Linux DO](https://linux.do/)

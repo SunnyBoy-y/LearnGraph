@@ -120,7 +120,8 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - name: Unit and UI tests
-        run: npm run test -- --reporter=default --reporter=junit --outputFile=test-results/junit.xml
+        # Limit worker contention on shared runners; keep all tests blocking.
+        run: npm run test -- --maxWorkers=2 --reporter=default --reporter=junit --outputFile=test-results/junit.xml
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4

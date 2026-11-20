@@ -330,7 +330,8 @@ prune_backups 1
 
     @unittest.skipIf(os.name == "nt", "Shell health tests run in isolated Linux Docker")
     def test_shell_requires_health_of_all_three_business_roles(self):
-        result, _ = self.shell_helpers('''service_container() { printf '%s' "$1"; }
+        result, _ = self.shell_helpers('''BUSINESS_SERVICES=(app preview egress-proxy)
+service_container() { printf '%s' "$1"; }
 docker() { if [ "$4" = preview ]; then printf 'sha256:fixture unhealthy'; else printf 'sha256:fixture healthy'; fi; }
 if business_healthy sha256:fixture; then exit 99; fi
 docker() { printf 'sha256:fixture healthy'; }

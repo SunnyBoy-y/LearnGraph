@@ -56,6 +56,14 @@
               <a href="#overview" class="is-active">概览</a>
               <a href="#status-language">实现状态与阅读约定</a>
               <a href="#quickstart">本地启动</a>
+              <a href="#deployment">部署与更新</a>
+            </div>
+            <div class="nav-group">
+              <p>新功能</p>
+              <a href="#voice">全双工语音</a>
+              <a href="#research">联网研究与论文</a>
+              <a href="#long-running-tasks">长程与定时任务</a>
+              <a href="#android">Android 客户端</a>
             </div>
             <div class="nav-group">
               <p>核心架构</p>
@@ -229,6 +237,44 @@ npm.cmd run check</code></pre>
           </div>
         </section>
 
+        <section id="deployment" class="doc-section" data-title="部署与更新">
+          <div class="section-heading"><div><p class="overline">Deployment</p><h2>部署与更新</h2></div></div>
+          <p>Docker Compose 默认启动 app、sandboxd 和 egress-proxy。主站与 API 使用 18000，交互式子应用预览使用 18001。</p>
+          <div class="code-block"><div class="code-header"><span>Shell</span><button type="button" data-copy-code>复制</button></div><pre><code>docker compose up -d --build</code></pre></div>
+          <p>首次登录使用容器日志中的管理员临时密码，用户名为 <code>admin</code>。数据库、上传文件和主密钥需随数据卷备份；迁移到 PostgreSQL 后还需备份数据库卷。</p>
+          <p>管理员可在「设置 → 关于 → 版本与更新」使用宿主机更新器升级或回退。安装、备份和公网配置见 <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/docs/deployment-and-updates.md">部署与更新指南</a>，容器迁移见 <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/docs/container-topology.md">容器拓扑</a>。</p>
+        </section>
+
+        <section id="voice" class="doc-section" data-title="全双工语音">
+          <div class="section-heading"><div><p class="overline">Duplex voice</p><h2>全双工语音</h2></div></div>
+          <p>语音会话复用对话模型、记忆和学习证据；实时转写、语音合成、插话打断与句级字幕由语音管线协作完成。配置对话模型、DashScope 实时 ASR 和火山引擎 TTS 后即可使用。</p>
+          <p>前端优先使用同源 WebSocket 传输音频；服务端关闭该通道或前端指定 <code>VITE_VOICE_TRANSPORT=webrtc</code> 时可使用 WebRTC。反向代理需支持 WebSocket Upgrade，HTTPS 页面还需使用安全连接。</p>
+          <p><code>GET /api/v1/voice/capabilities</code> 返回服务端能力和权限状态。练习通过统一判分链写入作答与学习证据；研究和其他后台任务的进度与结果显示在当前对话。浏览器麦克风需要 localhost 或 HTTPS，Android 客户端还需录音权限。</p>
+          <div class="source-ref">代码：<code>backend/app/api/routers/voice.py</code> · <code>backend/app/voice/</code> · <code>frontend/src/features/voice/</code> · <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/docs/voice-wss-transport.md">WebSocket 传输说明</a></div>
+        </section>
+
+        <section id="research" class="doc-section" data-title="联网研究与论文">
+          <div class="section-heading"><div><p class="overline">Research</p><h2>联网研究与论文</h2></div></div>
+          <p>Agent 可按当前搜索路由调用搜索、网页读取和已授权 MCP 工具。普通网页读取结果不足时，可使用隔离浏览器读取动态页面；浏览器运行依赖沙箱镜像与已审批的网络出口。</p>
+          <p>论文搜索支持 OpenAlex 和 arXiv，覆盖关键词、作者、年份和开放获取筛选。公开 PDF 经授权后可读取、保存正文片段并按页引用，书目信息支持 BibTeX 导出。</p>
+          <p>搜索摘要、论文摘要和实际读取的正文片段分别记录来源与证据状态。论文接口位于 <code>/api/v1/papers</code>，包括 <code>search</code>、<code>read</code> 和 <code>save</code>。</p>
+          <div class="source-ref">详见 <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/docs/paper-search-and-library.md">论文检索与资料沉淀</a> · <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/docs/web-tool-supplements.md">联网工具说明</a></div>
+        </section>
+
+        <section id="long-running-tasks" class="doc-section" data-title="长程与定时任务">
+          <div class="section-heading"><div><p class="overline">Tasks</p><h2>长程与定时任务</h2></div></div>
+          <p>在聊天中输入 <code>/goal 目标</code> 启动多轮任务，使用 <code>/goal status</code>、<code>/goal pause</code> 和 <code>/goal resume</code> 管理进度。默认最多 6 轮，可通过 <code>--rounds</code> 设置 1–20 轮。执行依赖持久队列和支持工具调用的远程模型。</p>
+          <p>工作区定时任务支持五字段 cron、IANA 时区、Skill 脚本与已授权 MCP 工具。页面提供启停、手动运行和执行记录；应用服务需保持运行，每次执行重新校验权限和扩展授权。</p>
+          <div class="source-ref">详见 <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/docs/chat-goals.md">长程任务</a> · <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/docs/skill-mcp-schedules-verification.md#定时任务">定时任务</a></div>
+        </section>
+
+        <section id="android" class="doc-section" data-title="Android 客户端">
+          <div class="section-heading"><div><p class="overline">Mobile</p><h2>Android 客户端</h2></div></div>
+          <p>原生客户端使用 Kotlin、Jetpack Compose、GeckoView 和 WebExtension Bridge 连接 LearnGraph 服务，提供拍照、系统分享、文件下载、扫码、通知与录音权限桥接。</p>
+          <p>客户端构建需要 Java 21 和 Android SDK 35；测试和打包入口位于 <code>mobile/</code>。连接局域网服务时，请配置服务监听地址，并确保手机可以访问主站与预览地址。</p>
+          <div class="source-ref">详见 <a href="https://github.com/SunnyBoy-y/LearnGraph/blob/main/mobile/native/README.md">Android 客户端说明</a></div>
+        </section>
+
         <section id="architecture" class="doc-section" data-title="系统架构">
           <div class="section-heading">
             <span class="section-index">03</span>
@@ -280,7 +326,7 @@ npm.cmd run check</code></pre>
               <div class="arch-layer">
                 <div class="arch-label">Facts</div>
                 <div class="arch-main">
-                  <strong>SQLAlchemy 2 · SQLite</strong>
+                  <strong>SQLAlchemy 2 · SQLite / PostgreSQL</strong>
                   <span>规范业务事实源</span>
                 </div>
               </div>
@@ -310,7 +356,7 @@ npm.cmd run check</code></pre>
             <span class="section-index">04A</span>
             <div><p class="overline">Architecture evolution</p><h2>从 v0.1 起步到可治理 Runtime</h2></div>
           </div>
-          <p>旧设计文档中的 <code>c173b36</code> 基线来自 rebase 前分支，不在当前 main 历史；当前 main 以 <code>ddf3a1c</code>（v0.1 首发）为起点，HEAD <code>57fd37f</code> 把记忆系统、沙箱审批制出网、交互式子应用与产物版本化推进到可观察、可恢复、可审计的边界，并已完成一轮上线前全盘审计（NO_GO → 修复 → 有条件放行）。</p>
+          <p>项目从 v0.1 的媒体输入和 Provider 路由逐步扩展到学习图谱、记忆、沙箱、语音、研究与长期任务。各能力通过持久化、授权和可观察状态协同运行。</p>
           <div class="timeline-rail">
             <div class="timeline-item timeline-baseline"><span class="timeline-dot"></span><div><small>起点 · ddf3a1c（v0.1）</small><strong>先让能力可靠进入系统</strong><p>建立首版媒体输入、转录路由、音视频附件策略、解析器、文件服务与验证脚本基线；失败从“泛化错误”变成可定位的能力问题。</p></div></div>
             <div class="timeline-item"><span class="timeline-dot"></span><div><small>07-31 ~ 08-08 · 记忆 WP 系列</small><strong>记忆系统升级</strong><p>长期记忆从“摘要 + 检索”升级为原子记忆能力（自动提取、按需回填、用户纠错优先），并切换为默认读取链路；事件溯源等底层架构仍在演进中。</p></div></div>
@@ -329,7 +375,7 @@ npm.cmd run check</code></pre>
             <div><span class="compare-label">baseline</span><h3>v0.1 起步版</h3><ul><li>重点是媒体能否被正确解析和路由</li><li>附件策略与 Provider 失败边界开始显式化</li><li>验证以脚本和单次请求为主</li></ul></div>
             <div><span class="compare-label">current</span><h3>记忆 + 治理版</h3><ul><li>输入、工具、沙箱和记忆均有稳定事实与生命周期</li><li>结果可流式呈现，也可从持久化记录恢复</li><li>每个高风险动作都有授权、审计和可拒绝路径</li></ul></div>
           </div>
-          <div class="source-ref">对比起点：<code>git show ddf3a1c</code> · 当前 HEAD：<code>57fd37f</code> · 当前证据：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/memory_event_store.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
+          <div class="source-ref">历史起点：<code>git show ddf3a1c</code> · 代码：<code>backend/app/services/agent_runtime.py</code> · <code>backend/app/services/memory_event_store.py</code> · <code>backend/app/services/sandbox.py</code> · <code>backend/app/services/egress_approvals.py</code></div>
         </section>
 
         <section id="media-inputs" class="doc-section" data-title="媒体与文档输入">
@@ -408,13 +454,12 @@ npm.cmd run check</code></pre>
             </div>
           </div>
           <p>
-            SQLite 是 MVP 的规范业务事实源。本地文件系统承载默认对象存储，
-            但文件路径、外部 UUID 或 SSE 事件都不能替代数据库中的稳定业务身份。
+            新安装默认使用 SQLite 保存业务事实，系统管理员可将主业务库迁移至 PostgreSQL。本地文件系统承载默认对象存储，数据库保存稳定的业务身份。
           </p>
           <table>
             <thead><tr><th>层</th><th>保存内容</th><th>关键边界</th></tr></thead>
             <tbody>
-              <tr><td>SQLAlchemy / SQLite</td><td>账号、RBAC、Goal、Graph、Session、Evidence、Provider、授权、审计</td><td>当前规范事实源</td></tr>
+              <tr><td>SQLAlchemy / SQLite / PostgreSQL</td><td>账号、RBAC、Goal、Graph、Session、Evidence、Provider、授权、审计</td><td>主业务事实源</td></tr>
               <tr><td>Message timeline</td><td>Message、MessageVersion、MessagePart、SSE 事件、Provider Trace</td><td>SSE 只负责传输</td></tr>
               <tr><td>Memory</td><td>原子记忆（提取 + 存储 + 按需回填）</td><td>记忆是长期事实，可随用户纠错更新</td></tr>
               <tr><td>Object Storage</td><td>上传文件、生成产物、内容寻址 Blob</td><td>默认本地，可经迁移边界切换</td></tr>

@@ -79,7 +79,8 @@ class OpeningPromptCacheStore:
                 version=row.version + 1,
                 window_started_at=now if reset else row.window_started_at,
                 generation_count=1 if reset else row.generation_count + 1,
-                lease_token=token, lease_until=now + LEASE_SECONDS,
+                lease_token=token,
+                lease_until=now + LEASE_SECONDS,
                 next_generation_at=now + GENERATION_INTERVAL,
             ).execution_options(synchronize_session=False)).rowcount
             self.db.commit()
