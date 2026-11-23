@@ -590,6 +590,13 @@ class SessionContextUsageView(BaseModel):
     compacted_message_count: int = 0
 
 
+class CompactContextRequest(BaseModel):
+    """Optional focus / force controls for manual compaction (e.g. ``/compact <focus>``)."""
+
+    focus: str | None = Field(default=None, max_length=1_000)
+    force: bool = False
+
+
 class CompactContextResultView(BaseModel):
     """Result of a manual context compaction request.
 
@@ -605,6 +612,8 @@ class CompactContextResultView(BaseModel):
     estimated_tokens_before: int
     estimated_tokens_after: int
     summary_preview: str = ""
+    focus_applied: str | None = None
+    microcompacted_tool_count: int = 0
 
 
 class BranchRequest(BaseModel):

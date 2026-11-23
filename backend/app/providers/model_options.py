@@ -437,7 +437,7 @@ def validate_model_capability_update(payload: dict[str, Any]) -> dict[str, Any]:
 
     try:
         chat_compaction_ratio = float(payload.get("chat_compaction_ratio", 0.8))
-        agent_compaction_ratio = float(payload.get("agent_compaction_ratio", 1 / 3))
+        agent_compaction_ratio = float(payload.get("agent_compaction_ratio", 0.78))
     except (TypeError, ValueError) as exc:
         raise ModelCapabilityError("compaction ratios must be numeric") from exc
     if context_window_tokens < 8_000 or context_window_tokens > 10_000_000:
@@ -506,7 +506,7 @@ _CATALOG_BASE_CAPABILITIES: dict[str, Any] = {
     "context_window_confidence": "unknown",
     "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
     "chat_compaction_ratio": 0.8,
-    "agent_compaction_ratio": 1 / 3,
+    "agent_compaction_ratio": 0.78,
 }
 
 
@@ -598,7 +598,7 @@ def catalog_capability_snapshot(
         1.0, max(0.1, float(merged.get("chat_compaction_ratio", 0.8)))
     )
     merged["agent_compaction_ratio"] = min(
-        1.0, max(0.1, float(merged.get("agent_compaction_ratio", 1 / 3)))
+        1.0, max(0.1, float(merged.get("agent_compaction_ratio", 0.78)))
     )
     merged.pop("legacy_thinking_mapping", None)
     return merged

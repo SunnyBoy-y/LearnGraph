@@ -3713,7 +3713,7 @@ function normalizeLoadedCapabilities(
     agent_compaction_ratio:
       Number.isFinite(agentRatio) && agentRatio >= 0.1 && agentRatio <= 1
         ? agentRatio
-        : 1 / 3,
+        : 0.78,
   };
 }
 
@@ -3741,7 +3741,7 @@ function emptyModelCapabilities(): ProviderModelCapabilities {
     context_window_confidence: "unknown",
     max_output_tokens: 4_096,
     chat_compaction_ratio: 0.8,
-    agent_compaction_ratio: 1 / 3,
+    agent_compaction_ratio: 0.78,
   };
 }
 

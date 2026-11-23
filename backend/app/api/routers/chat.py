@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File,
     Form,
@@ -58,6 +59,7 @@ from app.domain.schemas.chat import (
     SessionActivitySummaryRequest,
     SessionAutoTitleRequest,
     SessionContextUsageView,
+    CompactContextRequest,
     CompactContextResultView,
     SessionCreateRequest,
     SessionFileView,
@@ -1320,12 +1322,14 @@ def compact_session_context(
     model_id: Annotated[str | None, Query(min_length=1, max_length=160)] = None,
     provider_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     agent_mode: bool = False,
+    payload: Annotated[CompactContextRequest | None, Body()] = None,
 ) -> CompactContextResultView:
     """Manually compact the session context into a durable summary.
 
     Mirrors the automatic compaction path: older messages are reduced to a
     summary record that the next prompt build uses instead of the raw
-    history. Returns a ``skipped`` result (with reason) when the context is
+    history. Accepts an optional ``focus`` instruction (``/compact <focus>``)
+    and ``force`` flag; returns a ``skipped`` result when the context is
     still small or there is nothing to compact.
     """
     require_session_access(session_id, "write", db, context)
@@ -1336,7 +1340,12 @@ def compact_session_context(
             settings,
             model_id=model_id,
             provider_id=provider_id,
-        ).compact_context(session_id, agent_mode=agent_mode)
+        ).compact_context(
+            session_id,
+            agent_mode=agent_mode,
+            focus=payload.focus if payload is not None else None,
+            force=bool(payload.force) if payload is not None else False,
+        )
     )
 
 

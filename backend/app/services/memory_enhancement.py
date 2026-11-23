@@ -1586,20 +1586,13 @@ def _summary_schema() -> dict[str, Any]:
     }
 
 
-def _summary_prompt(base_summary: str, transcript: str) -> str:
-    base_block = (
-        f"已有的早期会话摘要（在此基础上滚动合并，不要丢失其中的关键事实）：\n{base_summary}\n\n"
-        if base_summary
-        else ""
-    )
-    return (
-        "你是 LearnGraph 的会话摘要器。请把下面这段学习对话压缩成一份可复用的会话摘要，"
-        "供后续对话作为上下文注入。\n\n"
-        f"{base_block}"
-        f"新增对话内容：\n{transcript}\n\n"
-        "要求：用中文；保留结论、约定、用户偏好、已解决与未解决的问题、关键实体和数字；"
-        "省略寒暄和重复；按主题组织成条目；总长不超过 600 字。"
-        "输出合并后的完整摘要（覆盖已有摘要 + 新增内容）。"
+def _summary_prompt(base_summary: str, transcript: str, *, has_tools: bool = False) -> str:
+    from app.services.context_compaction import build_structured_handoff_prompt
+
+    return build_structured_handoff_prompt(
+        transcript,
+        base_summary=base_summary,
+        has_tools=has_tools,
     )
 
 
@@ -1704,11 +1697,23 @@ def summarize_session_context(
                 "The configured summarization model provider is unavailable",
             )
         return {"status": "provider_unavailable"}
-    transcript = "\n".join(
-        f"[{item.role}] {item.content[:_SUMMARY_MESSAGE_CHAR_CAP]}"
+    from app.services.context_compaction import message_execution_digest
+
+    has_tools = any(
+        isinstance(getattr(item, "parts", None), list)
+        and any(
+            isinstance(part, dict)
+            and (part.get("type") or part.get("part_type"))
+            in {"agent_step", "tool_call", "source_list"}
+            for part in item.parts
+        )
         for item in fresh_messages
     )
-    prompt = _summary_prompt(base_summary, transcript)
+    transcript = "\n".join(
+        message_execution_digest(item)[:_SUMMARY_MESSAGE_CHAR_CAP]
+        for item in fresh_messages
+    )
+    prompt = _summary_prompt(base_summary, transcript, has_tools=has_tools)
     if estimate_tokens(prompt + json.dumps(_summary_schema())) > 12000:
         return {"status": "input_budget_exceeded"}
     output_cap = min(int(getattr(model, "max_output_tokens", 2048) or 2048), 2048)

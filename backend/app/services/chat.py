@@ -27,6 +27,7 @@ from app.core.errors import AppError
 from app.core.config import Settings, get_settings
 from app.domain.models import (
     AudioTranscription,
+    ChatGoalRun,
     ChatSession,
     ContextSummary,
     Evidence,
@@ -145,6 +146,22 @@ from app.services.session_workspace import SessionWorkspaceService
 from app.services.session_titles import (
     apply_session_title_fallback,
     is_default_session_title,
+)
+from app.services.context_compaction import (
+    DEFAULT_AGENT_COMPACTION_RATIO,
+    DEFAULT_CHAT_COMPACTION_RATIO,
+    MICROCOMPACT_TRIGGER_RATIO,
+    InLoopCompactionResult,
+    MicrocompactStats,
+    build_rehydration_note,
+    build_structured_handoff_prompt,
+    build_structured_mechanical_summary,
+    compact_in_loop_provider_messages,
+    estimate_provider_messages_tokens,
+    estimate_tool_definitions_tokens,
+    is_context_overflow_error,
+    message_execution_digest,
+    microcompact_provider_messages,
 )
 from app.services.token_estimate import estimate_tokens
 from app.services.text_utils import truncate_without_splitting_urls
@@ -2615,28 +2632,157 @@ class ChatService:
         except Exception:
             pass
 
+    def _tool_result_store(self, session_id: str) -> Any | None:
+        settings_obj = getattr(self, "settings", None)
+        storage_root = getattr(settings_obj, "storage_root", None)
+        if not storage_root:
+            return None
+        from app.services.tool_results import ToolResultStore
+
+        return ToolResultStore(storage_root, self.workspace_id, self.actor_id, session_id)
+
+    def _observed_sandbox_paths(self, session_id: str) -> list[str]:
+        runtime = getattr(self, "agent_tool_runtime", None)
+        versions = getattr(runtime, "_observed_file_versions", None)
+        if not isinstance(versions, dict):
+            return []
+        return [
+            path
+            for key in versions
+            if isinstance(key, tuple)
+            and len(key) == 2
+            and key[0] == session_id
+            and isinstance((path := key[1]), str)
+            and path
+        ]
+
+    def _rehydration_note_for_session(
+        self,
+        session_id: str,
+        *,
+        activated_capability_ids: set[str] | None = None,
+        activated_capability_families: set[str] | None = None,
+    ) -> str:
+        goal = None
+        session_files: list[dict[str, Any]] = []
+        db = getattr(self, "db", None)
+        if db is not None and callable(getattr(db, "scalar", None)):
+            try:
+                goal = db.scalar(
+                    select(ChatGoalRun).where(
+                        ChatGoalRun.workspace_id == self.workspace_id,
+                        ChatGoalRun.session_id == session_id,
+                    )
+                )
+            except Exception:
+                goal = None
+            try:
+                from app.services.session_files import collect_session_files
+
+                session_files = collect_session_files(db, self.workspace_id, session_id)
+            except Exception:
+                session_files = []
+        return build_rehydration_note(
+            goal=goal,
+            session_files=session_files,
+            observed_paths=self._observed_sandbox_paths(session_id),
+            activated_capability_ids=activated_capability_ids,
+            activated_capability_families=activated_capability_families,
+        )
+
+    def _can_sync_model_summarize(self) -> bool:
+        provider = getattr(self, "model_provider", None)
+        if provider is None or not getattr(provider, "available", True):
+            return False
+        if getattr(provider, "supports_sync_compaction", False):
+            return True
+        provider_type = str(getattr(provider, "provider_type", "") or "")
+        return provider_type not in {"", "unknown", "local_mock"}
+
+    def _summarize_prompt_with_model(self, prompt: str) -> str:
+        provider = getattr(self, "model_provider", None)
+        if provider is None or not getattr(provider, "available", True):
+            return ""
+        try:
+            if callable(getattr(provider, "stream_chat", None)):
+                chunks: list[str] = []
+                for event in provider.stream_chat(
+                    [ProviderChatMessage(role="user", content=prompt)]
+                ):
+                    if getattr(event, "type", None) == "text_delta" and getattr(event, "content", None):
+                        chunks.append(event.content)
+                return "".join(chunks).strip()
+            if callable(getattr(provider, "stream_answer", None)):
+                return "".join(chunk for chunk in provider.stream_answer(prompt) if chunk).strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _summarize_older_with_model(
+        self,
+        older: list[Message],
+        *,
+        base_summary: str = "",
+        focus: str | None = None,
+    ) -> str:
+        if not older:
+            return ""
+        lines: list[str] = []
+        total = 0
+        has_tools = False
+        for item in older:
+            parts_list = getattr(item, "parts", None)
+            if isinstance(parts_list, list) and any(
+                isinstance(part, dict)
+                and (part.get("type") or part.get("part_type")) in {"agent_step", "tool_call", "source_list"}
+                for part in parts_list
+            ):
+                has_tools = True
+            digest = message_execution_digest(item)
+            sticker = self._sticker_history_stub(parts_list)
+            if sticker:
+                digest = f"{digest}{sticker}"
+            if total + len(digest) > 24_000 and lines:
+                lines.append("[...earlier messages truncated for summarizer budget...]")
+                break
+            lines.append(digest)
+            total += len(digest)
+        prompt = build_structured_handoff_prompt(
+            "\n\n".join(lines),
+            base_summary=base_summary,
+            focus=focus,
+            has_tools=has_tools,
+        )
+        return self._summarize_prompt_with_model(prompt)
+
     def _compose_context_summary_text(
         self,
         session_id: str,
         older: list[Message],
+        *,
+        focus: str | None = None,
+        allow_model_fallback: bool = False,
     ) -> tuple[str, str]:
         """Older-history summary text for compaction: (text, kind).
 
         Prefers the freshest background LLM rolling summary (ContextSummary
         kind='model') for the message prefix it covers, then appends mechanical
-        truncation only for uncovered messages. Without a usable model summary
-        this degrades to the historical pure-truncation behaviour.
+        truncation only for uncovered messages. When ``allow_model_fallback``
+        is enabled (or ``focus`` is requested) and a real model provider is
+        available, falls back to synchronous structured execution-handoff
+        summarization before degrading to structured mechanical digestion.
         """
 
-        def mechanical(items: list[Message]) -> str:
-            return "\n".join(
-                f"- {item.role} {item.id}: "
-                f"{truncate_without_splitting_urls(item.content, 400)}{self._sticker_history_stub(item.parts)}"
-                for item in items
+        def mechanical(items: list[Message], *, include_focus: str | None = None) -> str:
+            return build_structured_mechanical_summary(
+                items,
+                sticker_stub_fn=self._sticker_history_stub,
+                focus=include_focus,
             )
 
         if not older:
             return "", "mechanical"
+        focus_text = focus.strip() if isinstance(focus, str) and focus.strip() else None
         latest = self.db.scalar(
             select(ContextSummary)
             .where(
@@ -2647,32 +2793,124 @@ class ChatService:
             .order_by(ContextSummary.version.desc())
             .limit(1)
         )
-        if latest is None:
-            return mechanical(older), "mechanical"
-        covered_ids = set(latest.source_message_ids or [])
-        older_ids = {item.id for item in older}
-        # A summary that covers messages outside `older` would duplicate
-        # content already present verbatim in the recent window — skip it.
-        if not covered_ids or not covered_ids.issubset(older_ids):
-            return mechanical(older), "mechanical"
-        import hashlib as summary_hashlib
-        source_hash = summary_hashlib.sha256(
-            chr(10).join(f"{item.id}:{item.content}" for item in older if item.id in covered_ids).encode("utf-8")
-        ).hexdigest()
-        if latest.source_hash != source_hash:
-            return mechanical(older), "mechanical"
-        uncovered = [item for item in older if item.id not in covered_ids]
-        parts = [f"[模型生成的早期会话摘要]\n{latest.summary}"]
-        covered_stickers = [
-            f"- {item.role} {item.id}:{sticker_text}"
-            for item in older if item.id in covered_ids
-            if (sticker_text := self._sticker_history_stub(item.parts))
-        ]
-        if covered_stickers:
-            parts.append("[摘要涉及的已发送表情语义]\n" + "\n".join(covered_stickers))
-        if uncovered:
-            parts.append(f"[尚未纳入摘要的较早消息（截断）]\n{mechanical(uncovered)}")
-        return "\n\n".join(parts), "model_composite"
+        if latest is not None and not focus_text:
+            covered_ids = set(latest.source_message_ids or [])
+            older_ids = {item.id for item in older}
+            # A summary that covers messages outside `older` would duplicate
+            # content already present verbatim in the recent window — skip it.
+            if covered_ids and covered_ids.issubset(older_ids):
+                import hashlib as summary_hashlib
+                source_hash = summary_hashlib.sha256(
+                    chr(10).join(f"{item.id}:{item.content}" for item in older if item.id in covered_ids).encode("utf-8")
+                ).hexdigest()
+                if latest.source_hash == source_hash:
+                    uncovered = [item for item in older if item.id not in covered_ids]
+                    parts = [f"[模型生成的早期会话摘要]\n{latest.summary}"]
+                    covered_stickers = [
+                        f"- {item.role} {item.id}:{sticker_text}"
+                        for item in older if item.id in covered_ids
+                        if (sticker_text := self._sticker_history_stub(item.parts))
+                    ]
+                    if covered_stickers:
+                        parts.append("[摘要涉及的已发送表情语义]\n" + "\n".join(covered_stickers))
+                    if uncovered:
+                        parts.append(f"[尚未纳入摘要的较早消息（截断）]\n{mechanical(uncovered)}")
+                    return "\n\n".join(parts), "model_composite"
+
+        if allow_model_fallback and self._can_sync_model_summarize():
+            base_summary = latest.summary if latest is not None and focus_text else ""
+            sync_summary = self._summarize_older_with_model(
+                older,
+                base_summary=base_summary,
+                focus=focus_text,
+            )
+            if sync_summary:
+                covered_stickers = [
+                    f"- {item.role} {item.id}:{sticker_text}"
+                    for item in older
+                    if (sticker_text := self._sticker_history_stub(item.parts))
+                ]
+                if covered_stickers:
+                    sync_summary = (
+                        f"{sync_summary}\n\n[摘要涉及的已发送表情语义]\n"
+                        + "\n".join(covered_stickers)
+                    )
+                return sync_summary, "model"
+
+        return mechanical(older, include_focus=focus_text), "mechanical"
+
+    def _prepare_in_loop_messages(
+        self,
+        session_id: str,
+        messages: list[ProviderChatMessage],
+        *,
+        agent_mode: bool,
+        tool_definitions: list[dict[str, Any]] | None,
+        activated_capability_ids: set[str] | None,
+        activated_capability_families: set[str] | None,
+        provider_trace: dict[str, Any],
+        force_compact: bool = False,
+        aggressive: bool = False,
+    ) -> tuple[list[ProviderChatMessage], InLoopCompactionResult | None, MicrocompactStats | None]:
+        input_budget = self._input_token_budget()
+        threshold = int(input_budget * self._context_compaction_ratio(agent_mode))
+        tool_defs_tokens = estimate_tool_definitions_tokens(tool_definitions)
+        current_tokens = estimate_provider_messages_tokens(messages, tool_definitions)
+
+        mc_stats: MicrocompactStats | None = None
+        if force_compact or current_tokens >= int(input_budget * MICROCOMPACT_TRIGGER_RATIO):
+            messages, mc_stats = microcompact_provider_messages(
+                messages,
+                keep_recent_tool_messages=2 if aggressive else 4,
+                min_clear_chars=160 if aggressive else 320,
+                store=self._tool_result_store(session_id),
+            )
+            if mc_stats.cleared_count > 0:
+                provider_trace["microcompact_cleared"] = (
+                    int(provider_trace.get("microcompact_cleared") or 0)
+                    + mc_stats.cleared_count
+                )
+                current_tokens = estimate_provider_messages_tokens(messages, tool_definitions)
+
+        if force_compact or current_tokens >= threshold:
+            effective_budget = max(1_000, input_budget - tool_defs_tokens)
+            keep_tail_tokens = max(
+                600,
+                int(effective_budget * (0.18 if aggressive else 0.30)),
+            )
+            rehydration = self._rehydration_note_for_session(
+                session_id,
+                activated_capability_ids=activated_capability_ids,
+                activated_capability_families=activated_capability_families,
+            )
+            summary_fn = (
+                (
+                    lambda prior, tx: self._summarize_prompt_with_model(
+                        build_structured_handoff_prompt(
+                            tx,
+                            base_summary=prior,
+                            has_tools=True,
+                        )
+                    )
+                )
+                if self._can_sync_model_summarize()
+                else None
+            )
+            messages, in_loop_result = compact_in_loop_provider_messages(
+                messages,
+                keep_tail_tokens=keep_tail_tokens,
+                min_keep_units=1,
+                summary_fn=summary_fn,
+                rehydration_note=rehydration,
+                tool_definitions=tool_definitions,
+            )
+            if in_loop_result.compacted:
+                provider_trace["in_loop_compactions"] = (
+                    int(provider_trace.get("in_loop_compactions") or 0) + 1
+                )
+            return messages, in_loop_result, mc_stats
+
+        return messages, None, mc_stats
 
     def _session_memory_policy_enabled(self, session_id: str | None) -> bool:
         """Effective memory policy (workspace AND session) for tool gating.
@@ -2707,7 +2945,7 @@ class ChatService:
         capabilities = getattr(self.model_provider, "capabilities", {})
         if not isinstance(capabilities, dict):
             capabilities = {}
-        default = 1 / 3 if agent_mode else 0.8
+        default = DEFAULT_AGENT_COMPACTION_RATIO if agent_mode else DEFAULT_CHAT_COMPACTION_RATIO
         key = "agent_compaction_ratio" if agent_mode else "chat_compaction_ratio"
         try:
             ratio = float(capabilities.get(key, default))
@@ -2975,7 +3213,11 @@ class ChatService:
         recent, older, recent_tokens = self._partition_recent_older(
             history, input_budget
         )
-        summary_text, summary_kind = self._compose_context_summary_text(session_id, older)
+        summary_text, summary_kind = self._compose_context_summary_text(
+            session_id,
+            older,
+            allow_model_fallback=self._can_sync_model_summarize(),
+        )
         summary = self._record_context_summary(
             session_id,
             older=older,
@@ -2984,8 +3226,10 @@ class ChatService:
             recent_tokens=recent_tokens,
             before_tokens=self._estimate_tokens(full_with_context),
         )
+        rehydration_note = self._rehydration_note_for_session(session_id)
+        rehydration_block = f"\n\n{rehydration_note}" if rehydration_note else ""
         recent_text = "\n\n".join(f"[{item.role} message_id={item.id}]\n{item.content}{self._sticker_history_stub(item.parts)}" for item in recent)
-        prompt = f"较早会话结构摘要：\n{summary_text}\n\n最近完整消息：\n{recent_text}\n\n当前用户消息：\n{current_content}"
+        prompt = f"较早会话结构摘要：\n{summary_text}{rehydration_block}\n\n最近完整消息：\n{recent_text}\n\n当前用户消息：\n{current_content}"
         body = f"{authorized_context}\n\n{prompt}" if authorized_context else prompt
         return f"{style_instructions}\n\n{body}", summary
 
@@ -3364,6 +3608,8 @@ class ChatService:
         history_before_message_id: str | None = None,
         agent_mode_enabled: bool = False,
         web_search_results_present: bool = False,
+        web_search_enabled: bool = False,
+        tool_definitions: list[dict[str, Any]] | None = None,
         audio_transcripts: list[tuple[FileRecord, AudioTranscription]] | None = None,
     ) -> tuple[list[ProviderChatMessage], ContextSummary | None]:
         session = self.sessions.require(session_id, "session")
@@ -3532,9 +3778,49 @@ class ChatService:
             )
         messages.append(ProviderChatMessage(role="user", content=current_content))
 
+        effective_tool_defs = (
+            list(tool_definitions)
+            if tool_definitions is not None
+            else (
+                self._agent_tool_definitions(
+                    True,
+                    web_search_enabled,
+                    session_id=session_id,
+                )
+                if agent_mode_enabled
+                else []
+            )
+        )
+        tool_defs_tokens = (
+            self._estimate_tokens(json.dumps(effective_tool_defs, ensure_ascii=False))
+            if effective_tool_defs
+            else 0
+        )
+        turn_tail_size = 2 if authorized_context else 1
+        prefix = messages[: len(messages) - len(history) - turn_tail_size]
+        turn_tail = messages[-turn_tail_size:]
+
         serialized = self._structured_billing_input(messages)
         input_budget = self._input_token_budget()
-        if self._estimate_tokens(serialized) < int(
+        total_estimated_tokens = self._estimate_tokens(serialized) + tool_defs_tokens
+
+        # Layer 1 (pre-turn): microcompact older bulky tool results before hard compaction.
+        if (
+            (agent_mode_enabled or any(m.role == "tool" for m in history))
+            and total_estimated_tokens >= int(input_budget * MICROCOMPACT_TRIGGER_RATIO)
+        ):
+            compacted_history, mc_stats = microcompact_provider_messages(
+                history,
+                keep_recent_tool_messages=4,
+                store=self._tool_result_store(session_id),
+            )
+            if mc_stats.cleared_count > 0:
+                history = compacted_history
+                messages = [*prefix, *history, *turn_tail]
+                serialized = self._structured_billing_input(messages)
+                total_estimated_tokens = self._estimate_tokens(serialized) + tool_defs_tokens
+
+        if total_estimated_tokens < int(
             input_budget * self._context_compaction_ratio(agent_mode_enabled)
         ):
             return messages, None
@@ -3546,26 +3832,34 @@ class ChatService:
             for message in history
         )
         if has_linked_provider_history:
-            # Keep a protocol-valid suffix beginning at a user turn. This
+            # Keep a protocol-valid suffix beginning at a real user turn. This
             # retains complete recent assistant/tool continuation state while
             # older tool transactions are represented only by a durable
             # summary and are never replayed out of order.
-            recent_budget = max(1_000, int(input_budget * 0.3))
+            effective_budget = max(1_000, input_budget - tool_defs_tokens)
+            recent_budget = max(1_000, int(effective_budget * 0.3))
             start = len(history)
             used = 0
             for index in range(len(history) - 1, -1, -1):
-                cost = self._estimate_tokens(
-                    json.dumps(history[index].as_payload(), ensure_ascii=False)
-                )
+                cost = estimate_provider_messages_tokens([history[index]])
                 if start < len(history) and used + cost > recent_budget:
                     break
                 start = index
                 used += cost
-            while start < len(history) and history[start].role != "user":
+            while start < len(history) and (
+                history[start].role != "user"
+                or (
+                    bool(history[start].content_parts)
+                    and start > 0
+                    and history[start - 1].role == "tool"
+                )
+            ):
                 start += 1
             recent_history = history[start:]
             recent_visible_turns = sum(
-                message.role in {"user", "assistant"} for message in recent_history
+                message.role in {"user", "assistant"}
+                and not (bool(message.content_parts) and not message.content)
+                for message in recent_history
             )
             timeline = [
                 item
@@ -3590,20 +3884,21 @@ class ChatService:
                     ),
                     start,
                 )
-                while (
-                    recent_start < len(history)
-                    and history[recent_start].role != "user"
+                while recent_start < len(history) and (
+                    history[recent_start].role != "user"
+                    or (
+                        bool(history[recent_start].content_parts)
+                        and recent_start > 0
+                        and history[recent_start - 1].role == "tool"
+                    )
                 ):
                     recent_start += 1
                 recent_history = history[recent_start:]
-                used = sum(
-                    self._estimate_tokens(
-                        json.dumps(message.as_payload(), ensure_ascii=False)
-                    )
-                    for message in recent_history
-                )
+                used = estimate_provider_messages_tokens(recent_history)
             summary_text, summary_kind = self._compose_context_summary_text(
-                session_id, older
+                session_id,
+                older,
+                allow_model_fallback=self._can_sync_model_summarize(),
             )
             summary = self._record_context_summary(
                 session_id,
@@ -3611,11 +3906,14 @@ class ChatService:
                 summary_text=summary_text,
                 summary_kind=summary_kind,
                 recent_tokens=used,
-                before_tokens=self._estimate_tokens(serialized),
+                before_tokens=total_estimated_tokens,
             )
-            # Keep both current-turn references and the question outside history compaction.
-            turn_tail_size = 2 if authorized_context else 1
-            prefix = messages[: len(messages) - len(history) - turn_tail_size]
+            rehydration_note = self._rehydration_note_for_session(session_id)
+            rehydration_msgs = (
+                [ProviderChatMessage(role="system", content=rehydration_note)]
+                if rehydration_note
+                else []
+            )
             return [
                 *prefix,
                 ProviderChatMessage(
@@ -3626,8 +3924,9 @@ class ChatService:
                         f"{summary_text}"
                     ),
                 ),
+                *rehydration_msgs,
                 *recent_history,
-                *messages[-turn_tail_size:],
+                *turn_tail,
             ], summary
 
         # Preserve availability under a true context overflow. The normal path
@@ -10042,6 +10341,13 @@ class ChatService:
         estimated, compacted_count = self._effective_context_estimate(
             session_id, history
         )
+        if agent_mode:
+            tool_defs = self._agent_tool_definitions(
+                True,
+                False,
+                session_id=session_id,
+            )
+            estimated += estimate_tool_definitions_tokens(tool_defs)
         input_budget = self._input_token_budget()
         ratio = self._context_compaction_ratio(agent_mode)
         threshold = max(1, int(input_budget * ratio))
@@ -10060,14 +10366,21 @@ class ChatService:
             "compacted_message_count": compacted_count,
         }
 
-    def compact_context(self, session_id: str, *, agent_mode: bool = False) -> dict[str, Any]:
+    def compact_context(
+        self,
+        session_id: str,
+        *,
+        agent_mode: bool = False,
+        focus: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
         """Manually compact the session context into a durable summary.
 
-        Mirrors the automatic compaction path in ``_build_model_prompt``:
-        older messages are reduced to a summary record (model-backed when a
-        background rolling summary is available, otherwise mechanical) that
-        the next prompt build uses instead of the raw history. Returns a
-        skipped result instead of raising when compaction would be pointless.
+        Mirrors the automatic compaction path: older messages are reduced to a
+        structured execution handoff summary record (model-backed when a
+        background rolling summary or synchronous model provider is available,
+        otherwise structured mechanical digestion). Supports optional ``focus``
+        instructions (``/compact <focus>``) and ``force`` flag.
         """
         history = self._session_timeline(session_id)
         estimated, compacted_count = self._effective_context_estimate(
@@ -10076,6 +10389,7 @@ class ChatService:
         input_budget = self._input_token_budget()
         ratio = self._context_compaction_ratio(agent_mode)
         threshold = max(1, int(input_budget * ratio))
+        focus_text = focus.strip() if isinstance(focus, str) and focus.strip() else None
         skipped = {
             "skipped": True,
             "reason": "context_too_small",
@@ -10085,15 +10399,24 @@ class ChatService:
             "estimated_tokens_after": estimated,
             "summary_preview": "",
         }
-        if estimated < int(threshold * 0.5):
+        if not force and not focus_text and estimated < int(threshold * 0.5):
             return skipped
         recent, older, recent_tokens = self._partition_recent_older(
             history, input_budget
         )
+        if not older and force and len(history) >= 2:
+            older = history[:-1]
+            recent = history[-1:]
+            recent_tokens = self._estimate_tokens(
+                recent[0].content + self._sticker_history_stub(recent[0].parts)
+            )
         if not older:
             return {**skipped, "reason": "nothing_to_compact"}
         summary_text, summary_kind = self._compose_context_summary_text(
-            session_id, older
+            session_id,
+            older,
+            focus=focus_text,
+            allow_model_fallback=True,
         )
         summary = self._record_context_summary(
             session_id,
@@ -11540,6 +11863,7 @@ class ChatService:
                 history_before_message_id=parent.id,
                 agent_mode_enabled=retry_agent_mode,
                 web_search_results_present=bool(source_context),
+                web_search_enabled=bool(retry_context.web_search),
                 audio_transcripts=retry_audio_transcripts,
             )
             provider_messages, image_input_trace = self._with_image_inputs(
@@ -11743,7 +12067,7 @@ class ChatService:
         self.db.commit()
 
         def stream() -> Iterable[str]:
-            nonlocal next_ordinal, provider_trace, source_record
+            nonlocal next_ordinal, provider_trace, source_record, provider_messages
             sequence = 1
             chunk_sequence = 0
             final_text = ""
@@ -12024,6 +12348,7 @@ class ChatService:
                 retry_tool_rounds = 0
                 max_agent_tool_rounds = None if getattr(self, "_managed_control", None) else MAX_AGENT_TOOL_ROUNDS
                 stream_retry_count = 0
+                overflow_compact_count = 0
                 # Turn-local progressive-disclosure state (mirror of the primary
                 # stream). Populated by lg_capability_activate and applied to the
                 # next retry provider invocation; never durable authorization.
@@ -12032,6 +12357,46 @@ class ChatService:
                 for attempt_no in (count(1) if max_attempts is None else range(1, max_attempts + 1)):
                     if cancellation_requested():
                         raise _GenerationCancellationRequested()
+                    retry_tool_definitions = (
+                        self._agent_tool_definitions(
+                            retry_agent_mode,
+                            retry_context.web_search,
+                            session_id=session_id,
+                            capability_families=activated_capability_families,
+                            activated_capabilities=activated_capability_ids,
+                        )
+                        if structured_chat
+                        else []
+                    )
+                    if structured_chat and attempt_no > 1:
+                        provider_messages, in_loop_res, _mc_res = self._prepare_in_loop_messages(
+                            session_id,
+                            provider_messages,
+                            agent_mode=bool(retry_agent_mode),
+                            tool_definitions=retry_tool_definitions,
+                            activated_capability_ids=activated_capability_ids,
+                            activated_capability_families=activated_capability_families,
+                            provider_trace=provider_trace,
+                        )
+                        if in_loop_res is not None and in_loop_res.compacted:
+                            compacted_ev = self._append_event(
+                                session_id=session_id,
+                                message_id=message.id,
+                                message_version_id=version.id,
+                                part_id=None,
+                                sequence=sequence,
+                                event_type="context.compaction.completed",
+                                payload={
+                                    "summary_id": None,
+                                    "estimated_tokens_before": in_loop_res.tokens_before,
+                                    "estimated_tokens_after": in_loop_res.tokens_after,
+                                    "source_message_ids": [],
+                                    "kind": in_loop_res.summary_kind,
+                                    "reason": "in_loop_budget",
+                                },
+                            )
+                            sequence += 1
+                            yield self._encode_event(compacted_ev)
                     current_billing_input = (
                         self._structured_billing_input(provider_messages)
                         if structured_chat
@@ -12075,13 +12440,6 @@ class ChatService:
                     invocation_tool_calls: list[dict] = []
                     try:
                         if structured_chat:
-                            retry_tool_definitions = self._agent_tool_definitions(
-                                retry_agent_mode,
-                                retry_context.web_search,
-                                session_id=session_id,
-                                capability_families=activated_capability_families,
-                                activated_capabilities=activated_capability_ids,
-                            )
                             for provider_event in self._stream_agent_chat(
                                 provider_messages,
                                 tools=retry_tool_definitions or None, session_id=session_id,
@@ -13047,6 +13405,75 @@ class ChatService:
                         yield from maybe_start_answer()
                         break
                     except (ProviderHTTPError, TimeoutError) as exc:
+                        if (
+                            structured_chat
+                            and is_context_overflow_error(exc)
+                            and overflow_compact_count < 2
+                        ):
+                            overflow_compact_count += 1
+                            active_attempt.status = "failed"
+                            active_attempt.error_type = "ContextOverflowCompacting"
+                            record_active_usage()
+                            for reasoning_record in attempt_reasoning.values():
+                                if reasoning_record.status == "streaming":
+                                    yield terminalize_reasoning(
+                                        reasoning_record,
+                                        status="failed",
+                                        error_code="context_overflow_compacting",
+                                    )
+                            if final_text != attempt_text_start:
+                                final_text = attempt_text_start
+                                text_record.status = "pending"
+                                text_record.content = final_text
+                                message.content = final_text
+                                message.parts = assembled_parts("pending", final_text)
+                            provider_messages, in_loop_res, mc_res = self._prepare_in_loop_messages(
+                                session_id,
+                                provider_messages,
+                                agent_mode=bool(retry_agent_mode),
+                                tool_definitions=retry_tool_definitions,
+                                activated_capability_ids=activated_capability_ids,
+                                activated_capability_families=activated_capability_families,
+                                provider_trace=provider_trace,
+                                force_compact=True,
+                                aggressive=(overflow_compact_count > 1),
+                            )
+                            if (in_loop_res is not None and in_loop_res.compacted) or (
+                                mc_res is not None and mc_res.cleared_count > 0
+                            ):
+                                provider_trace["reactive_overflow_compactions"] = overflow_compact_count
+                                compacted_ev = self._append_event(
+                                    session_id=session_id,
+                                    message_id=message.id,
+                                    message_version_id=version.id,
+                                    part_id=None,
+                                    sequence=sequence,
+                                    event_type="context.compaction.completed",
+                                    payload={
+                                        "summary_id": None,
+                                        "estimated_tokens_before": (
+                                            in_loop_res.tokens_before
+                                            if in_loop_res is not None and in_loop_res.compacted
+                                            else mc_res.tokens_before
+                                        ),
+                                        "estimated_tokens_after": (
+                                            in_loop_res.tokens_after
+                                            if in_loop_res is not None and in_loop_res.compacted
+                                            else mc_res.tokens_after
+                                        ),
+                                        "source_message_ids": [],
+                                        "kind": (
+                                            in_loop_res.summary_kind
+                                            if in_loop_res is not None and in_loop_res.compacted
+                                            else "microcompact"
+                                        ),
+                                        "reason": "reactive_context_overflow",
+                                    },
+                                )
+                                sequence += 1
+                                yield self._encode_event(compacted_ev)
+                                self.db.commit()
+                                continue
                         error_category = _stream_retry_category(exc)
                         if error_category is None:
                             raise
@@ -14173,6 +14600,7 @@ class ChatService:
                 additional_context=additional_context,
                 agent_mode_enabled=bool(payload.agent_mode),
                 web_search_results_present=bool(source_context),
+                web_search_enabled=bool(payload.web_search),
                 audio_transcripts=audio_transcripts,
             )
             provider_messages, image_input_trace = self._with_image_inputs(
@@ -15634,9 +16062,50 @@ class ChatService:
                 # advance ``attempt_no`` too, so indexing by ``attempt_no``
                 # would starve retries after a few successful tool rounds.
                 stream_retry_count = 0
+                overflow_compact_count = 0
                 for attempt_no in (count(1) if max_attempts is None else range(1, max_attempts + 1)):
                     if cancelled():
                         raise _GenerationCancellationRequested()
+                    tool_definitions = (
+                        self._agent_tool_definitions(
+                            payload.agent_mode,
+                            payload.web_search,
+                            session_id=session_id,
+                            capability_families=activated_capability_families,
+                            activated_capabilities=activated_capability_ids,
+                        )
+                        if structured_chat
+                        else []
+                    )
+                    if structured_chat and attempt_no > 1:
+                        provider_messages, in_loop_res, _mc_res = self._prepare_in_loop_messages(
+                            session_id,
+                            provider_messages,
+                            agent_mode=bool(payload.agent_mode),
+                            tool_definitions=tool_definitions,
+                            activated_capability_ids=activated_capability_ids,
+                            activated_capability_families=activated_capability_families,
+                            provider_trace=provider_trace,
+                        )
+                        if in_loop_res is not None and in_loop_res.compacted:
+                            compacted_ev = self._append_event(
+                                session_id=session_id,
+                                message_id=assistant_message.id,
+                                message_version_id=assistant_version.id,
+                                part_id=None,
+                                sequence=sequence,
+                                event_type="context.compaction.completed",
+                                payload={
+                                    "summary_id": None,
+                                    "estimated_tokens_before": in_loop_res.tokens_before,
+                                    "estimated_tokens_after": in_loop_res.tokens_after,
+                                    "source_message_ids": [],
+                                    "kind": in_loop_res.summary_kind,
+                                    "reason": "in_loop_budget",
+                                },
+                            )
+                            sequence += 1
+                            yield self._encode_event(compacted_ev)
                     current_billing_input = (
                         self._structured_billing_input(provider_messages)
                         if structured_chat
@@ -15675,13 +16144,6 @@ class ChatService:
                         text_before_invocation = final_text
 
                         if structured_chat:
-                            tool_definitions = self._agent_tool_definitions(
-                                payload.agent_mode,
-                                payload.web_search,
-                                session_id=session_id,
-                                capability_families=activated_capability_families,
-                                activated_capabilities=activated_capability_ids,
-                            )
                             for provider_event in self._stream_agent_chat(
                                 provider_messages,
                                 tools=tool_definitions or None, session_id=session_id,
@@ -16679,6 +17141,92 @@ class ChatService:
                             attempt.error_type = "NativeImageInputUnsupported"
                             self.db.commit()
                             continue
+                        if (
+                            structured_chat
+                            and is_context_overflow_error(exc)
+                            and overflow_compact_count < 2
+                        ):
+                            overflow_compact_count += 1
+                            attempt.status = "failed"
+                            attempt.error_type = "ContextOverflowCompacting"
+                            overflow_usage = dict(
+                                getattr(self.model_provider, "last_usage", {}) or {}
+                            )
+                            self.billing.record_usage(
+                                quote,
+                                input_tokens=int(overflow_usage.get("input_tokens") or 0),
+                                output_tokens=int(overflow_usage.get("output_tokens") or 0),
+                                cached_input_tokens=int(overflow_usage.get("cached_input_tokens") or 0),
+                                cache_creation_input_tokens=int(overflow_usage.get("cache_creation_input_tokens") or 0),
+                                reasoning_tokens=int(overflow_usage.get("reasoning_tokens") or 0),
+                                attempt=attempt_no,
+                                latency_ms=int((time.monotonic() - attempt_started_at) * 1000),
+                                usage_reported=bool(overflow_usage),
+                                usage_units=overflow_usage,
+                            )
+                            if (
+                                invocation_reasoning_record is not None
+                                and invocation_reasoning_record.status == "streaming"
+                            ):
+                                yield terminalize_streamed_part(
+                                    invocation_reasoning_record,
+                                    status="failed",
+                                    error_code="context_overflow_compacting",
+                                )
+                                assistant_message.parts = assembled_parts("streaming", final_text)
+                            if final_text != text_before_invocation:
+                                final_text = text_before_invocation
+                                text_record.status = "pending"
+                                text_record.content = final_text
+                                assistant_message.content = final_text
+                                assistant_message.parts = assembled_parts("pending", final_text)
+                            provider_messages, in_loop_res, mc_res = self._prepare_in_loop_messages(
+                                session_id,
+                                provider_messages,
+                                agent_mode=bool(payload.agent_mode),
+                                tool_definitions=tool_definitions,
+                                activated_capability_ids=activated_capability_ids,
+                                activated_capability_families=activated_capability_families,
+                                provider_trace=provider_trace,
+                                force_compact=True,
+                                aggressive=(overflow_compact_count > 1),
+                            )
+                            if (in_loop_res is not None and in_loop_res.compacted) or (
+                                mc_res is not None and mc_res.cleared_count > 0
+                            ):
+                                provider_trace["reactive_overflow_compactions"] = overflow_compact_count
+                                compacted_ev = self._append_event(
+                                    session_id=session_id,
+                                    message_id=assistant_message.id,
+                                    message_version_id=assistant_version.id,
+                                    part_id=None,
+                                    sequence=sequence,
+                                    event_type="context.compaction.completed",
+                                    payload={
+                                        "summary_id": None,
+                                        "estimated_tokens_before": (
+                                            in_loop_res.tokens_before
+                                            if in_loop_res is not None and in_loop_res.compacted
+                                            else mc_res.tokens_before
+                                        ),
+                                        "estimated_tokens_after": (
+                                            in_loop_res.tokens_after
+                                            if in_loop_res is not None and in_loop_res.compacted
+                                            else mc_res.tokens_after
+                                        ),
+                                        "source_message_ids": [],
+                                        "kind": (
+                                            in_loop_res.summary_kind
+                                            if in_loop_res is not None and in_loop_res.compacted
+                                            else "microcompact"
+                                        ),
+                                        "reason": "reactive_context_overflow",
+                                    },
+                                )
+                                sequence += 1
+                                yield self._encode_event(compacted_ev)
+                                self.db.commit()
+                                continue
                         error_category = _stream_retry_category(exc)
                         if error_category is None:
                             raise

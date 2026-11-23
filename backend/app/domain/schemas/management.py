@@ -926,7 +926,7 @@ class ProviderModelCapabilityUpdateRequest(BaseModel):
     context_window_confidence: Literal["confirmed", "inferred", "unknown"] = "unknown"
     max_output_tokens: int = Field(default=4_096, ge=1, le=1_000_000)
     chat_compaction_ratio: float = Field(default=0.8, ge=0.1, le=1.0)
-    agent_compaction_ratio: float = Field(default=1 / 3, ge=0.1, le=1.0)
+    agent_compaction_ratio: float = Field(default=0.78, ge=0.1, le=1.0)
 
     @model_validator(mode="after")
     def validate_context_limits(self) -> "ProviderModelCapabilityUpdateRequest":
