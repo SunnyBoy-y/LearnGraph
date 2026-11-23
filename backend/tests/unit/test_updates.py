@@ -35,7 +35,8 @@ def api(tmp_path):
 def test_health_reports_connected_database_instead_of_sqlite_bootstrap(dialect):
     db = SimpleNamespace(execute=lambda _: None, scalar=lambda _: None,
         connection=lambda: SimpleNamespace(dialect=SimpleNamespace(name=dialect)))
-    settings = SimpleNamespace(app_version="v1.0.0",database_url="sqlite:////data/learngraph.db")
+    settings = SimpleNamespace(app_version="v1.0.0", database_url="sqlite:////data/learngraph.db",
+        durable_queue_enabled=True)
     assert health.health(db,settings).database == dialect
 
 
