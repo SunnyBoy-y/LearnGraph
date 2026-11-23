@@ -7,6 +7,8 @@ import logging
 import uuid
 from urllib.parse import urlsplit
 
+import anyio
+
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials
 from starlette.requests import Request
@@ -134,13 +136,29 @@ def install_websocket_runtime(app):
             with contextlib.suppress(Exception):
                 await socket.send_text('{"type":"voice.error","code":"voice_runtime_failed","message":"Voice runtime could not continue"}')
         finally:
-            if body:
-                from app.voice.events import release_runtime_owner
+            try:
+                if body:
+                    from app.voice.events import release_runtime_owner
 
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(
-                        release_runtime_owner, session_id, body["runtime_owner_id"],
-                        expected_session_epoch=body["runtime_session_epoch"],
-                        expected_peer_generation=body["runtime_peer_generation"],
-                    )
-            await socket.close()
+                    # TestClient and server shutdown cancel the ASGI task on exit;
+                    # shield lease release so it finishes before returning.
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            await asyncio.to_thread(
+                                release_runtime_owner, session_id, body["runtime_owner_id"],
+                                expected_session_epoch=body["runtime_session_epoch"],
+                                expected_peer_generation=body["runtime_peer_generation"],
+                            )
+                        except asyncio.CancelledError:
+                            with contextlib.suppress(Exception):
+                                release_runtime_owner(
+                                    session_id, body["runtime_owner_id"],
+                                    expected_session_epoch=body["runtime_session_epoch"],
+                                    expected_peer_generation=body["runtime_peer_generation"],
+                                )
+                            raise
+                        except Exception:
+                            pass
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await socket.close()

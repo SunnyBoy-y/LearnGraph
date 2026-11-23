@@ -734,21 +734,26 @@ class TutorAgent(LLMWorker):
         context: str = "",
     ) -> None:
         """Queue a web research task and return immediately with a task receipt."""
-        if getattr(self._session, "id", None):
-            from app.core.database import SessionLocal
-            from app.domain.models import VoiceSessionRecord
+        voice_session_id = getattr(self, "_voice_session_id", "")
+        if voice_session_id:
+            from sqlalchemy.exc import OperationalError
 
-            with SessionLocal() as db:
-                fresh_session = db.get(VoiceSessionRecord, self._session.id)
-                if fresh_session is not None and (fresh_session.context_snapshot or {}).get("web_search_enabled", True) is False:
-                    await params.result_callback(
-                        {
-                            "ok": False,
-                            "error": "web_search_disabled",
-                            "message": "联网搜索当前已关闭，请先开启联网开关后再试。",
-                        }
-                    )
-                    return
+            try:
+                fresh_session = load_session_row(voice_session_id)
+            except OperationalError:
+                fresh_session = None
+            if (
+                fresh_session is not None
+                and (fresh_session.context_snapshot or {}).get("web_search_enabled", True) is False
+            ):
+                await params.result_callback(
+                    {
+                        "ok": False,
+                        "error": "web_search_disabled",
+                        "message": "联网搜索当前已关闭，请先开启联网开关后再试。",
+                    }
+                )
+                return
         await self._delegate(
             params,
             kind=DelegationKind.RESEARCH,

@@ -287,18 +287,18 @@ def test_typed_turn_message_still_announces_its_idempotency_key():
 def test_speech_guidance_uses_understanding_instead_of_a_time_budget():
     instruction = speech_budget_instruction()
 
-    assert "不以句数或时长控制回答" in instruction
-    assert "必要信息讲清楚后就停止" in instruction
-    assert "不必等用户明确要求详细" in instruction
+    assert "必须简短、口语化、直奔主题" in instruction
+    assert "普通问答先用 2 到 3 句讲清核心结论" in instruction
+    assert "仅在用户明确要求详细讲解或展开说明时，才做完整展开" in instruction
 
 
 def test_speech_budget_forbids_truncating_facts_or_long_code():
     """预算约束详略，不约束内容：这条是防"为了守预算而丢事实"的硬约束。"""
     instruction = speech_budget_instruction()
 
-    assert "不得" in instruction
-    assert "事实、数字、风险、限制或真实完成状态" in instruction
-    assert "代码、文件和完整过程在画布展示" in instruction
+    assert "不得为了简短而省略" in instruction
+    assert "关键数字、风险或真实完成状态" in instruction
+    assert "代码、文件和完整过程留在画布展示" in instruction
 
 
 def test_retired_environment_budgets_cannot_truncate_the_guidance(monkeypatch):
