@@ -76,6 +76,12 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run cap:sync
+      - name: Configure Gradle wrapper for CI network
+        working-directory: mobile
+        run: |
+          sed -i 's|https\\://mirrors.cloud.tencent.com/gradle/|https\\://services.gradle.org/distributions/|g' \
+            android/gradle/wrapper/gradle-wrapper.properties \
+            native/gradle/wrapper/gradle-wrapper.properties
       - name: Android local unit tests
         working-directory: mobile/android
         run: bash ./gradlew -Dorg.gradle.java.home="$JAVA_HOME" :app:testDebugUnitTest --no-daemon
