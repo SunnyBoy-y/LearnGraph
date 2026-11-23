@@ -69,24 +69,75 @@ COPY VERSION /app/VERSION
 RUN python -c "import os,pathlib; expected=pathlib.Path('/app/VERSION').read_text().strip(); assert os.environ['LEARNGRAPH_APP_VERSION']==expected, 'APP_VERSION must exactly match VERSION / GitHub Release tag'"
 
 # 可选：国内构建时用 DEBIAN_MIRROR 覆盖 deb.debian.org（Fastly 线路偶发 502，
-# 例如 --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn）。默认不变。
+# 例如 --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn）。
+# 无论默认源或自定义源遇到 502 / 超时，都会自动在候选镜像间回退重试。
 ARG DEBIAN_MIRROR=deb.debian.org
-RUN if [ "$DEBIAN_MIRROR" != "deb.debian.org" ]; then \
-        sed -i "s|deb\.debian\.org|$DEBIAN_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
-    fi \
-    && echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends tini ca-certificates curl \
-    && install -d /usr/share/postgresql-common/pgdg \
-    && curl --fail --retry 3 -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-    && echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main' > /etc/apt/sources.list.d/pgdg.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client-18 \
-    && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99retries \
-    && useradd --system --uid 1000 --create-home --home-dir /home/learngraph \
-        --shell /usr/sbin/nologin learngraph \
-    && mkdir -p /app /data \
-    && chown learngraph:learngraph /app /data
+RUN set -eu; \
+    cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.orig; \
+    { \
+        echo 'Acquire::Retries "1";'; \
+        echo 'Acquire::http::Timeout "15";'; \
+        echo 'Acquire::https::Timeout "15";'; \
+        echo 'Acquire::http::Pipeline-Depth "0";'; \
+    } > /etc/apt/apt.conf.d/99retries; \
+    preferred_mirror="${DEBIAN_MIRROR:-deb.debian.org}"; \
+    WORKING_DEBIAN_MIRROR=""; \
+    set_debian_mirror() { \
+        cp /tmp/debian.sources.orig /etc/apt/sources.list.d/debian.sources; \
+        if [ "$1" != "deb.debian.org" ]; then \
+            sed -i "s|deb\.debian\.org|$1|g" /etc/apt/sources.list.d/debian.sources; \
+        fi; \
+    }; \
+    apt_install() { \
+        mirrors="${WORKING_DEBIAN_MIRROR:-$preferred_mirror}"; \
+        for fallback in "$preferred_mirror" deb.debian.org mirrors.aliyun.com mirrors.ustc.edu.cn mirrors.tuna.tsinghua.edu.cn; do \
+            case " $mirrors " in \
+                *" $fallback "*) ;; \
+                *) mirrors="$mirrors $fallback" ;; \
+            esac; \
+        done; \
+        for mirror in $mirrors; do \
+            echo "Trying Debian apt mirror: $mirror"; \
+            set_debian_mirror "$mirror"; \
+            rm -rf /var/lib/apt/lists/*; \
+            if apt-get update && apt-get install -y --no-install-recommends "$@"; then \
+                WORKING_DEBIAN_MIRROR="$mirror"; \
+                return 0; \
+            fi; \
+            echo "Debian apt mirror failed: $mirror" >&2; \
+        done; \
+        return 1; \
+    }; \
+    apt_install tini ca-certificates curl; \
+    install -d /usr/share/postgresql-common/pgdg; \
+    pgdg_key_ok=0; \
+    for key_url in \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        https://mirrors.aliyun.com/postgresql/repos/apt/ACCC4CF8.asc; do \
+        if curl --fail --location --connect-timeout 15 --max-time 60 --retry 3 \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc "$key_url"; then \
+            pgdg_key_ok=1; \
+            break; \
+        fi; \
+    done; \
+    [ "$pgdg_key_ok" -eq 1 ]; \
+    pg_ok=0; \
+    for pg_repo in \
+        https://apt.postgresql.org/pub/repos/apt \
+        https://mirrors.aliyun.com/postgresql/repos/apt; do \
+        echo "Trying PostgreSQL apt repo: $pg_repo"; \
+        echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] ${pg_repo} bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list; \
+        if apt_install postgresql-client-18; then \
+            pg_ok=1; \
+            break; \
+        fi; \
+    done; \
+    [ "$pg_ok" -eq 1 ]; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99retries /tmp/debian.sources.orig; \
+    useradd --system --uid 1000 --create-home --home-dir /home/learngraph \
+        --shell /usr/sbin/nologin learngraph; \
+    mkdir -p /app /data; \
+    chown learngraph:learngraph /app /data
 
 WORKDIR /app
 

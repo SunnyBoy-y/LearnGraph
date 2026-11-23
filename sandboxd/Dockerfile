@@ -35,17 +35,43 @@ COPY backend/sandbox ./sandbox-profiles
 FROM ${PYTHON_IMAGE} AS runtime
 
 # 可选：国内构建时用 DEBIAN_MIRROR 覆盖 deb.debian.org（Fastly 线路偶发 502，
-# 例如 --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn）。默认不变。
+# 例如 --build-arg DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn）。
+# 无论默认源或自定义源遇到 502 / 超时，都会自动在候选镜像间回退重试。
 ARG DEBIAN_MIRROR=deb.debian.org
-RUN if [ "$DEBIAN_MIRROR" != "deb.debian.org" ]; then \
-        sed -i "s|deb\.debian\.org|$DEBIAN_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
-    fi \
-    && echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends tini \
-    && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99retries \
-    && mkdir -p /app /var/lib/sandboxd \
-    && chown 1000:1000 /app /var/lib/sandboxd
+RUN set -eu; \
+    cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.orig; \
+    { \
+        echo 'Acquire::Retries "1";'; \
+        echo 'Acquire::http::Timeout "15";'; \
+        echo 'Acquire::https::Timeout "15";'; \
+        echo 'Acquire::http::Pipeline-Depth "0";'; \
+    } > /etc/apt/apt.conf.d/99retries; \
+    preferred_mirror="${DEBIAN_MIRROR:-deb.debian.org}"; \
+    mirrors="$preferred_mirror"; \
+    for fallback in deb.debian.org mirrors.aliyun.com mirrors.ustc.edu.cn mirrors.tuna.tsinghua.edu.cn; do \
+        case " $mirrors " in \
+            *" $fallback "*) ;; \
+            *) mirrors="$mirrors $fallback" ;; \
+        esac; \
+    done; \
+    installed=0; \
+    for mirror in $mirrors; do \
+        echo "Trying Debian apt mirror: $mirror"; \
+        cp /tmp/debian.sources.orig /etc/apt/sources.list.d/debian.sources; \
+        if [ "$mirror" != "deb.debian.org" ]; then \
+            sed -i "s|deb\.debian\.org|$mirror|g" /etc/apt/sources.list.d/debian.sources; \
+        fi; \
+        rm -rf /var/lib/apt/lists/*; \
+        if apt-get update && apt-get install -y --no-install-recommends tini; then \
+            installed=1; \
+            break; \
+        fi; \
+        echo "Debian apt mirror failed: $mirror" >&2; \
+    done; \
+    [ "$installed" -eq 1 ]; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99retries /tmp/debian.sources.orig; \
+    mkdir -p /app /var/lib/sandboxd; \
+    chown 1000:1000 /app /var/lib/sandboxd
 
 WORKDIR /app
 
