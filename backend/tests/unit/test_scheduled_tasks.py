@@ -131,11 +131,34 @@ def test_interrupted_run_is_recorded_not_retried(env):
     env.db.expire_all()
     task = env.service.require(task.id)
     task.lease_until = utc_now()-timedelta(seconds=1)
+    run.dispatched_at = utc_now()-timedelta(minutes=10)
     env.db.commit()
     reconcile_runs(env.db)
     env.db.expire_all()
     assert env.db.get(ScheduledExtensionRun,run.id).error_code == 'scheduled_run_interrupted'
     assert env.service.require(task.id).lease_token is None
+
+
+def test_worker_recovers_an_undispatched_slot_without_claiming_it_again(env):
+    from app.services.scheduled_tasks import _schedule_dispatch_batch
+
+    task = env.service.create(payload(env, remaining_executions=1, cron_expression="* * * * *"))
+    task.next_run_at = utc_now() - timedelta(minutes=1)
+    env.db.commit()
+    assert len(claim_due(env.settings, env.factory)) == 1
+    env.db.expire_all()
+    task.lease_until = utc_now() - timedelta(seconds=1)
+    env.db.commit()
+    reconcile_runs(env.db, settings=env.settings)
+
+    [(task_id, run_id, recovered)] = _schedule_dispatch_batch(env.settings, env.factory, 4, ())
+    assert task_id == task.id and recovered is True
+    execute_run(task_id, run_id, env.settings, env.factory, recovered=True)
+    execute_run(task_id, run_id, env.settings, env.factory, recovered=True)
+    env.db.expire_all()
+    assert env.db.get(ScheduledExtensionRun, run_id).status == "succeeded"
+    assert env.db.get(ScheduledExtensionTask, task_id).remaining_executions == 0
+    assert _schedule_dispatch_batch(env.settings, env.factory, 4, ()) == []
 
 
 def test_running_definition_cannot_be_edited_or_deleted(env):

@@ -9,7 +9,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from PIL import Image
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.core.database import SessionLocal
 from app.core.errors import AppError
@@ -20,6 +20,21 @@ from app.services.durable_queue import run_one_durable_job
 from app.services.stickers import StickerService, clean_semantics, digest, run_sticker_index_batch, validate_vectors
 from app.services.sticker_market import catalog, market_archive
 from app.services.sticker_pipeline import StickerPipeline, image_parts
+
+
+@pytest.fixture(autouse=True)
+def isolate_sticker_jobs(client):
+    """Remove only sticker jobs created by this test from the shared test queue."""
+    kinds = ("sticker.semantic", "sticker.index")
+    with SessionLocal() as db:
+        existing = set(db.scalars(select(DurableJob.id).where(DurableJob.kind.in_(kinds))))
+    yield
+    with SessionLocal() as db:
+        statement = delete(DurableJob).where(DurableJob.kind.in_(kinds))
+        if existing:
+            statement = statement.where(DurableJob.id.not_in(existing))
+        db.execute(statement)
+        db.commit()
 
 
 def image_bytes(color="red"):

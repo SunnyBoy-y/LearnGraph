@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from sqlalchemy import select, text
 
-from app.api.deps import DB, AppSettings
+from app.api.deps import DB, AppSettings, CurrentWorkspace
 from app.core.admission import snapshot_admission_metrics
 from app.core.config import running_in_container
 from app.domain.models import ProviderConfig
 from app.domain.schemas.common import HealthResponse
+from app.services.task_reliability import durable_worker_health, task_execution_metrics
 
 
 router = APIRouter(tags=["health"])
@@ -59,4 +60,12 @@ def health(db: DB, settings: AppSettings) -> HealthResponse:
         database=db.connection().dialect.name,
         remote_capabilities_enabled=remote_enabled is not None,
         agent_stream_admission=snapshot_admission_metrics(),
+        durable_queue=durable_worker_health(db, settings),
     )
+
+
+@router.get("/task-reliability", tags=["management"])
+def task_reliability(db: DB, context: CurrentWorkspace, days: int = Query(7, ge=1, le=30)) -> dict:
+    """Aggregate execution signals for the caller's workspace."""
+    context.require_permission("workspace.manage")
+    return task_execution_metrics(db, context.workspace_id, days)

@@ -264,18 +264,41 @@ def execution_context(db, task, settings):
     return service
 
 
-def execute_run(task_id, run_id, settings, session_factory):
+def _lock_run_owner(db, task_id, token, *, lease_until=None, expired_at=None):
+    if not token:
+        return False
+    query = update(Task).where(Task.id == task_id, Task.lease_token == token)
+    if expired_at is not None:
+        query = query.where(Task.lease_until <= expired_at)
+    values = {"lease_until": lease_until} if lease_until is not None else {"lease_token": token}
+    with db.no_autoflush:
+        return db.execute(query.values(**values).execution_options(synchronize_session=False)).rowcount == 1
+
+
+def execute_run(task_id, run_id, settings, session_factory, *, recovered=False):
     with session_factory() as db:
         task, run = db.get(Task, task_id), db.get(Run, run_id)
-        if task is None or run is None or run.status != "running":
+        if task is None or run is None or run.task_id != task.id or run.status != "running":
             return
         token = task.lease_token
-        claimed = db.execute(update(Run).where(Run.id == run.id, Run.workspace_id == task.workspace_id,
-            Run.status == "running", Run.dispatched_at.is_(None)).values(dispatched_at=utc_now()).execution_options(synchronize_session=False))
+        dispatch_time = utc_now()
+        if not _lock_run_owner(db, task_id, token,
+                               lease_until=dispatch_time + timedelta(seconds=task.timeout_seconds + 180)):
+            db.rollback()
+            return
+        claimed = db.execute(update(Run).where(Run.id == run_id, Run.task_id == task_id,
+            Run.workspace_id == task.workspace_id, Run.status == "running", Run.dispatched_at.is_(None))
+            .values(dispatched_at=dispatch_time).execution_options(synchronize_session=False))
         if claimed.rowcount != 1:
             db.rollback()
-            return  # A duplicate background callback must never replay side effects.
+            return  # A duplicate callback must never replay side effects.
+        if recovered:
+            AuditRepository(db, task.workspace_id).record(
+                actor_id=task.created_by, action="scheduled_task.recovered_dispatch",
+                resource_type="scheduled_task", resource_id=task_id, details={"run_id": run_id},
+            )
         db.commit()
+        db.refresh(run)
         try:
             service = execution_context(db, task, settings)
             payload = ScheduledTaskCreate.model_validate(config(task))
@@ -316,59 +339,95 @@ def execute_run(task_id, run_id, settings, session_factory):
             if run is None:
                 return
             run.status, run.error_code, run.error_message = "failed", "scheduled_execution_failed", "Execution failed; inspect backend logs"
+        if not _lock_run_owner(db, task_id, token):
+            db.rollback()
+            return
         if run.status != "running":
             run.finished_at = utc_now()
             db.execute(update(Task).where(Task.id == task_id, Task.lease_token == token).values(
                 lease_token=None, lease_until=None, last_status=run.status))
+            record_run_outcome(db, task, run)
         db.commit()
-        if run.status != 'running':
-            record_run_outcome(db,task,run)
-            db.commit()
 
 
 def reconcile_runs(db, now=None, settings=None):
     from app.core.config import get_settings
     settings = settings or get_settings()
     now = aware(now or utc_now())
-    for run, task in db.execute(select(Run, Task).join(Task, Task.id == Run.task_id).where(Run.status == "running")):
-        job_id = (run.result_json or {}).get("job_id")
-        job = db.get(SandboxJob, job_id) if job_id else None
-        if job is not None and job.workspace_id != task.workspace_id:
-            job = None
-        if job is not None:
-            invocation_id = run.result_json.get("invocation_id")
-            if invocation_id:
-                invocation = SkillSandboxRunService(db, task.workspace_id, task.created_by, settings).refresh_invocation(invocation_id)
-                run.result_json = {**run.result_json, **invocation.result_json, "status": invocation.status}
-        command_id = (run.result_json or {}).get("command_id")
-        command = db.get(SandboxAgentCommand, command_id) if command_id else None
-        if job is not None and job.status in {"FAILED", "CANCELLED", "EXPIRED"}:
-            run.status, run.error_code, run.error_message = "failed", job.error_class or "sandbox_job_failed", job.error_message
-        elif command is not None and command.workspace_id == task.workspace_id and command.status not in {"queued", "pending", "running"}:
-            run.status = "succeeded" if command.status in {"completed", "succeeded"} and command.exit_code == 0 else "failed"
-            run.error_code, run.error_message = command.error_class, command.error_message
-            run.result_json = {**run.result_json, "status": run.status, "exit_code": command.exit_code,
-                               "stdout_summary": command.stdout_summary, "stderr_summary": command.stderr_summary}
-        elif task.lease_until and aware(task.lease_until) <= now:
-            if job is not None and job.status in {"QUEUED", "STARTING", "RUNNING", "PAUSED"}:
-                from app.services.sandbox_scheduler import SandboxSchedulerService
-                SandboxSchedulerService(db, settings).cancel_job(job)
-                # Do not release the lease until termination is actually observed.
-                continue
-            run.status, run.error_code = "failed", "scheduled_run_interrupted"
-            run.error_message = "Run exceeded its lease or the worker restarted; side effects are not automatically replayed"
-        else:
-            continue
-        run.finished_at = now
-        task.lease_token, task.lease_until, task.last_status = None, None, run.status
-        record_run_outcome(db,task,run)
-    db.commit()
+    active = db.execute(select(Run.id, Run.task_id).where(
+        Run.status == "running", Run.dispatched_at.is_not(None),
+    ).order_by(Run.started_at)).all()
+    for run_id, task_id in active:
+        try:
+            _reconcile_run(db, run_id, task_id, now, settings)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Scheduled run reconciliation failed: %s", run_id)
+
+
+def _reconcile_run(db, run_id, task_id, now, settings):
+    run = db.get(Run, run_id, populate_existing=True)
+    task = db.get(Task, task_id, populate_existing=True)
+    if run is None or task is None or run.status != "running" or task.workspace_id != run.workspace_id:
+        return
+    token = task.lease_token
+    job_id = (run.result_json or {}).get("job_id")
+    job = db.get(SandboxJob, job_id) if job_id else None
+    if job is not None and job.workspace_id != task.workspace_id:
+        job = None
+    if job is not None:
+        invocation_id = run.result_json.get("invocation_id")
+        if invocation_id:
+            invocation = SkillSandboxRunService(db, task.workspace_id, task.created_by, settings).refresh_invocation(invocation_id)
+            if not _lock_run_owner(db, task_id, token):
+                db.rollback()
+                return
+            db.refresh(run)
+            run.result_json = {**run.result_json, **invocation.result_json, "status": invocation.status}
+    command_id = (run.result_json or {}).get("command_id")
+    command = db.get(SandboxAgentCommand, command_id) if command_id else None
+    expired_at = None
+    if job is not None and job.status in {"FAILED", "CANCELLED", "EXPIRED"}:
+        status, code, message = "failed", job.error_class or "sandbox_job_failed", job.error_message
+    elif command is not None and command.workspace_id == task.workspace_id and command.status not in {"queued", "pending", "running"}:
+        status = "succeeded" if command.status in {"completed", "succeeded"} and command.exit_code == 0 else "failed"
+        code, message = command.error_class, command.error_message
+        run.result_json = {**run.result_json, "status": status, "exit_code": command.exit_code,
+                           "stdout_summary": command.stdout_summary, "stderr_summary": command.stderr_summary}
+    elif task.lease_until and aware(task.lease_until) <= now:
+        if job is not None and job.status in {"QUEUED", "STARTING", "RUNNING", "PAUSED"}:
+            from app.services.sandbox_scheduler import SandboxSchedulerService
+            SandboxSchedulerService(db, settings).cancel_job(job)
+            return  # Release only after termination is observed.
+        status, code = "failed", "scheduled_run_interrupted"
+        message = "The dispatched run exceeded its lease; check its result before rerunning"
+        expired_at = now
+    else:
+        return
+    if not _lock_run_owner(db, task_id, token, expired_at=expired_at):
+        db.rollback()
+        return
+    run.status, run.error_code, run.error_message = status, code, message
+    run.finished_at = now
+    task.lease_token, task.lease_until, task.last_status = None, None, status
+    record_run_outcome(db, task, run)
+
+
+def pending_dispatches(db, limit, *, exclude=()):
+    """Already-claimed slots which never crossed the side-effect boundary."""
+    query = select(Run.task_id, Run.id).join(Task, Task.id == Run.task_id).where(
+        Run.status == "running", Run.dispatched_at.is_(None), Run.workspace_id == Task.workspace_id,
+        Task.lease_token.is_not(None),
+    )
+    if exclude:
+        query = query.where(Run.id.not_in(exclude))
+    return list(db.execute(query.order_by(Run.started_at, Run.id).limit(limit)).tuples())
 
 
 def claim_due(settings, session_factory, limit=4):
     claimed = []
     with session_factory() as db:
-        reconcile_runs(db, settings=settings)
         ids = list(db.scalars(select(Task.id).where(Task.enabled.is_(True), Task.next_run_at <= utc_now(),
                               Task.trigger_type=='time',Task.lease_token.is_(None)).order_by(Task.next_run_at).limit(limit)))
         for task_id in ids:
@@ -476,25 +535,69 @@ def publish_event(db,workspace_id,actor_id,event_type,payload,*,event_id=None,we
     return event
 
 
+async def _scheduled_reconciliation(stop, settings, session_factory):
+    def tick():
+        with session_factory() as db:
+            reconcile_runs(db, settings=settings)
+
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(tick)
+        except Exception:
+            logger.exception("Scheduled task reconciliation polling failed")
+        await _wait_for_schedule_poll(stop, settings.scheduled_tasks_poll_seconds)
+
+
+async def _wait_for_schedule_poll(stop, interval):
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=interval)
+    except TimeoutError:
+        pass
+
+
+def _schedule_dispatch_batch(settings, session_factory, slots, in_flight):
+    with session_factory() as db:
+        pending = pending_dispatches(db, slots, exclude=in_flight)
+    claims = [(task_id, run_id, True) for task_id, run_id in pending]
+    if len(claims) < slots:
+        claims.extend((task_id, run_id, False) for task_id, run_id in claim_due(
+            settings, session_factory, slots - len(claims),
+        ))
+    return claims
+
+
 async def scheduled_task_worker(stop: asyncio.Event, settings=None, session_factory=None):
     from app.core.config import get_settings
     from app.core.database import SessionLocal
     settings, session_factory = settings or get_settings(), session_factory or SessionLocal
-    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="extension-schedule")
-    pending = set()
+    capacity = 4
+    pool = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="extension-schedule")
+    pending = {}
+    reconciliation = asyncio.create_task(_scheduled_reconciliation(stop, settings, session_factory))
     try:
         while not stop.is_set():
-            pending = {job for job in pending if not job.done()}
+            for future in tuple(pending):
+                if not future.done():
+                    continue
+                run_id = pending.pop(future)
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("Scheduled dispatch execution stopped unexpectedly: %s", run_id)
             try:
-                slots = max(0, 4 - len(pending))
+                slots = capacity - len(pending)
                 if slots:
-                    for task_id, run_id in await asyncio.to_thread(claim_due, settings, session_factory, slots):
-                        pending.add(pool.submit(execute_run, task_id, run_id, settings, session_factory))
+                    dispatches = await asyncio.to_thread(
+                        _schedule_dispatch_batch, settings, session_factory, slots, tuple(pending.values()),
+                    )
+                    if not stop.is_set():
+                        for task_id, run_id, recovered in dispatches:
+                            future = pool.submit(execute_run, task_id, run_id, settings, session_factory, recovered=recovered)
+                            pending[future] = run_id
             except Exception:
                 logger.exception("Scheduled task polling failed")
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=settings.scheduled_tasks_poll_seconds)
-            except asyncio.TimeoutError:
-                pass
+            await _wait_for_schedule_poll(stop, settings.scheduled_tasks_poll_seconds)
     finally:
-        await asyncio.to_thread(pool.shutdown, wait=True)
+        reconciliation.cancel()
+        await asyncio.gather(reconciliation, return_exceptions=True)
+        await asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=True)

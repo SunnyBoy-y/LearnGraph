@@ -57,7 +57,7 @@ def test_worker_keeps_sticker_reconciliation_without_package_sweep(monkeypatch):
     async def exercise():
         stop = asyncio.Event()
 
-        def finish(_worker):
+        def finish(_worker, **_kwargs):
             stop.set()
             return False
 

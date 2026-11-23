@@ -24,6 +24,10 @@ class Base(DeclarativeBase):
     pass
 
 
+# Register the queue ledger even for database-only entry points (backup/migration).
+from app.domain import task_reliability_models as _task_reliability_models  # noqa: E402, F401
+
+
 settings = get_settings()
 logger = logging.getLogger(__name__)
 # Busy timeout for the single SQLite write lock, sourced from settings

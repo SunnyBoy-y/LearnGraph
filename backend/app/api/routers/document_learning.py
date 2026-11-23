@@ -15,7 +15,6 @@ from app.domain.schemas.files import (
 )
 from app.services.authorization import AuthorizationService
 from app.services.document_learning import DocumentLearningService
-from app.services.durable_queue import enqueue_document_job
 
 
 router = APIRouter(tags=["document-learning"])
@@ -57,15 +56,7 @@ def create_document_job(
     ] = None,
 ) -> DocumentJobView:
     _require_file_access(db, context, file_id, "write")
-    job, created = service(db, context, settings).create_job(
-        file_id, payload, idempotency_key
-    )
-    if created or job.status == "queued":
-        enqueue_document_job(
-            context.workspace_id,
-            job.id,
-            DocumentLearningService.execution_token(job),
-        )
+    job, _ = service(db, context, settings).create_job(file_id, payload, idempotency_key, dispatch=True)
     return DocumentJobView.model_validate(job)
 
 
@@ -128,11 +119,6 @@ def retry_document_job(
     job = document_service.get_job(job_id)
     _require_file_access(db, context, job.file_id, "write")
     job = document_service.retry(job_id)
-    enqueue_document_job(
-        context.workspace_id,
-        job.id,
-        DocumentLearningService.execution_token(job),
-    )
     return DocumentJobView.model_validate(job)
 
 

@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base
 from app.domain.models import Workspace, WorkspaceSetting, ChatSession, Message, MemoryExtractionState, MemoryJobState, DurableJob, utc_now
+from app.domain.task_reliability_models import DurableJobAttempt
 from app.services import durable_queue as queue_module
 from app.services.memory_job_guard import job_id_for
 
@@ -17,7 +18,7 @@ from app.services.memory_job_guard import job_id_for
 def queue_env(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{(tmp_path / 'queue.db').as_posix()}")
     Base.metadata.create_all(engine, tables=[model.__table__ for model in (
-        Workspace, WorkspaceSetting, ChatSession, Message, MemoryExtractionState, MemoryJobState, DurableJob,
+        Workspace, WorkspaceSetting, ChatSession, Message, MemoryExtractionState, MemoryJobState, DurableJob, DurableJobAttempt,
     )])
     factory = sessionmaker(engine, expire_on_commit=False)
     settings = SimpleNamespace(durable_queue_lease_seconds=300, durable_queue_max_attempts=3,

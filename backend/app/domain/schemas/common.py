@@ -19,6 +19,7 @@ class HealthResponse(BaseModel):
     # P0-4: live agent-stream admission occupancy. Optional with a default so
     # existing clients keep working unchanged.
     agent_stream_admission: dict[str, Any] | None = None
+    durable_queue: dict[str, Any] | None = None
 
 
 class ActionResponse(BaseModel):

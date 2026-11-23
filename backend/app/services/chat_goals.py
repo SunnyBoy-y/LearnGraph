@@ -234,6 +234,8 @@ def _finish(db: Session, queue: DurableQueue, job: DurableJob, session_id: str, 
             continue
         if target == "queued":
             queue.rearm(job)
+        elif target == "failed":
+            queue.fail(job, "chat_goal_round_failed", error_code="chat_goal_round_failed", retryable=False)
         else:
             queue.complete(job)
         return

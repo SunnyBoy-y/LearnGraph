@@ -34,7 +34,6 @@ from app.services.file_previews import FilePreviewService
 from app.services.file_stream_tickets import issue_file_stream_ticket, read_file_stream_ticket
 from app.services.authorization import AuthorizationService
 from app.services.document_learning import DocumentLearningService
-from app.services.durable_queue import enqueue_document_job
 
 
 router = APIRouter(prefix="/files", tags=["files"])
@@ -205,15 +204,7 @@ def parse_file(
         context.principal.user_id,
         settings,
     )
-    job, created = document_service.create_job(
-        file_id, DocumentJobCreate(), idempotency_key
-    )
-    if created or job.status == "queued":
-        enqueue_document_job(
-            context.workspace_id,
-            job.id,
-            DocumentLearningService.execution_token(job),
-        )
+    job, _ = document_service.create_job(file_id, DocumentJobCreate(), idempotency_key, dispatch=True)
     return DocumentJobView.model_validate(job)
 
 

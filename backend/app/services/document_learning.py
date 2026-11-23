@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import bindparam, delete, func, or_, select, text, update
+from sqlalchemy import bindparam, delete, func, literal, or_, select, text, update
+from sqlalchemy.exc import DisconnectionError, OperationalError, TimeoutError as PoolTimeout
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
@@ -19,6 +20,7 @@ from app.domain.models import (
     DocumentJob,
     DocumentJobEvent,
     DocumentRevision,
+    DurableJob,
     FileRecord,
     FileTextChunk,
     Goal,
@@ -189,6 +191,7 @@ class DocumentLearningService:
         self.chunks = FileTextChunkRepository(db, workspace_id)
         self.audit = AuditRepository(db, workspace_id)
         self.storage = object_storage_provider(db, workspace_id, settings)
+        self._execution_lease: tuple[str, str] | None = None
 
     def list_collections(self) -> list[DocumentCollectionView]:
         collections = list(
@@ -387,6 +390,8 @@ class DocumentLearningService:
         file_id: str,
         payload: DocumentJobCreate,
         idempotency_key: str | None,
+        *,
+        dispatch: bool = False,
     ) -> tuple[DocumentJob, bool]:
         record = self.files.require(file_id, "file")
         if record.parse_capability == "attachment_only":
@@ -420,6 +425,10 @@ class DocumentLearningService:
                         "idempotency_key_reused",
                         "The Idempotency-Key was already used with different parameters",
                     )
+                if dispatch and existing.status == "queued":
+                    self._enqueue(existing)
+                    self.db.commit()
+                    self.db.refresh(existing)
                 return existing, False
         job = DocumentJob(
             workspace_id=self.workspace_id,
@@ -444,9 +453,16 @@ class DocumentLearningService:
             resource_id=job.id,
             details={"file_id": file_id, "job_type": payload.job_type},
         )
+        if dispatch:
+            self._enqueue(job)
         self.db.commit()
         self.db.refresh(job)
         return job, True
+
+    def _enqueue(self, job: DocumentJob) -> None:
+        from app.services.durable_queue import enqueue_document_job
+
+        enqueue_document_job(self.db, self.workspace_id, job.id, self.execution_token(job))
 
     @staticmethod
     def execution_token(job: DocumentJob) -> str:
@@ -506,6 +522,7 @@ class DocumentLearningService:
         job.completed_at = None
         job.execution_token = str(uuid4())
         self._event(job, "job.retried", {"progress": 0})
+        self._enqueue(job)
         self.db.commit()
         self.db.refresh(job)
         return job
@@ -567,6 +584,8 @@ class DocumentLearningService:
                 self._complete(job, reusable, reused=True, execution_token=execution_token)
                 return job
 
+            if not self._execution_is_current(job, execution_token):
+                raise _DocumentJobExecutionStopped
             revision_no = int(
                 self.db.scalar(
                     select(func.max(DocumentRevision.revision_no)).where(
@@ -753,6 +772,9 @@ class DocumentLearningService:
                     "Document parser could not extract safe text",
                 ) from exc
         except Exception as exc:
+            self.db.rollback()
+            if self._execution_lease is not None and isinstance(exc, (DisconnectionError, OperationalError, PoolTimeout)):
+                raise
             self._fail(
                 job,
                 "document_job_failed",
@@ -1314,7 +1336,20 @@ class DocumentLearningService:
             )
         )
 
+    def _lock_execution_lease(self) -> bool:
+        if self._execution_lease is None:
+            return True
+        queue_id, token = self._execution_lease
+        with self.db.no_autoflush:
+            return self.db.execute(update(DurableJob).where(
+                DurableJob.id == queue_id, DurableJob.workspace_id == self.workspace_id,
+                DurableJob.status == "leased", DurableJob.lease_token == token,
+                DurableJob.lease_expires_at > utc_now(),
+            ).values(lease_token=token).execution_options(synchronize_session=False)).rowcount == 1
+
     def _execution_is_current(self, job: DocumentJob, execution_token: str) -> bool:
+        if not self._lock_execution_lease():
+            return False
         self.db.refresh(job)
         return (
             job.status in {"queued", "running"}
@@ -1329,19 +1364,27 @@ class DocumentLearningService:
         job: DocumentJob,
         execution_token: str,
     ) -> DocumentJob | None:
+        if not self._lock_execution_lease():
+            return None
+        statuses = ("queued", "running") if self._execution_lease is not None else ("queued",)
         statement = update(DocumentJob).where(
             DocumentJob.workspace_id == self.workspace_id,
             DocumentJob.id == job.id,
-            DocumentJob.status == "queued",
+            DocumentJob.status.in_(statuses),
         )
         if execution_token:
             statement = statement.where(DocumentJob.execution_token == execution_token)
-        result = self.db.execute(
-            statement.values(status="running", started_at=utc_now())
-        )
-        self.db.commit()
+        result = self.db.execute(statement.values(status="running", started_at=utc_now()))
         if result.rowcount != 1:
             return None
+        if job.document_revision_id:
+            self.db.execute(update(DocumentRevision).where(
+                DocumentRevision.id == job.document_revision_id,
+                DocumentRevision.workspace_id == self.workspace_id,
+                DocumentRevision.status == "running",
+            ).values(status="failed", error_code="process_interrupted", completed_at=utc_now()))
+            job.document_revision_id = None
+        self.db.commit()
         return self.get_job(job.id)
 
     def _set_stage(
@@ -1447,23 +1490,54 @@ class DocumentLearningService:
         self.db.refresh(job)
 
 
-def run_document_job(job_id: str, expected_execution_token: str | None = None) -> None:
-    """Background entry point that owns its own transaction/session."""
-
+def run_document_job(job_id: str, expected_execution_token: str | None = None, *,
+                     lease: tuple[str, str] | None = None) -> tuple[str, str | None]:
+    """Return the business outcome to the queue instead of treating any return as success."""
     settings = get_settings()
     with SessionLocal() as db:
-        job = db.scalar(select(DocumentJob).where(DocumentJob.id == job_id))
-        if job is None:
-            return
-        DocumentLearningService(
-            db,
-            job.workspace_id,
-            job.created_by,
-            settings,
-        ).execute_job(
-            job.id,
-            expected_execution_token=expected_execution_token,
-        )
+        job = db.get(DocumentJob, job_id)
+        if job is None or (expected_execution_token is not None and
+                           DocumentLearningService.execution_token(job) != expected_execution_token):
+            return "cancelled", None
+        if job.status in {"failed", "interrupted", "cancelled"}:
+            return job.status, job.error_code
+        service = DocumentLearningService(db, job.workspace_id, job.created_by, settings)
+        service._execution_lease = lease
+        result = service.execute_job(job.id, expected_execution_token=expected_execution_token)
+        if expected_execution_token is not None and DocumentLearningService.execution_token(result) != expected_execution_token:
+            return "cancelled", None
+        return result.status, result.error_code
+
+
+def _document_dispatch_matches():
+    key = literal("document.parse_index:") + DocumentJob.id + literal(":") + func.coalesce(DocumentJob.execution_token, "")
+    return (DurableJob.workspace_id == DocumentJob.workspace_id, DurableJob.dedupe_key == key)
+
+
+def reconcile_document_dispatches(limit: int = 50) -> int:
+    """Repair old queued business rows with no dispatch for their generation."""
+    from app.services.durable_queue import enqueue_document_job
+
+    with SessionLocal() as db:
+        matches = _document_dispatch_matches()
+        failed_dispatch = select(DurableJob.id).where(*matches, DurableJob.status == "failed").exists()
+        failed_ids = db.scalars(select(DocumentJob.id).where(
+            DocumentJob.status.in_(("queued", "running")), failed_dispatch,
+        ).limit(limit)).all()
+        if failed_ids:
+            db.execute(update(DocumentJob).where(
+                DocumentJob.id.in_(failed_ids), DocumentJob.status.in_(("queued", "running")), failed_dispatch,
+            ).values(status="interrupted", error_code="document_dispatch_failed",
+                     error_message="The background dispatch could not finish", completed_at=utc_now())
+               .execution_options(synchronize_session=False))
+            db.commit()
+        candidates = db.execute(select(DocumentJob.workspace_id, DocumentJob.id, DocumentJob.execution_token).where(
+            DocumentJob.status == "queued", ~select(DurableJob.id).where(*matches).exists(),
+        ).order_by(DocumentJob.created_at).limit(limit)).all()
+        db.rollback()
+        for workspace_id, job_id, token in candidates:
+            enqueue_document_job(db, workspace_id, job_id, token or "", commit=True)
+        return len(candidates)
 
 
 def mark_interrupted_document_jobs() -> int:
@@ -1471,9 +1545,10 @@ def mark_interrupted_document_jobs() -> int:
 
     with SessionLocal() as db:
         jobs = list(
-            db.scalars(
-                select(DocumentJob).where(DocumentJob.status == "running")
-            ).all()
+            db.scalars(select(DocumentJob).where(
+                DocumentJob.status == "running",
+                ~select(DurableJob.id).where(*_document_dispatch_matches(), DurableJob.status.in_(("queued", "leased"))).exists(),
+            )).all()
         )
         now = utc_now()
         for job in jobs:

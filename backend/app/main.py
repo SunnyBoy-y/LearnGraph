@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import asyncio
-from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +28,7 @@ from app.core.scheduler import (
     wal_checkpoint_scheduler,
 )
 from app.services.durable_queue import (
-    durable_queue_worker,
+    supervise_durable_queue,
 )
 from app.services.memory_outbox_runtime import memory_outbox_scheduler
 from app.services.model_pricing_sync import model_pricing_sync_worker
@@ -102,8 +101,8 @@ async def lifespan(app: FastAPI):
         enqueue_interrupted_chat_resumes()
         durable_queue_stop = asyncio.Event()
         durable_queue_tasks = [
-            asyncio.create_task(durable_queue_worker(durable_queue_stop, f"api-{uuid4()}", goal_lane=False)),
-            asyncio.create_task(durable_queue_worker(durable_queue_stop, f"goal-{uuid4()}", goal_lane=True)),
+            asyncio.create_task(supervise_durable_queue(durable_queue_stop, goal_lane=False), name="durable-general"),
+            asyncio.create_task(supervise_durable_queue(durable_queue_stop, goal_lane=True), name="durable-goal"),
         ]
     scheduler_stop: asyncio.Event | None = None
     scheduler_task: asyncio.Task[None] | None = None
