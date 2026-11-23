@@ -30,6 +30,12 @@ PUBLIC_OPERATIONS = {("GET", "/api/v1/version")}
 # it cannot exercise the bearer-token 401 invariant below.
 SCOPED_TICKET_OPERATIONS = {("GET", "/api/v1/migrations/backup/browser/{ticket}")}
 
+# Endpoints authenticated by an endpoint-specific secret header rather than a
+# user bearer token; anonymous requests must still be rejected with 403.
+SCOPED_AUTH_OPERATIONS = {
+    ("POST", "/api/v1/scheduled-tasks/{task_id}/trigger"): 403,
+}
+
 
 def _iter_operations(client):
     spec = client.get("/openapi.json").json()
@@ -89,7 +95,8 @@ def test_openapi_all_endpoints_reject_anonymous(client):
             "GET", "/api/v1/files/{file_id}/stream"
         ) else None
         r = client.request(method, path, params=params)
-        if r.status_code != 401:
+        expected_status = SCOPED_AUTH_OPERATIONS.get((method, path), 401)
+        if r.status_code != expected_status:
             failures.append((method, path, r.status_code))
         checked += 1
     assert not failures, f"{len(failures)} 个端点未强制认证（首个：{failures[:5]}）"
