@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import timedelta, timezone
+
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.domain.models import (
@@ -51,6 +54,7 @@ from app.domain.models import (
     VoiceSpeechDeliveryRecord,
     VoiceTaskLinkRecord,
     VoiceTurnRecord,
+    utc_now,
 )
 from app.domain.learning_package_models import open_eligibility_guard
 from app.repositories.scoped import ScopedRepository
@@ -110,6 +114,26 @@ class SessionRepository(ScopedRepository[ChatSession]):
 class MessageRepository(ScopedRepository[Message]):
     def __init__(self, db: Session, workspace_id: str) -> None:
         super().__init__(db, Message, workspace_id)
+
+    def add(self, instance: Message) -> Message:
+        if instance.created_at is None:
+            now = utc_now()
+            latest = self.db.scalar(
+                select(func.max(Message.created_at)).where(
+                    Message.workspace_id == self.workspace_id,
+                    Message.session_id == instance.session_id,
+                )
+            )
+            if latest is not None:
+                latest_utc = (
+                    latest
+                    if latest.tzinfo is not None
+                    else latest.replace(tzinfo=timezone.utc)
+                )
+                if now <= latest_utc:
+                    now = latest_utc + timedelta(microseconds=1)
+            instance.created_at = now
+        return super().add(instance)
 
 
 class MessageVersionRepository(ScopedRepository[MessageVersion]):
