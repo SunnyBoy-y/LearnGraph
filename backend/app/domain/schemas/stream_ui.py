@@ -2,15 +2,116 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, model_validator
 from app.domain.safe_svg import validate_illustration_svg
 
+MAX_DOCUMENT_NODES = 160
+MAX_DOCUMENT_DEPTH = 6  # Number of parent links from a root node.
+MAX_CONTAINER_CHILDREN = 40
+MAX_RAIL_CHILDREN = 12
+MAX_CHART_ABS_VALUE = 10**15
+
+
+class UIFieldError(ValueError):
+    def __init__(self, message: str, *, code: str = "value_error", **details):
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+
+def ui_issue(path: tuple, message: str, *, code: str = "value_error", **details) -> dict:
+    return {"type": "value_error", "loc": path,
+            "ctx": {"error": UIFieldError(message, code=code, **details)}}
+
+RESERVED_IDS = {"__proto__", "prototype", "constructor"}
+DATA_BINDING_RE = re.compile(r"^@/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*$")
+DATA_PATH_RE = re.compile(r"^@?/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*$")
+DATA_TEMPLATE_RE = re.compile(r"@\{(/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*)\}")
+
+
 def safe_id(value: str) -> str:
-    if value in {"__proto__", "prototype", "constructor"}:
+    if value in RESERVED_IDS:
         raise ValueError("Reserved identifier")
     return value
+
+
+def is_data_binding(value: object) -> bool:
+    return isinstance(value, str) and len(value) <= 200 and bool(DATA_BINDING_RE.fullmatch(value))
+
+
+def parse_data_path(expr: str) -> list[str] | None:
+    if not isinstance(expr, str) or len(expr) > 200 or not DATA_PATH_RE.fullmatch(expr):
+        return None
+    raw = expr[1:] if expr.startswith("@") else expr
+    parts = [part for part in raw.split("/") if part]
+    if not parts or len(parts) > 8 or any(part in RESERVED_IDS for part in parts):
+        return None
+    return parts
+
+
+def resolve_data_path(data_model: dict[str, object], expr: str) -> tuple[bool, object]:
+    parts = parse_data_path(expr)
+    if not parts:
+        return False, None
+    current: object = data_model
+    for part in parts:
+        if isinstance(current, dict):
+            if part not in current:
+                return False, None
+            current = current[part]
+        elif isinstance(current, list) and part.isdigit():
+            idx = int(part)
+            if idx < 0 or idx >= len(current):
+                return False, None
+            current = current[idx]
+        else:
+            return False, None
+    return True, current
+
+
+def validate_data_model(data: object, *, max_depth: int = 8, max_nodes: int = 1000) -> dict[str, object]:
+    if not isinstance(data, dict):
+        raise ValueError("data_model must be an object")
+    count = 0
+
+    def walk(value: object, depth: int):
+        nonlocal count
+        count += 1
+        if count > max_nodes:
+            raise ValueError("data_model exceeds node limit")
+        if depth > max_depth:
+            raise ValueError("data_model exceeds nesting depth")
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            if not math.isfinite(value) or abs(value) > 1e15:
+                raise ValueError("data_model numbers must be bounded and finite")
+            return value
+        if isinstance(value, str):
+            if len(value) > 16000:
+                raise ValueError("data_model string too long")
+            return value
+        if isinstance(value, list):
+            if len(value) > 500:
+                raise ValueError("data_model array too large")
+            return [walk(item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            if len(value) > 200:
+                raise ValueError("data_model object too large")
+            out: dict[str, object] = {}
+            for key, item in value.items():
+                if not isinstance(key, str) or not key or len(key) > 100 or key in RESERVED_IDS:
+                    raise ValueError("Invalid data_model key")
+                out[key] = walk(item, depth + 1)
+            return out
+        raise ValueError("Unsupported data_model value type")
+
+    result = walk(data, 0)
+    assert isinstance(result, dict)
+    return result
 
 
 Id = Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$"), AfterValidator(safe_id)]
@@ -125,6 +226,9 @@ class DocumentNode(StrictModel):
     columns: Annotated[int, Field(ge=1, le=3)] = 2
     align: Literal["start", "center", "end"] = "start"
     width: Literal["reading", "full"] = "reading"
+    weight: Annotated[int, Field(ge=1, le=6)] = 1
+    image_variant: Literal["default", "hero", "thumbnail", "compact", "wide"] = "default"
+    fit: Literal["contain", "cover", "scale-down"] = "contain"
     language: Annotated[str, Field(max_length=40, pattern=r"^[a-zA-Z0-9_+#.-]*$")] = ""
     query: Annotated[str, Field(max_length=500)] = ""
     query_alternatives: Annotated[list[Annotated[str, Field(min_length=1, max_length=150)]], Field(max_length=2)] = Field(default_factory=list)
@@ -157,13 +261,23 @@ class DocumentNode(StrictModel):
             self.caption = ""
         if self.fallback_svg and self.type not in {"image", "image_group", "gallery"}:
             raise ValueError("fallback_svg belongs to an image node")
+        if self.image_variant != "default" and self.type not in {"image", "image_group", "gallery", "figure"}:
+            raise ValueError("image_variant belongs to an image or figure node")
+        if self.fit != "contain" and self.type not in {"image", "image_group", "gallery", "figure"}:
+            raise ValueError("fit belongs to an image or figure node")
         if self.visual is not None:
             if set(self.visual) - {"props", "rows", "nodes", "edges", "items"}:
-                raise ValueError("Unexpected embedded visual fields")
+                raise ValidationError.from_exception_data(type(self).__name__, [
+                    ui_issue(("visual",), "Unexpected embedded visual fields")])
             if self.type not in {"chart", "table", "graph", "diagram", "timeline", "metric"}:
-                raise ValueError("Visual data requires a visual node")
+                raise ValidationError.from_exception_data(type(self).__name__, [
+                    ui_issue(("visual",), "Visual data requires a visual node", node_type=self.type)])
             component = "graph" if self.type == "diagram" else self.type
-            Snapshot.model_validate({**self.visual, "component": component, "block_id": self.id})
+            try:
+                Snapshot.model_validate({**self.visual, "component": component, "block_id": self.id})
+            except ValidationError as exc:
+                errors = [{**error, "loc": ("visual", *error["loc"])} for error in exc.errors(include_url=False)]
+                raise ValidationError.from_exception_data(type(self).__name__, errors) from exc
         return self
 
 
@@ -171,30 +285,44 @@ RAIL_TYPES = {"feature_list", "step_list", "status_list"}
 LAYOUT_TYPES = {"section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure"} | RAIL_TYPES
 
 
+def container_child_limit(parent_type: str | None) -> int:
+    return MAX_RAIL_CHILDREN if parent_type in RAIL_TYPES else MAX_CONTAINER_CHILDREN
+
+
 def validate_document(blocks: list[DocumentNode]):
     by_id = {node.id: node for node in blocks}
     if len(by_id) != len(blocks):
         raise ValueError("Duplicate document ids")
-    for node in blocks:
+    issues = []
+    children: dict[str | None, list[int]] = {}
+    for index, node in enumerate(blocks):
         parent_node = by_id.get(node.parent_id)
+        path = ("blocks", index, "parent_id")
+        details = {"node_id": node.id, "parent_id": node.parent_id}
+        children.setdefault(node.parent_id, []).append(index)
         if node.type == "rail_item" and (parent_node is None or parent_node.type not in RAIL_TYPES):
-            raise ValueError("Rail items require a feature_list, step_list or status_list parent")
-        if parent_node and parent_node.type in RAIL_TYPES and node.type != "rail_item":
-            raise ValueError("Rail lists only accept rail_item children")
+            issues.append(ui_issue(path, "Rail items require a feature_list, step_list or status_list parent", **details))
+        elif parent_node and parent_node.type in RAIL_TYPES and node.type != "rail_item":
+            issues.append(ui_issue(path, "Rail lists only accept rail_item children", **details))
+        elif parent_node and parent_node.type not in LAYOUT_TYPES:
+            issues.append(ui_issue(path, "Only layout nodes can contain children", parent_type=parent_node.type, **details))
         seen = {node.id}
         parent = node.parent_id
         while parent is not None:
-            if parent in seen or parent not in by_id or len(seen) >= 7:
-                raise ValueError("Missing parent, cycle, or document depth exceeds 6")
+            if parent in seen or parent not in by_id or len(seen) > MAX_DOCUMENT_DEPTH:
+                issues.append(ui_issue(path, f"Missing parent, cycle, or document depth exceeds {MAX_DOCUMENT_DEPTH}", **details))
+                break
             seen.add(parent)
-            if by_id[parent].type not in LAYOUT_TYPES:
-                raise ValueError("Only layout nodes can contain children")
             parent = by_id[parent].parent_id
-    for parent in {node.parent_id for node in blocks}:
-        count = sum(node.parent_id == parent for node in blocks)
-        limit = 12 if parent in by_id and by_id[parent].type in RAIL_TYPES else 40
-        if count > limit:
-            raise ValueError(f"At most {limit} children per container")
+    for parent, indices in children.items():
+        limit = container_child_limit(by_id[parent].type if parent in by_id else None)
+        if len(indices) > limit:
+            issues.append(ui_issue(("blocks", indices[limit], "parent_id"),
+                f"At most {limit} children per container. Choose a layout node with room or move related siblings under a section.",
+                code="ui_container_limit", parent_id=parent, count=len(indices), limit=limit,
+                node_id=blocks[indices[limit]].id))
+    if issues:
+        raise ValidationError.from_exception_data("Document", issues)
     for node in blocks:
         if node.type in {"image", "image_group", "gallery"} and node.media:
             parent = node.parent_id
@@ -210,7 +338,7 @@ class Collections(StrictModel):
     nodes: Annotated[list[Node], Field(max_length=100)] = Field(default_factory=list)
     edges: Annotated[list[Edge], Field(max_length=300)] = Field(default_factory=list)
     items: Annotated[list[Item], Field(max_length=100)] = Field(default_factory=list)
-    blocks: Annotated[list[DocumentNode], Field(max_length=160)] = Field(default_factory=list)
+    blocks: Annotated[list[DocumentNode], Field(max_length=MAX_DOCUMENT_NODES)] = Field(default_factory=list)
 
 
 class InputPreview(StrictModel):
@@ -218,6 +346,53 @@ class InputPreview(StrictModel):
     sequence: Annotated[int, Field(ge=1)]
     # The authoritative snapshot is retained for rollback and final validation.
     base: dict | None = None
+
+
+CheckFunction = Literal[
+    "required", "non_empty", "min_length", "max_length",
+    "min_value", "max_value", "range", "one_of",
+    "gt", "gte", "lt", "lte", "eq", "ne",
+    "is_finite_number",
+]
+
+
+class CheckRule(StrictModel):
+    id: Id
+    fn: CheckFunction
+    path: Annotated[str, Field(min_length=2, max_length=200)]
+    args: Annotated[list[Scalar], Field(max_length=8)] = Field(default_factory=list)
+    message: Annotated[str, Field(min_length=1, max_length=240)]
+    severity: Literal["error", "warning", "info"] = "warning"
+    target_id: Id | None = None
+
+    @model_validator(mode="after")
+    def valid_rule(self):
+        if parse_data_path(self.path) is None:
+            raise ValueError("Invalid data path in check rule")
+        num_fns_1 = {"min_value", "max_value", "gt", "gte", "lt", "lte"}
+        len_fns_1 = {"min_length", "max_length"}
+        if self.fn in num_fns_1:
+            if len(self.args) != 1 or isinstance(self.args[0], bool) or not isinstance(self.args[0], (int, float)) or not math.isfinite(self.args[0]):
+                raise ValueError(f"{self.fn} requires 1 finite number argument")
+        elif self.fn in len_fns_1:
+            if len(self.args) != 1 or type(self.args[0]) is not int or self.args[0] < 0:
+                raise ValueError(f"{self.fn} requires 1 non-negative integer argument")
+        elif self.fn == "range":
+            if (
+                len(self.args) != 2
+                or any(isinstance(a, bool) or not isinstance(a, (int, float)) or not math.isfinite(a) for a in self.args)
+                or float(self.args[0]) > float(self.args[1])  # type: ignore[arg-type]
+            ):
+                raise ValueError("range requires [min, max] finite numbers with min <= max")
+        elif self.fn == "one_of":
+            if not self.args:
+                raise ValueError("one_of requires at least 1 option argument")
+        elif self.fn in {"eq", "ne"}:
+            if len(self.args) != 1:
+                raise ValueError(f"{self.fn} requires 1 argument")
+        elif self.args:
+            raise ValueError(f"{self.fn} takes no arguments")
+        return self
 
 
 class Snapshot(Collections):
@@ -228,11 +403,16 @@ class Snapshot(Collections):
     resource_revision: Annotated[int, Field(ge=0)] = 0
     state: Literal["streaming", "completed", "removed"] = "streaming"
     props: Props
+    data_model: dict[str, object] = Field(default_factory=dict)
+    checks: Annotated[list[CheckRule], Field(max_length=40)] = Field(default_factory=list)
     layout: Literal["inline", "block", "side"] | None = None
     preview: InputPreview | None = None
 
     @model_validator(mode="after")
     def consistent(self):
+        self.data_model = validate_data_model(self.data_model)
+        if len({rule.id for rule in self.checks}) != len(self.checks):
+            raise ValueError("Duplicate check rule ids")
         for field in ("rows", "nodes", "edges", "items", "blocks"):
             values = getattr(self, field)
             if len({value.id for value in values}) != len(values):
@@ -250,37 +430,69 @@ class Snapshot(Collections):
         if self.component == "chart":
             keys = {column.key for column in self.props.columns}
             if not keys and self.rows:
-                raise ValueError("Charts require columns")
-            for row in self.rows:
-                if any(key not in keys or isinstance(value, bool) or not isinstance(value, (float, int))
-                       or not math.isfinite(value) or abs(value) > 1e15 for key, value in row.values.items()):
-                    raise ValueError("Chart values must be bounded finite numbers in declared columns")
+                raise ValidationError.from_exception_data("Chart", [
+                    ui_issue(("props", "columns"), "Charts require columns")])
+            issues = []
+            for index, row in enumerate(self.rows):
+                for key, value in row.values.items():
+                    path = ("rows", index, "values", key)
+                    if key not in keys:
+                        issues.append(ui_issue(path, "Chart values must use declared columns", row_id=row.id))
+                        continue
+                    binding = is_data_binding(value)
+                    if binding:
+                        found, value = resolve_data_path(self.data_model, value)
+                        if not found:
+                            continue
+                    if (isinstance(value, bool) or not isinstance(value, (float, int))
+                            or abs(value) > MAX_CHART_ABS_VALUE or not math.isfinite(value)):
+                        message = ("Chart data binding must resolve to a bounded finite number" if binding
+                                   else "Chart values must be bounded finite numbers, without quotes")
+                        issues.append(ui_issue(path, message, code="ui_chart_number", row_id=row.id))
+            if issues:
+                raise ValidationError.from_exception_data("Chart", issues)
         return self
 
 
 class Command(StrictModel):
     protocol: Literal["suip/0.1"] = "suip/0.1"
-    op: Literal["mount", "patch", "revise", "complete", "remove"]
+    op: Literal["mount", "patch", "revise", "data", "complete", "remove"]
     block_id: Id
     base_revision: Annotated[int, Field(ge=0)] = 0
     component: Component | None = None
     props: dict[str, object] = Field(default_factory=dict)
+    data_model: dict[str, object] = Field(default_factory=dict)
+    checks: Annotated[list[CheckRule], Field(max_length=40)] = Field(default_factory=list)
+    delete_paths: Annotated[list[Annotated[str, Field(min_length=2, max_length=200)]], Field(max_length=100)] = Field(default_factory=list)
     upsert: Collections = Field(default_factory=Collections)
     delete: dict[Literal["rows", "nodes", "edges", "items", "blocks"], list[Id]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def valid_operation(self):
+        self.data_model = validate_data_model(self.data_model)
+        if len({rule.id for rule in self.checks}) != len(self.checks):
+            raise ValueError("Duplicate check rule ids")
+        for path in self.delete_paths:
+            if parse_data_path(path) is None:
+                raise ValueError("Invalid data path in delete_paths")
         if any(node.media or node.resource_state != "pending" or node.resource_reason for node in self.upsert.blocks):
             raise ValueError("Media must be resolved by the server, not supplied by a model")
         if any((node.query or node.query_alternatives) and node.type not in {"image", "image_group", "gallery"}
                for node in self.upsert.blocks):
             raise ValueError("Image queries require an image/image_group/gallery node. media_text is a layout: put query on a child image node and link it with parent_id.")
-        if self.op == "mount" and (not self.component or self.base_revision != 0 or self.delete):
+        if self.op == "mount" and (not self.component or self.base_revision != 0 or self.delete or self.delete_paths):
             raise ValueError("Mount requires component, base_revision=0, and no delete")
         if self.op != "mount" and self.component is not None:
             raise ValueError("Component can only be set on mount")
-        if self.op in {"complete", "remove"} and (self.props or self.delete or any(self.upsert.model_dump().values())):
-            raise ValueError("Terminal commands cannot modify props or collections")
+        if self.op == "data":
+            if self.props or self.checks or self.delete or any(self.upsert.model_dump().values()):
+                raise ValueError("Data commands can only update data_model")
+            if not self.data_model and not self.delete_paths:
+                raise ValueError("Data commands require data_model or delete_paths")
+        if self.op in {"complete", "remove"} and (
+            self.props or self.checks or self.delete or self.data_model or self.delete_paths or any(self.upsert.model_dump().values())
+        ):
+            raise ValueError("Terminal commands cannot modify props, data_model, checks, or collections")
         if any(len(ids) > 500 for ids in self.delete.values()):
             raise ValueError("Delete batch too large")
         return self

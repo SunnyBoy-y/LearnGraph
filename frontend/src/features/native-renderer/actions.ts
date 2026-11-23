@@ -7,7 +7,7 @@ export type GraphReviewResult = Pick<GraphChangeSet, 'id' | 'graph_id' | 'status
 export interface ActionEnvironment {
   sessionId(): string
   send(request: NativeSendRequest): void | Promise<void>
-  submitUIAction(sessionId: string, action: UIAction): Promise<{ prompt: string }>
+  submitUIAction?: (sessionId: string, action: UIAction) => Promise<{ prompt: string }>
   reviewGraph(sessionId: string, proposalId: string, decision: 'confirm' | 'reject' | 'undo', reason: string): Promise<GraphReviewResult>
   rejectReason(proposalId: string): Promise<string | null>
   graphResolved(result: GraphReviewResult): void
@@ -27,15 +27,23 @@ export async function dispatchRendererAction(action: TrustedComponentAction, env
     return
   }
   if (action.componentType === 'stream_ui') {
-    if (action.event !== 'explain' && action.event !== 'graph.node.explain') return
+    if (action.event !== 'explain' && action.event !== 'graph.node.explain' && action.event !== 'document.block.explain') return
     const revision = Number(action.payload.revision)
     if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('交互组件版本无效')
     const uiAction: UIAction = {
       part_id: action.componentId, revision, action: action.event,
       ...(typeof action.payload.node_id === 'string' ? { node_id: action.payload.node_id } : {}),
+      ...(typeof action.payload.block_id === 'string' ? { block_id: action.payload.block_id } : {}),
+      ...(action.payload.view_state && typeof action.payload.view_state === 'object'
+        ? { view_state: action.payload.view_state as Record<string, unknown> }
+        : {}),
     }
-    const { prompt } = await environment.submitUIAction(sessionId, uiAction)
-    await send(prompt, { ui_action: uiAction })
+    const userMessage = typeof action.payload.userMessage === 'string' && action.payload.userMessage.trim()
+      ? action.payload.userMessage.trim()
+      : uiAction.node_id
+        ? `请解释图谱节点「${uiAction.node_id}」及其关联。`
+        : '请解释当前图表，分析其中的主要信息。'
+    await send(userMessage, { ui_action: uiAction })
     return
   }
   if (action.componentType === 'graph_update_proposal') {

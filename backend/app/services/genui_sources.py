@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from app.core.errors import AppError
 from app.domain.models import Message, MessagePartRecord, MessageVersion
-from app.domain.schemas.stream_ui import Command, DataReference
+from app.domain.schemas.stream_ui import DataReference
 
 
 def source_reference_hint(part_id: str, output: object) -> str:
@@ -75,13 +75,8 @@ def resolve_command_sources(db, workspace_id: str, session_id: str, raw: dict, c
     Referenced collections cannot be overwritten with model-generated numbers in
     a later patch. Detaching a reference must be explicit (data_ref=null).
     """
-    from app.services.stream_ui import MAX_UI_BYTES
-    try:
-        if len(json.dumps(raw, allow_nan=False, ensure_ascii=False).encode()) > MAX_UI_BYTES:
-            raise ValueError("UI command too large")
-        Command.model_validate(raw)
-    except (ValueError, TypeError, RecursionError) as exc:
-        raise AppError(422, "invalid_ui_command", "UI command exceeds serialization limits") from exc
+    from app.services.stream_ui import parse_command
+    parse_command(raw)
     result = deepcopy(raw)
     base = (current or {}).get("preview", {}).get("base") if (current or {}).get("preview") else current
     component = raw.get("component") or (base or {}).get("component")

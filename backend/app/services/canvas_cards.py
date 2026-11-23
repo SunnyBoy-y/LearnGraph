@@ -68,7 +68,9 @@ DEFAULT_RENDER_CONTRACT: dict[str, Any] = {
 
 
 def get_render_contract(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    contract = dict(DEFAULT_RENDER_CONTRACT)
+    from app.services.stream_ui import stream_ui_constraints
+
+    contract = {**DEFAULT_RENDER_CONTRACT, "stream_ui": stream_ui_constraints()}
     if not overrides:
         return contract
     for key in (

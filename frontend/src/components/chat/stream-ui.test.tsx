@@ -131,7 +131,11 @@ describe("stream UI", () => {
       componentId: "graph-part",
       componentType: "stream_ui",
       event: "graph.node.explain",
-      payload: { revision: 3, node_id: "ming" },
+      payload: {
+        revision: 3,
+        node_id: "ming",
+        userMessage: "请解释图表「项目活跃度」中的节点「小明」及其关联。",
+      },
     });
   });
 
@@ -167,7 +171,10 @@ describe("stream UI", () => {
       componentId: `graph-footer-${embedded}`,
       componentType: "stream_ui",
       event: "explain",
-      payload: { revision: 3 },
+      payload: {
+        revision: 3,
+        userMessage: "请解释图表「高中函数知识图谱」，分析其中的主要信息。",
+      },
     });
     rerender(<StreamUI data={data} partId={`graph-footer-${embedded}`} embedded={embedded} />);
     expect(container.querySelector(".stream-ui__footer")).toBeNull();

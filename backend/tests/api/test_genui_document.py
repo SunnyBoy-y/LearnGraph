@@ -157,7 +157,94 @@ def test_oversized_command_is_rejected_before_source_lookup_or_copy():
     from app.services.genui_sources import resolve_command_sources
     with pytest.raises(AppError) as error:
         resolve_command_sources(None, "workspace", "session", {"props": {"title": "x" * 200000}}, None)
-    assert error.value.code == "invalid_ui_command"
+    assert error.value.code == "ui_payload_too_large"
+    assert error.value.details["stage"] == "command"
+    assert error.value.details["actual_bytes"] > error.value.details["limit_bytes"] == 192_000
+
+
+def test_large_valid_request_and_snapshot_byte_limit_are_distinct():
+    def command(count, size):
+        return {"op": "mount", "block_id": "report", "component": "document", "props": {"title": "Report"},
+                "upsert": {"blocks": [{"id": f"p{i}", "type": "paragraph", "text": "e" * size}
+                                      for i in range(count)]}}
+
+    valid = command(4, 2000)
+    assert len(json.dumps(valid).encode()) > 6000
+    assert len(compile_command(valid).blocks) == 4
+    oversized_snapshot = command(38, 4700)
+    assert len(json.dumps(oversized_snapshot).encode()) < 192_000
+    with pytest.raises(AppError) as error:
+        compile_command(oversized_snapshot)
+    assert error.value.code == "ui_payload_too_large"
+    assert error.value.details["stage"] == "snapshot"
+
+
+def test_small_nested_errors_preserve_paths_and_do_not_report_size(document_context):
+    db, workspace, sid, mid, vid, _ = document_context
+    chart = chart_command()
+    chart["upsert"]["rows"][0]["values"]["v"] = "18"
+    visual = {"props": chart["props"], "rows": chart["upsert"]["rows"]}
+    command = {"op": "mount", "block_id": "report", "component": "document", "props": {"title": "Report"},
+               "upsert": {"blocks": [{"id": "chart", "type": "chart", "visual": visual},
+                                     {"id": "missing-type"},
+                                     {"id": "leaf", "type": "heading", "visual": visual}]}}
+    with pytest.raises(AppError) as nested:
+        prepare_command(db, workspace, sid, mid, vid, command)
+    assert nested.value.code == "ui_schema_invalid"
+    assert [(issue["path"], issue["node_id"]) for issue in nested.value.details["issues"]] == [
+        ("upsert.blocks[0].visual.rows[0].values.v", "chart"),
+        ("upsert.blocks[1].type", "missing-type"),
+        ("upsert.blocks[2].visual", "leaf"),
+    ]
+    with pytest.raises(AppError) as standalone:
+        prepare_command(db, workspace, sid, mid, vid, chart)
+    assert standalone.value.code == "ui_schema_invalid"
+    assert standalone.value.details["issues"][0]["path"] == "rows[0].values.v"
+
+
+def test_dry_run_checks_merged_capacity_and_does_not_write(document_context):
+    from app.domain.models import MessagePartRecord
+    from app.services.canvas_cards import get_render_contract
+    from app.services.stream_ui import run_ui_tool
+
+    db, workspace, sid, mid, vid, _ = document_context
+    blocks = [{"id": "section", "type": "section"}, {"id": "heading", "type": "heading"}]
+    blocks.extend({"id": f"p{i}", "type": "paragraph"} for i in range(38))
+    mount = {"op": "mount", "block_id": "report", "component": "document",
+             "props": {"title": "Report"}, "upsert": {"blocks": blocks}}
+    context = (db, workspace, sid, mid, vid)
+    report, meta = run_ui_tool(*context, {"op": "validate", "command": mount})
+    assert report["valid"] and report["proposed_revision"] == 0 and not meta
+    with pytest.raises(AppError) as missing:
+        run_ui_tool(*context, {"op": "inspect", "block_id": "report"})
+    assert missing.value.code == "ui_block_not_found"
+    current = compile_command(mount).model_dump(mode="json")
+    part = MessagePartRecord(workspace_id=workspace, message_version_id=vid, ordinal=2,
+                             part_type="ui", status="streaming", data=current)
+    db.add(part)
+    db.commit()
+    report, meta = run_ui_tool(*context, {"op": "inspect", "block_id": "report"})
+    assert not meta and report["revision"] == 0
+    assert report["containers"] == [{"id": None, "child_count": 40, "remaining_children": 0},
+                                    {"id": "section", "child_count": 0, "remaining_children": 40}]
+    assert report["nodes"][1] == {"id": "heading", "parent_id": None, "type": "heading"}
+    patch = {"op": "patch", "block_id": "report", "upsert": {"blocks": [
+        {"id": "overflow", "type": "paragraph"},
+        {"id": "invalid-parent", "type": "paragraph", "parent_id": "heading"},
+    ]}}
+    with pytest.raises(AppError) as invalid:
+        run_ui_tool(*context, {"op": "validate", "command": patch})
+    assert invalid.value.code == "ui_container_limit"
+    issues = {issue["node_id"]: issue for issue in invalid.value.details["issues"]}
+    assert issues["invalid-parent"]["parent_type"] == "heading"
+    assert issues["overflow"]["count"] == 41 and issues["overflow"]["parent_id"] is None
+    for node in patch["upsert"]["blocks"]:
+        node["parent_id"] = "section"
+    report, meta = run_ui_tool(*context, {"op": "validate", "command": patch})
+    assert report["valid"] and report["proposed_revision"] == 1 and not meta
+    assert part.data == current
+    limits = get_render_contract()["stream_ui"]
+    assert limits["document"]["max_nodes"] == 160 and limits["document"]["max_children_per_container"] == 40
 
 
 def test_numeric_preview_keeps_the_last_committed_values(document_context):

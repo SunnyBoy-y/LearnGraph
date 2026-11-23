@@ -190,3 +190,121 @@ def test_model_tool_schema_describes_the_actual_embedded_visual_contract():
     assert definitions["UIProps"]["additionalProperties"] is False
     assert "toc" in schema["properties"]["props"]["properties"]
     assert "unit" not in definitions["Series"]["properties"]
+
+
+def test_data_model_separation_op_data_and_bindings():
+    mounted = compile_command({
+        "op": "mount",
+        "block_id": "kpi",
+        "component": "metric",
+        "props": {"title": "系统指标", "unit": "%"},
+        "data_model": {"cpu": 42, "memory": {"used": 64, "total": 128}},
+        "upsert": {
+            "items": [
+                {"id": "cpu", "label": "CPU", "value": "@/cpu"},
+                {"id": "mem", "label": "内存", "value": "@/memory/used", "description": "总量 @{/memory/total} GB"},
+            ]
+        },
+    })
+    assert mounted.data_model == {"cpu": 42, "memory": {"used": 64, "total": 128}}
+    assert mounted.revision == 0
+
+    updated = compile_command({
+        "op": "data",
+        "block_id": "kpi",
+        "base_revision": 0,
+        "data_model": {"memory": {"used": 80}},
+    }, mounted.model_dump(mode="json"))
+    assert updated.revision == 1
+    assert updated.data_model == {"cpu": 42, "memory": {"used": 80, "total": 128}}
+    assert [i.id for i in updated.items] == ["cpu", "mem"]
+
+    deleted = compile_command({
+        "op": "data",
+        "block_id": "kpi",
+        "base_revision": 1,
+        "delete_paths": ["/memory/total"],
+    }, updated.model_dump(mode="json"))
+    assert deleted.revision == 2
+    assert deleted.data_model == {"cpu": 42, "memory": {"used": 80}}
+
+    completed = compile_command({"op": "complete", "block_id": "kpi", "base_revision": 2}, deleted.model_dump(mode="json"))
+    assert completed.state == "completed"
+
+
+def test_data_model_security_and_chart_binding_validation():
+    # Reject prototype keys in data_model
+    with pytest.raises(AppError) as err:
+        compile_command(mount(data_model={"__proto__": {"admin": True}}))
+    assert err.value.status_code == 422
+
+    # Reject op=data mixing structure changes
+    base = compile_command(mount(data_model={"x": 1})).model_dump(mode="json")
+    with pytest.raises(AppError) as err2:
+        compile_command({
+            "op": "data",
+            "block_id": "demo",
+            "base_revision": 0,
+            "data_model": {"x": 2},
+            "props": {"title": "illegal"},
+        }, base)
+    assert err2.value.status_code == 422
+
+    # Chart accepts @/path bindings resolving to numbers, rejects non-numeric resolved bindings
+    chart = compile_command({
+        "op": "mount",
+        "block_id": "c1",
+        "component": "chart",
+        "props": {"title": "趋势", "columns": [{"key": "v", "label": "值"}]},
+        "data_model": {"q1": {"v": 100}},
+        "upsert": {"rows": [{"id": "r1", "label": "Q1", "values": {"v": "@/q1/v"}}]},
+    })
+    assert chart.rows[0].values["v"] == "@/q1/v"
+
+    with pytest.raises(AppError):
+        compile_command({
+            "op": "data",
+            "block_id": "c1",
+            "base_revision": 0,
+            "data_model": {"q1": {"v": "not-a-number"}},
+        }, chart.model_dump(mode="json"))
+
+
+def test_weight_image_variant_fit_and_catalog_checks():
+    from app.services.genui_catalog import evaluate_checks
+
+    snap = compile_command({
+        "op": "mount",
+        "block_id": "doc_layout",
+        "component": "document",
+        "props": {"title": "版式与校验"},
+        "data_model": {"cpu": 95, "env": "prod"},
+        "checks": [
+            {"id": "c_cpu", "fn": "max_value", "path": "@/cpu", "args": [80], "severity": "warning", "message": "CPU 超出阈值"},
+            {"id": "c_env", "fn": "one_of", "path": "@/env", "args": ["dev", "prod"], "severity": "info", "message": "环境非法"},
+        ],
+        "upsert": {
+            "blocks": [
+                {"id": "row1", "type": "row", "columns": 2},
+                {"id": "left", "parent_id": "row1", "type": "paragraph", "text": "主内容", "weight": 2},
+                {"id": "img1", "parent_id": "row1", "type": "image", "query": "server architecture", "image_variant": "hero", "fit": "cover"},
+            ]
+        },
+    })
+    assert snap.blocks[1].weight == 2
+    assert snap.blocks[2].image_variant == "hero"
+    assert snap.blocks[2].fit == "cover"
+    assert len(snap.checks) == 2
+
+    results = evaluate_checks([r.model_dump() for r in snap.checks], snap.data_model)
+    assert results[0]["passed"] is False and results[0]["message"] == "CPU 超出阈值"
+    assert results[1]["passed"] is True
+
+    # Reject image_variant/fit on non-image node
+    with pytest.raises(AppError):
+        compile_command(mount(component="document", upsert={"blocks": [{"id": "p", "type": "paragraph", "text": "x", "image_variant": "hero"}]}))
+    with pytest.raises(AppError):
+        compile_command(mount(component="document", upsert={"blocks": [{"id": "p", "type": "paragraph", "text": "x", "fit": "cover"}]}))
+    # Reject invalid check rule arguments
+    with pytest.raises(AppError):
+        compile_command(mount(checks=[{"id": "bad", "fn": "range", "path": "@/x", "args": [10, 5], "message": "bad range"}]))

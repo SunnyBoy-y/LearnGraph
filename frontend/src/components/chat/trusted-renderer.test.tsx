@@ -88,7 +88,11 @@ describe('TrustedComponentRenderer third-party delegation', () => {
     fireEvent.click(screen.getByRole('button', { name: '让 AI 解释此节点' }))
     expect(onAction).toHaveBeenNthCalledWith(2, {
       componentId: 'new-graph', componentType: 'stream_ui', event: 'graph.node.explain',
-      payload: { revision: 3, node_id: 'ming' },
+      payload: {
+        revision: 3,
+        node_id: 'ming',
+        userMessage: '请解释图表「流式关系图」中的节点「小明」及其关联。',
+      },
     })
     expect(screen.getByRole('textbox', { name: '已有输入控件' })).toHaveValue('已有答案')
   })

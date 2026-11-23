@@ -9,6 +9,7 @@ import { StreamUI } from "./stream-ui";
 import type { DocumentNode, UISnapshot } from "@/lib/stream-ui";
 import type { MessagePart } from "@/types/sessions";
 import { StreamUIStateScope, useStreamUIState } from "@/lib/stream-ui-local-state";
+import { useBoundText } from "@/lib/data-model-store";
 import { simplifyDocument } from "@/genui/presentation-simplifier";
 import { DocumentTOC } from "@/genui/document-toc";
 import { RailList } from "@/genui/rail-list";
@@ -32,12 +33,19 @@ const Markdown = memo(function Markdown({ text }: { text: string }) {
 
 function AccordionItem({ node, children }: {node: DocumentNode; children: ReactNode}) {
   const [open, setOpen] = useStreamUIState(`${node.id}:open`, false);
+  const label = useBoundText(node.label);
   return <details open={open} onToggle={event => { if (event.currentTarget.open !== open) setOpen(event.currentTarget.open); }}>
-    <summary>{node.icon && <AnswerIcon name={node.icon} />}{node.label || "展开内容"}</summary>{children}
+    <summary>{node.icon && <AnswerIcon name={node.icon} />}{label || "展开内容"}</summary>{children}
   </details>;
 }
 
-function ResourceImage({ media, fallbackAlt, fallbackSvg }: { media: DocumentNode["media"][number]; fallbackAlt: string; fallbackSvg: string }) {
+function ResourceImage({ media, fallbackAlt, fallbackSvg, imageVariant = "default", fit = "contain" }: {
+  media: DocumentNode["media"][number];
+  fallbackAlt: string;
+  fallbackSvg: string;
+  imageVariant?: DocumentNode["image_variant"];
+  fit?: DocumentNode["fit"];
+}) {
   const { source, failed: fileFailed } = useFileStreamUrl(media.file_id ?? undefined);
   const src = media.file_id ? source : media.url;
   const [failed, setFailed] = useState(false);
@@ -48,7 +56,7 @@ function ResourceImage({ media, fallbackAlt, fallbackSvg }: { media: DocumentNod
   // accessible label and caption through the metadata returned with that file.
   const alt = media.title || "检索图片";
   if ((failed || fileFailed) && fallbackSvg) return <SvgIllustration svg={fallbackSvg} alt={fallbackAlt || "内容示意"} />;
-  return <figure className="rich-doc__image">
+  return <figure className="rich-doc__image" data-image-variant={imageVariant !== "default" ? imageVariant : undefined} data-fit={fit !== "contain" ? fit : undefined}>
     {failed || fileFailed ? <p className="rich-doc__fallback">{alt || media.title} · 图片暂时无法加载</p> :
       <button type="button" disabled={!src} className="rich-doc__image-button" onClick={() => setOpen(true)} aria-label={`放大图片：${alt || media.title}`}>
         {!loaded && <span className="rich-doc__image-loading" role="status">正在加载图片…</span>}
@@ -82,8 +90,10 @@ function Images({ node }: { node: DocumentNode }) {
   </figure>;
   const media = node.type === "image" ? node.media.slice(0, 1) : node.media;
   return <div>
-    <div className={node.type === "gallery" ? "rich-doc__gallery" : "rich-doc__image-group"}>
-      {media.map(image => <ResourceImage key={`${image.file_id ?? ""}:${image.url}`} media={image} fallbackAlt={node.alt} fallbackSvg={node.fallback_svg} />)}
+    <div className={node.type === "gallery" ? "rich-doc__gallery" : "rich-doc__image-group"}
+      data-image-variant={node.image_variant !== "default" ? node.image_variant : undefined}
+      data-fit={node.fit !== "contain" ? node.fit : undefined}>
+      {media.map(image => <ResourceImage key={`${image.file_id ?? ""}:${image.url}`} media={image} fallbackAlt={node.alt} fallbackSvg={node.fallback_svg} imageVariant={node.image_variant} fit={node.fit} />)}
     </div>
   </div>;
 }
@@ -152,18 +162,24 @@ function Simulation({ node }: { node: DocumentNode }) {
   </figure>;
 }
 
+function TabLabel({ child }: { child: DocumentNode }) {
+  const label = useBoundText(child.label);
+  return <>{child.icon && <AnswerIcon name={child.icon} />}{label || "内容"}</>;
+}
+
 function Tabs({ node, nodes, render }: { node: DocumentNode; nodes: DocumentNode[]; render: (node: DocumentNode) => React.ReactNode }) {
   const domId = useId();
   const [selected, setSelected] = useStreamUIState(`${node.id}:tab`, "");
+  const tabListLabel = useBoundText(node.label);
   const active = nodes.some(child => child.id === selected) ? selected : nodes[0]?.id;
-  return <div><div className="rich-doc__tablist" role="tablist" aria-label={node.label || "内容分组"}>
+  return <div><div className="rich-doc__tablist" role="tablist" aria-label={tabListLabel || "内容分组"}>
     {nodes.map(child => <button type="button" role="tab" id={`${domId}-${child.id}-tab`} aria-selected={active === child.id}
       aria-controls={`${domId}-${child.id}-panel`} tabIndex={active === child.id ? 0 : -1} key={child.id}
       onClick={() => setSelected(child.id)} onKeyDown={event => {
         const index = nodes.findIndex(item => item.id === active);
         const next = event.key === "ArrowRight" ? (index + 1) % nodes.length : event.key === "ArrowLeft" ? (index + nodes.length - 1) % nodes.length : event.key === "Home" ? 0 : event.key === "End" ? nodes.length - 1 : -1;
         if (next >= 0) { event.preventDefault(); setSelected(nodes[next].id); event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("button")[next]?.focus(); }
-      }}>{child.icon && <AnswerIcon name={child.icon} />}{child.label || "内容"}</button>)}
+      }}><TabLabel child={child} /></button>)}
   </div>{nodes.map(child => <div key={child.id} role="tabpanel" id={`${domId}-${child.id}-panel`} aria-labelledby={`${domId}-${child.id}-tab`} hidden={active !== child.id}>{render(child)}</div>)}</div>;
 }
 
@@ -172,40 +188,48 @@ const NodeContent = memo(function NodeContent({ node, childrenByParent, scope }:
 }) {
   const onBlockExplain = useContext(BlockActionContext);
   const interrupted = useContext(InterruptedContext);
+  const boundText = useBoundText(node.type === "code" ? "" : node.text);
+  const nodeText = node.type === "code" ? node.text : boundText;
+  const nodeLabel = useBoundText(node.label);
+  const nodeCaption = useBoundText(node.caption);
+  const nodeAlt = useBoundText(node.alt);
   const children = childrenByParent.get(node.id) ?? [];
-  const render = (child: DocumentNode) => <div key={child.id} className="rich-doc__node" data-width={child.width}>
+  const render = (child: DocumentNode) => <div key={child.id} className="rich-doc__node" data-width={child.width}
+    data-weight={child.weight > 1 ? child.weight : undefined}
+    style={child.weight > 1 ? ({ "--rich-weight": child.weight } as CSSProperties) : undefined}>
     <NodeBoundary><NodeView node={child} childrenByParent={childrenByParent} scope={scope} /></NodeBoundary>
   </div>;
   const body = children.map(render);
-  if (node.state === "error") return <p role="alert">{node.label || node.alt || "此内容生成失败，请重试。"}</p>;
-  if (node.state === "pending" && !node.text && !body.length && !["feature_list", "step_list", "status_list", "icon"].includes(node.type)) return <p className={`rich-doc__resource rich-doc__resource--${node.type}`} role="status">{node.label || "正在准备内容…"}</p>;
+  if (node.state === "error") return <p role="alert">{nodeLabel || nodeAlt || "此内容生成失败，请重试。"}</p>;
+  if (node.state === "pending" && !nodeText && !body.length && !["feature_list", "step_list", "status_list", "icon"].includes(node.type)) return <p className={`rich-doc__resource rich-doc__resource--${node.type}`} role="status">{nodeLabel || "正在准备内容…"}</p>;
   switch (node.type) {
     case "feature_list": case "step_list": case "status_list":
       return <RailList node={node} items={children} interrupted={interrupted} renderText={text => <Markdown text={text} />} />;
-    case "icon": return <div className="rich-doc__standalone-icon" data-align={node.align}><AnswerIcon name={node.icon} size="large" label={node.alt || node.label} /></div>;
-    case "heading": return createElement(`h${node.level}`, {id: `${scope}-${node.id}`, tabIndex: -1}, node.icon && <AnswerIcon name={node.icon} />, node.text || node.label);
-    case "paragraph": case "list": return node.icon ? <div className="rich-doc__icon-copy"><AnswerIcon name={node.icon} /><div><Markdown text={node.text} /></div></div> : <Markdown text={node.text} />;
-    case "quote": return <blockquote><Markdown text={node.text} /></blockquote>;
+    case "icon": return <div className="rich-doc__standalone-icon" data-align={node.align}><AnswerIcon name={node.icon} size="large" label={nodeAlt || nodeLabel} /></div>;
+    case "heading": return createElement(`h${node.level}`, {id: `${scope}-${node.id}`, tabIndex: -1}, node.icon && <AnswerIcon name={node.icon} />, nodeText || nodeLabel);
+    case "paragraph": case "list": return node.icon ? <div className="rich-doc__icon-copy"><AnswerIcon name={node.icon} /><div><Markdown text={nodeText} /></div></div> : <Markdown text={nodeText} />;
+    case "quote": return <blockquote><Markdown text={nodeText} /></blockquote>;
     case "code": {
-      const fence = "`".repeat(Math.max(3, ...Array.from(node.text.matchAll(/`+/g), match => match[0].length + 1)));
-      return <Markdown text={`${fence}${node.language}\n${node.text}\n${fence}`} />;
+      const fence = "`".repeat(Math.max(3, ...Array.from(nodeText.matchAll(/`+/g), match => match[0].length + 1)));
+      return <Markdown text={`${fence}${node.language}\n${nodeText}\n${fence}`} />;
     }
-    case "math": return <Markdown text={mathMarkdown(node.text, node.inline)} />;
+    case "math": return <Markdown text={mathMarkdown(nodeText, node.inline)} />;
     case "divider": return <hr />;
     case "image": case "image_group": case "gallery": return <Images node={node} />;
     case "simulation": case "interactive": return <Simulation node={node} />;
     case "chart": case "table": case "graph": case "diagram": case "timeline": case "metric":
-      return node.visual ? <StreamUI embedded partId={`${scope}:${node.id}`} onAction={onBlockExplain ? action => onBlockExplain(node.id, action.payload) : undefined} data={{...node.visual, protocol: "suip/0.1", component: node.type === "diagram" ? "graph" : node.type, block_id: node.id, revision: 0, state: "completed"}} /> : <p role="status">{node.label || "等待数据填充…"}</p>;
+      return node.visual ? <StreamUI embedded partId={`${scope}:${node.id}`} onAction={onBlockExplain ? action => onBlockExplain(node.id, action.payload) : undefined} data={{...node.visual, protocol: "suip/0.1", component: node.type === "diagram" ? "graph" : node.type, block_id: node.id, revision: 0, state: "completed"}} /> : <p role="status">{nodeLabel || "等待数据填充…"}</p>;
     case "tabs": return <Tabs node={node} nodes={children} render={render} />;
     case "accordion": return <div className="rich-doc__stack">{children.map(child => <AccordionItem key={child.id} node={child}>{render(child)}</AccordionItem>)}</div>;
     case "figure": {
       const hasImage = (child: DocumentNode): boolean => ["image", "image_group", "gallery"].includes(child.type)
         || (childrenByParent.get(child.id) ?? []).some(hasImage);
-      return <figure>{body}{node.caption && !children.some(hasImage) && <figcaption>{node.caption}</figcaption>}</figure>;
+      return <figure data-image-variant={node.image_variant !== "default" ? node.image_variant : undefined}
+        data-fit={node.fit !== "contain" ? node.fit : undefined}>{body}{nodeCaption && !children.some(hasImage) && <figcaption>{nodeCaption}</figcaption>}</figure>;
     }
     default: return <section className={`rich-doc__layout rich-doc__${node.type}`} data-align={node.align} data-width={node.width}
       style={{ "--rich-columns": Math.min(node.columns, Math.max(1, children.filter(child => child.width !== "full").length)) } as CSSProperties}>
-      {node.label ? <h3 className="rich-doc__section-title">{node.icon && <AnswerIcon name={node.icon} />}{node.label}</h3> : node.icon && <AnswerIcon name={node.icon} />}{node.text && <Markdown text={node.text} />}{body}
+      {nodeLabel ? <h3 className="rich-doc__section-title">{node.icon && <AnswerIcon name={node.icon} />}{nodeLabel}</h3> : node.icon && <AnswerIcon name={node.icon} />}{nodeText && <Markdown text={nodeText} />}{body}
     </section>;
   }
 });
@@ -221,7 +245,8 @@ const NodeView = memo(function NodeView(props: {node: DocumentNode; childrenByPa
 
 export default function RichDocument({ snapshot, siblingParts, failed = false, settled = false, onBlockExplain }: { snapshot: UISnapshot; siblingParts?: MessagePart[]; failed?: boolean; settled?: boolean; onBlockExplain?: (blockId: string, payload: Record<string, unknown>) => void }) {
   const scope = useContext(StreamUIStateScope);
-  const blocks = useMemo(() => snapshot.blocks?.some(node => node.icon) ? snapshot.blocks : simplifyDocument(snapshot), [snapshot]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const blocks = useMemo(() => snapshot.blocks?.some(node => node.icon) ? snapshot.blocks : simplifyDocument(snapshot), [snapshot.blocks, snapshot.state, snapshot.preview]);
   const headings = blocks.filter(node => node.type === "heading" && node.state !== "pending");
   const childrenByParent = useMemo(() => {
     const result = new Map<string | null, DocumentNode[]>();
@@ -237,7 +262,9 @@ export default function RichDocument({ snapshot, siblingParts, failed = false, s
     {snapshot.props.icon && <AnswerIcon name={snapshot.props.icon} size="small" label={snapshot.props.title} />}
     {(snapshot.props.toc || snapshot.props.density === "editorial") && <DocumentTOC headings={headings} scope={scope} />}
     {snapshot.props.description && <p>{snapshot.props.description}</p>}
-    {roots.length ? roots.map(node => <div key={node.id} className="rich-doc__node" data-width={node.width}>
+    {roots.length ? roots.map(node => <div key={node.id} className="rich-doc__node" data-width={node.width}
+      data-weight={node.weight > 1 ? node.weight : undefined}
+      style={node.weight > 1 ? ({ "--rich-weight": node.weight } as CSSProperties) : undefined}>
       <NodeBoundary><NodeView node={node} scope={scope} childrenByParent={childrenByParent} /></NodeBoundary>
     </div>) :
     <p className="rich-doc__resource" role="status">{snapshot.state === "streaming" && !failed && !settled ? "正在组织内容…" : "暂无可显示的内容"}</p>}

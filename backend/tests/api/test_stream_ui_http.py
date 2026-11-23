@@ -113,6 +113,10 @@ def test_ui_stream_live_history_replay_actions_and_retry(client, register_user, 
     followup = client.post(f"/api/v1/sessions/{sid}/messages/stream", headers=headers,
                            json={"content": result.json()["prompt"], "ui_action": action, "agent_mode": True})
     assert followup.status_code == 200 and '"type": "message.completed"' in followup.text
+    # Zero-RTT path: client generates userMessage locally and submits directly to /messages/stream without calling /ui/actions first.
+    zero_rtt = client.post(f"/api/v1/sessions/{sid}/messages/stream", headers=headers,
+                           json={"content": "请解释图表「小明的参与事件」中的节点「小明」及其关联。", "ui_action": action, "agent_mode": True})
+    assert zero_rtt.status_code == 200 and '"type": "message.completed"' in zero_rtt.text
     current_input = provider.histories[-1]
     assert any('"selected_node_id": "p1"' in (message.content or "") for message in current_input)
     context_message = next(message.content for message in current_input if '"selected_node_id": "p1"' in (message.content or ""))

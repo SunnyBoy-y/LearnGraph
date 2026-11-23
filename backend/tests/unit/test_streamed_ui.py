@@ -92,3 +92,74 @@ def test_transport_failure_rolls_back_preview_and_raises():
     assert next(events).command["rollback"] is True
     with pytest.raises(RuntimeError, match="transport failed"):
         next(events)
+
+
+def test_progressive_keys_stream_label_caption_and_timeline_text_before_close():
+    long_step_label = "第一步规划阶段说明" * 20
+    long_rail_label = "配置环境与依赖安装" * 20
+    long_caption = "这是正在流式输出的图注" * 20
+    long_tl_label = "第一阶段启动里程碑" * 10
+    long_tl_desc = "完成核心架构设计与验证" * 20
+    # Document block label & caption stream while strings are still open
+    doc_cmd = {
+        "op": "mount",
+        "block_id": "doc_prog",
+        "component": "document",
+        "props": {"title": "进度文档"},
+        "upsert": {
+            "blocks": [
+                {"id": "steps", "type": "step_list", "label": long_step_label},
+                {"id": "s1", "parent_id": "steps", "type": "rail_item", "label": long_rail_label, "caption": "补充说明文字"},
+                {"id": "fig", "type": "figure", "caption": long_caption},
+            ]
+        },
+    }
+    raw = json.dumps(doc_cmd, ensure_ascii=False)
+    stream = UIArgumentStream()
+    seen = []
+    for ch in raw:
+        cmd = stream.feed(ch)
+        if cmd:
+            seen.append(compile_command(cmd))
+    assert not stream.disabled
+    assert any(
+        any(b.id == "steps" and 0 < len(b.label) < len(long_step_label) for b in s.blocks)
+        for s in seen
+    )
+    assert any(
+        any(b.id == "s1" and 0 < len(b.label) < len(long_rail_label) for b in s.blocks)
+        for s in seen
+    )
+    assert any(
+        any(b.id == "fig" and 0 < len(b.caption) < len(long_caption) for b in s.blocks)
+        for s in seen
+    )
+
+    # Timeline items stream label & description before item object closes
+    tl_cmd = {
+        "op": "mount",
+        "block_id": "tl_prog",
+        "component": "timeline",
+        "props": {"title": "时间线"},
+        "upsert": {
+            "items": [
+                {"id": "t1", "label": long_tl_label, "description": long_tl_desc},
+            ]
+        },
+    }
+    raw_tl = json.dumps(tl_cmd, ensure_ascii=False)
+    tl_stream = UIArgumentStream()
+    tl_seen = []
+    for ch in raw_tl:
+        cmd = tl_stream.feed(ch)
+        if cmd:
+            tl_seen.append(compile_command(cmd))
+    assert not tl_stream.disabled
+    assert any(
+        s.items and 0 < len(s.items[0].label) < len(long_tl_label)
+        for s in tl_seen
+    )
+    assert any(
+        s.items and 0 < len(s.items[0].description) < len(long_tl_desc)
+        for s in tl_seen
+    )

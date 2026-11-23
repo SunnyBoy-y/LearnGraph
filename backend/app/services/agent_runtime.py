@@ -3280,20 +3280,14 @@ class AgentToolRuntime:
             default_budget = 4000 if name in {"sandbox_exec", "sandbox_bash", "sandbox_get_job"} else AGENT_TOOL_RESULT_MAX_BYTES // 4
             self._result_max_bytes = min(AGENT_TOOL_RESULT_MAX_BYTES, max(4096, int(arguments.get("max_output_tokens", default_budget)) * 4))
             if name == "ui_stream":
-                from app.services.stream_ui import prepare_command
+                from app.services.stream_ui import run_ui_tool
                 if not assistant_message_id or not assistant_version_id:
                     raise AppError(422, "ui_message_required", "UI streaming requires an assistant message")
-                update = prepare_command(
+                output, meta = run_ui_tool(
                     self.extensions.db, self.workspace_id, chat_session_id,
                     assistant_message_id, assistant_version_id, arguments,
                 )
-                snapshot = update["snapshot"]
-                return self._success(
-                    {"block_id": snapshot["block_id"], "revision": snapshot["revision"],
-                     "state": snapshot["state"],
-                     "reference": f"[[artifact:block_id:{snapshot['block_id']}]]"},
-                    {"tool": name, "ui_stream": update}, [],
-                )
+                return self._success(output, {"tool": name, **meta}, [])
             if name == "search_session_fragments":
                 if self.session_retrieval is None:
                     return self._failure(

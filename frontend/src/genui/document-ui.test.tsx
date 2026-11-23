@@ -18,7 +18,7 @@ describe("document native UI", () => {
     fireEvent.click(await screen.findByRole("button", {name: "柱状", exact: true}));
     fireEvent.click(screen.getByRole("button", {name: "让 AI 解释", exact: true}));
     expect(onAction).toHaveBeenCalledWith(expect.objectContaining({componentId: "parent-report", event: "document.block.explain",
-      payload: expect.objectContaining({revision: 7, block_id: "trend", view_state: expect.objectContaining({mode: "bar"})})}));
+      payload: expect.objectContaining({revision: 7, block_id: "trend", userMessage: "请解释图表「增长」，分析其中的主要信息。", view_state: expect.objectContaining({mode: "bar"})})}));
   });
   it("does not replay uncommitted numbers from an older persisted preview", () => {
     const {rerender} = render(<StreamUI partId="numeric-preview" data={{...chart, state: "streaming", preview: {tool_call_id: "pending", sequence: 1, base: null}}} />);

@@ -159,10 +159,17 @@ def test_svg_is_requested_only_after_search_failure(client, register_user, auth_
                  "upsert": {"blocks": [{**image, "fallback_svg": svg}]}},
                 {"op": "complete", "block_id": "on_demand", "base_revision": 1},
             ]
+            if self.step == 2:
+                assert json.loads(messages[-1].content)["resources"] == [
+                    {"id": "pic", "state": "unavailable", "reason": "disabled", "has_fallback_svg": False},
+                ]
             if self.step == 3:
                 result = json.loads(messages[-1].content)
-                assert "ui_fallback_needed" in json.dumps(result)
-                assert "on_demand" in json.dumps(result)
+                assert result["error"] == "ui_fallback_needed"
+                assert result["details"]["block_id"] == "on_demand"
+                assert result["details"]["blocks"][0]["resource_reason"] == "disabled"
+            if self.step == 4:
+                assert json.loads(messages[-1].content)["resources"][0]["has_fallback_svg"] is True
             if self.step <= 4:
                 yield ProviderStreamEvent("tool_calls", tool_calls=[{"id": str(self.step), "type": "function",
                     "function": {"name": "ui_stream", "arguments": json.dumps(commands[self.step - 1])}}])

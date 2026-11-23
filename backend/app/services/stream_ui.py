@@ -1,6 +1,8 @@
 """Compile validated model commands to snapshots carried by existing part SSE events."""
 from __future__ import annotations
 
+from collections import Counter
+from copy import deepcopy
 import json
 
 from pydantic import ValidationError
@@ -8,9 +10,133 @@ from sqlalchemy import select
 
 from app.core.errors import AppError
 from app.domain.models import ChatSession, Message, MessagePartRecord, MessageVersion
-from app.domain.schemas.stream_ui import Command, Props, Snapshot, UIAction
+from app.domain.schemas.stream_ui import (
+    Command,
+    DATA_TEMPLATE_RE,
+    LAYOUT_TYPES,
+    MAX_CHART_ABS_VALUE,
+    MAX_CONTAINER_CHILDREN,
+    MAX_DOCUMENT_DEPTH,
+    MAX_DOCUMENT_NODES,
+    MAX_RAIL_CHILDREN,
+    Props,
+    container_child_limit,
+    Snapshot,
+    UIAction,
+    is_data_binding,
+    parse_data_path,
+    resolve_data_path,
+    validate_data_model,
+)
 
 MAX_UI_BYTES = 192_000
+MAX_UI_BLOCKS = 20
+IMAGE_NODE_TYPES = {"image", "image_group", "gallery"}
+
+
+def stream_ui_constraints() -> dict:
+    return {
+        "max_command_bytes": MAX_UI_BYTES,
+        "max_snapshot_bytes": MAX_UI_BYTES,
+        "max_blocks_per_message": MAX_UI_BLOCKS,
+        "document": {
+            "max_nodes": MAX_DOCUMENT_NODES,
+            "max_depth": MAX_DOCUMENT_DEPTH,
+            "max_children_per_container": MAX_CONTAINER_CHILDREN,
+            "max_children_per_rail": MAX_RAIL_CHILDREN,
+            "layout_types": sorted(LAYOUT_TYPES),
+        },
+        "chart": {"value_type": "finite JSON number or @/path data binding", "max_abs_value": MAX_CHART_ABS_VALUE},
+    }
+
+
+def check_command_size(raw: dict) -> None:
+    try:
+        size = len(json.dumps(raw, allow_nan=False, ensure_ascii=False).encode())
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise AppError(422, "ui_serialization_invalid", "UI command must be serializable as finite UTF-8 JSON") from exc
+    if size > MAX_UI_BYTES:
+        raise AppError(422, "ui_payload_too_large", "UI command exceeds the byte limit",
+                       {"actual_bytes": size, "limit_bytes": MAX_UI_BYTES, "stage": "command"})
+
+
+def schema_error(exc: ValidationError, stage: str, raw: dict) -> AppError:
+    errors = exc.errors(include_input=False, include_url=False)
+    issues = []
+    for error in errors[:24]:
+        loc = error["loc"]
+        path = "".join(f"[{part}]" if isinstance(part, int) else ("." if index else "") + part[:100]
+                       for index, part in enumerate(loc))
+        detail = error.get("ctx", {}).get("error")
+        issue = {"path": path or None, "code": getattr(detail, "code", error["type"]),
+                 "message": (str(detail) if detail else error["msg"])[:240], **getattr(detail, "details", {})}
+        if loc[:2] == ("upsert", "blocks") and len(loc) > 2 and isinstance(loc[2], int):
+            node = raw["upsert"]["blocks"][loc[2]]
+            if isinstance(node, dict) and isinstance(node.get("id"), str):
+                issue["node_id"] = node["id"][:100]
+        issues.append(issue)
+    first = issues[0]
+    code = ("ui_container_limit" if any(issue["code"] == "ui_container_limit" for issue in issues)
+            else "ui_schema_invalid")
+    return AppError(422, code, first["message"],
+                   {"stage": stage, "issues": issues, "issue_count": len(errors)})
+
+
+def parse_command(raw: dict, *, check_size: bool = True) -> Command:
+    if check_size:
+        check_command_size(raw)
+    try:
+        return Command.model_validate(raw)
+    except ValidationError as exc:
+        raise schema_error(exc, "command", raw) from exc
+
+
+def merge_data_model(base: dict, patch: dict, delete_paths: list[str] | tuple[str, ...] = ()) -> dict:
+    def _deep_merge(target: dict, updates: dict) -> dict:
+        out = deepcopy(target)
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(out.get(key), dict):
+                out[key] = _deep_merge(out[key], value)
+            else:
+                out[key] = deepcopy(value)
+        return out
+
+    merged = _deep_merge(base or {}, patch or {})
+    for path in delete_paths:
+        parts = parse_data_path(path)
+        if not parts:
+            raise ValueError("Invalid data path in delete_paths")
+        cursor: object = merged
+        for part in parts[:-1]:
+            if isinstance(cursor, dict) and part in cursor:
+                cursor = cursor[part]
+            elif isinstance(cursor, list) and part.isdigit() and 0 <= int(part) < len(cursor):
+                cursor = cursor[int(part)]
+            else:
+                cursor = None
+                break
+        leaf = parts[-1]
+        if isinstance(cursor, dict):
+            cursor.pop(leaf, None)
+        elif isinstance(cursor, list) and leaf.isdigit() and 0 <= int(leaf) < len(cursor):
+            cursor.pop(int(leaf))
+    return validate_data_model(merged)
+
+
+def _resolve_binding_value(value: object, data_model: dict[str, object]):
+    if not data_model or not isinstance(value, str):
+        return value
+    if is_data_binding(value):
+        found, resolved = resolve_data_path(data_model, value)
+        return resolved if found else value
+    if "@{" in value:
+        def _sub(match):
+            found, resolved = resolve_data_path(data_model, "@" + match.group(1))
+            if not found or resolved is None:
+                return ""
+            return str(resolved)
+        return DATA_TEMPLATE_RE.sub(_sub, value)
+    return value
 
 
 def merge_resource_results(prepared: Snapshot, current: dict, published: dict | None = None) -> Snapshot:
@@ -39,8 +165,7 @@ def compile_command(raw: dict, current: dict | None = None) -> Snapshot:
     try:
         if current and current.get("preview"):
             current = current["preview"]["base"]
-        if len(json.dumps(raw, allow_nan=False, ensure_ascii=False).encode()) > MAX_UI_BYTES:
-            raise ValueError("UI command too large")
+        check_command_size(raw)
         # Same-subject updates need not resend a potentially large drawing.
         # Reuse only a server-saved SVG, before normal command/security checks;
         # Drawings are optional and can be supplied after a search failure.
@@ -57,13 +182,15 @@ def compile_command(raw: dict, current: dict | None = None) -> Snapshot:
                     node = {**node, "fallback_svg": old["fallback_svg"]}
                 blocks.append(node)
             raw = {**raw, "upsert": {**raw["upsert"], "blocks": blocks}}
-        command = Command.model_validate(raw)
+        command = parse_command(raw, check_size=False)
         if command.op == "mount":
             if current is not None:
                 raise AppError(409, "ui_block_exists", "Block already exists; use patch")
             result = Snapshot.model_validate({
                 "block_id": command.block_id, "component": command.component,
-                "props": command.props, **command.upsert.model_dump(),
+                "props": command.props, "data_model": command.data_model,
+                "checks": [rule.model_dump() for rule in command.checks],
+                **command.upsert.model_dump(),
                 "blocks": [{**node.model_dump(), "revision": 0} for node in command.upsert.blocks],
             })
         else:
@@ -89,7 +216,26 @@ def compile_command(raw: dict, current: dict | None = None) -> Snapshot:
                          "revision": entry["revision"] + 1}
                         if entry["state"] in {"pending", "streaming"} else entry for entry in data["blocks"]
                     ]
+            elif command.op == "data":
+                data["data_model"] = merge_data_model(
+                    data.get("data_model", {}),
+                    command.data_model,
+                    command.delete_paths,
+                )
             else:
+                if command.data_model or command.delete_paths:
+                    data["data_model"] = merge_data_model(
+                        data.get("data_model", {}),
+                        command.data_model,
+                        command.delete_paths,
+                    )
+                if command.checks:
+                    existing_checks = {entry["id"]: entry for entry in data.get("checks", [])}
+                    for rule in command.checks:
+                        existing_checks[rule.id] = rule.model_dump()
+                    if len(existing_checks) > 40:
+                        raise ValueError("Too many check rules")
+                    data["checks"] = list(existing_checks.values())
                 data["props"] = {**data["props"], **command.props}
                 for key in ("rows", "nodes", "edges", "items", "blocks"):
                     incoming = getattr(command.upsert, key)
@@ -116,11 +262,15 @@ def compile_command(raw: dict, current: dict | None = None) -> Snapshot:
                 data["edges"] = [entry for entry in data["edges"]
                                  if entry["source"] not in removed and entry["target"] not in removed]
             result = Snapshot.model_validate(data)
-        if len(result.model_dump_json().encode()) > MAX_UI_BYTES:
-            raise ValueError("UI snapshot too large")
+        size = len(result.model_dump_json().encode())
+        if size > MAX_UI_BYTES:
+            raise AppError(422, "ui_payload_too_large", "UI snapshot exceeds the byte limit",
+                           {"actual_bytes": size, "limit_bytes": MAX_UI_BYTES, "stage": "snapshot"})
         return result
-    except (ValidationError, ValueError, TypeError, RecursionError) as exc:
-        raise AppError(422, "invalid_ui_command", str(exc)[:1500]) from exc
+    except ValidationError as exc:
+        raise schema_error(exc, "snapshot", raw) from exc
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise AppError(422, "ui_schema_invalid", str(exc)[:240]) from exc
 
 
 def find_block(db, workspace_id: str, version_id: str, block_id: str):
@@ -131,7 +281,7 @@ def find_block(db, workspace_id: str, version_id: str, block_id: str):
     )) if part.data.get("block_id") == block_id), None)
 
 
-def prepare_command(db, workspace_id: str, session_id: str, message_id: str, version_id: str, raw: dict):
+def _active_ui_version(db, workspace_id: str, session_id: str, message_id: str, version_id: str):
     version = db.scalar(select(MessageVersion).join(Message, Message.id == MessageVersion.message_id).where(
         MessageVersion.id == version_id, MessageVersion.workspace_id == workspace_id,
         Message.id == message_id, Message.workspace_id == workspace_id, Message.session_id == session_id,
@@ -139,6 +289,23 @@ def prepare_command(db, workspace_id: str, session_id: str, message_id: str, ver
     ))
     if version is None:
         raise AppError(404, "ui_message_not_found", "Active assistant message not found")
+
+
+def _completed_ui_block(db, workspace_id, session_id, version_id, block_id):
+    return next((item for item in db.scalars(select(MessagePartRecord).join(
+        MessageVersion, MessageVersion.id == MessagePartRecord.message_version_id,
+    ).join(Message, Message.id == MessageVersion.message_id).where(
+        Message.workspace_id == workspace_id, Message.session_id == session_id, Message.role == "assistant",
+        MessageVersion.workspace_id == workspace_id, MessageVersion.version == Message.version,
+        MessagePartRecord.workspace_id == workspace_id, MessagePartRecord.part_type == "ui",
+        MessagePartRecord.status == "completed", MessageVersion.id != version_id,
+        Message.status.in_(["completed", "interrupted", "failed", "cancelled"]),
+    ).order_by(Message.created_at.desc(), MessagePartRecord.ordinal.desc()))
+        if (item.data or {}).get("block_id") == block_id), None)
+
+
+def prepare_command(db, workspace_id: str, session_id: str, message_id: str, version_id: str, raw: dict):
+    _active_ui_version(db, workspace_id, session_id, message_id, version_id)
     part = find_block(db, workspace_id, version_id, raw.get("block_id"))
     previous = None
     session = db.get(ChatSession, session_id)
@@ -147,16 +314,7 @@ def prepare_command(db, workspace_id: str, session_id: str, message_id: str, ver
             raise AppError(409, "ui_revision_conflict", "Use patch for the block already present in this answer")
         # A new answer carries a revised projection of the selected historical
         # block. Historical messages stay immutable and remain replayable.
-        previous = next((item for item in db.scalars(select(MessagePartRecord).join(
-            MessageVersion, MessageVersion.id == MessagePartRecord.message_version_id,
-        ).join(Message, Message.id == MessageVersion.message_id).where(
-            Message.workspace_id == workspace_id, Message.session_id == session_id, Message.role == "assistant",
-            MessageVersion.workspace_id == workspace_id, MessageVersion.version == Message.version,
-            MessagePartRecord.workspace_id == workspace_id, MessagePartRecord.part_type == "ui",
-            MessagePartRecord.status == "completed", MessageVersion.id != version_id,
-            Message.status.in_(["completed", "interrupted", "failed", "cancelled"]),
-        ).order_by(Message.created_at.desc(), MessagePartRecord.ordinal.desc()))
-            if (item.data or {}).get("block_id") == raw.get("block_id")), None)
+        previous = _completed_ui_block(db, workspace_id, session_id, version_id, raw.get("block_id"))
         if previous is None or (previous.data or {}).get("state") != "completed":
             raise AppError(404, "ui_block_not_found", "Completed block not found in this conversation")
     if previous is None and part is None and raw.get("op") != "mount" and session and session.session_kind == "agent":
@@ -174,8 +332,9 @@ def prepare_command(db, workspace_id: str, session_id: str, message_id: str, ver
             MessagePartRecord.workspace_id == workspace_id,
             MessagePartRecord.message_version_id == version_id, MessagePartRecord.part_type == "ui",
         ))))
-        if count >= 20 and part is None:
-            raise AppError(422, "ui_block_limit", "At most 20 UI blocks per message")
+        if count >= MAX_UI_BLOCKS and part is None:
+            raise AppError(422, "ui_block_limit", f"At most {MAX_UI_BLOCKS} UI blocks per message",
+                           {"count": count, "limit": MAX_UI_BLOCKS})
     from app.services.genui_sources import resolve_command_sources
     current = part.data if part else previous.data if previous else None
     raw = resolve_command_sources(db, workspace_id, session_id, raw, current)
@@ -189,9 +348,74 @@ def prepare_command(db, workspace_id: str, session_id: str, message_id: str, ver
             "You may also finish with a plain explanation; the server will close the block automatically.",
             {"block_id": snapshot.block_id, "revision": raw.get("base_revision", 0),
              "blocks": [{key: node.model_dump()[key] for key in
-                         ("id", "parent_id", "type", "query", "query_alternatives", "alt", "caption")}
+                         ("id", "parent_id", "type", "query", "query_alternatives", "alt", "caption",
+                          "resource_state", "resource_reason")}
                         for node in failed_images[:8]]})
     return {"op": raw["op"], "part_id": part.id if part else None, "snapshot": snapshot.model_dump(mode="json")}
+
+
+def ui_resources(snapshot: dict) -> list[dict]:
+    return [{"id": node["id"], "state": node["resource_state"],
+             "reason": node["resource_reason"], "has_fallback_svg": bool(node.get("fallback_svg"))}
+            for node in snapshot["blocks"] if node["type"] in IMAGE_NODE_TYPES]
+
+
+def _ui_summary(snapshot: dict) -> dict:
+    result = {key: snapshot[key] for key in ("block_id", "revision", "resource_revision", "state")}
+    if snapshot["component"] == "document":
+        count = len(snapshot["blocks"])
+        root_children = sum(node["parent_id"] is None for node in snapshot["blocks"])
+        result["document_capacity"] = {"remaining_nodes": MAX_DOCUMENT_NODES - count,
+                                       "remaining_root_children": MAX_CONTAINER_CHILDREN - root_children}
+        result["resources"] = ui_resources(snapshot)
+    return result
+
+
+def inspect_block(db, workspace_id, session_id, message_id, version_id, raw):
+    check_command_size(raw)
+    if set(raw) != {"op", "block_id"}:
+        raise AppError(422, "ui_schema_invalid", "Inspect accepts only op and block_id")
+    # Reuse the canonical identifier validation without admitting mutation fields.
+    block_id = parse_command({"op": "complete", "block_id": raw["block_id"]}).block_id
+    _active_ui_version(db, workspace_id, session_id, message_id, version_id)
+    part = find_block(db, workspace_id, version_id, block_id)
+    snapshot = part.data if part else None
+    if snapshot and snapshot.get("preview"):
+        snapshot = snapshot["preview"]["base"]
+    if snapshot is None:
+        previous = _completed_ui_block(db, workspace_id, session_id, version_id, block_id)
+        if previous and previous.data.get("state") == "completed":
+            snapshot = previous.data
+    if snapshot is None:
+        raise AppError(404, "ui_block_not_found", "Committed block not found in this conversation")
+    result = {**_ui_summary(snapshot), "component": snapshot["component"]}
+    if snapshot["component"] == "document":
+        blocks = snapshot["blocks"]
+        counts = Counter(node["parent_id"] for node in blocks)
+        result["nodes"] = [{key: node[key] for key in ("id", "parent_id", "type")} for node in blocks]
+        containers = [(None, None)] + [(node["id"], node["type"]) for node in blocks if node["type"] in LAYOUT_TYPES]
+        result["containers"] = [{"id": node_id, "child_count": counts[node_id],
+                                 "remaining_children": container_child_limit(kind) - counts[node_id]}
+                                for node_id, kind in containers]
+    return result
+
+
+def run_ui_tool(db, workspace_id, session_id, message_id, version_id, raw):
+    """Prepare tool output and optional write metadata. Read-only ops never emit UI parts."""
+    if raw.get("op") == "inspect":
+        return inspect_block(db, workspace_id, session_id, message_id, version_id, raw), {}
+    validate = raw.get("op") == "validate"
+    if validate:
+        if set(raw) != {"op", "command"} or not isinstance(raw["command"], dict):
+            raise AppError(422, "ui_schema_invalid", "Validate accepts only op and a mutation command object")
+        raw = raw["command"]
+    update = prepare_command(db, workspace_id, session_id, message_id, version_id, raw)
+    summary = _ui_summary(update["snapshot"])
+    if validate:
+        summary["proposed_revision"] = summary.pop("revision")
+        return {"valid": True, **summary}, {}
+    summary["reference"] = f"[[artifact:block_id:{summary['block_id']}]]"
+    return summary, {"ui_stream": update}
 
 
 def prepare_preview(db, workspace_id, session_id, message_id, version_id, envelope):
@@ -263,8 +487,13 @@ def action_prompt(db, workspace_id: str, session_id: str, action: UIAction, *, d
         block = next((block for block in snapshot.blocks if block.id == action.block_id), None)
         if snapshot.component != "document" or block is None or block.visual is None or block.state != "completed":
             raise AppError(422, "ui_invalid_action", "Visual block does not belong to this completed document")
-        snapshot = Snapshot.model_validate({**block.visual, "block_id": block.id,
-            "component": "graph" if block.type == "diagram" else block.type, "state": "completed"})
+        snapshot = Snapshot.model_validate({
+            "data_model": snapshot.data_model,
+            **block.visual,
+            "block_id": block.id,
+            "component": "graph" if block.type == "diagram" else block.type,
+            "state": "completed",
+        })
     selected_graph_node = action.action == "graph.node.explain" or (action.action == "document.block.explain" and action.node_id is not None)
     target = snapshot.props.title
     if selected_graph_node:
@@ -282,6 +511,22 @@ def action_prompt(db, workspace_id: str, session_id: str, action: UIAction, *, d
     # Stay within normal chat's 50k character limit even for a large block.
     # Selected graph nodes and their neighborhood take priority over unrelated data.
     data = context["snapshot"]
+    dm = snapshot.data_model
+    if dm:
+        for row_item in data.get("rows", []):
+            row_item["label"] = _resolve_binding_value(row_item.get("label"), dm)
+            row_item["values"] = {k: _resolve_binding_value(v, dm) for k, v in row_item.get("values", {}).items()}
+        for item_entry in data.get("items", []):
+            for field in ("label", "value", "description", "date"):
+                item_entry[field] = _resolve_binding_value(item_entry.get(field), dm)
+        for node_entry in data.get("nodes", []):
+            for field in ("label", "description"):
+                node_entry[field] = _resolve_binding_value(node_entry.get(field), dm)
+        for block_entry in data.get("blocks", []):
+            if block_entry.get("type") != "code":
+                block_entry["text"] = _resolve_binding_value(block_entry.get("text"), dm)
+            for field in ("label", "caption", "alt"):
+                block_entry[field] = _resolve_binding_value(block_entry.get(field), dm)
     context["total_counts"] = {key: len(data[key]) for key in ("rows", "nodes", "edges", "items", "blocks")}
     view = action.view_state
     if snapshot.component == "chart" and view:
@@ -354,6 +599,11 @@ def tool_definitions() -> list[dict]:
     }
     node_properties["visual"] = {"anyOf": [{"$ref": "#/$defs/EmbeddedVisual"}, {"type": "null"}],
                                   "description": "Component props and data must be nested here, never directly on a document node. Metric uses items, chart/table use rows.", "default": None}
+    schema["$defs"]["UIMutation"] = {key: deepcopy(schema[key]) for key in
+                                    ("type", "properties", "required", "additionalProperties")}
+    schema["properties"]["op"]["enum"] += ["inspect", "validate"]
+    schema["properties"]["command"] = {"$ref": "#/$defs/UIMutation", "description": "Mutation to dry-run, only for op=validate."}
+    schema["required"] = ["op"]
     return [{"type": "function", "function": {
         "name": "ui_stream", "description": (
             "Stream native interactive chart/graph/timeline/table/metric or composable document blocks among your text. "
@@ -371,7 +621,7 @@ def tool_definitions() -> list[dict]:
             "Microsoft 3D icons are bundled same-origin: no web/image search or image node is needed. "
             "In ordinary Markdown write inline emoji as normal Unicode (e.g. 🚀 💡 🧠); the frontend converts recognized emoji. Do not write fluent:slug as prose. "
             "Feature lists are parallel concepts, step lists are ordered instructions, status lists require actual provided execution states. "
-            "Nodes use text,label,caption,alt,level=2..6,columns=1..3,language,align=start|center|end,width=reading|full. "
+            "Nodes use text,label,caption,alt,level=2..6,columns=1..3,language,align=start|center|end,width=reading|full,weight=1..6,image_variant=default|hero|thumbnail|compact|wide,fit=contain|cover|scale-down. "
             "Choose layout by content: root/section/stack stay vertical; explicitly group parallel content in row/columns/grid/media_text and choose columns. "
             "The frontend only wraps to fit available width and fills unused row space; it never automatically pairs adjacent widgets. width=full spans a row. "
             "Image nodes declare a short query and up to two query_alternatives preserving the same subject and stage (never URL); server tries alternatives on failure. Search requires web enabled and configured. "
@@ -386,11 +636,21 @@ def tool_definitions() -> list[dict]:
             "Set props.background=auto|paper|warm|cool|dark on mount to choose the graph canvas background, including during streaming. "
             "Math nodes use bare TeX in text without $, $$, \\( or \\[ delimiters. JSON strings use normal JSON escaping, not double-escaped layout newlines. "
             "simulation/interactive use registered engine=chase|quadratic|sort_steps and optional values:number[]. "
-            "Use local sliders/steps, never scripts, formulas as code, HTML or CSS. Tree depth <=6, total <=160, siblings <=40. "
+            "Use local sliders/steps, never scripts, formulas as code, HTML or CSS. "
+            f"Document depth <= {MAX_DOCUMENT_DEPTH} parent links, total nodes <= {MAX_DOCUMENT_NODES}, "
+            f"root/ordinary container children <= {MAX_CONTAINER_CHILDREN}, rail children <= {MAX_RAIL_CHILDREN}. "
+            "Use a layout node, such as section, as a parent; heading is a leaf. Include type in every upserted node. "
+            "For a larger document, group related nodes under explicit sections before filling the root. "
+            "Every operation except validate requires block_id. Use op=inspect with block_id to read the committed tree, "
+            "revision, image status, and remaining capacity. Use op=validate with command={...mutation...} for a dry run. "
+            "Dry runs never publish and report diagnostics from the first failing validation stage. "
+            "Check resources in mount/patch/inspect results. If a photo is pending, keep writing without drawing a backup. "
+            "If state=unavailable, reason explains why (e.g. disabled or no_results). Add an SVG only if an illustration helps. "
             "Use ordinary Markdown for simple answers; compose only when it helps explain. "
             "Start writing useful content immediately in a mount; its arguments are previewed as they arrive. Do not plan or rehearse the entire page or SVG coordinates before calling. "
             "Emit blocks in reading order, parent before child, using short stable ids. Prefer a small useful first section to a fully planned page. "
             "Use patch with base_revision from the last result for later additions, then complete. No empty mount is required. "
+            "For separate data updates, declare data_model on mount/patch and bind fields with @/path (or @{/path} inside text), then use op=data with base_revision, data_model, and optional delete_paths to update only bound values without resending structure. "
             "To edit a completed block from an earlier answer in this same conversation, use revise with its block_id and last base_revision, then complete. "
             "Revise copies only that block into this answer and preserves the original history. Omit component on revise. "
             "component is mount-only; complete takes only op, block_id and base_revision, with no component, props or upsert. "

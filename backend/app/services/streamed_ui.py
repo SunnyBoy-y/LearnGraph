@@ -7,6 +7,10 @@ import json
 from app.services.stream_ui import MAX_UI_BYTES
 
 
+PROGRESSIVE_BLOCK_KEYS = ("text", "label", "caption")
+PROGRESSIVE_ITEM_KEYS = ("label", "description")
+
+
 class UIArgumentStream:
     """A bounded JSON lexer. Only completed fields and inert text are exposed.
 
@@ -132,6 +136,29 @@ class UIArgumentStream:
             self.disabled = True
             return None
 
+    def _decode_partial_string(self):
+        # Withhold an incomplete escape/surrogate suffix while retaining the
+        # longest decodable prefix of the string.
+        for trim in range(min(13, len(self.token) + 1)):
+            try:
+                text = json.loads('"' + (self.token[:-trim] if trim else self.token) + '"')
+                text.encode("utf-8")
+                return text
+            except (ValueError, UnicodeError):
+                continue
+        return None
+
+    def _apply_progressive_keys(self, target: dict, path: tuple, keys: tuple[str, ...]):
+        if not (self.string and not self.key_string):
+            return
+        current_path = self._path()
+        for key in keys:
+            if current_path == path + (key,):
+                decoded = self._decode_partial_string()
+                if decoded is not None:
+                    target[key] = decoded
+                return
+
     def _preview(self):
         raw = self.root
         if not isinstance(raw, dict) or raw.get("op") not in {"mount", "patch"}:
@@ -157,24 +184,25 @@ class UIArgumentStream:
                     count += 1
                 elif collection == "blocks" and isinstance(value, dict):
                     node = {key: item for key, item in value.items() if path + (key,) in self.complete}
-                    if self.string and not self.key_string and self._path() == path + ("text",):
-                        # Withhold an incomplete escape/surrogate suffix while
-                        # retaining the longest decodable prefix of the text.
-                        for trim in range(min(13, len(self.token) + 1)):
-                            try:
-                                text = json.loads('"' + (self.token[:-trim] if trim else self.token) + '"')
-                                text.encode("utf-8")
-                                node["text"] = text
-                                break
-                            except (ValueError, UnicodeError):
-                                continue
-                    if ("id" in node and node.get("type") in {"paragraph", "heading", "list", "quote", "code", "math", "rail_item"}
-                            and (node.get("type") != "rail_item" or (node.get("parent_id") and str(node.get("label", "")).strip()))):
+                    self._apply_progressive_keys(node, path, PROGRESSIVE_BLOCK_KEYS)
+                    node_type = node.get("type")
+                    if ("id" in node and node_type in {"paragraph", "heading", "list", "quote", "code", "math", "rail_item"}
+                            and (node_type != "rail_item" or (node.get("parent_id") and str(node.get("label", "")).strip()))):
                         node["state"] = "streaming"
                         entries.append(node)
-                    elif "id" in node and node.get("type") in {"chart", "metric", "table", "graph", "diagram", "timeline"}:
+                    elif ("id" in node and node_type in {"section", "stack", "row", "columns", "grid", "media_text",
+                                                        "tabs", "accordion", "figure", "feature_list", "step_list", "status_list"}
+                            and any(str(node.get(key, "")).strip() for key in ("label", "caption", "text"))):
+                        node["state"] = "streaming"
+                        entries.append(node)
+                    elif "id" in node and node_type in {"chart", "metric", "table", "graph", "diagram", "timeline"}:
                         # Establish a stable slot before the data object closes.
                         entries.append({key: node[key] for key in ("id", "parent_id", "type", "label") if key in node} | {"state": "pending"})
+                elif collection == "items" and isinstance(value, dict) and raw.get("component") != "metric":
+                    item = {key: entry for key, entry in value.items() if path + (key,) in self.complete}
+                    self._apply_progressive_keys(item, path, PROGRESSIVE_ITEM_KEYS)
+                    if "id" in item and str(item.get("label", "")).strip():
+                        entries.append(item)
             if entries:
                 command["upsert"][collection] = entries
         # Bound persistence/SSE volume for token-sized chunks, but publish each

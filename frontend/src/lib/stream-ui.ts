@@ -1,6 +1,34 @@
 import { z } from "zod";
 import { parseIllustrationSvg } from "./safe-illustration";
+import { isDataBinding, parseDataPath, readDataPath } from "./data-model-store";
 import { railIconSchema, railTypes } from "@/genui/rail-list-schema";
+
+const RESERVED_DATA_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
+function isValidDataModel(data: unknown): boolean {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  let nodes = 0;
+  const walk = (value: unknown, depth: number): boolean => {
+    nodes += 1;
+    if (nodes > 1000 || depth > 8) return false;
+    if (value === null || typeof value === "boolean") return true;
+    if (typeof value === "number") return Number.isFinite(value) && Math.abs(value) <= 1e15;
+    if (typeof value === "string") return value.length <= 16000;
+    if (Array.isArray(value)) {
+      if (value.length > 500) return false;
+      return value.every((item) => walk(item, depth + 1));
+    }
+    if (typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>);
+      if (entries.length > 200) return false;
+      return entries.every(
+        ([k, v]) => k.length > 0 && k.length <= 100 && !RESERVED_DATA_KEYS.has(k) && walk(v, depth + 1),
+      );
+    }
+    return false;
+  };
+  return walk(data, 0);
+}
 
 const id = z
   .string()
@@ -77,6 +105,9 @@ export const documentNodeSchema = z.object({
   text: z.string().max(16000).default(""), label: z.string().max(240).default(""),
   level: z.number().int().min(2).max(6).default(3), columns: z.number().int().min(1).max(3).default(2),
   align: z.enum(["start", "center", "end"]).default("start"), width: z.enum(["reading", "full"]).default("reading"),
+  weight: z.number().int().min(1).max(6).default(1),
+  image_variant: z.enum(["default", "hero", "thumbnail", "compact", "wide"]).default("default"),
+  fit: z.enum(["contain", "cover", "scale-down"]).default("contain"),
   language: z.string().max(40).regex(/^[a-zA-Z0-9_+#.-]*$/).default(""),
   query: z.string().max(500).default(""), alt: z.string().max(500).default(""), caption: z.string().max(1000).default(""),
   query_alternatives: z.array(z.string().min(1).max(150)).max(2).default([]),
@@ -94,9 +125,29 @@ export const documentNodeSchema = z.object({
 }).strict().superRefine((node, ctx) => {
   if (node.type === "icon" && node.icon == null) ctx.addIssue({code: "custom", message: "Standalone icon nodes require an icon"});
   if (node.type !== "rail_item" && node.item_status != null) ctx.addIssue({code: "custom", message: "item_status belongs to rail items"});
+  if (node.image_variant !== "default" && !["image", "image_group", "gallery", "figure"].includes(node.type)) {
+    ctx.addIssue({code: "custom", message: "image_variant belongs to image or figure nodes"});
+  }
+  if (node.fit !== "contain" && !["image", "image_group", "gallery", "figure"].includes(node.type)) {
+    ctx.addIssue({code: "custom", message: "fit belongs to image or figure nodes"});
+  }
 });
 export type DocumentNode = z.infer<typeof documentNodeSchema>;
 const layoutTypes = new Set(["section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure", ...railTypes]);
+
+const checkRuleSchema = z.object({
+  id,
+  fn: z.enum([
+    "required", "non_empty", "min_length", "max_length",
+    "min_value", "max_value", "range", "one_of",
+    "gt", "gte", "lt", "lte", "eq", "ne", "is_finite_number",
+  ]),
+  path: z.string().min(2).max(200).refine((v) => parseDataPath(v) !== null, "Invalid check path"),
+  args: z.array(scalar).max(8).default([]),
+  message: z.string().min(1).max(240),
+  severity: z.enum(["error", "warning", "info"]).default("warning"),
+  target_id: id.nullish(),
+}).strict();
 
 export const uiSnapshotSchema = z
   .object({
@@ -136,6 +187,8 @@ export const uiSnapshotSchema = z
     edges: z.array(edge).max(300).default([]),
     items: z.array(item).max(100).default([]),
     blocks: z.array(documentNodeSchema).max(160).optional(),
+    data_model: z.record(z.string(), z.unknown()).refine(isValidDataModel, "Invalid data_model").optional(),
+    checks: z.array(checkRuleSchema).max(40).optional(),
     // Artifact placement is added by the existing answer orchestration layer.
     layout: z.enum(["inline", "block", "side"]).nullish(),
   })
@@ -144,6 +197,8 @@ export const uiSnapshotSchema = z
     const blocks = snapshot.blocks ?? [];
     const byId = new Map(blocks.map((node) => [node.id, node]));
     const bad = (message: string) => ctx.addIssue({ code: "custom", message });
+    const checks = snapshot.checks ?? [];
+    if (new Set(checks.map((rule) => rule.id)).size !== checks.length) bad("Duplicate check rule ids");
     if (byId.size !== blocks.length || (blocks.length && snapshot.component !== "document")) bad("Invalid document blocks");
     const counts = new Map<string | null, number>();
     for (const node of blocks) {
@@ -194,12 +249,17 @@ export const uiSnapshotSchema = z
       snapshot.component === "chart" &&
       ((!keys.size && snapshot.rows.length > 0) ||
         snapshot.rows.some((row) =>
-          Object.entries(row.values).some(
-            ([key, value]) =>
-              !keys.has(key) ||
-              typeof value !== "number" ||
-              Math.abs(value) > 1e15,
-          ),
+          Object.entries(row.values).some(([key, value]) => {
+            if (!keys.has(key)) return true;
+            if (isDataBinding(value)) {
+              const resolved = readDataPath(snapshot.data_model ?? {}, value);
+              if (resolved !== undefined && (typeof resolved !== "number" || !Number.isFinite(resolved) || Math.abs(resolved) > 1e15)) {
+                return true;
+              }
+              return false;
+            }
+            return typeof value !== "number" || Math.abs(value) > 1e15;
+          }),
         ))
     )
       ctx.addIssue({ code: "custom", message: "Invalid chart values" });
@@ -250,7 +310,7 @@ export function committedNumericPreview(snapshot: UISnapshot): UISnapshot {
   const candidate = parseUISnapshot(snapshot.preview.base);
   const base = candidate && !candidate.preview && candidate.block_id === snapshot.block_id && candidate.component === snapshot.component ? candidate : null;
   if (snapshot.component === "chart" || snapshot.component === "metric") {
-    return {...snapshot, props: base?.props ?? snapshot.props, rows: base?.rows ?? [], items: base?.items ?? []};
+    return {...snapshot, props: base?.props ?? snapshot.props, rows: base?.rows ?? [], items: base?.items ?? [], data_model: base?.data_model ?? {}};
   }
   if (snapshot.component === "document") {
     const previous = new Map((base?.blocks ?? []).map(node => [node.id, node]));

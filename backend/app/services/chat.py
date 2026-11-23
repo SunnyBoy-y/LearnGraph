@@ -5052,6 +5052,39 @@ class ChatService:
         moved_records.extend((part, "artifact_sink") for part in sink_parts)
         return segments[0], clean_full_text, extra_records, moved_records
 
+    def _rich_media_provider(self):
+        provider = getattr(self.agent_tool_runtime, "image_search_provider", None)
+        if provider is None and getattr(self, "_rich_media_enabled", False):
+            if not hasattr(self, "_rich_image_provider"):
+                try:
+                    self._rich_image_provider = self._image_search_provider_loader() if self._image_search_provider_loader else None
+                except AppError:
+                    self._rich_image_provider = None
+            provider = self._rich_image_provider
+        return provider
+
+    def _ui_tool_resource_feedback(self, output: str, meta: dict) -> str:
+        update = meta.get("ui_stream")
+        if not update or update["op"] not in {"mount", "patch", "revise"}:
+            return output
+        pending = {node["id"] for node in update["snapshot"]["blocks"]
+                   if node["type"] in {"image", "image_group", "gallery"} and node["resource_state"] == "pending"}
+        if not pending:
+            return output
+        if not getattr(self, "_rich_media_enabled", False):
+            reason = "disabled"
+        elif not callable(getattr(self._rich_media_provider(), "image_search", None)):
+            reason = "provider_unavailable"
+        else:
+            return output
+        # The scheduler publishes the same outcome on the resource revision.
+        # Report it here as well so the model can act on the mount/patch result.
+        payload = json.loads(output)
+        for resource in payload.get("resources", []):
+            if resource["id"] in pending:
+                resource.update(state="unavailable", reason=reason)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
     def _emit_sandbox_side_effect_parts(
         self,
         *,
@@ -5121,17 +5154,9 @@ class ChatService:
                 from app.services.rich_media import MediaJobs
                 if not hasattr(self, "_rich_media_jobs"):
                     self._rich_media_jobs = MediaJobs()
-                runtime = self.agent_tool_runtime
-                provider = getattr(runtime, "image_search_provider", None)
-                if provider is None and getattr(self, "_rich_media_enabled", False) and any(
+                provider = self._rich_media_provider() if any(
                     node.query and node.type in {"image", "image_group", "gallery"} for node in snapshot.blocks
-                ):
-                    if not hasattr(self, "_rich_image_provider"):
-                        try:
-                            self._rich_image_provider = self._image_search_provider_loader() if self._image_search_provider_loader else None
-                        except AppError:
-                            self._rich_image_provider = None
-                    provider = self._rich_image_provider
+                ) else None
                 self._rich_media_jobs.schedule(
                     snapshot.model_dump(mode="json"), provider, getattr(self, "_rich_media_enabled", False),
                     set(getattr(self, "_rich_media_domains", [])),
@@ -6108,6 +6133,8 @@ class ChatService:
                 )
                 raise
             output, meta, sources = result
+            if function.get("name") == "ui_stream":
+                output = self._ui_tool_resource_feedback(output, meta)
             self._record_agent_run_event(
                 chat_session_id,
                 run_id,
@@ -6117,7 +6144,7 @@ class ChatService:
                 sources=sources,
                 tool_call_id=str(tool_call.get("id") or ""),
             )
-            return result
+            return output, meta, sources
 
         call_id = tool_call.get("id")
         function = tool_call.get("function")
@@ -6140,14 +6167,12 @@ class ChatService:
                 [],
             )
         if tool_name == "ui_stream":
-            from app.services.stream_ui import prepare_command
+            from app.services.stream_ui import run_ui_tool
             try:
-                update = prepare_command(self.db, self.workspace_id, chat_session_id,
-                                         assistant_message_id, assistant_version_id, arguments)
-                snapshot = update["snapshot"]
-                return (json.dumps({"block_id": snapshot["block_id"], "revision": snapshot["revision"],
-                                    "state": snapshot["state"], "reference": f"[[artifact:block_id:{snapshot['block_id']}]]"}),
-                        {"status": "completed", "ui_stream": update}, [])
+                payload, meta = run_ui_tool(self.db, self.workspace_id, chat_session_id,
+                                            assistant_message_id, assistant_version_id, arguments)
+                output = self._ui_tool_resource_feedback(json.dumps(payload), meta)
+                return output, {"status": "completed", **meta}, []
             except AppError as exc:
                 return (json.dumps({"error": exc.code, "message": exc.message, "details": exc.details}),
                         {"status": "failed", "reason": exc.code, "details": exc.details}, [])

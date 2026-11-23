@@ -14,6 +14,7 @@ from app.core.errors import AppError
 from app.providers.ports.model import ProviderStreamEvent
 from app.services.stream_ui import MAX_UI_BYTES, compile_command
 from app.services.genui_catalog import presentation_catalog_prompt
+from app.services.genui_express import ExpressUIParser
 from app.services.genui_inline import canonical_inline_document
 
 _PRESENTATION_POLICY = presentation_catalog_prompt() + """回答可以自然混排 Markdown 和原生交互内容；简单问答直接用 Markdown，不强制可视化，不额外分类。
@@ -70,6 +71,9 @@ class InlineUIParser:
         self.body_line: list[str] = []
         self.body_bytes = 0
         self.block_id = ""
+        self.mode: str | None = None
+        self.revision = 0
+        self.express: ExpressUIParser | None = None
         self.line_head = ""
         self.fence: tuple[str, int] | None = None
         self.created: list[str] = []
@@ -98,7 +102,19 @@ class InlineUIParser:
         body = "".join(self.body or [])
         self.body = None
         self.body_line = []
+        express = self.express
+        mode = self.mode
+        self.express = None
+        self.mode = None
         try:
+            if mode == "express":
+                if express is None:
+                    raise ValueError("Empty Express UI declaration")
+                commands = express.finish()
+                self.revision = express.revision
+                for command in commands:
+                    yield UICommandEvent(command)
+                return
             raw = json.loads(body)
             if not isinstance(raw, dict) or set(raw) - {"props", "upsert"}:
                 raise ValueError("Unexpected declaration fields")
@@ -119,7 +135,7 @@ class InlineUIParser:
             yield UICommandEvent({"op": "complete", "block_id": self.block_id, "base_revision": 1})
         except (ValueError, TypeError, RecursionError, AppError):
             self.failed_declaration = True
-            yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": 0})
+            yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": self.revision})
             yield self._fallback(body)
 
     def feed(self, text: str):
@@ -128,6 +144,13 @@ class InlineUIParser:
             if self.body is not None:
                 self.body_line.append(char)
                 self.body_bytes += len(char.encode("utf-8"))
+                if self.body_bytes > MAX_UI_BYTES:
+                    self.failed_declaration = True
+                    body = "".join(self.body) + "".join(self.body_line)
+                    self.body = None; self.body_line = []; self.express = None; self.mode = None
+                    yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": self.revision})
+                    yield self._fallback(body)
+                    continue
                 if char == "\n":
                     line = "".join(self.body_line)
                     if line.strip() == ":::":
@@ -138,32 +161,49 @@ class InlineUIParser:
                         continue
                     self.body.append(line)
                     self.body_line = []
-                if self.body_bytes > MAX_UI_BYTES:
-                    self.failed_declaration = True
-                    body = "".join(self.body) + "".join(self.body_line)
-                    self.body = None; self.body_line = []
-                    yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": 0})
-                    yield self._fallback(body)
+                    if self.mode is None and line.strip():
+                        self.mode = "json" if line.lstrip().startswith("{") else "express"
+                        if self.mode == "express":
+                            self.express = ExpressUIParser(self.block_id, initial_revision=self.revision)
+                    if self.mode == "express" and self.express is not None:
+                        try:
+                            commands = self.express.feed_line(line)
+                            self.revision = self.express.revision
+                            if out:
+                                yield ProviderStreamEvent("text_delta", content="".join(out)); out.clear()
+                            for command in commands:
+                                yield UICommandEvent(command)
+                        except (ValueError, TypeError, RecursionError, AppError):
+                            self.failed_declaration = True
+                            body = "".join(self.body)
+                            self.body = None; self.body_line = []; self.express = None; self.mode = None
+                            yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": self.revision})
+                            yield self._fallback(body)
                 continue
             if self.header or (not self.line_head and self.fence is None and char == ":"):
                 self.header += char
                 if char == "\n":
-                    match = re.fullmatch(r":::ui ([a-zA-Z0-9_-]{1,70})\r?\n", self.header)
+                    match = re.fullmatch(r":::ui ([a-zA-Z0-9_-]{1,70})(?: (express|json))?\r?\n", self.header)
                     if match and len(self.created) < 20:
                         if out:
                             yield ProviderStreamEvent("text_delta", content="".join(out)); out.clear()
                         self.block_id = "r" + uuid4().hex[:10] + "_" + match[1]
                         self.created.append(self.block_id)
                         self.body = []
+                        self.body_line = []
                         self.body_bytes = 0
+                        self.mode = match[2] or None
+                        self.revision = 0
+                        self.express = ExpressUIParser(self.block_id) if self.mode == "express" else None
                         yield ProviderStreamEvent("text_delta", content=f"\n[[artifact:block_id:{self.block_id}]]\n")
                         yield UICommandEvent({"op": "mount", "block_id": self.block_id, "component": "document",
                                               "props": {"title": "正在组织内容"}})
                         self.header = ""; self.line_head = ""
                         continue
                 # Buffer only a possible header, never a whole ordinary line.
-                if char == "\n" or len(self.header) > 80 or not (
-                    ":::ui ".startswith(self.header) or re.fullmatch(r":::ui [a-zA-Z0-9_-]*\r?", self.header)
+                if char == "\n" or len(self.header) > 90 or not (
+                    ":::ui ".startswith(self.header)
+                    or re.fullmatch(r":::ui [a-zA-Z0-9_-]+(?: (?:e(?:x(?:p(?:r(?:e(?:ss?)?)?)?)?)?|j(?:s(?:o(?:n?)?)?)?)?)?\r?", self.header)
                 ):
                     out.append(self.header)
                     for value in self.header:
@@ -181,8 +221,8 @@ class InlineUIParser:
         elif self.body is not None:
             self.failed_declaration = True
             body = "".join(self.body) + "".join(self.body_line)
-            self.body = None
-            yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": 0})
+            self.body = None; self.express = None; self.mode = None
+            yield UICommandEvent({"op": "remove", "block_id": self.block_id, "base_revision": self.revision})
             yield self._fallback(body)
         if self.header:
             yield ProviderStreamEvent("text_delta", content=self.header)

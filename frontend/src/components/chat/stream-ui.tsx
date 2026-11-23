@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useMemo, useState } from "react";
+import { Component, lazy, memo, Suspense, useEffect, useMemo, useState } from "react";
 import type {
   ComponentType,
   CSSProperties,
@@ -20,6 +20,17 @@ import {
 } from "@/components/ui/select";
 import { committedNumericPreview, parseUISnapshot } from "@/lib/stream-ui";
 import type { UISnapshot } from "@/lib/stream-ui";
+import {
+  DataModelStore,
+  DataModelStoreContext,
+  extractBindingPaths,
+  normalizeBindingPath,
+  useBoundText,
+  useBoundValue,
+  useDataModelPaths,
+  useDataModelStore,
+} from "@/lib/data-model-store";
+import { evaluateChecks } from "@/genui/catalog-functions";
 import type { MessagePart } from "@/types/sessions";
 import {
   StreamUIStateScope,
@@ -55,6 +66,18 @@ const format = (value: unknown) =>
       : String(value);
 
 function ChartView({ snapshot: s }: ViewProps) {
+  const store = useDataModelStore();
+  const bindingPaths = useMemo(() => {
+    const paths = new Set<string>();
+    for (const row of s.rows) {
+      for (const p of extractBindingPaths(row.label)) paths.add(p);
+      for (const v of Object.values(row.values)) {
+        for (const p of extractBindingPaths(v)) paths.add(p);
+      }
+    }
+    return Array.from(paths);
+  }, [s.rows]);
+  const dataStamp = useDataModelPaths(bindingPaths);
   const [mode, setMode] = useStreamUIState<"line" | "bar" | null>("mode", null);
   const [hidden, setHidden] = useStreamUIState<string[]>("hidden", []);
   const [hovered, setHovered] = useStreamUIState<string | null>(
@@ -67,7 +90,21 @@ function ChartView({ snapshot: s }: ViewProps) {
   const columns = s.props.columns.filter(
     (column) => staticChart || !hidden.includes(column.key),
   );
-  const rows = staticChart ? s.rows : s.rows.slice(-limit);
+  const resolvedRows = useMemo(() => {
+    void dataStamp;
+    if (!store || !bindingPaths.length) return s.rows;
+    return s.rows.map((row) => ({
+      ...row,
+      label: store.resolveText(row.label),
+      values: Object.fromEntries(
+        Object.entries(row.values).map(([k, v]) => [
+          k,
+          store.resolveValue(v) as (typeof row.values)[string],
+        ]),
+      ),
+    }));
+  }, [s.rows, store, bindingPaths.length, dataStamp]);
+  const rows = staticChart ? resolvedRows : resolvedRows.slice(-limit);
   const values = rows.flatMap((row) =>
     columns.flatMap((column) =>
       typeof row.values[column.key] === "number"
@@ -291,7 +328,36 @@ function ChartView({ snapshot: s }: ViewProps) {
   );
 }
 
-function GraphView({ snapshot: s, onExplain }: ViewProps) {
+function GraphView({ snapshot: rawSnapshot, onExplain }: ViewProps) {
+  const store = useDataModelStore();
+  const bindingPaths = useMemo(() => {
+    const paths = new Set<string>();
+    for (const n of rawSnapshot.nodes) {
+      for (const p of extractBindingPaths(n.label)) paths.add(p);
+      for (const p of extractBindingPaths(n.description)) paths.add(p);
+    }
+    for (const e of rawSnapshot.edges) {
+      for (const p of extractBindingPaths(e.label)) paths.add(p);
+    }
+    return Array.from(paths);
+  }, [rawSnapshot.nodes, rawSnapshot.edges]);
+  const dataStamp = useDataModelPaths(bindingPaths);
+  const s = useMemo(() => {
+    void dataStamp;
+    if (!store || !bindingPaths.length) return rawSnapshot;
+    return {
+      ...rawSnapshot,
+      nodes: rawSnapshot.nodes.map((n) => ({
+        ...n,
+        label: store.resolveText(n.label),
+        description: store.resolveText(n.description),
+      })),
+      edges: rawSnapshot.edges.map((e) => ({
+        ...e,
+        label: store.resolveText(e.label),
+      })),
+    };
+  }, [rawSnapshot, store, bindingPaths.length, dataStamp]);
   const [selected, setSelected] = useStreamUIState<string | null>(
     "selected",
     null,
@@ -338,23 +404,61 @@ function GraphView({ snapshot: s, onExplain }: ViewProps) {
   );
 }
 
+const TableCellView = memo(function TableCellView({ value }: { value: unknown }) {
+  const bound = useBoundValue(value);
+  return <td>{format(bound)}</td>;
+});
+
+const TableRowView = memo(function TableRowView({
+  row,
+  columns,
+}: {
+  row: UISnapshot["rows"][number];
+  columns: UISnapshot["props"]["columns"];
+}) {
+  const label = useBoundText(row.label);
+  return (
+    <tr>
+      <th scope="row">{label}</th>
+      {columns.map((column) => (
+        <TableCellView key={column.key} value={row.values[column.key]} />
+      ))}
+    </tr>
+  );
+});
+
 function TableView({ snapshot: s }: ViewProps) {
+  const store = useDataModelStore();
   const [query, setQuery] = useStreamUIState("query", "");
   const [sort, setSort] = useStreamUIState<{
     key: string;
     descending: boolean;
   } | null>("sort", null);
   const explore = presentation(s).tableExplore;
+  const bindingPaths = useMemo(() => {
+    if (!explore) return [];
+    const paths = new Set<string>();
+    for (const r of s.rows) {
+      for (const p of extractBindingPaths(r.label)) paths.add(p);
+      for (const v of Object.values(r.values)) {
+        for (const p of extractBindingPaths(v)) paths.add(p);
+      }
+    }
+    return Array.from(paths);
+  }, [explore, s.rows]);
+  useDataModelPaths(bindingPaths);
+  const resolveVal = (v: unknown) => (store ? store.resolveValue(v) : v);
+  const resolveLbl = (v: string) => (store ? store.resolveText(v) : v);
   const rows = s.rows
     .filter((row) => !explore ||
-      `${row.label} ${Object.values(row.values).join(" ")}`
+      `${resolveLbl(row.label)} ${Object.values(row.values).map(resolveVal).join(" ")}`
         .toLowerCase()
         .includes(query.toLowerCase()),
     )
     .toSorted((a, b) => {
       if (!explore || !sort) return 0;
-      const left = a.values[sort.key],
-        right = b.values[sort.key];
+      const left = resolveVal(a.values[sort.key]),
+        right = resolveVal(b.values[sort.key]);
       const result =
         typeof left === "number" && typeof right === "number"
           ? left - right
@@ -416,12 +520,7 @@ function TableView({ snapshot: s }: ViewProps) {
           </thead>
           <tbody>
             {rows.map((row) => (
-              <tr key={row.id}>
-                <th scope="row">{row.label}</th>
-                {s.props.columns.map((column) => (
-                  <td key={column.key}>{format(row.values[column.key])}</td>
-                ))}
-              </tr>
+              <TableRowView key={row.id} row={row} columns={s.props.columns} />
             ))}
           </tbody>
         </table>
@@ -431,14 +530,66 @@ function TableView({ snapshot: s }: ViewProps) {
   );
 }
 
+const TimelineItemView = memo(function TimelineItemView({
+  item,
+}: {
+  item: UISnapshot["items"][number];
+}) {
+  const date = useBoundText(item.date);
+  const label = useBoundText(item.label);
+  const description = useBoundText(item.description);
+  const value = useBoundValue(item.value);
+  return (
+    <li>
+      {date && <time>{date}</time>}
+      <div>
+        <strong>
+          {item.icon && <AnswerIcon name={item.icon} />}
+          {label}
+        </strong>
+        {description && <p>{description}</p>}
+        {value != null && <small>{format(value)}</small>}
+      </div>
+    </li>
+  );
+});
+
 function TimelineView({ snapshot: s }: ViewProps) {
   return s.items.length ? <ol className="stream-ui__events" aria-label="阶段安排">
-    {s.items.map(item => <li key={item.id}>
-      {item.date && <time>{item.date}</time>}
-      <div><strong>{item.icon && <AnswerIcon name={item.icon} />}{item.label}</strong>{item.description && <p>{item.description}</p>}{item.value != null && <small>{format(item.value)}</small>}</div>
-    </li>)}
+    {s.items.map(item => <TimelineItemView key={item.id} item={item} />)}
   </ol> : <Empty settled={s.state === "completed"} />;
 }
+
+const MetricItemView = memo(function MetricItemView({
+  item,
+  unitFallback,
+  emphasis,
+}: {
+  item: UISnapshot["items"][number];
+  unitFallback: string;
+  emphasis: "primary" | "secondary" | "context";
+}) {
+  const label = useBoundText(item.label);
+  const rawValue = useBoundValue(item.value);
+  const description = useBoundText(item.description);
+  // Models may include a unit in a string-valued metric. Keep that unit
+  // subordinate without changing the saved value or action context.
+  const split = typeof rawValue === "string" ? rawValue.match(/^([约≈]?\s*[+−-]?\d[\d,]*(?:\.\d+)?)\s*(人(?:\/月)?|个月|月|天|年|次|个|元|万元|%|GB|MB|KB|ms|s|小时|分钟|秒)$/u) : null;
+  const value = split ? split[1] + (split[2] === "%" ? "%" : "") : format(rawValue);
+  const unit = split ? split[2] === "%" ? "" : split[2] : unitFallback;
+  return (
+    <li className="metric-card__item" data-emphasis={emphasis}>
+      <span className="metric-card__label">{item.icon && <AnswerIcon name={item.icon} />}{label}</span>
+      <strong className="metric-card__value">
+        <span>{value}</span>
+        {unit && <small>{unit}</small>}
+      </strong>
+      {description && (
+        <small className="metric-card__hint">{description}</small>
+      )}
+    </li>
+  );
+});
 
 function MetricView({ snapshot: s }: ViewProps) {
   return s.items.length ? (
@@ -448,23 +599,14 @@ function MetricView({ snapshot: s }: ViewProps) {
         { "--metric-columns": Math.min(s.items.length, 3) } as CSSProperties
       }
     >
-      {s.items.map((item, index) => {
-        // Models may include a unit in a string-valued metric. Keep that unit
-        // subordinate without changing the saved value or action context.
-        const split = typeof item.value === "string" ? item.value.match(/^([约≈]?\s*[+−-]?\d[\d,]*(?:\.\d+)?)\s*(人(?:\/月)?|个月|月|天|年|次|个|元|万元|%|GB|MB|KB|ms|s|小时|分钟|秒)$/u) : null;
-        const value = split ? split[1] + (split[2] === "%" ? "%" : "") : format(item.value);
-        const unit = split ? split[2] === "%" ? "" : split[2] : s.props.unit;
-        return <li className="metric-card__item" data-emphasis={index === 0 ? "primary" : index === 1 ? "secondary" : "context"} key={item.id}>
-          <span className="metric-card__label">{item.icon && <AnswerIcon name={item.icon} />}{item.label}</span>
-          <strong className="metric-card__value">
-            <span>{value}</span>
-            {unit && <small>{unit}</small>}
-          </strong>
-          {item.description && (
-            <small className="metric-card__hint">{item.description}</small>
-          )}
-        </li>;
-      })}
+      {s.items.map((item, index) => (
+        <MetricItemView
+          key={item.id}
+          item={item}
+          unitFallback={s.props.unit}
+          emphasis={index === 0 ? "primary" : index === 1 ? "secondary" : "context"}
+        />
+      ))}
     </ul>
   ) : (
     <Empty settled={s.state === "completed"} />
@@ -525,6 +667,23 @@ function ValidatedUI({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const store = useDataModelStore();
+  const checkPaths = useMemo(
+    () =>
+      (snapshot.checks ?? [])
+        .map((rule) => normalizeBindingPath(rule.path))
+        .filter((p): p is string => Boolean(p)),
+    [snapshot.checks],
+  );
+  const checkStamp = useDataModelPaths(checkPaths);
+  const failedChecks = useMemo(() => {
+    void checkStamp;
+    if (!snapshot.checks?.length) return [];
+    const dataModel = store ? store.getDataModel() : snapshot.data_model ?? {};
+    return evaluateChecks(snapshot.checks, dataModel).filter((result) => !result.passed);
+  }, [snapshot.checks, snapshot.data_model, store, checkStamp]);
+  const boundTitle = useBoundText(snapshot.props.title);
+  const boundDescription = useBoundText(snapshot.props.description);
   const View = UI_REGISTRY[snapshot.component];
   const showFooterNote = snapshot.component !== "graph";
 
@@ -534,17 +693,29 @@ function ValidatedUI({
     snapshot.state === "completed" &&
     !!onAction &&
     !busy;
-  async function explain(nodeId?: string, blockId?: string, viewState?: Record<string, unknown>) {
+  async function explain(
+    nodeId?: string,
+    blockId?: string,
+    viewState?: Record<string, unknown>,
+    embeddedUserMessage?: string,
+  ) {
     if (!canExplain) return;
     setBusy(true);
     setError("");
     try {
+      const targetNode = nodeId ? snapshot.nodes.find((item) => item.id === nodeId) : undefined;
+      const userMessage =
+        embeddedUserMessage ||
+        (nodeId
+          ? `请解释图表「${snapshot.props.title}」中的节点「${targetNode?.label ?? nodeId}」及其关联。`
+          : `请解释图表「${snapshot.props.title}」，分析其中的主要信息。`);
       await onAction?.({
         componentId: partId,
         componentType: "stream_ui",
         event: blockId ? "document.block.explain" : nodeId ? "graph.node.explain" : "explain",
         payload: {
           revision: snapshot.revision,
+          userMessage,
           ...(nodeId ? { node_id: nodeId } : {}),
           ...(blockId ? {block_id: blockId} : {}),
           ...(viewState ? {view_state: viewState} : ["chart", "table"].includes(snapshot.component) ? {view_state: streamUIViewState(`${partId}:${snapshot.component}`)} : {}),
@@ -571,8 +742,8 @@ function ValidatedUI({
       </p>}
       {snapshot.component !== "document" && <header className="stream-ui__heading">
         <div className="stream-ui__heading-copy">
-          <h3 className="stream-ui__title">{snapshot.props.icon && <AnswerIcon name={snapshot.props.icon} />}{snapshot.props.title}</h3>
-          {snapshot.component !== "graph" && snapshot.props.description && <p>{snapshot.props.description}</p>}
+          <h3 className="stream-ui__title">{snapshot.props.icon && <AnswerIcon name={snapshot.props.icon} />}{boundTitle}</h3>
+          {snapshot.component !== "graph" && boundDescription && <p>{boundDescription}</p>}
         </div>
         {(snapshot.state === "streaming" || failed) && (
           <Badge
@@ -602,6 +773,7 @@ function ValidatedUI({
           typeof payload.node_id === "string" ? payload.node_id : undefined,
           blockId,
           payload.view_state && typeof payload.view_state === "object" ? payload.view_state as Record<string, unknown> : undefined,
+          typeof payload.userMessage === "string" ? payload.userMessage : undefined,
         ); } : undefined}
       /></Suspense>
       {failed && snapshot.component === "document" && <p className="rich-doc__caption" role="status">生成已中断，已生成内容仍可操作。</p>}
@@ -620,6 +792,19 @@ function ValidatedUI({
           {busy ? "正在提交…" : "让 AI 解释"}
         </Button>}
       </footer>}
+      {failedChecks.length > 0 && (
+        <ul className="stream-ui__checks" aria-label="数据校验提示">
+          {failedChecks.map((check) => (
+            <li
+              key={check.id}
+              data-severity={check.severity}
+              role={check.severity === "error" ? "alert" : "status"}
+            >
+              {check.message}
+            </li>
+          ))}
+        </ul>
+      )}
       {error && <p role="alert">{error}</p>}
     </section>
   );
@@ -644,10 +829,21 @@ export function StreamUI({
   embedded?: boolean;
   settled?: boolean;
 }) {
+  const parentStore = useDataModelStore();
   const snapshot = useMemo(() => {
     const parsed = parseUISnapshot(data);
     return parsed ? committedNumericPreview(parsed) : null;
   }, [data]);
+  const ownStore = useMemo(
+    () => new DataModelStore(snapshot?.data_model ?? {}),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [partId],
+  );
+  useEffect(() => {
+    if (snapshot) {
+      ownStore.setDataModel(snapshot.data_model ?? {});
+    }
+  }, [ownStore, snapshot]);
   if (!snapshot)
     return (
       <p className="stream-ui__invalid" role="alert">
@@ -655,20 +851,24 @@ export function StreamUI({
       </p>
     );
   if (snapshot.state === "removed") return null;
+  const hasOwnDataModel = Object.keys(snapshot.data_model ?? {}).length > 0;
+  const activeStore = embedded && parentStore && !hasOwnDataModel ? parentStore : ownStore;
   return (
     <UIErrorBoundary key={partId}>
-      <StreamUIStateScope.Provider value={`${partId}:${snapshot.component}`}>
-        <ValidatedUI
-          snapshot={snapshot}
-          siblingParts={siblingParts}
-          partId={partId}
-          interactive={interactive}
-          failed={failed}
-          onAction={onAction}
-          embedded={embedded}
-          settled={settled}
-        />
-      </StreamUIStateScope.Provider>
+      <DataModelStoreContext.Provider value={activeStore}>
+        <StreamUIStateScope.Provider value={`${partId}:${snapshot.component}`}>
+          <ValidatedUI
+            snapshot={snapshot}
+            siblingParts={siblingParts}
+            partId={partId}
+            interactive={interactive}
+            failed={failed}
+            onAction={onAction}
+            embedded={embedded}
+            settled={settled}
+          />
+        </StreamUIStateScope.Provider>
+      </DataModelStoreContext.Provider>
     </UIErrorBoundary>
   );
 }

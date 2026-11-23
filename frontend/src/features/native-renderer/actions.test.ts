@@ -15,26 +15,31 @@ function action(componentType: string, event: string, payload: Record<string, un
 }
 
 describe('native renderer actions use the existing conversation contract', () => {
-  it('validates a UI revision before sending the authoritative prompt and ui_action', async () => {
+  it('sends client-side userMessage and ui_action in zero RTT without calling submitUIAction', async () => {
     const env = environment()
-    await dispatchRendererAction(action('stream_ui', 'graph.node.explain', { revision: 3, node_id: 'n1' }), env)
+    const userMessage = '请解释图表「知识图谱」中的节点「概念A」及其关联。'
+    await dispatchRendererAction(action('stream_ui', 'graph.node.explain', { revision: 3, node_id: 'n1', userMessage }), env)
     const uiAction = { part_id: 'part1', revision: 3, action: 'graph.node.explain', node_id: 'n1' }
-    expect(env.submitUIAction).toHaveBeenCalledWith('s1', uiAction)
-    expect(env.send).toHaveBeenCalledWith({ content: '解释服务端校验后的组件', graph_action: 'none', generation_mode: 'text', ui_action: uiAction })
-    expect(vi.mocked(env.submitUIAction).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(env.send).mock.invocationCallOrder[0])
+    expect(env.submitUIAction).not.toHaveBeenCalled()
+    expect(env.send).toHaveBeenCalledWith({ content: userMessage, graph_action: 'none', generation_mode: 'text', ui_action: uiAction })
   })
 
-  it('never sends after failed validation or a session switch during validation', async () => {
+  it('forwards document.block.explain with block_id, view_state and fallback userMessage', async () => {
+    const env = environment()
+    await dispatchRendererAction(action('stream_ui', 'document.block.explain', { revision: 7, block_id: 'trend', view_state: { mode: 'bar' } }), env)
+    expect(env.submitUIAction).not.toHaveBeenCalled()
+    expect(env.send).toHaveBeenCalledWith({
+      content: '请解释当前图表，分析其中的主要信息。',
+      graph_action: 'none',
+      generation_mode: 'text',
+      ui_action: { part_id: 'part1', revision: 7, action: 'document.block.explain', block_id: 'trend', view_state: { mode: 'bar' } },
+    })
+  })
+
+  it('propagates chat admission rejection from send', async () => {
     const rejected = environment()
-    vi.mocked(rejected.submitUIAction).mockRejectedValue(new Error('stale revision'))
+    vi.mocked(rejected.send).mockRejectedValue(new Error('stale revision'))
     await expect(dispatchRendererAction(action('stream_ui', 'explain', { revision: 1 }), rejected)).rejects.toThrow('stale revision')
-    expect(rejected.send).not.toHaveBeenCalled()
-    const switched = environment()
-    let sessionId = 's1'
-    switched.sessionId = () => sessionId
-    switched.submitUIAction = async () => { sessionId = 's2'; return { prompt: '旧会话的提示' } }
-    await expect(dispatchRendererAction(action('stream_ui', 'explain', { revision: 1 }), switched)).rejects.toThrow('会话已切换')
-    expect(switched.send).not.toHaveBeenCalled()
   })
 
   it('reviews graph proposals through the original APIs and honors reject cancellation', async () => {

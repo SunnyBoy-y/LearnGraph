@@ -6,7 +6,7 @@ import { MotionConfig } from 'motion/react'
 import { toast } from '@/lib/notifications'
 import { AppToaster } from '@/components/shared/app-toaster'
 import { authStore } from '@/api/auth-store'
-import { confirmGraphChangeSet, rejectGraphChangeSet, submitUIAction, undoGraphChangeSet } from '@/api/sessions'
+import { confirmGraphChangeSet, rejectGraphChangeSet, undoGraphChangeSet } from '@/api/sessions'
 import { AnswerParts } from '@/components/chat/answer-parts'
 import { ChatStreamPartRenderer } from '@/components/chat/chat-stream-part-renderer'
 import { StreamStatsBadge } from '@/components/chat/stream-stats-badge'
@@ -146,11 +146,6 @@ function NativeRenderer() {
     try {
       await dispatchRendererAction(action, {
         sessionId: () => payload.sessionId, send,
-        submitUIAction: async (sessionId, uiAction) => {
-          if (window.LearnGraphRenderer) return submitUIAction(sessionId, uiAction)
-          record('validate-ui-action', uiAction)
-          return { prompt: uiAction.node_id ? `请解释图谱节点 ${uiAction.node_id}` : '请解释这个组件' }
-        },
         reviewGraph: async (sessionId, proposalId, decision, rejectionReason) => {
           if (!window.LearnGraphRenderer) {
             record('graph-review', { sessionId, proposalId, decision, reason: rejectionReason })

@@ -122,7 +122,6 @@ import {
   retrySessionMessage,
   startSandboxBootstrap,
   streamSessionMessage,
-  submitUIAction,
   undoGraphChangeSet,
   updateSession,
   updateSetting,
@@ -7389,7 +7388,13 @@ export function ChatCanvasPage() {
           ...(typeof action.payload.block_id === "string" ? { block_id: action.payload.block_id } : {}),
           ...(action.payload.view_state && typeof action.payload.view_state === "object" ? { view_state: action.payload.view_state as Record<string, unknown> } : {}),
         } satisfies NonNullable<MessageCreateRequest["ui_action"]>;
-        return submitUIAction(sessionId, uiAction).then(({ prompt }) => send(prompt, { graphAction: "none", generationMode: "text", uiAction }));
+        const userMessage =
+          typeof action.payload.userMessage === "string" && action.payload.userMessage.trim()
+            ? action.payload.userMessage.trim()
+            : uiAction.node_id
+              ? `请解释图谱节点「${uiAction.node_id}」及其关联。`
+              : "请解释当前图表，分析其中的主要信息。";
+        return send(userMessage, { graphAction: "none", generationMode: "text", uiAction });
       }
       if (action.componentType === "graph_update_proposal") {
         const proposalId = action.payload.proposal_id;
@@ -7507,7 +7512,7 @@ export function ChatCanvasPage() {
       }
       void send(answer, { graphAction: "none" });
     },
-    [submitGraphReview, send, sessionId],
+    [submitGraphReview, send],
   );
 
   // Message rows intentionally skip changing inline callbacks in their memo
