@@ -943,13 +943,17 @@ class ProviderModelCapabilityView(BaseModel):
     capabilities: dict[str, Any]
 
 
+class ProviderModelCatalogSyncItemView(ProviderModelCapabilityView):
+    enabled: bool = False
+
+
 class ProviderModelCatalogSyncRequest(BaseModel):
     model_ids: list[str] = Field(min_length=1, max_length=2_000)
 
 
 class ProviderModelCatalogSyncView(BaseModel):
     provider_id: str
-    models: list[ProviderModelCapabilityView]
+    models: list[ProviderModelCatalogSyncItemView]
 
 
 class ProviderModelStateUpdateRequest(BaseModel):

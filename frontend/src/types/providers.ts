@@ -594,6 +594,7 @@ export interface ProviderModel {
   streaming: boolean;
   remote: boolean;
   enabled?: boolean;
+  is_new?: boolean;
   capabilities?: ProviderModelCapabilities;
   [key: string]: unknown;
 }
@@ -687,9 +688,13 @@ export interface ProviderModelDefaultsView {
   capabilities: ProviderModelCapabilities & UnknownRecord;
 }
 
+export interface ProviderModelCatalogSyncItem extends ProviderModelCapabilityView {
+  enabled?: boolean;
+}
+
 export interface ProviderModelCatalogSyncView {
   provider_id: string;
-  models: ProviderModelCapabilityView[];
+  models: ProviderModelCatalogSyncItem[];
 }
 
 export interface ProviderModelStateView {

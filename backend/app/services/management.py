@@ -456,7 +456,10 @@ class ProviderService:
                 "supports_agent_tools": True,
                 "discovered_model_ids": list(CODEX_KNOWN_MODELS),
                 "discovered_model_count": len(CODEX_KNOWN_MODELS),
-                "model_states": {model_id: True for model_id in CODEX_KNOWN_MODELS},
+                "model_states": {
+                    model_id: (model_id == CODEX_DEFAULT_MODEL)
+                    for model_id in CODEX_KNOWN_MODELS
+                },
                 "default_model": CODEX_DEFAULT_MODEL,
             }
         ollama_defaults: dict[str, object] = {}
@@ -589,6 +592,27 @@ class ProviderService:
         # presented as unavailable by consumers of the provider API.
         if payload.provider_type in MODEL_PROVIDER_TYPES:
             capabilities.setdefault("supports_agent_tools", True)
+        if (
+            payload.provider_type in _MODEL_MANAGEMENT_PROVIDER_TYPES
+            and "model_states" not in capabilities
+        ):
+            initial_default = str(
+                capabilities.get("default_model")
+                or capabilities.get("default_embedding_model_id")
+                or capabilities.get("default_image_generation_model_id")
+                or capabilities.get("default_vision_model_id")
+                or ""
+            ).strip()
+            initial_discovered = [
+                str(item).strip()
+                for item in capabilities.get("discovered_model_ids") or []
+                if str(item).strip()
+            ]
+            if initial_default or initial_discovered:
+                initial_states = {model_id: False for model_id in initial_discovered}
+                if initial_default:
+                    initial_states[initial_default] = True
+                capabilities["model_states"] = initial_states
         # Local providers (Ollama) are fully configured with only a base URL.
         configured_without_secret = (
             not secret
@@ -1056,7 +1080,7 @@ class ProviderService:
     def _import_discover(self, provider: ProviderConfig) -> ProviderConfig:
         """导入后自动发现模型，发现成功且可选默认模型则自动启用。"""
         try:
-            self.models(provider.id)
+            self.models(provider.id, mark_new_models=False)
             provider = self.providers.require(provider.id, "provider")
             self.db.refresh(provider)
         except AppError:
@@ -2011,8 +2035,10 @@ class ProviderService:
             if str(key) in known_ids
         }
         for model_id in known_ids:
-            states.setdefault(model_id, True)
+            states.setdefault(model_id, False)
         capabilities["model_states"] = states
+        for item in synced:
+            item["enabled"] = states.get(item["model_id"], False)
         provider.capabilities = capabilities
         self.audit.record(
             actor_id=self.actor_id,
@@ -2083,7 +2109,58 @@ class ProviderService:
             if str(item).strip()
         ]
         default_id = str(capabilities.get("default_model") or "").strip()
-        return list(dict.fromkeys([*discovered, default_id, *snapshot_keys]))
+        return [
+            item
+            for item in dict.fromkeys([*discovered, default_id, *snapshot_keys])
+            if item
+        ]
+
+    @classmethod
+    def _merge_discovered_model_states(
+        cls, capabilities: dict, model_ids: list[str], *, mark_new_models: bool,
+    ) -> tuple[dict[str, bool], list[str]]:
+        previous_discovered = [
+            str(item).strip() for item in capabilities.get("discovered_model_ids") or [] if str(item).strip()
+        ]
+        previous_states = {
+            str(key).strip(): value is not False
+            for key, value in dict(capabilities.get("model_states") or {}).items()
+            if str(key).strip()
+        }
+        previous_models = dict(capabilities.get("models") or {})
+        previous_known = set(cls._known_model_ids(capabilities, previous_discovered)) | set(previous_states.keys())
+        had_prior_catalog = bool(previous_discovered or previous_states or previous_models)
+        known_ids = cls._known_model_ids(capabilities, model_ids)
+        known_set = set(known_ids)
+        newly_discovered = (
+            [model_id for model_id in model_ids if model_id not in previous_known]
+            if mark_new_models and had_prior_catalog else []
+        )
+        states: dict[str, bool] = {}
+        for model_id in known_ids:
+            if model_id in previous_states:
+                states[model_id] = previous_states[model_id]
+            elif model_id in previous_known:
+                states[model_id] = True
+            else:
+                states[model_id] = False
+        existing_new_ids = [
+            str(item).strip() for item in capabilities.get("new_model_ids") or [] if str(item).strip()
+        ]
+        surviving_new = [
+            model_id for model_id in existing_new_ids
+            if model_id in known_set and not states.get(model_id, False)
+        ]
+        new_model_ids = list(dict.fromkeys([*newly_discovered, *surviving_new])) if mark_new_models else surviving_new
+        return states, new_model_ids
+
+    @staticmethod
+    def _set_new_model_ids(capabilities: dict, new_model_ids: list[str]) -> None:
+        cleaned = list(dict.fromkeys(str(item).strip() for item in new_model_ids if str(item).strip()))
+        if cleaned:
+            capabilities["new_model_ids"] = cleaned
+        else:
+            capabilities.pop("new_model_ids", None)
 
     def delete_model(self, provider_id: str, model_id: str) -> dict:
         """Remove a workspace-pinned model from the provider's unified model list."""
@@ -2133,12 +2210,16 @@ class ProviderService:
         capabilities["discovered_model_ids"] = discovered
         capabilities["discovered_model_count"] = len(discovered)
         capabilities["model_states"] = states
+        self._set_new_model_ids(
+            capabilities,
+            [item for item in capabilities.get("new_model_ids") or [] if str(item).strip() != normalized_model_id],
+        )
         default_field = self._model_default_field(provider)
         configured_default = self._read_model_default(capabilities, default_field)
         known_ids = self._known_model_ids(capabilities, discovered)
         if configured_default == normalized_model_id:
             next_default = next(
-                (item for item in known_ids if states.get(item, True)), ""
+                (item for item in known_ids if states.get(item, False)), ""
             )
             if next_default:
                 self._write_model_default(capabilities, default_field, next_default)
@@ -2197,11 +2278,16 @@ class ProviderService:
                 "snapshot or a saved per-model snapshot",
             )
         states = {
-            str(key): value is not False
+            str(key).strip(): value is not False
             for key, value in dict(capabilities.get("model_states") or {}).items()
+            if str(key).strip()
         }
         states[normalized_model_id] = enabled
         capabilities["model_states"] = states
+        self._set_new_model_ids(
+            capabilities,
+            [item for item in capabilities.get("new_model_ids") or [] if str(item).strip() != normalized_model_id],
+        )
         if enabled and not configured_default:
             self._write_model_default(capabilities, default_field, normalized_model_id)
             configured_default = normalized_model_id
@@ -2210,7 +2296,7 @@ class ProviderService:
                 (
                     item
                     for item in self._known_model_ids(capabilities, discovered)
-                    if states.get(item, True)
+                    if states.get(item, False)
                 ),
                 "",
             )
@@ -2280,18 +2366,30 @@ class ProviderService:
                 {"model_ids": unknown},
             )
         previous_states = {
-            str(key): value is not False
+            str(key).strip(): value is not False
             for key, value in dict(capabilities.get("model_states") or {}).items()
+            if str(key).strip()
         }
         states = {
             model_id: bool(
                 requested_states.get(
-                    model_id, previous_states.get(model_id, True)
+                    model_id, previous_states.get(model_id, False)
                 )
             )
             for model_id in known_ids
+            if model_id
         }
         capabilities["model_states"] = states
+        reviewed_ids = {str(key).strip() for key in requested_states}
+        self._set_new_model_ids(
+            capabilities,
+            [
+                item for item in capabilities.get("new_model_ids") or []
+                if str(item).strip() in known_ids
+                and str(item).strip() not in reviewed_ids
+                and not states.get(str(item).strip(), False)
+            ],
+        )
         default_field = self._model_default_field(provider)
         configured_default = self._read_model_default(capabilities, default_field)
         if not configured_default or not states.get(configured_default, False):
@@ -2361,21 +2459,22 @@ class ProviderService:
             for key, value in dict(capabilities.get("model_states") or {}).items()
         }
         known_ids = self._known_model_ids(capabilities, model_ids)
-        states: dict[str, bool] = {}
-        for model_id in known_ids:
-            states[model_id] = previous_states.get(model_id, True)
+        states, new_model_ids = self._merge_discovered_model_states(
+            capabilities, model_ids, mark_new_models=True,
+        )
         capabilities["discovered_model_ids"] = list(model_ids)
         capabilities["discovered_model_count"] = len(model_ids)
         capabilities["model_states"] = states
+        self._set_new_model_ids(capabilities, new_model_ids)
         default_field = self._model_default_field(provider)
         configured_default = self._read_model_default(capabilities, default_field)
         if (
             not configured_default
             or configured_default not in model_ids
-            or states.get(configured_default, True) is False
+            or states.get(configured_default, False) is False
         ):
             next_default = next(
-                (item for item in model_ids if states.get(item, True)), ""
+                (item for item in model_ids if states.get(item, False)), ""
             )
             if next_default:
                 self._write_model_default(capabilities, default_field, next_default)
@@ -2414,8 +2513,9 @@ class ProviderService:
             "discovered_model_ids": list(model_ids),
             "discovered_model_count": len(model_ids),
             "enabled_model_ids": [
-                model_id for model_id in model_ids if states.get(model_id, True)
+                model_id for model_id in model_ids if states.get(model_id, False)
             ],
+            "new_model_ids": new_model_ids,
             "default_model": (
                 capabilities.get(default_field)
                 or capabilities.get("default_model")
@@ -3324,17 +3424,21 @@ class ProviderService:
         invalidate_provider_plan_cache(self.workspace_id, provider_id=provider_id)
         return {"status": "deleted", "resource_id": provider_id}
 
-    def models(self, provider_id: str) -> dict:
+    def models(self, provider_id: str, *, mark_new_models: bool = True) -> dict:
         # The discovery snapshot write (capabilities + catalog defaults +
         # audit) can collide with parallel writers on the single SQLite
         # write lock. Re-run the idempotent snapshot when the commit was
         # interrupted by ``database is locked`` instead of failing the page.
         return retry_sqlite_locked(
             self.db,
-            lambda: self._models_impl(provider_id),
+            lambda: self._models_impl(
+                provider_id, mark_new_models=mark_new_models
+            ),
         )
 
-    def _models_impl(self, provider_id: str) -> dict:
+    def _models_impl(
+        self, provider_id: str, *, mark_new_models: bool = True
+    ) -> dict:
         provider = self.providers.require(provider_id, "provider")
         if provider.provider_type == "local_mock":
             return {
@@ -3371,31 +3475,18 @@ class ProviderService:
             or capabilities.get("brand_id") == "deepseek"
             or provider.provider_type == "deepseek_chat"
         )
-        # Persist every discovery snapshot so model pickers—including local
-        # Ollama embedding configuration—survive a page reload.
+        known_ids = self._known_model_ids(capabilities, model_ids)
+        states, new_model_ids = self._merge_discovered_model_states(
+            capabilities, model_ids, mark_new_models=mark_new_models,
+        )
         capabilities["discovered_model_ids"] = list(model_ids)
         capabilities["discovered_model_count"] = len(model_ids)
-        # Workspace-pinned manual models (per-model capability snapshots) keep
-        # their toggle state across a re-discovery; only models neither
-        # discovered nor saved as a snapshot are pruned here.
-        known_ids = self._known_model_ids(capabilities, model_ids)
-        states = {
-            str(key): value is not False
-            for key, value in dict(capabilities.get("model_states") or {}).items()
-            if str(key) in known_ids
-        }
-        for model_id in model_ids:
-            states.setdefault(model_id, True)
         if provider.provider_type == "codex_chatgpt":
-            # Drop ChatGPT-auth rejects from older static catalogues so the
-            # model picker no longer offers ids the backend will 400 on.
             for stale_id in list(states):
-                if (
-                    stale_id not in model_ids
-                    and stale_id in CODEX_UNSUPPORTED_CHATGPT_MODELS
-                ):
+                if stale_id not in model_ids and stale_id in CODEX_UNSUPPORTED_CHATGPT_MODELS:
                     states.pop(stale_id, None)
         capabilities["model_states"] = states
+        self._set_new_model_ids(capabilities, new_model_ids)
         configured_default = str(
             (
                 capabilities.get("default_embedding_model_id")
@@ -3408,11 +3499,10 @@ class ProviderService:
         if (
             not configured_default
             or configured_default not in known_ids
-            or states.get(configured_default, True) is False
+            or states.get(configured_default, False) is False
         ):
             configured_default = next(
-                (model_id for model_id in known_ids if states.get(model_id, True)),
-                CODEX_DEFAULT_MODEL if provider.provider_type == "codex_chatgpt" else "",
+                (model_id for model_id in known_ids if states.get(model_id, False)), "",
             )
         if provider.provider_type in EMBEDDING_PROVIDER_TYPES:
             capabilities["default_embedding_model_id"] = configured_default
@@ -3431,6 +3521,18 @@ class ProviderService:
             provider = self.providers.require(provider.id, "provider")
             self.db.refresh(provider)
             capabilities = dict(provider.capabilities or {})
+        persisted_states = dict(capabilities.get("model_states") or {})
+        persisted_new = [
+            str(item).strip()
+            for item in capabilities.get("new_model_ids") or []
+            if str(item).strip()
+        ]
+        new_model_set = set(persisted_new)
+        model_id_set = set(model_ids)
+        ordered_model_ids = [
+            *[model_id for model_id in persisted_new if model_id in model_id_set],
+            *[model_id for model_id in model_ids if model_id not in new_model_set],
+        ]
         return {
             "provider_id": provider.id,
             "status": "discovered_with_warnings" if warnings else "discovered",
@@ -3453,10 +3555,8 @@ class ProviderService:
                     ),
                     "streaming": True,
                     "remote": True,
-                    "enabled": dict(
-                        (provider.capabilities or {}).get("model_states") or {}
-                    ).get(model_id, True)
-                    is not False,
+                    "enabled": persisted_states.get(model_id, False) is True,
+                    "is_new": model_id in new_model_set,
                     "capabilities": model_capabilities_for_model(
                         {
                             **capabilities,
@@ -3466,7 +3566,7 @@ class ProviderService:
                         model_id,
                     ),
                 }
-                for model_id in model_ids
+                for model_id in ordered_model_ids
             ],
         }
 
@@ -3496,7 +3596,7 @@ class ProviderService:
             "capability_source": capabilities.get("capability_source", "official_catalog"),
         }
 
-    def probe(self, provider_id: str) -> ProviderConfig:
+    def probe(self, provider_id: str, *, mark_new_models: bool = True) -> ProviderConfig:
         provider = self.providers.require(provider_id, "provider")
         details: dict[str, object]
         discovered_model_ids: list[str] = []
@@ -3547,25 +3647,24 @@ class ProviderService:
             *IMAGE_GENERATION_PROVIDER_TYPES,
             *VISION_PROVIDER_TYPES,
         }:
+            states, new_model_ids = self._merge_discovered_model_states(
+                capabilities, discovered_model_ids, mark_new_models=mark_new_models,
+            )
             capabilities["discovered_model_count"] = details["discovered_model_count"]
             capabilities["discovered_model_ids"] = discovered_model_ids
-        if provider.provider_type in MODEL_PROVIDER_TYPES:
-            states = {
-                str(key): value is not False
-                for key, value in dict(capabilities.get("model_states") or {}).items()
-            }
-            for model_id in discovered_model_ids:
-                states.setdefault(model_id, True)
             capabilities["model_states"] = states
+            self._set_new_model_ids(capabilities, new_model_ids)
+        if provider.provider_type in MODEL_PROVIDER_TYPES:
+            states = dict(capabilities.get("model_states") or {})
             configured_default = str(capabilities.get("default_model") or "").strip()
-            if not configured_default or states.get(configured_default, True) is False:
+            if not configured_default or states.get(configured_default, False) is False:
                 capabilities["default_model"] = next(
                     (
                         model_id
                         for model_id in self._known_model_ids(
                             capabilities, discovered_model_ids
                         )
-                        if states.get(model_id, True)
+                        if states.get(model_id, False)
                     ),
                     "",
                 )
@@ -3624,7 +3723,7 @@ class ProviderService:
         """Probe a newly stored credential and auto-enable only on real health."""
 
         try:
-            self.probe(provider_id)
+            self.probe(provider_id, mark_new_models=False)
         except AppError as exc:
             self.db.rollback()
             provider = self.providers.require(provider_id, "provider")

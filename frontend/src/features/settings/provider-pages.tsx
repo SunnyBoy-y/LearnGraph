@@ -69,6 +69,7 @@ import {
   startCodexDeviceLogin,
   syncProviderModelCatalogDefaults,
   updateProviderModelCapabilities,
+  updateProviderModelState,
   updateProviderModelStates,
   updateProvider,
 } from "@/api";
@@ -196,6 +197,27 @@ function providerDefaultModelId(provider: Provider): string {
   }
   return "";
 }
+function sortProviderModels<T extends { is_new?: boolean }>(models: T[]): T[] {
+  const fresh: T[] = [];
+  const existing: T[] = [];
+  for (const model of models) {
+    if (model.is_new) fresh.push(model);
+    else existing.push(model);
+  }
+  return [...fresh, ...existing];
+}
+
+function providerNewModelSet(provider: Provider): Set<string> {
+  return new Set(
+    Array.isArray(provider.capabilities.new_model_ids)
+      ? provider.capabilities.new_model_ids.filter(
+          (item): item is string =>
+            typeof item === "string" && Boolean(item.trim()),
+        )
+      : [],
+  );
+}
+
 function persistedProviderModels(
   provider: Provider,
 ): ProviderModelsResponse | undefined {
@@ -220,6 +242,7 @@ function persistedProviderModels(
           ProviderModelCapabilities
         >)
       : {};
+  const newModelSet = providerNewModelSet(provider);
   // Models pinned manually through a catalog-defaults sync live as per-model
   // capability snapshots even when the vendor never reported them, so they
   // belong in the persisted list too.
@@ -231,14 +254,17 @@ function persistedProviderModels(
   return {
     provider_id: provider.id,
     status: "persisted_discovery",
-    models: ids.map((id) => ({
-      id,
-      roles: ["llm"],
-      streaming: true,
-      remote: true,
-      enabled: rawStates[id] !== false,
-      capabilities: rawCapabilities[id],
-    })),
+    models: sortProviderModels(
+      ids.map((id) => ({
+        id,
+        roles: ["llm"],
+        streaming: true,
+        remote: true,
+        enabled: rawStates[id] !== false,
+        is_new: newModelSet.has(id),
+        capabilities: rawCapabilities[id],
+      })),
+    ),
   };
 }
 
@@ -267,6 +293,7 @@ function manualProviderModels(provider: Provider): ProviderModelsResponse["model
         )
       : [],
   );
+  const newModelSet = providerNewModelSet(provider);
   return Object.entries(snapshots)
     .filter(([id]) => !discoveredIds.has(id))
     .map(([id, capabilities]) => ({
@@ -275,6 +302,7 @@ function manualProviderModels(provider: Provider): ProviderModelsResponse["model
       streaming: true,
       remote: true,
       enabled: states[id] !== false,
+      is_new: newModelSet.has(id),
       capabilities,
     }));
 }
@@ -293,8 +321,12 @@ function mergeProviderModelLists(
   if (!fresh) return persistedProviderModels(provider);
   const known = new Set(fresh.models.map((model) => model.id));
   const additions = manual.filter((model) => !known.has(model.id));
-  if (!additions.length) return fresh;
-  return { ...fresh, models: [...fresh.models, ...additions] };
+  return {
+    ...fresh,
+    models: sortProviderModels(
+      additions.length ? [...fresh.models, ...additions] : fresh.models,
+    ),
+  };
 }
 
 function SearchableModelSelect({
@@ -606,9 +638,9 @@ function ProvidersPageForm() {
       const fallbackModel =
         configuredProviderRole === "transcription"
           ? result.models.find(
-              (model) => !isRealtimeTranscriptionModel(model.id),
+              (model) => model.enabled !== false && !isRealtimeTranscriptionModel(model.id),
             )?.id
-          : result.models[0]?.id;
+          : result.models.find((model) => model.enabled !== false)?.id;
       setDefaultModels((current) =>
         current[result.provider_id] ||
         (typeof configuredModel === "string" && configuredModel.trim()) ||
@@ -620,21 +652,22 @@ function ProvidersPageForm() {
         const configuredRealtime =
           configuredProvider?.capabilities
             .default_realtime_transcription_model_id;
+        const realtimeFallback = result.models.find(
+          (model) => model.enabled !== false && isRealtimeTranscriptionModel(model.id),
+        )?.id;
         setRealtimeTranscriptionModels((current) =>
           current[result.provider_id] ||
           (typeof configuredRealtime === "string" &&
             configuredRealtime.trim()) ||
-          !result.models.find((model) => isRealtimeTranscriptionModel(model.id))
-            ?.id
+          !realtimeFallback
             ? current
             : {
                 ...current,
-                [result.provider_id]: result.models.find((model) =>
-                  isRealtimeTranscriptionModel(model.id),
-                )!.id,
+                [result.provider_id]: realtimeFallback,
               },
         );
       }
+      void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -1949,7 +1982,7 @@ function ProvidersPageForm() {
                           roles: ["llm"],
                           streaming: true,
                           remote: true,
-                          enabled: true,
+                          enabled: false,
                           capabilities: snapshot.capabilities,
                         },
                       ],
@@ -3744,7 +3777,7 @@ function searchRouteLabel(route: SearchRoute) {
   }
 }
 
-function ModelCapabilitiesDialog({
+export function ModelCapabilitiesDialog({
   models,
   onClose,
   onConfigureBalance,
@@ -3784,9 +3817,10 @@ function ModelCapabilitiesDialog({
   const [modelSearch, setModelSearch] = useState("");
   // The dialog can grow the list by pinning models manually, so it keeps its
   // own copy instead of reading the discovery-derived prop directly.
-  const [modelsList, setModelsList] = useState(
-    () => mergeProviderModelLists(models, provider) ?? models,
-  );
+  const [modelsList, setModelsList] = useState(() => {
+    const initial = mergeProviderModelLists(models, provider) ?? models;
+    return { ...initial, models: sortProviderModels(initial.models) };
+  });
   const [manualModelId, setManualModelId] = useState("");
   const [modelStates, setModelStates] = useState<Record<string, boolean>>(
     Object.fromEntries(modelsList.models.map((model) => [model.id, model.enabled !== false])),
@@ -3798,7 +3832,17 @@ function ModelCapabilitiesDialog({
   const latestModels = useQuery({
     gcTime: 0,
     queryKey: workspaceQueryKey(providerWorkspaceId, "provider-models", "capability-dialog", provider.id),
-    queryFn: () => discoverProviderModels(provider.id),
+    queryFn: async () => {
+      const result = await discoverProviderModels(provider.id);
+      void queryClient.invalidateQueries({
+        predicate: (query) =>
+          query.queryKey[0] === "providers" ||
+          (query.queryKey[0] === "workspace" &&
+            query.queryKey[1] === providerWorkspaceId &&
+            query.queryKey[2] === "providers"),
+      });
+      return result;
+    },
     enabled: false,
     retry: false,
   });
@@ -3811,15 +3855,12 @@ function ModelCapabilitiesDialog({
     const merged = mergeProviderModelLists(discovered, provider) ?? discovered;
     const mergedIds = new Set(merged.models.map((model) => model.id));
     setModelsList((current) => {
-      const byId = new Map(current.models.map((model) => [model.id, model]));
-      for (const model of merged.models) byId.set(model.id, model);
-      // Models the vendor no longer reports and the workspace never pinned
-      // manually are gone from the persisted snapshot — drop them instead of
-      // letting a stale row fail the bulk save with 404.
-      for (const id of [...byId.keys()]) {
-        if (!mergedIds.has(id)) byId.delete(id);
+      const byId = new Map(merged.models.map((model) => [model.id, model]));
+      for (const model of current.models) {
+        if (!mergedIds.has(model.id) || byId.has(model.id)) continue;
+        byId.set(model.id, model);
       }
-      return { ...merged, models: [...byId.values()] };
+      return { ...merged, models: sortProviderModels([...byId.values()]) };
     });
     setModelStates((current) => {
       const next = { ...current };
@@ -3838,14 +3879,33 @@ function ModelCapabilitiesDialog({
     onSuccess: (result) => {
       setModelsList((current) => {
         const byId = new Map(current.models.map((model) => [model.id, model]));
-        for (const snapshot of result.models) byId.set(snapshot.model_id, { id: snapshot.model_id, roles: ["llm"], streaming: true, remote: true, enabled: true, capabilities: snapshot.capabilities });
-        return { ...current, models: [...byId.values()] };
+        for (const snapshot of result.models) {
+          const existing = byId.get(snapshot.model_id);
+          byId.set(snapshot.model_id, {
+            id: snapshot.model_id,
+            roles: existing?.roles ?? ["llm"],
+            streaming: existing?.streaming ?? true,
+            remote: existing?.remote ?? true,
+            enabled: snapshot.enabled ?? existing?.enabled ?? false,
+            is_new: existing?.is_new,
+            capabilities: snapshot.capabilities,
+          });
+        }
+        return { ...current, models: sortProviderModels([...byId.values()]) };
       });
-      setModelStates((current) => ({ ...current, ...Object.fromEntries(result.models.map((model) => [model.model_id, true])) }));
+      setModelStates((current) => ({
+        ...current,
+        ...Object.fromEntries(
+          result.models.map((model) => [
+            model.model_id,
+            current[model.model_id] ?? model.enabled ?? false,
+          ]),
+        ),
+      }));
       setManualModelId("");
       for (const snapshot of result.models) onSaved(snapshot);
       void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
-      toast.success(`已添加 ${result.models.length} 个模型，可按需编辑参数`);
+      toast.success(`已添加 ${result.models.length} 个模型，默认未启用，请按需勾选并保存`);
     },
     onError: (error) => toast.error(error.message),
   });
@@ -3899,9 +3959,17 @@ function ModelCapabilitiesDialog({
         connectionDirty: input.connectionDirty,
       })),
     onSuccess: ({ result, connectionDirty }) => {
+      setModelsList((current) => ({
+        ...current,
+        models: current.models.map((model) => ({
+          ...model,
+          enabled: result.states[model.id] ?? model.enabled,
+          is_new: false,
+        })),
+      }));
       queryClient.setQueryData<ProviderModelsResponse>(
         workspaceQueryKey(providerWorkspaceId, "provider-models", "capability-dialog", provider.id),
-        (current) => current ? { ...current, models: current.models.map((model) => ({ ...model, enabled: result.states[model.id] ?? model.enabled })) } : current,
+        (current) => current ? { ...current, models: current.models.map((model) => ({ ...model, enabled: result.states[model.id] ?? model.enabled, is_new: false })) } : current,
       );
       onStatesSaved(result);
       void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
@@ -3957,10 +4025,11 @@ function ModelCapabilitiesDialog({
     !Array.isArray(overridesRaw)
       ? Object.keys(overridesRaw as Record<string, unknown>)
       : [];
+  const orderedModels = sortProviderModels(modelsList.models);
   const visibleModels = (() => {
     const query = modelSearch.trim().toLowerCase();
-    if (!query) return modelsList.models;
-    return modelsList.models
+    if (!query) return orderedModels;
+    return orderedModels
       .map((model) => ({
         model,
         score: model.id.toLowerCase().includes(query)
@@ -3970,9 +4039,24 @@ function ModelCapabilitiesDialog({
             : -1,
       }))
       .filter((entry) => entry.score >= 0)
-      .sort((left, right) => left.score - right.score)
+      .sort(
+        (left, right) =>
+          left.score - right.score ||
+          Number(Boolean(right.model.is_new)) - Number(Boolean(left.model.is_new)),
+      )
       .map((entry) => entry.model);
   })();
+  const targetModels = modelSearch.trim() ? visibleModels : orderedModels;
+  const allTargetSelected =
+    targetModels.length > 0 &&
+    targetModels.every((model) => modelStates[model.id] === true);
+  const anyTargetSelected = targetModels.some(
+    (model) => modelStates[model.id] === true,
+  );
+  const enabledModelCount = orderedModels.filter(
+    (model) => modelStates[model.id] === true,
+  ).length;
+  const newModelCount = orderedModels.filter((model) => model.is_new).length;
   const balanceConfig = providerBalanceQueryConfig(provider);
   const balanceLast = balanceConfig?.enabled
     ? providerBalanceQueryLastResult(provider)
@@ -3990,7 +4074,7 @@ function ModelCapabilitiesDialog({
           <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-5">
             <div className="space-y-5 py-5">
               <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">模型开关在底部保存；添加、删除、默认模型及连接按钮立即生效。</p></div><div className="flex gap-2"><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, true]))); }} size="xs" type="button" variant="outline">全部启用</Button><Button onClick={() => { touchedModelIds.current = new Set(modelsList.models.map((model) => model.id)); setModelStates(Object.fromEntries(modelsList.models.map((model) => [model.id, false]))); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
+                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">模型开关在底部保存；新增与手动添加的模型默认未启用，请按需勾选后保存。</p></div><div className="flex gap-2"><Button disabled={targetModels.length === 0 || allTargetSelected} onClick={() => { for (const model of targetModels) touchedModelIds.current.add(model.id); setModelStates((current) => ({ ...current, ...Object.fromEntries(targetModels.map((model) => [model.id, true])) })); }} size="xs" type="button" variant="outline">全选</Button><Button disabled={targetModels.length === 0 || !anyTargetSelected} onClick={() => { for (const model of targetModels) touchedModelIds.current.add(model.id); setModelStates((current) => ({ ...current, ...Object.fromEntries(targetModels.map((model) => [model.id, false])) })); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
                 <div className="flex items-center gap-2">
                   <Textarea
                     aria-label="批量添加模型"
@@ -4028,6 +4112,14 @@ function ModelCapabilitiesDialog({
                 </div>
                 {latestModels.isError ? <p role="alert" className="text-xs text-destructive">模型刷新失败：{latestModels.error.message}；保留现有列表。</p> : null}
                 <Input aria-label="搜索模型" onChange={(event) => setModelSearch(event.target.value)} placeholder="模糊搜索模型名称…" value={modelSearch} />
+                {orderedModels.length > 0 ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                    <span>已启用 {enabledModelCount} / {orderedModels.length} 个模型</span>
+                    {newModelCount > 0 ? (
+                      <span className="text-primary">发现 {newModelCount} 个新增模型（已置顶，默认未启用）</span>
+                    ) : null}
+                  </div>
+                ) : null}
                 {/* Radix ScrollArea 视口内层是 display:table（为横向滚动而设），会把行撑到
                     max-content，令 truncate 失效、行溢出视口被裁。这里只做纵向滚动，
                     因此压成 block，让行按可用宽度收缩与换行。 */}
@@ -4048,7 +4140,14 @@ function ModelCapabilitiesDialog({
                     >
                       {/* 窄屏：模型名独占一行（省略号截断），操作按钮整体换到下一行；
                           宽屏（sm+）：回到 flex-1 的单行布局。 */}
-                      <span className="w-full min-w-0 truncate font-mono sm:w-auto sm:flex-1">{model.id}</span>
+                      <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:flex-1">
+                        <span className="min-w-0 truncate font-mono">{model.id}</span>
+                        {model.is_new ? (
+                          <span className="shrink-0 rounded-md border border-primary/25 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                            新增
+                          </span>
+                        ) : null}
+                      </div>
                       {overrideModelIds.includes(model.id) ? (
                         <span
                           className="rounded border px-1 py-0.5 text-[10px] text-muted-foreground"
@@ -4061,14 +4160,24 @@ function ModelCapabilitiesDialog({
                         <Button disabled size="xs" type="button" variant="ghost">默认</Button>
                       ) : (
                         <Button
-                          disabled={removeModel.isPending}
+                          disabled={removeModel.isPending || modelStates[model.id] !== true}
                           onClick={async () => {
                             try {
+                              if (model.enabled === false) {
+                                await updateProviderModelState(provider.id, model.id, true);
+                                setModelsList((current) => ({
+                                  ...current,
+                                  models: current.models.map((item) =>
+                                    item.id === model.id ? { ...item, enabled: true, is_new: false } : item,
+                                  ),
+                                }));
+                              }
                               await onSetDefault(model.id);
                               setDefaultModelId(model.id);
                             } catch { /* parent mutation displays the actual PATCH failure */ }
                           }}
                           size="xs"
+                          title={modelStates[model.id] !== true ? "请先启用该模型后再设为默认" : undefined}
                           type="button"
                           variant="ghost"
                         >

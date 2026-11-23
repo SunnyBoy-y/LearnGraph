@@ -134,10 +134,20 @@ def test_image_generation_model_toggle_persists(
         lambda self, provider: ["gpt-image-1", "dall-e-3"],
     )
     try:
-        # 发现快照
+        # 发现快照：首次发现默认全部未启用，由用户显式勾选
         r = client.get(f"/api/v1/providers/{pid}/models", headers=headers)
         assert r.status_code == 200, r.text
         assert [m["id"] for m in r.json()["models"]] == ["gpt-image-1", "dall-e-3"]
+        assert [m["enabled"] for m in r.json()["models"]] == [False, False]
+
+        # 显式启用 dall-e-3、保持 gpt-image-1 关闭
+        r = client.patch(
+            f"/api/v1/providers/{pid}/models",
+            headers=headers,
+            json={"states": {"gpt-image-1": False, "dall-e-3": True}},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["states"] == {"gpt-image-1": False, "dall-e-3": True}
 
         # 启用供应商并设置默认模型
         r = client.patch(
@@ -149,16 +159,7 @@ def test_image_generation_model_toggle_persists(
             },
         )
         assert r.status_code == 200, r.text
-
-        # 关闭 gpt-image-1
-        r = client.patch(
-            f"/api/v1/providers/{pid}/models",
-            headers=headers,
-            json={"states": {"gpt-image-1": False, "dall-e-3": True}},
-        )
-        assert r.status_code == 200, r.text
-        assert r.json()["states"] == {"gpt-image-1": False, "dall-e-3": True}
-        assert r.json()["default_model"] == "dall-e-3"
+        assert r.json()["capabilities"]["default_image_generation_model_id"] == "dall-e-3"
 
         # 持久化：Provider 列表必须携带最新开关状态
         r = client.get("/api/v1/providers", headers=headers)
@@ -323,5 +324,106 @@ def test_base_url_update_invalidates_runtime_cache(client, register_user, auth_h
         with SessionLocal() as db:
             rows = cached_provider_rows(db, ws, None, provider_id=pid)
         assert rows and rows[0].base_url == "http://127.0.0.1:10/v1"
+    finally:
+        client.delete(f"/api/v1/providers/{pid}", headers=headers)
+
+
+def test_model_discovery_and_manual_add_default_unchecked_and_mark_new(
+    client, register_user, auth_headers, monkeypatch
+):
+    """首次发现与手动添加默认不启用；厂商新增模型默认不勾选、标为新增并置顶。"""
+    from app.services import management as mgmt
+
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    r = client.post(
+        "/api/v1/providers",
+        headers=headers,
+        json={
+            "display_name": "模型新增置顶回归",
+            "provider_type": "openai_compatible_chat",
+            "base_url": "http://127.0.0.1:9/v1",
+            "api_key": "test-provider-api-key-05",
+        },
+    )
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+
+    discovered = ["gpt-5.4", "gpt-5.4-mini"]
+    monkeypatch.setattr(
+        mgmt.ProviderService,
+        "_discover",
+        lambda self, provider: list(discovered),
+    )
+    try:
+        # 1. 首次发现：全部默认未启用，不标新增
+        r = client.get(f"/api/v1/providers/{pid}/models", headers=headers)
+        assert r.status_code == 200, r.text
+        assert [
+            (m["id"], m["enabled"], m["is_new"]) for m in r.json()["models"]
+        ] == [
+            ("gpt-5.4", False, False),
+            ("gpt-5.4-mini", False, False),
+        ]
+
+        # 2. 手动添加模型：同样默认未启用
+        r = client.post(
+            f"/api/v1/providers/{pid}/models/sync-catalog-defaults",
+            headers=headers,
+            json={"model_ids": ["custom-relay-model"]},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["models"][0]["enabled"] is False
+
+        # 3. 仅启用 gpt-5.4
+        r = client.patch(
+            f"/api/v1/providers/{pid}/models",
+            headers=headers,
+            json={
+                "states": {
+                    "gpt-5.4": True,
+                    "gpt-5.4-mini": False,
+                    "custom-relay-model": False,
+                }
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        # 4. 厂商新增模型 gpt-5.6-terra：默认不启用、标 is_new=True 且置顶
+        discovered = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.6-terra"]
+        r = client.get(f"/api/v1/providers/{pid}/models", headers=headers)
+        assert r.status_code == 200, r.text
+        assert [
+            (m["id"], m["enabled"], m["is_new"]) for m in r.json()["models"]
+        ] == [
+            ("gpt-5.6-terra", False, True),
+            ("gpt-5.4", True, False),
+            ("gpt-5.4-mini", False, False),
+        ]
+
+        # 5. 保存模型开关后清除新增标记
+        r = client.patch(
+            f"/api/v1/providers/{pid}/models",
+            headers=headers,
+            json={
+                "states": {
+                    "gpt-5.6-terra": True,
+                    "gpt-5.4": True,
+                    "gpt-5.4-mini": False,
+                    "custom-relay-model": False,
+                }
+            },
+        )
+        assert r.status_code == 200, r.text
+
+        r = client.get(f"/api/v1/providers/{pid}/models", headers=headers)
+        assert r.status_code == 200, r.text
+        assert [
+            (m["id"], m["enabled"], m["is_new"]) for m in r.json()["models"]
+        ] == [
+            ("gpt-5.4", True, False),
+            ("gpt-5.4-mini", False, False),
+            ("gpt-5.6-terra", True, False),
+        ]
     finally:
         client.delete(f"/api/v1/providers/{pid}", headers=headers)
