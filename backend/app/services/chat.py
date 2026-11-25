@@ -1058,8 +1058,9 @@ class ChatService:
             # context bounded and use the current request only so a long chat
             # history does not make the quick lane slower than the main turn.
             preface_prompt = (
-                "先不要解决用户的问题。请用一句自然、简短的话说明你将如何处理，"
-                f"最多 60 个汉字，不要列清单。用户请求：\n{user_content[:FAST_PREFACE_MAX_INPUT_CHARS]}"
+                "先别急着给完整答案。像真人私教一样用一句大白话自然开个头，点明接下来怎么带用户处理这件事"
+                "（不超过 40 个汉字，别用“好的，我将为您…”这种客服腔，也别列清单）。"
+                f"用户请求：\n{user_content[:FAST_PREFACE_MAX_INPUT_CHARS]}"
             )
             messages = [ProviderChatMessage(role="user", content=preface_prompt)]
             quote = self._preflight_model_call(
@@ -3683,12 +3684,13 @@ class ChatService:
                         "Follow a normal agent loop: reason as needed, call tools "
                         "when authorized work requires them, then give the final "
                         "answer.\n"
-                        "When you are about to use tools, start with a brief line "
-                        "or two in the user language on what you will do next "
-                        "(e.g. which files to write or what to look up). Keep it "
-                        "natural — not a canned template, not the full answer.\n"
-                        "After tool results, you may add a short progress note "
-                        "before more tools if it helps the user follow along.\n"
+                        "When you are about to use tools, start with one short, "
+                        "natural line in the user's language directly addressing what "
+                        "you are checking or building next — speak like a helpful human "
+                        "tutor, never like a status logger or customer-service template, "
+                        "and skip narrating internal tool plumbing unless useful.\n"
+                        "After tool results, add a brief natural transition before "
+                        "more tools only if it helps the user follow along.\n"
                         "Artifact placement: when a tool call will produce a "
                         "visible artifact (image, interactive HTML / magic card, "
                         "chart, or downloadable file), introduce it with a short "
@@ -4195,6 +4197,7 @@ class ChatService:
         *,
         agent_mode_enabled: bool,
         goal_mode_enabled: bool = False,
+        node_ids: list[str] | None = None,
     ) -> str:
         """Inject authorized Agent Skill package instructions (D-077).
 
@@ -4259,7 +4262,11 @@ class ChatService:
         if not callable(loader):
             return ""
         try:
-            activated = {"goal-learning-route"} if goal_mode_enabled else set()
+            activated: set[str] = set()
+            if goal_mode_enabled:
+                activated.add("goal-learning-route")
+            if node_ids:
+                activated.add("node-learning")
             instructions = str(loader(activated_skill_keys=activated) or "")
             if goal_mode_enabled and "goal-learning-route" not in instructions:
                 raise AppError(
@@ -6523,7 +6530,8 @@ class ChatService:
                 strategy = (getattr(node, "teaching_strategy", None) or "").strip()
                 if strategy:
                     block += (
-                        "\n   teaching_strategy（不向用户展示原文，请按其组织百科式讲解）："
+                        "\n   teaching_strategy（内部教学参考，不要照搬原文或写成百科词条；"
+                        "用自然口语带用户先建立直觉再动手体验）："
                         f"{strategy}"
                     )
                 node_text.append(block)
@@ -6538,8 +6546,8 @@ class ChatService:
                     + "\n选中节点使用规则：\n"
                     "1. 用户问“当前选中了什么节点 / 你能看到我选了哪个节点吗”时，"
                     "必须直接按上面的 label（可附 node_id）回答，不要否认能看到选区。\n"
-                    "2. 默认以这些选中节点为讲解、对比、练习与追问焦点；"
-                    "只有用户明确转移话题时才离开该焦点。\n"
+                    "2. 当用户围绕选中节点提问、要求讲解或做练习时，以这些节点为焦点；"
+                    "但如果用户明显在聊别的或已经切换话题，顺着用户当前意图走，不要硬把话题拽回选中节点。\n"
                     "3. 不要声称“看不到用户屏幕 / 不知道选中节点 / 只能靠猜”——"
                     "本列表就是本轮选区的权威数据源。\n"
                     "4. 回答时可引用节点说明与掌握状态，但不要编造列表中不存在的节点。"
@@ -11875,6 +11883,7 @@ class ChatService:
         skill_package_context = self._agent_skill_package_instructions(
             agent_mode_enabled=retry_agent_mode,
             goal_mode_enabled=retry_goal_mode,
+            node_ids=node_ids,
         )
         retry_audio_transcripts: list[tuple[FileRecord, AudioTranscription]] = []
         if not retry_agent_mode and attached_files:
@@ -14594,6 +14603,7 @@ class ChatService:
         skill_package_context = self._agent_skill_package_instructions(
             agent_mode_enabled=bool(payload.agent_mode),
             goal_mode_enabled=bool(payload.goal_mode),
+            node_ids=payload.node_ids,
         )
         ui_context = ""
         if payload.ui_action is not None:

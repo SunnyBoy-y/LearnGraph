@@ -903,8 +903,8 @@ class GoalService:
                 "title 必须是干净的学科/主题短语（如「数据库原理与应用」「离散数学」「算法与数据结构」），"
                 "聚焦知识本体，不得输出「学习xxx」「xxx学习图谱」「xxx知识图谱」这类模板套话，"
                 "不得包含天数、速通、计划、路径规划等过程修饰。"
-                "每个节点必须并发生成 teaching_strategy：针对该学科的讲解/教学策略，"
-                "包括百科式定义切入、关键例子、常见误区与可验证的掌握标准，便于后续学习该节点时注入。"
+                "每个节点必须并发生成 teaching_strategy：针对该学科的带学思路，"
+                "包括用大白话和直觉切入、1–2 个贴近实际的例子、新手常见误区与可自测的掌握标准，便于后续带学该节点时注入。"
                 "节点索引从 0 开始；边只能引用本次 nodes；不得发布或声称用户已掌握。\n"
                 + "已确认 Goal："
                 + goal_context[:16_000]
@@ -937,8 +937,8 @@ class GoalService:
                 concept.teaching_strategy.strip()
                 if node_specs and getattr(concept, "teaching_strategy", None)
                 else (
-                    f"以百科词条方式讲解「{label}」：先给出准确定义与边界，"
-                    "再给出 1–2 个典型例子与常见误区，最后给出可自测的掌握标准。"
+                    f"先用大白话和直观例子带入「{label}」解决什么问题，再点出关键边界与常见误区，"
+                    "最后给一个可动手或自测的小检验。"
                 )
             )
             created_nodes.append(
@@ -1081,8 +1081,8 @@ class GoalService:
 
     def _create_root_node(self, graph: Graph, spec: ModelGraphNode) -> GraphNode:
         teaching_strategy = (spec.teaching_strategy or "").strip() or (
-            f"以百科词条方式讲解「{spec.label}」：先给出准确定义与边界，"
-            "再给出 1–2 个典型例子与常见误区，最后给出可自测的掌握标准。"
+            f"先用大白话和直观例子带入「{spec.label}」解决什么问题，再点出关键边界与常见误区，"
+            "最后给一个可动手或自测的小检验。"
         )
         return self.nodes.add(
             GraphNode(
@@ -1464,7 +1464,7 @@ class GoalService:
                     "本批次生成 "
                     + f"{trunk_min}-{trunk_max} 个"
                     + "左右主干节点，不要生成与根节点同名的节点。"
-                    + "每个节点必须并发生成 teaching_strategy（百科式定义切入、关键例子、常见误区、可验证掌握标准）。"
+                    + "每个节点必须并发生成 teaching_strategy（直觉/大白话切入、典型例子、常见误区、可自测掌握标准）。"
                     + "\n图谱标题：" + graph_title
                     + "\n根节点：" + root.label + " — " + (root.description or "")[:300]
                     + "\n已确认 Goal：" + goal_context[:12_000]
