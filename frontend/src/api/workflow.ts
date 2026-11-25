@@ -25,7 +25,7 @@ export const getSourceDeleteImpact = (sourceId: string) => apiClient.get<DeleteI
 export const deleteSourceConfirmed = (sourceId: string, confirmationText: string) => apiClient.post<ActionResponse, { confirmation_text: string }>(`/sources/${encodeURIComponent(sourceId)}/delete`, { confirmation_text: confirmationText })
 export const createSourceLink = (sourceId: string, target_type: SourceTargetType, target_id: string) => apiClient.post<SourceLink, { target_type: SourceTargetType; target_id: string; relation: string }>(`/sources/${encodeURIComponent(sourceId)}/links`, { target_type, target_id, relation: 'reference' })
 export const listActions = () => apiClient.get<ActionItem[]>('/actions')
-export const createAction = (title: string) => apiClient.post<ActionItem, { title: string }>('/actions', { title })
+export const createAction = (title: string, graphId?: string) => apiClient.post<ActionItem, { title: string; graph_id?: string }>('/actions', { title, graph_id: graphId })
 export const updateAction = (id: string, payload: Partial<Pick<ActionItem, 'title' | 'description' | 'status' | 'due_at' | 'priority' | 'position'>>) => apiClient.patch<ActionItem, typeof payload>(`/actions/${encodeURIComponent(id)}`, payload)
 export const createCompositeDraft = (target_message_id: string, source_version_ids: string[]) => apiClient.post<CompositeDraft, { target_message_id: string; source_version_ids: string[] }>('/message-composites', { target_message_id, source_version_ids })
 export const confirmCompositeDraft = (id: string) => apiClient.post<CompositeDraft>(`/message-composites/${encodeURIComponent(id)}/confirm`)

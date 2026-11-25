@@ -2364,7 +2364,6 @@ export function ContextRail({
   const activeSession = railSession.data;
   const creationParentSessionId = activeSession?.parent_session_id ?? sessionId;
   const showActivity = [
-    "/home",
     "/sources",
     "/evidence/",
     "/research/",

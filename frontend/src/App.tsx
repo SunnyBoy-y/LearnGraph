@@ -21,6 +21,9 @@ import { VoiceSessionProvider } from '@/features/voice/voice-session-controller'
 const LoginPage = lazy(() => import('@/features/auth/login-page').then((module) => ({ default: module.LoginPage })))
 const ChangePasswordPage = lazy(() => import('@/features/auth/change-password-page').then((module) => ({ default: module.ChangePasswordPage })))
 const DashboardPage = lazy(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.DashboardPage })))
+const LearningSessionsPage = lazy(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.LearningSessionsPage })))
+const LearningPlanPage = lazy(() => import('@/features/dashboard/learning-workspace-pages').then((module) => ({ default: module.LearningPlanPage })))
+const LearningReportPage = lazy(() => import('@/features/dashboard/learning-workspace-pages').then((module) => ({ default: module.LearningReportPage })))
 const GoalConfirmPage = lazy(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GoalConfirmPage })))
 const GraphReviewPage = lazy(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GraphReviewPage })))
 const CapabilityGraphPage = lazy(() => import('@/features/graph/graph-pages').then((module) => ({ default: module.CapabilityGraphPage })))
@@ -151,6 +154,9 @@ function AppRoutes() {
       >
         <Route element={<Navigate replace to="chat/new" />} index />
         <Route element={<DashboardPage />} path="home" />
+        <Route element={<LearningSessionsPage />} path="learning-sessions" />
+        <Route element={<LearningPlanPage />} path="learning-plan" />
+        <Route element={<LearningReportPage />} path="learning-report" />
         <Route element={<GoalModeRedirect />} path="goals/new/clarify" />
         <Route element={<GoalConfirmPage />} path="goals/:goalId/confirm" />
         <Route element={<GraphReviewPage />} path="goals/:goalId/graph-review" />

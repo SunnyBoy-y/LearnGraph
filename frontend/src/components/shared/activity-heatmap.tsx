@@ -9,7 +9,6 @@ import {
 } from "lucide-react";
 
 import { listActions, renderSessionActivitySummary } from "@/api";
-import { SectionHeading } from "@/components/shared/page-elements";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { getSessionActivityDays, listSessionPage, type SessionSummary, type SessionPage, type SessionPageParam } from '@/api/session-browser'
@@ -72,7 +71,7 @@ function activityIcon(kind: ActivityKind) {
 export function ActivityHeatmap({
   variant = "rail",
 }: {
-  variant?: "rail" | "panel";
+  variant?: "rail" | "panel" | "report";
 }) {
   const { workspaceId } = useAuth();
   const actions = useQuery({
@@ -117,7 +116,7 @@ export function ActivityHeatmap({
     return { today: todayDate, weeks: allWeeks, monthLabels: labels };
   }, []);
 
-  const [selectedKey, setSelectedKey] = useState(() => formatDayKey(today));
+  const [selectedKey, setSelectedKey] = useState(() => variant === "panel" ? "" : formatDayKey(today));
   const range = useMemo(() => {
     const end = new Date(today); end.setDate(end.getDate() + 1);
     return { start: weeks[0][0].toISOString(), end: end.toISOString() };
@@ -127,6 +126,7 @@ export function ActivityHeatmap({
     queryFn: ({ signal }) => getSessionActivityDays(range.start, range.end, { signal }), staleTime: 30_000,
   });
   const selectedRange = useMemo(() => {
+    if (!selectedKey) return {};
     const [year, month, day] = selectedKey.split('-').map(Number);
     return { created_after: new Date(year, month - 1, day).toISOString(), created_before: new Date(year, month - 1, day + 1).toISOString() };
   }, [selectedKey]);
@@ -137,6 +137,7 @@ export function ActivityHeatmap({
     initialPageParam: {} as SessionPageParam,
     getNextPageParam: page => page.has_more && page.next_cursor ? { cursor: page.next_cursor, direction: 'next' as const } : undefined,
     getPreviousPageParam: page => page.has_previous && page.previous_cursor ? { cursor: page.previous_cursor, direction: 'previous' as const } : undefined,
+    enabled: Boolean(selectedKey),
     maxPages: 5, staleTime: 30_000,
   });
   const sessions = { data: useMemo(() => daySessions.data?.pages.flatMap(page => page.items), [daySessions.data]) };
@@ -147,7 +148,7 @@ export function ActivityHeatmap({
   // unavailable degrades silently — the row keeps showing the title.
   useEffect(() => {
     const list = sessions.data;
-    if (!list) return;
+    if (!selectedKey || !list) return;
     const pending = list.filter(
       (session) =>
         formatDayKey(new Date(session.created_at)) === selectedKey &&
@@ -372,7 +373,10 @@ export function ActivityHeatmap({
                     aria-pressed={selectedKey === key}
                     className={`activity-heatmap__cell is-level-${Math.min(4, count)}`}
                     key={key}
-                    onClick={() => setSelectedKey(key)}
+                    onClick={() => {
+                      setExpandedDayKey(null);
+                      setSelectedKey(variant === "panel" && selectedKey === key ? "" : key);
+                    }}
                     title={`${dateLabel} · ${count > 0 ? `${count} 次活动` : "没有活动"}`}
                     type="button"
                   />
@@ -395,14 +399,15 @@ export function ActivityHeatmap({
     </span>
   );
 
-  if (variant === "panel") {
+  if (variant !== "rail") {
     return (
-      <div>
-        <SectionHeading
-          description={`${summary} · 连续学习 ${streak} 天`}
-          title="学习活动"
-        />
-        <div className="mt-5">{heatmapGrid}</div>
+      <div className="activity-heatmap-panel">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          {!days.isPending && !days.isError && !actions.isPending && !actions.isError ? <span><strong className="mr-1 text-base font-semibold tabular-nums text-foreground">{totalCount.toLocaleString("zh-CN")}</strong>次活动 · 过去一年</span> :
+            <span>{days.isError || actions.isError ? "学习活动统计暂不完整" : "正在读取学习活动…"}</span>}
+          {!days.isPending && !days.isError && !actions.isPending && !actions.isError && <span>连续活跃 {streak} 天</span>}
+        </div>
+        <div className="mt-2">{heatmapGrid}</div>
         <div className="activity-heatmap__meta mt-2">
           <span className="activity-heatmap__streak">
             点击方块查看当天的学习活动
@@ -410,7 +415,7 @@ export function ActivityHeatmap({
           {legend}
         </div>
 
-        <div className="mt-6 grid gap-x-10 gap-y-6 border-t pt-5 lg:grid-cols-2">
+        {variant === "report" && <div className="mt-6 grid gap-x-10 gap-y-6 border-t pt-5 lg:grid-cols-2">
           <div className="min-w-0">
             <p className="text-xs font-medium text-muted-foreground">
               月度活动 · 近 12 个月
@@ -480,9 +485,9 @@ export function ActivityHeatmap({
               ))}
             </div>
           </div>
-        </div>
+        </div>}
 
-        <div className="mt-6 border-t pt-5">
+        {selectedKey && <div className="mt-4 border-t pt-4" aria-live="polite">
           <p className="text-sm">
             <strong>{selectedHeading}</strong> 的活动
           </p>
@@ -512,7 +517,7 @@ export function ActivityHeatmap({
               {dayToggleButton}
             </p>
           )}
-        </div>
+        </div>}
       </div>
     );
   }
