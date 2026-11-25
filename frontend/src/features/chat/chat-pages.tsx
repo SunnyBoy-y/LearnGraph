@@ -10480,7 +10480,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 })}
                 <DropdownMenuSeparator />
                 <DropdownMenuLabel>模式与工具</DropdownMenuLabel>
-                {(["long-goal", "search", "agentic", "image"] as const).map((id) => {
+                {(["long-goal", "search", "image"] as const).map((id) => {
                   const command = composerCommands.find(
                     (item) => item.id === id,
                   );

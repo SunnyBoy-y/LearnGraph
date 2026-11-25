@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,7 +30,12 @@ describe("removed research controls", () => {
     );
     await screen.findByRole("heading", { name: "从一个问题开始" });
     await user.click(screen.getByRole("button", { name: "打开对话功能菜单" }));
-    expect(await screen.findByText("添加资料")).toBeInTheDocument();
+    const menu = within(await screen.findByRole("menu", { name: "打开对话功能菜单" }));
+    expect(menu.getByRole("menuitem", { name: "添加资料" })).toBeInTheDocument();
+    expect(menu.getByRole("menuitem", { name: "长程任务" })).toBeInTheDocument();
+    expect(menu.getByRole("menuitem", { name: /网络搜索/ })).toBeInTheDocument();
+    expect(menu.getByRole("menuitem", { name: "绘图" })).toBeInTheDocument();
+    expect(menu.queryByRole("menuitem", { name: "智能体" })).not.toBeInTheDocument();
     expect(screen.queryByText(/深度研究|Deep Research/i)).not.toBeInTheDocument();
     expect(document.querySelector('a[href*="/research/tasks"]')).toBeNull();
     expect(apiClient.post).not.toHaveBeenCalled();
