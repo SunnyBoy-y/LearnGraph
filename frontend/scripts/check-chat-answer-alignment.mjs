@@ -102,7 +102,44 @@ try {
       checks++
     }
   }
-  console.log(`PASS: ${checks} browser layout cases; all answer chrome aligned within 1px, prose unchanged.`)
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 700 })
+    await page.setContent(`<style>${css.join('\n')}</style>
+      <main class="workspace-main--chat"><div class="chat-canvas-page" style="height:640px;display:flex;flex-direction:column">
+        <div id="viewport" style="flex:1 1 0;min-height:0;overflow:auto"><div class="chat-messages-content">
+          <div class="is-assistant"><div data-message-content><div class="message-answer-segment">
+            <p>正文</p><div class="unified-artifact-card--wide" style="height:380px">宽图</div>
+          </div></div></div><section id="suggestions" class="chat-follow-up-prompts">推荐问题</section>
+        </div></div>
+        <div class="chat-composer-dock"><div class="chat-scroll-button-slot"><button class="chat-scroll-to-bottom">↓</button></div>
+          <div id="composer" style="height:140px;width:100%">输入框</div></div>
+      </div></main>`)
+    const geometry = await page.evaluate(() => {
+      const viewport = document.querySelector('#viewport')
+      viewport.scrollTop = viewport.scrollHeight
+      const box = (s) => document.querySelector(s).getBoundingClientRect()
+      const dock = document.querySelector('.chat-composer-dock')
+      const result = {
+        position: getComputedStyle(dock).position,
+        dock: box('.chat-composer-dock').top, bottom: box('#viewport').bottom,
+        suggestions: box('#suggestions').bottom, button: box('.chat-scroll-to-bottom').top,
+        slotBottom: box('.chat-scroll-button-slot').bottom, composer: box('#composer').top,
+        answer: box('.message-answer-segment').width, wide: box('.unified-artifact-card--wide').width,
+        column: box('[data-message-content]').width,
+        overflow: viewport.scrollWidth - viewport.clientWidth,
+      }
+      dock.classList.add('is-enlarged')
+      result.enlargedPosition = getComputedStyle(dock).position
+      return result
+    })
+    assert.equal(geometry.position, 'relative')
+    assert.equal(geometry.enlargedPosition, 'absolute')
+    assert(geometry.bottom <= geometry.dock + 1 && geometry.suggestions <= geometry.button + 1 && geometry.slotBottom <= geometry.composer + 1)
+    assert(Math.abs(geometry.wide - geometry.column) < 1 && geometry.wide >= geometry.answer && geometry.overflow <= 1)
+    if (width === 1440) assert(geometry.wide > geometry.answer)
+    checks++
+  }
+  console.log(`PASS: ${checks} browser layout cases; answer alignment, wide artifacts and dock spacing verified.`)
 } finally {
   await browser.close()
 }

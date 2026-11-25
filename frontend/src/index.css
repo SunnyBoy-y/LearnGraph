@@ -1296,7 +1296,13 @@ body.is-resizing .workspace-resizer {
   width: min(var(--chat-content-width), calc(100% - 48px));
   margin-inline: auto;
 }
-.chat-plus-menu { min-width: 236px; max-height: min(470px, calc(100vh - 120px)); overflow-y: auto; }
+.chat-plus-menu {
+  width: min(236px, calc(100vw - 16px));
+  min-width: 0;
+  overscroll-behavior-y: contain;
+}
+.chat-plus-menu[data-side='top'] { max-height: var(--chat-plus-menu-above); }
+.chat-plus-menu[data-side='bottom'] { max-height: var(--chat-plus-menu-below); }
 .chat-plus-menu [data-slot='dropdown-menu-item'] { gap: 9px; }
 .chat-context-bar { display: flex; min-width: 0; max-width: 100%; align-items: center; gap: 7px; margin: 0 0 7px; overflow-x: auto; padding: 0 4px; scrollbar-width: none; overscroll-behavior-x: contain; }
 .chat-workbench-toolbar { display: flex; min-width: 0; max-width: 100%; align-items: center; gap: 7px; margin: 0 0 7px; overflow-x: auto; padding: 0 4px; scrollbar-width: none; overscroll-behavior-x: contain; }
@@ -7713,7 +7719,6 @@ path.knowledge-plan-edge.is-selected { opacity: .7 !important; }
   .chat-composer.is-expanded [data-slot='input-group'] { border-radius: 20px; }
   .chat-composer.is-expanded .chat-composer__start,
   .chat-composer.is-expanded .chat-composer__end { align-self: center; padding-bottom: 0 !important; }
-  .chat-plus-menu { min-width: min(236px, calc(100vw - 40px)); }
 }
 
 /* --------------------------------------------------------------------------

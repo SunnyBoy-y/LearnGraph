@@ -38,7 +38,7 @@ beforeEach(() => {
     notifyActivityUpdated: vi.fn(), notifyCommittedAnswerStarted: vi.fn(),
     notifyLayoutChanged: vi.fn(), notifyUserTurnStarted: vi.fn(),
     returnToLatest: vi.fn(), scrollMessageIntoView: vi.fn(),
-    captureScrollSnapshot: vi.fn(), restoreScrollSnapshot: vi.fn(), resetTailSpace: vi.fn(),
+    captureScrollSnapshot: vi.fn(), restoreScrollSnapshot: vi.fn(), resetConversation: vi.fn(),
   };
   vi.mocked(useConversationScrollController).mockReturnValue(controller);
   style = document.createElement("style");

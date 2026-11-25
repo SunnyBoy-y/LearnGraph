@@ -74,6 +74,7 @@ import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
 import { RetryAnswerMenu, RetryMenuSettings } from "@/components/chat/retry-answer-menu";
 import { FollowUpPrompts } from "@/components/chat/suggested-prompts";
 import { MemoryOpeningSuggestions } from "./memory-opening-suggestions";
+import { ComposerActionMenu } from "./composer-action-menu";
 import {
   beginStreamStats,
   deltaTextOf,
@@ -198,10 +199,7 @@ import {
 import {
   PromptInput,
   PromptInputActionAddAttachments,
-  PromptInputActionMenu,
-  PromptInputActionMenuContent,
   PromptInputActionMenuItem,
-  PromptInputActionMenuTrigger,
   PromptInputBody,
   PromptInputAttachments,
   PromptInputButton,
@@ -2129,9 +2127,9 @@ function AssistantMessageInner({
           </p>
         ) : null}
         <div ref={messageContentRef} className="contents">
-        {displaySegments.map((segment, index) =>
+        {displaySegments.map(segment =>
           segment.kind === "chain" ? (
-            <div className="space-y-2" key={`chain-wrap-${message.id}-${index}`}>
+            <div className="space-y-2" key={`chain-wrap-${message.id}`}>
               <ThinkingChain
                 chainParts={segment.parts}
                 completedDurationSec={thinkingDurationSeconds(
@@ -2164,13 +2162,7 @@ function AssistantMessageInner({
           ) : (
             <div
               className="message-answer-segment"
-              data-conversation-answer-anchor={
-                finalAnswerStarted &&
-                (shown.status === "streaming" || shown.status === "pending")
-                  ? message.id
-                  : undefined
-              }
-              key={`parts-${message.id}-${index}`}
+              key={`parts-${message.id}`}
             >
               {renderAnswerParts(segment.parts)}
             </div>
@@ -2491,7 +2483,7 @@ export function ChatCanvasPage() {
     notifyCommittedAnswerStarted,
     notifyActivityUpdated,
     notifyUserTurnStarted,
-    resetTailSpace,
+    resetConversation,
     restoreScrollSnapshot,
     scrollMessageIntoView,
   } = conversationScroll;
@@ -2517,6 +2509,8 @@ export function ChatCanvasPage() {
     setTopbarModelSlot(document.getElementById("topbar-model-slot"));
   }, []);
   const [localMessages, setLocalMessages] = useLiveChatMessages(workspaceId);
+  // Keep the mounted row when SSE hands its temporary id over to history.
+  const optimisticRowKeys = useRef(new Map<string, string>());
   const [status, setStatus] = useState<ChatStatus>("ready");
   const [streamConnectionNotice, setStreamConnectionNotice] =
     useState<StreamConnectionNotice | null>(null);
@@ -2626,9 +2620,8 @@ export function ChatCanvasPage() {
   useEffect(() => {
     if (promotingDraftSessionIdRef.current === sessionId) return;
     setStreamConnectionNotice(null);
-    // 会话切换时释放上一段会话留下的尾部预留：否则新会话末尾会凭空多出一段空白。
-    resetTailSpace();
-  }, [conversationResetKey, resetTailSpace, sessionId]);
+    resetConversation();
+  }, [conversationResetKey, resetConversation, sessionId]);
   const [modelSearch, setModelSearch] = useState("");
   // Collapsed = icon + chevron, open = current mode word + chevron, matching
   // the ChatGPT composer trigger. Drives the chip content and Ctrl+Shift+M.
@@ -2903,14 +2896,7 @@ export function ChatCanvasPage() {
   const optimisticSessionId = useRef<string | null>(null);
   const retryExpectedVersionRef = useRef(0);
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-  /** 底部 Composer 整体高度写入 --composer-height，驱动正文安全区 / 淡出。
-      悬浮按钮直接挂到真实 dock 上，不能依赖回合进行中锁定的预留高度。 */
-  const [composerDockElement, setComposerDockElement] =
-    useState<HTMLDivElement | null>(null);
-  /** 已写入 --composer-height 的高度，以及回合进行中被推迟的收缩值。 */
-  const composerHeightRef = useRef(0);
-  const composerPendingShrinkRef = useRef<number | null>(null);
-  const composerHeightLockedRef = useRef(false);
+  const [scrollButtonHost, setScrollButtonHost] = useState<HTMLDivElement | null>(null);
   /** 待发送附件条（PromptInputAttachments）的 DOM 宿主：附件条由 portal 挂到这里，
       使其位于工作台功能条（资料/目标/联网）上方；附件状态仍归 PromptInput 所有。 */
   const [attachmentRowHost, setAttachmentRowHost] =
@@ -3026,48 +3012,6 @@ export function ChatCanvasPage() {
       observer?.disconnect();
     };
   }, [composerText, composerInstanceKey, composerEnlarged]);
-
-  // 底部 Composer 高度变化时写入 --composer-height，供正文安全区和底部淡出使用。
-  // 「回到底部」按钮由 dock 本身定位，不依赖这里可能被锁定的历史高度。
-  // 回合进行中只允许变高：正文的 padding-bottom 依赖该变量，收缩会直接改变
-  // 内容滚动高度（被当成「内容变多」，并让滚动位置被重新钳位）。收缩值先
-  // 记账，回合结束后补写。
-  useEffect(() => {
-    const element = composerDockElement;
-    if (!element) return;
-    const observer = new ResizeObserver(([entry]) => {
-      if (!entry) return;
-      const next = Math.round(entry.contentRect.height);
-      if (composerHeightLockedRef.current && next < composerHeightRef.current) {
-        composerPendingShrinkRef.current = next;
-        return;
-      }
-      composerPendingShrinkRef.current = null;
-      if (next === composerHeightRef.current) return;
-      composerHeightRef.current = next;
-      document.documentElement.style.setProperty(
-        "--composer-height",
-        `${next}px`,
-      );
-    });
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [composerDockElement]);
-
-  // 回合结束（空闲）后解除收缩抑制，并补写被推迟的收缩值。
-  useEffect(() => {
-    const busy = status === "submitted" || status === "streaming";
-    composerHeightLockedRef.current = busy;
-    if (busy) return;
-    const pending = composerPendingShrinkRef.current;
-    if (pending === null) return;
-    composerPendingShrinkRef.current = null;
-    composerHeightRef.current = pending;
-    document.documentElement.style.setProperty(
-      "--composer-height",
-      `${pending}px`,
-    );
-  }, [status]);
 
   useEffect(() => {
     if (!selectionMenu) return;
@@ -4061,9 +4005,7 @@ export function ChatCanvasPage() {
     ]);
   }, [history.data, localMessages, sessionId]);
   const activeCommittedAnswerTurnId = useMemo(() => {
-    // In voice mode, keep the scroll container following live speech at the bottom smoothly.
-    // Anchoring to the answer top causes compensateLayoutChange() to fight with live typing,
-    // which was the primary root cause of "一直出现文字跳动".
+    // Only text replies use the new-answer indicator.
     if (voiceModeOpen) return null;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
@@ -5860,7 +5802,7 @@ export function ChatCanvasPage() {
         created_at: new Date().toISOString(),
       };
       setLocalMessages((current) => [...current, user, assistant]);
-      // 新用户回合由滚动控制器做一次定位，之后 activity 阶段才允许跟随。
+      // 只在发送时定位用户消息，后续生成沿用这个锚点。
       notifyUserTurnStarted(user.id);
       setSelectionMenu(null);
       setStreamConnectionNotice(null);
@@ -6022,6 +5964,7 @@ export function ChatCanvasPage() {
       let autoTitleRequested = false;
       let autoTitlePromise: Promise<void> | null = null;
       const markPersistedId = (localId: string, persistedId: string) => {
+        optimisticRowKeys.current.set(persistedId, localId);
         setLocalMessages((current) =>
           current.map((message) =>
             message.id === localId
@@ -9601,6 +9544,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                     {visibleRows.map((row, messageIndex) => {
                 if (row.kind === "task-round") return <div key={row.key}>{renderRoundTasks(row.tasks, row.sourceText)}</div>;
                 const { message } = row;
+                const durableId = message.provider_trace?.optimistic_target_message_id;
+                const renderId = typeof durableId === "string" ? durableId : message.id;
+                const rowKey = optimisticRowKeys.current.get(renderId) ?? renderId;
                 const persisted =
                   !message.id.startsWith("temp") &&
                   message.id !== "welcome-local";
@@ -9622,7 +9568,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                   return (
                     <LazyMessageMount
                       eager={eagerMount}
-                      key={message.id}
+                      key={rowKey}
                       messageId={message.id}
                       minHeight={72}
                     >
@@ -9677,7 +9623,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 return (
                   <LazyMessageMount
                     eager={eagerMount}
-                    key={message.id}
+                    key={rowKey}
                     messageId={message.id}
                     minHeight={140}
                   >
@@ -9842,8 +9788,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             </>
           )}
         </ConversationContent>
-        <ConversationScrollButton portalTarget={composerDockElement} />
         </PartUIStateProvider>
+        <ConversationScrollButton portalTarget={scrollButtonHost} />
       </Conversation>
 
       {selectionMenu ? (
@@ -9950,8 +9896,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
 
       <div
         className={cn("chat-composer-dock", composerEnlarged && "is-enlarged")}
-        ref={setComposerDockElement}
       >
+        {!showNewChatWelcome && !composerEnlarged ? <div className="chat-scroll-button-slot" ref={setScrollButtonHost} /> : null}
         {showNewChatWelcome ? <h2 className="new-chat-heading">从一个问题开始</h2> : null}
         {effectiveAgentMode ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
@@ -10502,13 +10448,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             align="inline-start"
             className="chat-composer__start"
           >
-            <PromptInputActionMenu>
-              <PromptInputActionMenuTrigger
-                aria-label="打开对话功能菜单"
-                className="chat-composer__add"
-                tooltip="打开功能菜单"
-              />
-              <PromptInputActionMenuContent className="chat-plus-menu">
+            <ComposerActionMenu>
                 <DropdownMenuLabel>上下文</DropdownMenuLabel>
                 <PromptInputActionAddAttachments
                   disabled={
@@ -10580,8 +10520,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                     );
                   },
                 )}
-              </PromptInputActionMenuContent>
-            </PromptInputActionMenu>
+            </ComposerActionMenu>
           </InputGroupAddon>
           <PromptInputBody>
             <PromptInputTextarea

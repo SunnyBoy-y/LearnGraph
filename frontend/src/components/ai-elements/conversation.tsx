@@ -96,6 +96,7 @@ export const ConversationContent = ({
         height: "100%",
         overflow: "auto",
         overflowAnchor: "none",
+        scrollBehavior: "auto",
         scrollbarGutter: "stable both-edges",
         width: "100%",
       }}
@@ -179,7 +180,7 @@ export const ConversationScrollButton = ({
   }, [returnToLatest]);
 
   const visible =
-    hasNewContent || (!isAtBottom && mode === "MANUAL_READING");
+    hasNewContent || (!isAtBottom && mode !== "FOLLOW_ACTIVITY");
   if (!visible || portalTarget === null) return null;
 
   // 按钮只保留向下箭头（悬浮态文案会让按钮宽度随状态跳动）；

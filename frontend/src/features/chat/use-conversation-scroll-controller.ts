@@ -61,12 +61,8 @@ export interface ConversationScrollController {
   captureScrollSnapshot: () => ConversationScrollSnapshot | null;
   restoreScrollSnapshot: (snapshot: ConversationScrollSnapshot | null) => void;
   scrollRef: (node: HTMLDivElement | null) => void;
-  /**
-   * Drop the reserved trailing space. Hosts call this when the conversation
-   * itself changes (session switch), otherwise the last session's reservation
-   * would leave a blank gap at the end of the next one.
-   */
-  resetTailSpace: () => void;
+  /** Reset scroll state when switching to a different conversation. */
+  resetConversation: () => void;
   /**
    * Trailing space (px) reserved below the content so the active turn anchor is
    * actually reachable. Hosts must apply it to the content's bottom padding;
@@ -85,8 +81,6 @@ const NEAR_BOTTOM_THRESHOLD = 96;
  */
 const ANCHOR_BOTTOM_SLACK = NEAR_BOTTOM_THRESHOLD + 32;
 const ANCHOR_RETRY_FRAMES = 36;
-const DESIRED_ANSWER_TOP_RATIO = 0.3;
-const DESIRED_COMPACT_ANSWER_TOP_RATIO = 0.23;
 const DESIRED_USER_TOP_RATIO = 0.15;
 
 function clamp(value: number, min: number, max: number) {
@@ -95,13 +89,6 @@ function clamp(value: number, min: number, max: number) {
 
 function maxScrollTop(element: HTMLElement) {
   return Math.max(0, element.scrollHeight - element.clientHeight);
-}
-
-function findAnswerAnchor(turnId: string) {
-  const escapedTurnId = turnId.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-  return document.querySelector<HTMLElement>(
-    `[data-conversation-answer-anchor="${escapedTurnId}"]`,
-  );
 }
 
 function findMessageAnchor(messageId: string) {
@@ -146,7 +133,7 @@ export function useConversationScrollController(): ConversationScrollController 
   const layoutFrameRef = useRef<number | null>(null);
   const ignoreManualUntilRef = useRef(0);
   const expectedProgrammaticTopRef = useRef<number | null>(null);
-  const committedAnswerTurnRef = useRef<string | null>(null);
+  const userTurnRef = useRef<{ messageId: string; element?: HTMLElement } | null>(null);
   const processedAnswerTurnRef = useRef<string | null>(null);
   const touchStartYRef = useRef<number | null>(null);
   const contentObserverRef = useRef<ResizeObserver | null>(null);
@@ -214,10 +201,8 @@ export function useConversationScrollController(): ConversationScrollController 
   const refreshAtBottom = useCallback(() => {
     const element = scrollElementRef.current;
     if (!element) return;
-    setIsAtBottom(
-      element.scrollHeight - element.scrollTop - element.clientHeight <=
-        NEAR_BOTTOM_THRESHOLD,
-    );
+    const threshold = modeRef.current === "ANSWER_ANCHORED" ? 2 : NEAR_BOTTOM_THRESHOLD;
+    setIsAtBottom(maxScrollTop(element) - element.scrollTop <= threshold);
   }, [setIsAtBottom]);
 
   /**
@@ -375,12 +360,32 @@ export function useConversationScrollController(): ConversationScrollController 
     return true;
   }, [resolveLiveAnchor, setScrollTop]);
 
+  // Floor the total content height at the latest question's scroll target plus
+  // one viewport. The answer, composer clearance and follow-up prompts all
+  // share this space instead of adding a blank viewport below completed answers.
+  const refreshTurnFloor = useCallback(() => {
+    const scroller = scrollElementRef.current;
+    const content = contentElementRef.current;
+    const question = userTurnRef.current?.element;
+    if (!scroller || !content || !question || !isAnchorAttached(question, scroller)) return;
+    const offset = question.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+    const target = Math.max(0, offset - scroller.clientHeight * DESIRED_USER_TOP_RATIO);
+    content.style.minHeight = `${Math.ceil(target + scroller.clientHeight)}px`;
+    return target;
+  }, []);
+
+  const clearTurnFloor = useCallback(() => {
+    userTurnRef.current = null;
+    contentElementRef.current?.style.removeProperty("min-height");
+  }, []);
+
   const scheduleLayoutDecision = useCallback(() => {
     if (layoutFrameRef.current !== null) return;
     layoutFrameRef.current = window.requestAnimationFrame(() => {
       layoutFrameRef.current = null;
       const element = scrollElementRef.current;
       if (!element) return;
+      refreshTurnFloor();
       const nextHeight = element.scrollHeight;
       const previousHeight = lastContentHeightRef.current;
       lastContentHeightRef.current = nextHeight;
@@ -411,92 +416,60 @@ export function useConversationScrollController(): ConversationScrollController 
       }
 
       compensateLayoutChange();
+      refreshAtBottom();
       if (grew || (modeRef.current === "MANUAL_READING" && nextHeight > previousHeight + 1)) setHasNewContent(true);
     });
-  }, [compensateLayoutChange, resolveLiveAnchor, scrollToBottom]);
+  }, [compensateLayoutChange, refreshAtBottom, refreshTurnFloor, resolveLiveAnchor, scrollToBottom]);
 
   const notifyLayoutChanged = useCallback(() => {
     scheduleLayoutDecision();
   }, [scheduleLayoutDecision]);
 
   const resolveUserTurnAnchor = useCallback(
-    (messageId: string, frame = 0) => {
-      if (modeRef.current === "MANUAL_READING") return;
-      const element = findMessageAnchor(messageId);
-      if (element) {
-        const desired =
-          scrollElementRef.current?.clientHeight
-            ? scrollElementRef.current.clientHeight * DESIRED_USER_TOP_RATIO
-            : 0;
-        positionAnchor(element, desired, "user-message", () =>
-          findMessageAnchor(messageId),
-        );
+    function resolve(turn: NonNullable<typeof userTurnRef.current>, frame = 0) {
+      if (userTurnRef.current !== turn || modeRef.current !== "ANSWER_ANCHORED") return;
+      const scroller = scrollElementRef.current;
+      const element = findMessageAnchor(turn.messageId);
+      if (element && scroller && isAnchorAttached(element, scroller)) {
+        turn.element = element;
+        const target = refreshTurnFloor();
+        if (target !== undefined) setScrollTop(target, "user-message");
+        updateReadingAnchor({
+          element,
+          viewportTop: element.getBoundingClientRect().top,
+          resolve: () => findMessageAnchor(turn.messageId),
+        });
+        lastAnchorOffsetRef.current = null;
+        refreshAtBottom();
         return;
       }
-      if (frame >= ANCHOR_RETRY_FRAMES) return;
-      window.requestAnimationFrame(() =>
-        resolveUserTurnAnchor(messageId, frame + 1),
-      );
+      if (frame < ANCHOR_RETRY_FRAMES) {
+        window.requestAnimationFrame(() => resolve(turn, frame + 1));
+      }
     },
-    [positionAnchor],
-  );
-
-  const resolveCommittedAnswerAnchor = useCallback(
-    (turnId: string, frame = 0) => {
-      if (
-        processedAnswerTurnRef.current !== turnId ||
-        modeRef.current !== "ANSWER_ANCHORED"
-      ) {
-        return;
-      }
-      const element = findAnswerAnchor(turnId);
-      if (element) {
-        const viewportHeight = scrollElementRef.current?.clientHeight ?? 0;
-        const ratio =
-          viewportHeight > 0 && viewportHeight < 640
-            ? DESIRED_COMPACT_ANSWER_TOP_RATIO
-            : DESIRED_ANSWER_TOP_RATIO;
-        positionAnchor(element, viewportHeight * ratio, "answer-anchor", () =>
-          findAnswerAnchor(turnId),
-        );
-        return;
-      }
-      if (frame >= ANCHOR_RETRY_FRAMES) return;
-      window.requestAnimationFrame(() =>
-        resolveCommittedAnswerAnchor(turnId, frame + 1),
-      );
-    },
-    [positionAnchor],
+    [refreshAtBottom, refreshTurnFloor, setScrollTop, updateReadingAnchor],
   );
 
   const notifyUserTurnStarted = useCallback(
     (messageId: string) => {
-      committedAnswerTurnRef.current = null;
       processedAnswerTurnRef.current = null;
       updateReadingAnchor(null);
       setHasCommittedAnswer(false);
-      setMode("FOLLOW_ACTIVITY");
-      resolveUserTurnAnchor(messageId);
+      setHasNewContent(false);
+      setMode("ANSWER_ANCHORED");
+      const turn = { messageId };
+      userTurnRef.current = turn;
+      resolveUserTurnAnchor(turn);
     },
     [resolveUserTurnAnchor, setMode, updateReadingAnchor],
   );
 
-  const notifyCommittedAnswerStarted = useCallback(
-    (turnId: string) => {
-      if (processedAnswerTurnRef.current === turnId) return;
-      processedAnswerTurnRef.current = turnId;
-      committedAnswerTurnRef.current = turnId;
-      setHasCommittedAnswer(true);
-      if (modeRef.current === "MANUAL_READING") {
-        setHasNewContent(true);
-        return;
-      }
-      setMode("ANSWER_ANCHORED");
-      setHasNewContent(false);
-      resolveCommittedAnswerAnchor(turnId);
-    },
-    [resolveCommittedAnswerAnchor, setMode],
-  );
+  const notifyCommittedAnswerStarted = useCallback((turnId: string) => {
+    if (processedAnswerTurnRef.current === turnId) return;
+    processedAnswerTurnRef.current = turnId;
+    setHasCommittedAnswer(true);
+    if (modeRef.current === "MANUAL_READING") setHasNewContent(true);
+  }, []);
 
   const notifyActivityUpdated = useCallback(() => {
     if (modeRef.current !== "FOLLOW_ACTIVITY") return;
@@ -624,7 +597,20 @@ export function useConversationScrollController(): ConversationScrollController 
     [enterManualReading],
   );
 
+  const resetConversation = useCallback(() => {
+    clearTurnFloor();
+    resetTailSpace();
+    updateReadingAnchor(null);
+    lastAnchorOffsetRef.current = null;
+    processedAnswerTurnRef.current = null;
+    setHasCommittedAnswer(false);
+    setMode("FOLLOW_ACTIVITY");
+    setIsAtBottom(true);
+    scheduleLayoutDecision();
+  }, [clearTurnFloor, resetTailSpace, scheduleLayoutDecision, setIsAtBottom, setMode, updateReadingAnchor]);
+
   const returnToLatest = useCallback(() => {
+    clearTurnFloor();
     // The learner asked for the true bottom: drop the reserved tail so the last
     // message sits directly above the composer again.
     resetTailSpace();
@@ -632,7 +618,7 @@ export function useConversationScrollController(): ConversationScrollController 
     setMode("FOLLOW_ACTIVITY");
     setHasNewContent(false);
     scrollToBottom("return-latest");
-  }, [resetTailSpace, scrollToBottom, setMode, updateReadingAnchor]);
+  }, [clearTurnFloor, resetTailSpace, scrollToBottom, setMode, updateReadingAnchor]);
 
   const scrollMessageIntoView = useCallback(
     (messageId: string, block: "start" | "center" = "center") => {
@@ -673,8 +659,11 @@ export function useConversationScrollController(): ConversationScrollController 
   );
 
   const scrollRef = useCallback((node: HTMLDivElement | null) => {
+    const previous = scrollElementRef.current;
+    if (previous) contentObserverRef.current?.unobserve(previous);
     scrollElementRef.current = node;
     if (node) {
+      contentObserverRef.current?.observe(node);
       lastScrollTopRef.current = node.scrollTop;
       lastContentHeightRef.current = node.scrollHeight;
     }
@@ -690,6 +679,8 @@ export function useConversationScrollController(): ConversationScrollController 
         scheduleLayoutDecision();
       });
       contentObserverRef.current.observe(node);
+      const scroller = scrollElementRef.current;
+      if (scroller) contentObserverRef.current.observe(scroller);
       scheduleLayoutDecision();
     },
     [scheduleLayoutDecision],
@@ -746,7 +737,7 @@ export function useConversationScrollController(): ConversationScrollController 
     restoreScrollSnapshot,
     scrollMessageIntoView,
     scrollRef,
-    resetTailSpace,
+    resetConversation,
     tailSpace,
   };
 }
