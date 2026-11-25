@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Annotated, Any, Literal
@@ -12,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
+from app.core.errors import AppError
 from app.domain.models import ContextSummary
 from app.domain.models import Workspace
 from app.domain.schemas.management import (
@@ -38,12 +40,14 @@ from app.domain.schemas.management import (
     MemoryRevisionRestoreRequest,
     MemoryRevisionView,
     MemorySummarizationSettingsView,
+    MemoryTimelineView,
     MemoryTypeDefinitionView,
     MemoryUpdateRequest,
     MemoryView,
 )
 from app.providers.factory import memory_provider_for_workspace
 from app.services.memory import MemoryService
+from app.services.memory_occurrence import resolve_occurrence_window
 from app.services.memory_agent import MemoryIntentAgent
 from app.services.memory_enhancement import (
     embedding_index_status,
@@ -139,12 +143,34 @@ def list_memory_views(
         Query(),
     ] = "active",
     include_content: Annotated[bool, Query()] = False,
+    time_query: Annotated[str | None, Query(min_length=1, max_length=240)] = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+    timezone_name: Annotated[str | None, Query(max_length=80)] = None,
 ) -> list[MemoryView]:
     return service(db, context, settings).list_views(
         zone=zone,
         state=state,
         include_content=include_content,
+        window=resolve_occurrence_window(time_query=time_query, start_at=start_at, end_at=end_at, timezone_name=timezone_name),
     )
+
+
+@router.get("/timeline", response_model=MemoryTimelineView)
+def memory_timeline(
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    time_query: Annotated[str | None, Query(min_length=1, max_length=240)] = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+    timezone_name: Annotated[str | None, Query(max_length=80)] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 80,
+) -> dict:
+    window = resolve_occurrence_window(time_query=time_query, start_at=start_at, end_at=end_at, timezone_name=timezone_name)
+    if window is None:
+        raise AppError(422, "time_window_required", "Provide a time expression or an occurrence bound")
+    return service(db, context, settings).timeline(window=window, limit=limit)
 
 
 @router.get("/export")

@@ -203,7 +203,7 @@ class Settings(BaseSettings):
     # 预检为空（schema 已最新）时既不备份、也不写库——这是稳态启动路径。
     sqlite_migration_backup_enabled: bool = True
     # 保留最近 N 份迁移前备份；<=0 表示全部保留（不清理）。
-    sqlite_migration_backup_keep: int = 5
+    sqlite_migration_backup_keep: int = 3
     sqlite_migration_backup_dir: str = ""
     # SQLite connection-pool tuning. Each active agent stream holds one
     # connection for the whole generation; the SQLAlchemy default (5 + 10

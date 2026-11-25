@@ -806,6 +806,8 @@ function CreateMemoryDialog({
   const [goalId, setGoalId] = useState('')
   const [nodeId, setNodeId] = useState('')
   const [recordKind, setRecordKind] = useState('semantic_memory')
+  const [timeExpression, setTimeExpression] = useState('')
+  const [timezoneName, setTimezoneName] = useState('Asia/Shanghai')
 
   async function submit(event: FormEvent) {
     event.preventDefault()
@@ -827,6 +829,8 @@ function CreateMemoryDialog({
               : undefined,
         record_kind: recordKind,
         source: 'user_confirmed',
+        time_expression: timeExpression || undefined,
+        timezone_name: timezoneName,
       })
     } catch {
       return
@@ -834,6 +838,7 @@ function CreateMemoryDialog({
     setOpen(false)
     setTitle('')
     setContent('')
+    setTimeExpression('')
     setNodeId('')
   }
 
@@ -860,6 +865,16 @@ function CreateMemoryDialog({
             <div className="space-y-2">
               <Label htmlFor="memory-content">内容</Label>
               <Textarea className="min-h-32" id="memory-content" maxLength={50_000} onChange={(event) => setContent(event.target.value)} value={content} />
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="memory-time-expression">发生时间（可选）</Label>
+                <Input id="memory-time-expression" maxLength={120} value={timeExpression} onChange={(event) => setTimeExpression(event.target.value)} placeholder="昨天、上周、2026年10月18日" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="memory-create-timezone">时间表达的时区</Label>
+                <Input id="memory-create-timezone" maxLength={80} required value={timezoneName} onChange={(event) => setTimezoneName(event.target.value)} />
+              </div>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">

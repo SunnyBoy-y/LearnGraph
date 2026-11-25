@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.domain.memory_event_models import (
@@ -23,7 +23,8 @@ from app.domain.schemas.context_builds import (
 from app.services.memory_crypto import canonical_json_bytes
 from app.services.memory_router import MemoryRouter
 from app.services.token_estimate import estimate_tokens
-from app.services.memory_usage import memory_usage
+from app.services.memory_usage import lexical_relevance, memory_usage
+from app.services.memory_occurrence import OccurrenceWindow, temporal_recall_window, utc_datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,16 +46,22 @@ class ContextBuilder:
     def build(
         self, scope: MemoryScopeContext, request: ContextBuildRequest
     ) -> BuiltContext:
-        routed = self.router.route(scope, request.query)
-        episodes = self._episodes(scope, request.conversation_id)
-        learning = self._learning(scope)
-        strategies = self._strategies(scope)
+        routed = self.router.route(scope, request.query, timezone_name=request.timezone_name)
+        window = routed.window
+        # Date-specific recall is grounded in the scoped, windowed search index.
+        episodes = (self._episodes(scope, request.conversation_id, window=window)
+                    if window else self._episodes(scope, request.conversation_id))
+        topic = temporal_recall_window(request.query, timezone_name=request.timezone_name)[1] if window else ""
+        if window and topic:
+            episodes = [item for item in episodes if lexical_relevance(topic, f"{item['title']} {item['summary']}") >= 0.12]
+        learning = [] if window else self._learning(scope)
+        strategies = [] if window else self._strategies(scope)
         # Auxiliary sections must pass the same applicability boundary as
         # retrieved atoms; otherwise an old episode bypasses the retriever.
         episodes = [item for item in episodes if memory_usage(
             request.query, json.dumps(item, ensure_ascii=False), memory_type="event_summary",
             same_task=bool(scope.task_id and item.get("task_id") == scope.task_id),
-            same_conversation=True,
+            same_conversation=True, temporal_match=window is not None,
         ).allowed]
         strategies = [item for item in strategies if memory_usage(request.query, json.dumps(item, ensure_ascii=False)).allowed]
         def _content_hash(item: Any) -> str:
@@ -81,12 +88,16 @@ class ContextBuilder:
                 token_cost=estimate_tokens(f"{item.title}\n{item.content}"),
                 manifest_status="candidate",
                 external_source=item.external_source,
+                occurrence=item.occurrence,
             )
             for item in routed.retrieval.candidates
         ]
         effects = {(item.target_type, item.target_id): item.allowed_effect for item in routed.retrieval.candidates}
         sections: list[tuple[str, str, Any]] = []
-        task_view = self._task(scope, request.task_id)
+        task_view = None if window else self._task(scope, request.task_id)
+        if window:
+            bounds = window.as_dict()
+            sections.append(("time_window", json.dumps(bounds, ensure_ascii=False, sort_keys=True), bounds))
         if task_view is not None and not memory_usage(
             request.query, json.dumps(task_view, ensure_ascii=False), memory_type="event_summary", same_task=True,
         ).allowed:
@@ -109,6 +120,7 @@ class ContextBuilder:
                     "trust": item.trust,
                     "reason_codes": item.reason_codes,
                     "token_cost": item.token_cost,
+                    **({"occurrence": item.occurrence} if item.occurrence else {}),
                 }
                 for item in evidence
             ]
@@ -265,6 +277,8 @@ class ContextBuilder:
         status = str(getattr(item, "status", "") or "").casefold()
         if status in {"expired", "lapsed", "lapsed_unverified"}:
             return ["EXPIRED"]
+        if status == "historical" and getattr(item, "retrieval_reason", "") == "temporal_recall":
+            return []
         if status in {"cancelled", "superseded", "rescheduled", "historical"}:
             return ["SUPERSEDED"]
         if status in {"out_of_scope", "cross_workspace"}:
@@ -327,22 +341,25 @@ class ContextBuilder:
             "stream_version": task.get("stream_version"),
         }
 
-    def _episodes(self, scope: MemoryScopeContext, conversation_id: str | None) -> list[dict[str, Any]]:
-        if not conversation_id:
+    def _episodes(self, scope: MemoryScopeContext, conversation_id: str | None, *, window: OccurrenceWindow | None = None) -> list[dict[str, Any]]:
+        if not conversation_id and window is None:
             return []
-        rows = self.db.scalars(
-            select(ConversationEpisode)
-            .where(
-                ConversationEpisode.tenant_id == scope.tenant_id,
-                ConversationEpisode.workspace_id == scope.workspace_id,
-                ConversationEpisode.conversation_id == conversation_id,
-                (ConversationEpisode.subject_user_id == scope.principal_user_id)
-                | (ConversationEpisode.subject_user_id.is_(None)),
-                ConversationEpisode.status.in_(("open", "closed")),
-            )
-            .order_by(ConversationEpisode.ended_at.desc())
-            .limit(3)
-        ).all()
+        episode = ConversationEpisode
+        statement = select(episode).where(
+            episode.tenant_id == scope.tenant_id,
+            episode.workspace_id == scope.workspace_id,
+            or_(episode.subject_user_id == scope.principal_user_id, episode.subject_user_id.is_(None)),
+            episode.status.in_(("open", "closed")),
+        )
+        if window is None:
+            statement = statement.where(episode.conversation_id == conversation_id)
+        else:
+            start = func.coalesce(episode.started_at, episode.created_at)
+            if window.end_at is not None:
+                statement = statement.where(start < window.end_at)
+            if window.start_at is not None:
+                statement = statement.where(or_(start >= window.start_at, episode.ended_at > window.start_at))
+        rows = self.db.scalars(statement.order_by(episode.started_at.desc(), episode.id).limit(20 if window else 3)).all()
         return [
             {
                 "episode_id": row.id,
@@ -353,8 +370,13 @@ class ContextBuilder:
                 "constraints": row.constraints_json,
                 "open_questions": row.open_questions_json,
                 "source_message_refs": row.source_message_refs_json,
+                "occurrence": {
+                    "start_at": utc_datetime(row.started_at or row.created_at).isoformat(),
+                    "end_at": utc_datetime(row.ended_at).isoformat() if row.ended_at else None,
+                },
             }
             for row in rows
+            if window is None or window.contains(row.started_at or row.created_at, row.ended_at)
         ]
 
     def _learning(self, scope: MemoryScopeContext) -> list[dict[str, Any]]:

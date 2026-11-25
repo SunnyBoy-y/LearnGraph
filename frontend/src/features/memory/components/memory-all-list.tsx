@@ -47,7 +47,8 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { workspaceQueryKey } from '@/lib/query-keys'
 import type { MemoryEntry, MemoryRevision, MemoryZone } from '@/types/memory'
-import { formatMemoryTime, memoryCategoryLabel, memoryCategoryOptions, memoryUpdatedHint } from '../memory-display'
+import { formatMemoryTime, memoryCategoryLabel, memoryCategoryOptions, memoryOccurrenceHint, memoryUpdatedHint } from '../memory-display'
+import { MemoryTimelinePanel } from './memory-timeline-panel'
 import { MemoryGovernancePanel } from './memory-governance-panel'
 
 const zoneOptions: Array<{ zone: MemoryZone; title: string }> = [
@@ -117,6 +118,7 @@ export function MemoryAllList({
 
   return (
     <div className="space-y-3">
+      <MemoryTimelinePanel workspaceId={workspaceId} />
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1.5">
           <Button
@@ -265,6 +267,7 @@ function MemoryListRow({
       <Checkbox aria-label={`选择记忆：${item.title}`} checked={selected} className="mt-0.5" disabled={busy} onCheckedChange={(checked) => onSelect(checked === true)} />
       <div className="min-w-0 flex-1">
         <p className="line-clamp-2 text-sm font-medium leading-5">{item.title}</p>
+        {memoryOccurrenceHint(item) ? <p className="mt-1 text-xs text-muted-foreground">发生时间：{memoryOccurrenceHint(item)}</p> : null}
         <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
           <span>{memoryCategoryLabel(item)}</span>
           {sourceCount ? (
@@ -459,12 +462,16 @@ function EditMemoryDialog({
   })
   const [title, setTitle] = useState(item.title)
   const [content, setContent] = useState('')
+  const [timeExpression, setTimeExpression] = useState(item.temporal_semantics?.original_expression ?? '')
+  const [timezoneName, setTimezoneName] = useState(item.timezone_name || 'Asia/Shanghai')
   const [zone, setZone] = useState<MemoryZone>(item.zone)
 
   useEffect(() => {
     if (detail.data) {
       setTitle(detail.data.title)
       setContent(memoryBody(detail.data.content))
+      setTimeExpression(detail.data.temporal_semantics?.original_expression ?? '')
+      setTimezoneName(detail.data.timezone_name || 'Asia/Shanghai')
       setZone(detail.data.zone)
     }
   }, [detail.data])
@@ -478,6 +485,8 @@ function EditMemoryDialog({
         content: content.trim(),
         zone,
         reason: 'user_edit',
+        ...(timeExpression !== (detail.data?.temporal_semantics?.original_expression ?? '') ? { time_expression: timeExpression || null } : {}),
+        ...(timezoneName !== (detail.data?.timezone_name || 'Asia/Shanghai') ? { timezone_name: timezoneName } : {}),
       })
     } catch {
       await detail.refetch()
@@ -524,6 +533,15 @@ function EditMemoryDialog({
                   onChange={(event) => setContent(event.target.value)}
                   value={content}
                 />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor={`memory-time-${item.id}`}>发生时间（保留原始表达）</Label>
+                <Input id={`memory-time-${item.id}`} maxLength={120} value={timeExpression} onChange={(event) => setTimeExpression(event.target.value)} placeholder="例如：昨天、2026年10月18日" />
+                <p className="text-xs text-muted-foreground">{memoryOccurrenceHint(detail.data ?? item) || '未标注时间'}；留空可清除时间表达。</p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor={`memory-timezone-${item.id}`}>时间表达的时区</Label>
+                <Input id={`memory-timezone-${item.id}`} value={timezoneName} onChange={(event) => setTimezoneName(event.target.value)} required maxLength={80} />
               </div>
               <div className="space-y-2">
                 <Label htmlFor={`memory-zone-${item.id}`}>读取优先级</Label>
@@ -578,6 +596,10 @@ function TechnicalDetailDialog({
         ['zone', memory.data.zone],
         ['scope', memory.data.session_id ?? memory.data.namespace],
         ['record_kind', memory.data.record_kind],
+        ['发生时间', memoryOccurrenceHint(memory.data) ?? '未标注'],
+        ['event_at', memory.data.event_at ?? '—'],
+        ['timezone', memory.data.timezone_name || 'Asia/Shanghai'],
+        ['观测时间', memory.data.temporal_semantics?.observed_at ?? '—'],
         ['provider', memory.data.provider_id],
         ['sha256', memory.data.content_hash],
       ]

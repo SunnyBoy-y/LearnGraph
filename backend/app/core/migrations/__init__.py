@@ -418,6 +418,38 @@ def _opening_prompt_cache(connection: Connection) -> None:
     OpeningPromptCache.__table__.create(bind=connection, checkfirst=True)
 
 
+def _memory_search_event_at(connection: Connection) -> None:
+    """Add ``memory_search_documents.event_at`` and backfill existing rows."""
+
+    from app.domain.memory_event_models import MemorySearchDocument
+
+    table = MemorySearchDocument.__table__
+    if not inspect(connection).has_table(table.name):
+        return
+    existing = {str(column["name"]) for column in inspect(connection).get_columns(table.name)}
+    if "event_at" not in existing:
+        ddl = str(CreateColumn(table.c.event_at).compile(dialect=connection.dialect))
+        connection.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN {ddl}')
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_memory_search_event_at "
+        "ON memory_search_documents (workspace_id, event_at)"
+    )
+    if inspect(connection).has_table("memory_records"):
+        connection.exec_driver_sql(
+            "UPDATE memory_search_documents "
+            "SET event_at = COALESCE("
+            "(SELECT COALESCE(mr.event_at, mr.created_at) FROM memory_records mr "
+            "WHERE mr.id = memory_search_documents.target_id), "
+            "valid_from, created_at) "
+            "WHERE target_type = 'memory' AND event_at IS NULL"
+        )
+    connection.exec_driver_sql(
+        "UPDATE memory_search_documents "
+        "SET event_at = COALESCE(valid_from, created_at) "
+        "WHERE event_at IS NULL"
+    )
+
+
 MIGRATIONS = (
     SchemaMigration("0001_memory_foundation", "Create event-store FTS projection", _memory_foundation),
     SchemaMigration(
@@ -534,6 +566,21 @@ MIGRATIONS = (
         "v1.20.0", "Generic TURN username and isolated credential kind",
         _voice_relay_generic_turn,
     ),
+    SchemaMigration(
+        "v1.22.0",
+        "Temporal event_at projection and search index",
+        _memory_search_event_at,
+    ),
+)
+
+# Two previously shipped images used v1.21.0 for unrelated migrations.
+# Preserve both histories; the idempotent temporal migration now runs at v1.22.0.
+_LEGACY_V121_CHECKSUMS = frozenset(
+    hashlib.sha256(f"v1.21.0\0{description}".encode("utf-8")).hexdigest()
+    for description in (
+        "Repair approval state of published file-generated graphs",
+        "Temporal event_at projection and search index",
+    )
 )
 
 
@@ -548,6 +595,9 @@ def apply_schema_migrations(connection: Connection) -> None:
             "SELECT revision, checksum FROM schema_revisions"
         ).fetchall()
     }
+    if "v1.21.0" in rows and rows["v1.21.0"] not in _LEGACY_V121_CHECKSUMS:
+        raise RuntimeError("Schema migration checksum mismatch: v1.21.0")
+
     for migration in MIGRATIONS:
         prior = rows.get(migration.revision)
         if prior is not None:

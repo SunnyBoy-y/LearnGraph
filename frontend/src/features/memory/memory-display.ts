@@ -46,6 +46,22 @@ export function memoryCategoryOptions(items: MemoryEntry[]): string[] {
   return CATEGORY_ORDER.filter((label) => present.has(label))
 }
 
+export function memoryOccurrenceHint(item: Pick<MemoryEntry, 'temporal_semantics' | 'event_at' | 'timezone_name'>): string | null {
+  const temporal = item.temporal_semantics
+  const raw = temporal?.original_expression
+  const normalized = temporal?.normalized_display
+  if (raw && normalized) return `${raw} · ${normalized}`
+  if (raw) return raw
+  if (!item.event_at) return null
+  const date = new Date(/[zZ]|[+-]\d\d:\d\d$/.test(item.event_at) ? item.event_at : `${item.event_at}Z`)
+  if (Number.isNaN(date.getTime())) return null
+  try {
+    return date.toLocaleString('zh-CN', { hour12: false, timeZone: item.timezone_name || 'Asia/Shanghai' })
+  } catch {
+    return date.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })
+  }
+}
+
 export function formatMemoryTime(value: string | null | undefined): string {
   if (!value) return '—'
   const date = new Date(value)

@@ -16,6 +16,7 @@ from app.services.memory_enhancement import (
     load_enhancement_config,
     semantic_boosts_for_documents,
 )
+from app.services.memory_occurrence import OccurrenceWindow, temporal_metadata, utc_datetime
 from app.services.memory_projector import (
     ensure_memory_search_fts,
     normalize_bm25_score,
@@ -43,6 +44,7 @@ class RetrievalCandidate:
     external_source: dict[str, Any] | None = None
     trust: str = "derived"
     allowed_effect: str = "context"
+    occurrence: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,8 @@ class MemoryHybridRetriever:
         top_k: int = 6,
         min_score: float = 0.20,
         min_confidence: float = 0.0,
+        window: OccurrenceWindow | None = None,
+        temporal_topic: str = "",
     ) -> RetrievalResult:
         excluded = {
             "out_of_scope": 0,
@@ -103,7 +107,7 @@ class MemoryHybridRetriever:
         hard_filters = (
             MemorySearchDocument.tenant_id == scope.tenant_id,
             MemorySearchDocument.memory_layer.in_(allowed_layers),
-            MemorySearchDocument.status == "active",
+            MemorySearchDocument.status.in_(("active", "historical")) if window is not None else MemorySearchDocument.status == "active",
             workspace_scope,
             (MemorySearchDocument.subject_user_id == scope.principal_user_id)
             | (MemorySearchDocument.subject_user_id.is_(None)),
@@ -118,16 +122,20 @@ class MemoryHybridRetriever:
             R.workspace_id.is_not_distinct_from(D.workspace_id),
             or_(R.subject_user_id.is_(None), R.subject_user_id == scope.principal_user_id),
             R.state == "active", R.lifecycle_status == "active", R.ledger_status == "active",
-            R.zone != "archive", R.deleted_at.is_(None), R.content_destroyed_at.is_(None),
+            R.zone != "archive" if window is None else True,
+            R.deleted_at.is_(None), R.content_destroyed_at.is_(None),
             R.auto_recall_suppressed.is_(False),
             R.sensitivity.in_(scope.allowed_sensitivity), R.memory_layer.in_(allowed_layers),
-            or_(R.atom_schema_version < 1, R.summary_eligibility.in_(("durable", "current")), and_(R.record_kind == "event_summary", R.summary_eligibility == "historical")),
+            (or_(R.atom_schema_version < 1, R.summary_eligibility.in_(("durable", "current", "historical")))
+             if window is not None else
+             or_(R.atom_schema_version < 1, R.summary_eligibility.in_(("durable", "current")), and_(R.record_kind == "event_summary", R.summary_eligibility == "historical"))),
             R.temporal_status.not_in(("cancelled", "rescheduled", "lapsed_unverified", "expired")),
-            or_(R.valid_until.is_(None), R.valid_until >= now),
+            or_(R.valid_until.is_(None), R.valid_until >= now) if window is None else True,
         )
         statement = (select(D, R).outerjoin(R, and_(D.target_type == "memory", R.id == D.target_id))
             .where(*hard_filters, or_(R.id.is_(None), canonical_ok),
-                   or_(D.valid_until.is_(None), D.valid_until >= now), D.confidence >= min_confidence)
+                   or_(D.valid_until.is_(None), D.valid_until >= now) if window is None else True,
+                   D.confidence >= min_confidence)
             .order_by(D.id).execution_options(yield_per=128))
         # Bound memory/embedding cost AFTER every eligible document can compete.
         pool_limit = max(top_k, min(200, max(24, top_k * 8)))
@@ -139,6 +147,22 @@ class MemoryHybridRetriever:
         stream = self.db.execute(statement)
         try:
             for document, record in stream:
+                if document.target_type == "memory" and record is None:
+                    projection = document.metadata_json or {}
+                    if projection.get("temporal_status") in {"cancelled", "rescheduled", "lapsed_unverified", "expired"} or projection.get("summary_eligibility") == "excluded":
+                        excluded["usage_policy"] += 1
+                        continue
+                metadata = temporal_metadata(record.structured_payload if record else document.metadata_json)
+                event_at = record.event_at if record else document.event_at
+                if window is not None and not window.matches_memory(event_at, metadata):
+                    excluded["outside_time_window"] = excluded.get("outside_time_window", 0) + 1
+                    continue
+                temporal_match = window is not None and (
+                    not temporal_topic or lexical_relevance(temporal_topic, f"{document.subject} {document.content}") >= 0.12
+                )
+                if window is not None and not temporal_match:
+                    excluded["irrelevant"] += 1
+                    continue
                 # Revalidate BEFORE ranking/embedding so unsafe historical
                 # entries cannot crowd out good memories or reach providers.
                 if unsafe_memory_reason(f"{document.subject}\n{document.content}"):
@@ -155,6 +179,7 @@ class MemoryHybridRetriever:
                     same_task=bool(scope.task_id and document.task_id == scope.task_id),
                     same_conversation=bool(scope.conversation_id and document.conversation_id == scope.conversation_id),
                     semantic=1.0 if embedding_enabled else 0.0, lexical_override=title_relevance,
+                    temporal_match=temporal_match,
                 )
                 if not preliminary.allowed:
                     excluded["irrelevant" if preliminary.reason == "irrelevant_to_current_request" else "usage_policy"] += 1
@@ -174,7 +199,7 @@ class MemoryHybridRetriever:
                     query, document.content, memory_type=usage_type, policy=policy,
                     same_task=bool(scope.task_id and document.task_id == scope.task_id),
                     same_conversation=bool(scope.conversation_id and document.conversation_id == scope.conversation_id),
-                    semantic=1.0, preference_verified=verified,
+                    semantic=1.0, preference_verified=verified, temporal_match=temporal_match,
                 )
                 if not applicability.allowed:
                     excluded["usage_policy"] += 1
@@ -271,6 +296,7 @@ class MemoryHybridRetriever:
                 same_task=bool(scope.task_id and document.task_id == scope.task_id),
                 same_conversation=bool(scope.conversation_id and document.conversation_id == scope.conversation_id),
                 preference_verified=preference_checks.get(document.id, False),
+                temporal_match=window is not None,
             )
             if not applicability.allowed:
                 excluded["irrelevant" if applicability.reason == "irrelevant_to_current_request" else "usage_policy"] += 1
@@ -285,6 +311,11 @@ class MemoryHybridRetriever:
             if score < min_score:
                 excluded["quality"] += 1
                 continue
+            record = canonical_records.get(document.id)
+            event_at = record.event_at if record else document.event_at
+            metadata = temporal_metadata(record.structured_payload if record else document.metadata_json)
+            occurrence = ({**metadata, "event_at": utc_datetime(event_at).isoformat() if event_at else None}
+                          if event_at is not None or metadata else None)
             candidates.append(
                 RetrievalCandidate(
                     document.id,
@@ -317,6 +348,7 @@ class MemoryHybridRetriever:
                         and record.assertion_type == "explicit"
                     ) else "derived"),
                     allowed_effect=applicability.allowed_effect,
+                    occurrence=occurrence,
                     retrieval_reason=applicability.reason,
                 )
             )

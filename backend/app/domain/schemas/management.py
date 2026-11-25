@@ -31,6 +31,9 @@ class MemoryCreateRequest(BaseModel):
     ] = "none"
     source: str = Field(default="user", max_length=120)
     source_ids: list[str] = Field(default_factory=list, max_length=100)
+    event_at: datetime | None = None
+    time_expression: str | None = Field(default=None, max_length=120)
+    timezone_name: str = Field(default="Asia/Shanghai", max_length=80)
 
     @model_validator(mode="after")
     def validate_scope(self) -> "MemoryCreateRequest":
@@ -67,6 +70,9 @@ class MemoryUpdateRequest(BaseModel):
     node_id: str | None = Field(default=None, min_length=1, max_length=36)
     scope_type: Literal["workspace", "goal", "node", "session"] | None = None
     scope_id: str | None = Field(default=None, min_length=1, max_length=64)
+    event_at: datetime | None = None
+    time_expression: str | None = Field(default=None, max_length=120)
+    timezone_name: str | None = Field(default=None, max_length=80)
     reason: str = Field(default="user_edit", max_length=500)
 
     @model_validator(mode="after")
@@ -84,9 +90,33 @@ class MemoryUpdateRequest(BaseModel):
             and self.node_id is None
             and self.scope_type is None
             and self.scope_id is None
+            and "event_at" not in self.model_fields_set
+            and "time_expression" not in self.model_fields_set
+            and self.timezone_name is None
         ):
             raise ValueError("At least one mutable memory field is required")
         return self
+
+
+class MemoryTimelineWindowView(BaseModel):
+    start_at: datetime | None
+    end_at: datetime | None
+    display: str
+
+
+class MemoryTimelineEpisodeView(BaseModel):
+    id: str
+    conversation_id: str
+    title: str
+    summary: str
+    started_at: datetime
+    ended_at: datetime | None
+
+
+class MemoryTimelineView(BaseModel):
+    time_window: MemoryTimelineWindowView
+    memories: list[MemoryView]
+    episodes: list[MemoryTimelineEpisodeView]
 
 
 class MemoryView(ORMModel):
@@ -122,6 +152,7 @@ class MemoryView(ORMModel):
     next_review_at: datetime | None = None
     last_verified_at: datetime | None = None
     timezone_name: str = "Asia/Shanghai"
+    temporal_semantics: dict[str, Any] | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: float = 0.7
     importance: float = 0.5

@@ -110,6 +110,7 @@ _DATABASE_READ_TOOLS: frozenset[str] = frozenset(
     {
         "search_session_fragments",
         "search_conversation_history",
+        "query_memory_timeline",
         "read_conversation_segment",
         "create_conversation_link",
         "get_memory_evidence",

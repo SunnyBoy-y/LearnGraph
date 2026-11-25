@@ -41,12 +41,23 @@ export function listMemories(params: {
   return apiClient.get<MemoryEntry[]>('/memory', { query: params })
 }
 
-export function listMemoryViews(params: {
+export interface MemoryTimeFilter {
+  time_query?: string
+  start_at?: string
+  end_at?: string
+  timezone_name?: string
+}
+
+export function listMemoryTimeline(params: MemoryTimeFilter & { limit?: number }): Promise<import('@/types/memory').MemoryTimeline> {
+  return apiClient.get('/memory/timeline', { query: { ...params } })
+}
+
+export function listMemoryViews(params: MemoryTimeFilter & {
   zone?: MemoryZone
   state?: MemoryState
   include_content?: boolean
 } = {}): Promise<MemoryEntry[]> {
-  return apiClient.get<MemoryEntry[]>('/memory/views', { query: params })
+  return apiClient.get<MemoryEntry[]>('/memory/views', { query: { ...params } })
 }
 
 export function getMemory(memoryId: string): Promise<MemoryEntry> {

@@ -312,13 +312,14 @@ class MemoryProjector:
         if payload is None:
             return
 
+        historical = (payload.get("zone") == "archive"
+                      or (payload.get("summary_eligibility") == "historical"
+                          and payload.get("record_kind") != "event_summary"))
         hidden = (payload.get("state", "active") != "active"
                   or payload.get("ledger_status", "active") != "active"
-                  or payload.get("zone") == "archive"
                   or bool(payload.get("auto_recall_suppressed"))
                   or (int(payload.get("atom_schema_version") or 0) >= 1
-                      and payload.get("summary_eligibility", "durable") in {"historical", "excluded"}
-                      and not (payload.get("summary_eligibility") == "historical" and payload.get("record_kind") == "event_summary")))
+                      and payload.get("summary_eligibility", "durable") == "excluded"))
         if hidden:
             self._remove_search_document(memory_id)
             return
@@ -380,14 +381,24 @@ class MemoryProjector:
         existing.entity_aliases_text = " ".join(
             str(v) for v in payload.get("entity_aliases", []) or []
         )
-        existing.status = "active"
+        existing.status = "historical" if historical else "active"
         existing.sensitivity = str(payload.get("sensitivity") or event.sensitivity or "normal")
         if payload.get("child_agent_denied") and existing.sensitivity in {"public", "normal"}:
             existing.sensitivity = "private"
-        for field in ("valid_from", "valid_until"):
+        for field in ("valid_from", "valid_until", "event_at"):
             if field in payload:
                 value = payload[field]
-                setattr(existing, field, datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None)
+                if value:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    value = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+                setattr(existing, field, value or None)
+        if existing.event_at is None:
+            existing.event_at = existing.valid_from or event.occurred_at
+        metadata = {**(existing.metadata_json or {})}
+        for field in ("timezone_name", "temporal_status", "summary_eligibility", "temporal_semantics"):
+            if field in payload:
+                metadata[field] = payload[field]
+        existing.metadata_json = metadata
         existing.importance = float(payload.get("importance") or existing.importance or 0.5)
         existing.confidence = float(payload.get("confidence") or existing.confidence or 0.7)
         existing.tenant_id = event.tenant_id

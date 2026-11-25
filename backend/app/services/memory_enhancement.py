@@ -861,9 +861,9 @@ def _extraction_prompt(
         "人物事实、可以从图谱/掌握度中查到的权威状态（掌握分数、路线版本、文件路径等）、"
         "以及任何未经用户明确表达的臆测。一次事件绝不能推断成习惯。\n"
         f"可信当前时间：{utc_now().isoformat()}；默认时区：Asia/Shanghai。"
-        "识别相对时间时，把用户陈述中的时间表达原样放入 time_expression（"
-        "例如“下个月”“明天下午”“每周五”），不要自行换算成绝对时间；"
-        "程序会用消息发生时间和用户时区确定性规范化。"
+        "识别时间概念时（无论是过去事件如“昨天”“上周”“10月18日”，还是未来计划如“下个月”“明天下午”“每周五”），"
+        "把用户陈述中的时间表达原样放入 time_expression，不要自行换算成绝对时间；"
+        "程序会用消息发生时间和用户时区确定性规范化出 event_at 与时间区间。"
         "做过某个题材的项目只能形成任务经历，不能推断用户喜欢该题材。"
         "同一任务的多轮修改只算一次经历；客户、作业或替别人提出的要求不属于用户偏好。"
         "只有用户明确表达稳定偏好时才使用 learning_preference；其余任务细节使用 event_summary 或 NOOP。"
@@ -1317,9 +1317,10 @@ def extract_session_memories(
     auto_committed = 0
     skipped = 0
     observed_at = messages[-1].created_at if messages else utc_now()
+    observed_by_message = {message.id: _as_utc(message.created_at) for message in messages}
     observed_by_evidence = {
-        evidence.id: evidence.observed_at
-        for evidence in evidence_by_message.values()
+        evidence.id: observed_by_message.get(message_id) or evidence.observed_at
+        for message_id, evidence in evidence_by_message.items()
     }
     with memory_service.atomic_write():
         normalizer = TemporalNormalizer()
@@ -1422,22 +1423,34 @@ def extract_session_memories(
             temporal_semantics: dict[str, Any] | None = None
             original_expression = str(
                 proposal.get("time_expression") or proposal.get("original_expression") or ""
-            ).strip()
+            )
             timezone_name = str(proposal.get("timezone_name") or "Asia/Shanghai").strip()
-            if original_expression and raw_temporal_status in {
-                "planned", "ongoing", "scheduled", "tentative", "rescheduled",
-                "in_progress", "completed", "cancelled", "lapsed_unverified", "expired",
-            }:
+            if original_expression:
                 semantics = normalizer.normalize(
                     original_expression,
                     observed_at=observed_for_proposal,
                     timezone_name=timezone_name,
+                    prefer_past=raw_temporal_status in {"timeless", "completed", "historical"},
                 )
                 temporal_semantics = semantics.as_dict()
                 if semantics.start_at is not None and event_at is None:
                     event_at = semantics.start_at.isoformat()
-                if semantics.end_at is not None and valid_until is None:
+                if (
+                    semantics.end_at is not None
+                    and valid_until is None
+                    and raw_temporal_status
+                    in {
+                        "planned",
+                        "ongoing",
+                        "scheduled",
+                        "tentative",
+                        "rescheduled",
+                        "in_progress",
+                    }
+                ):
                     valid_until = semantics.end_at.isoformat()
+            if event_at is None:
+                event_at = observed_for_proposal.isoformat()
             temporal_anchor = (
                 _parse_extraction_time(valid_until)
                 or _parse_extraction_time(event_at)

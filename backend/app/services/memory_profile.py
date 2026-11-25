@@ -1348,6 +1348,13 @@ class MemoryProfileService:
                 "ledger_status": record.ledger_status,
                 "temporal_status": record.temporal_status,
                 "summary_eligibility": record.summary_eligibility,
+                "event_at": record.event_at.isoformat() if record.event_at else None,
+                "temporal_display": (
+                    ((record.structured_payload or {}).get("temporal_semantics") or {}).get("normalized_display")
+                    if isinstance((record.structured_payload or {}).get("temporal_semantics"), dict)
+                    else None
+                ),
+                "created_at": record.created_at.isoformat(),
                 "updated_at": record.updated_at.isoformat(),
             }
             for record in records
@@ -1373,8 +1380,8 @@ class MemoryProfileService:
             "你是 LearnGraph 的原子记忆整理器。把本次明确由用户输入的修改意图转换为"
             "最小、规范化、可验证的原子操作。不要保存输入原文，不要发明事实。\n"
             f"可信当前时间：{now.isoformat()}；用户时区：{request.timezone_name}。\n"
-            "时间规则：把用户输入中的相对时间表达原样放入 time_expression，"
-            "不要自行换算成绝对时间；程序会用消息发生时间和用户时区确定性规范化。"
+            "时间规则：把用户输入中的时间表达（无论是过去时间如“昨天”“上周”“10月18日”，还是未来时间如“下周”“明天下午”）"
+            "原样放入 time_expression，不要自行换算成绝对时间；程序会用消息发生时间和用户时区确定性规范化。"
             "计划过去不等于完成；"
             "取消用 CANCEL；改期用 RESCHEDULE；没有足够信息则 NOOP。\n"
             "一次事件不能推断成习惯。CREATE 每条只能有一个事实。"
@@ -1477,21 +1484,33 @@ class MemoryProfileService:
             temporal_semantics: dict[str, Any] | None = None
             time_expression = str(
                 raw.get("time_expression") or raw.get("original_expression") or ""
-            ).strip()
-            if time_expression and raw_temporal_status in {
-                "planned", "ongoing", "scheduled", "tentative", "rescheduled",
-                "in_progress", "completed", "cancelled", "lapsed_unverified", "expired",
-            }:
+            )
+            if time_expression:
                 semantics = normalizer.normalize(
                     time_expression,
                     observed_at=now,
                     timezone_name=request.timezone_name,
+                    prefer_past=raw_temporal_status in {"timeless", "completed", "historical"},
                 )
                 temporal_semantics = semantics.as_dict()
                 if semantics.start_at is not None and event_at is None:
                     event_at = semantics.start_at
-                if semantics.end_at is not None and valid_until is None:
+                if (
+                    semantics.end_at is not None
+                    and valid_until is None
+                    and raw_temporal_status
+                    in {
+                        "planned",
+                        "ongoing",
+                        "scheduled",
+                        "tentative",
+                        "rescheduled",
+                        "in_progress",
+                    }
+                ):
                     valid_until = semantics.end_at
+            if event_at is None:
+                event_at = now
             temporal_anchor = valid_until or event_at
             temporal_status = normalize_plan_status(
                 raw_temporal_status,

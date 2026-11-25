@@ -16,7 +16,36 @@ export type MemoryResolutionStatus =
   | 'resolved'
   | 'recurring'
 
+export interface MemoryTemporalSemantics {
+  original_expression: string
+  time_expression?: string
+  normalized_display: string
+  timezone: string
+  granularity: string
+  start_at: IsoDateTime | null
+  end_at: IsoDateTime | null
+  observed_at: IsoDateTime
+  normalizer_version?: string
+  timezone_source?: string
+}
+
+export interface MemoryTimeline {
+  time_window: { start_at: IsoDateTime | null; end_at: IsoDateTime | null; display: string }
+  memories: MemoryEntry[]
+  episodes: Array<{
+    id: string
+    conversation_id: string
+    title: string
+    summary: string
+    started_at: IsoDateTime
+    ended_at: IsoDateTime | null
+  }>
+}
+
 export interface MemoryCreateRequest {
+  event_at?: IsoDateTime | null
+  time_expression?: string | null
+  timezone_name?: string
   title: string
   content: string
   namespace?: MemoryNamespace
@@ -36,6 +65,9 @@ export interface MemoryCreateRequest {
 }
 
 export interface MemoryUpdateRequest {
+  event_at?: IsoDateTime | null
+  time_expression?: string | null
+  timezone_name?: string
   expected_revision?: number
   title?: string
   content?: string
@@ -82,6 +114,7 @@ export interface MemoryEntry {
   valid_from?: IsoDateTime | null
   valid_until?: IsoDateTime | null
   event_at?: IsoDateTime | null
+  temporal_semantics?: MemoryTemporalSemantics | null
   next_review_at?: IsoDateTime | null
   last_verified_at?: IsoDateTime | null
   timezone_name?: string

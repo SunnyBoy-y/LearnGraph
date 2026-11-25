@@ -10,6 +10,7 @@ class ContextBuildRequest(BaseModel):
     message_id: str | None = Field(default=None, max_length=64)
     task_id: str | None = Field(default=None, max_length=64)
     query: str = Field(min_length=1, max_length=50_000)
+    timezone_name: str | None = Field(default=None, max_length=80)
     token_budget: int = Field(default=16_000, ge=256, le=500_000)
     agent_id: str = Field(default="main_agent", max_length=80)
     provider_id: str = Field(default="", max_length=80)
@@ -38,6 +39,7 @@ class ContextEvidenceView(BaseModel):
     token_cost: int = 0
     manifest_status: str = "selected"
     external_source: dict[str, Any] | None = None
+    occurrence: dict[str, Any] | None = None
 
 
 class ContextBuildView(BaseModel):

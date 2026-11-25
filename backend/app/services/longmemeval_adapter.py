@@ -224,6 +224,7 @@ class LongMemEvalAdapter:
                         status="active",
                         sensitivity="normal",
                         valid_from=observed_at,
+                        event_at=observed_at,
                         importance=0.6,
                         confidence=1.0,
                         source_event_id=event_result.event.event_id,

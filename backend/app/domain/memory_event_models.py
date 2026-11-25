@@ -183,6 +183,7 @@ class MemorySearchDocument(Base, TimestampMixin):
     zone: Mapped[str] = mapped_column(String(16), default="recent", index=True)
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     importance: Mapped[float] = mapped_column(Float, default=0.5)
     confidence: Mapped[float] = mapped_column(Float, default=0.7)
     source_event_id: Mapped[str] = mapped_column(String(64), index=True)

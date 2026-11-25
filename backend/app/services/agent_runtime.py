@@ -1106,9 +1106,31 @@ class AgentToolRuntime:
                             "query": {"type": "string"},
                             "goal_id": {"type": "string"},
                             "session_id": {"type": "string"},
+                            "time_query": {"type": "string"},
+                            "start_at": {"type": "string", "format": "date-time"},
+                            "end_at": {"type": "string", "format": "date-time"},
+                            "timezone_name": {"type": "string"},
                             "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
                         },
                         "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_memory_timeline",
+                    "description": "Recall what happened in a date range, including historical memories and conversation episodes. Supply time_query (yesterday, last week, 2026-10-18) or start_at/end_at. No memory is created.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "time_query": {"type": "string"},
+                            "start_at": {"type": "string", "format": "date-time"},
+                            "end_at": {"type": "string", "format": "date-time"},
+                            "timezone_name": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        },
                         "additionalProperties": False,
                     },
                 },
@@ -3320,6 +3342,7 @@ class AgentToolRuntime:
                 )
             if name in {
                 "search_conversation_history",
+                "query_memory_timeline",
                 "read_conversation_segment",
                 "create_conversation_link",
                 "get_memory_evidence",
@@ -7210,10 +7233,30 @@ class AgentToolRuntime:
     ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         if self.memory_tools is None:
             return self._failure("memory_tools_unavailable", "Memory tools are unavailable")
+        temporal_args = {}
+        if name in {"query_memory_timeline", "search_conversation_history"}:
+            for key in ("time_query", "timezone_name"):
+                if key in arguments:
+                    if not isinstance(arguments[key], str) or not arguments[key].strip():
+                        raise AppError(422, "invalid_tool_arguments", f"{key} must be a non-empty string")
+                    temporal_args[key] = arguments[key]
+            for key in ("start_at", "end_at"):
+                if key in arguments:
+                    temporal_args[key] = self._parse_iso_datetime(arguments[key], key)
+        if name == "query_memory_timeline":
+            from app.services.memory_occurrence import resolve_occurrence_window
+            window = resolve_occurrence_window(**temporal_args)
+            if window is None:
+                raise AppError(422, "time_window_required", "Provide time_query or an occurrence bound")
+            limit = arguments.get("limit", 80)
+            if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+                raise AppError(422, "invalid_tool_arguments", "limit must be between 1 and 100")
+            result = self.memory_tools.timeline(window=window, limit=limit)
+            return self._success(result, {"memory_count": len(result["memories"]), "episode_count": len(result["episodes"])}, [])
         if name == "search_conversation_history":
             query = arguments.get("query")
-            if not isinstance(query, str) or not query.strip():
-                raise AppError(422, "invalid_tool_arguments", "query is required")
+            if not isinstance(query, str):
+                raise AppError(422, "invalid_tool_arguments", "query must be a string")
             top_k = arguments.get("top_k", 8)
             if not isinstance(top_k, int):
                 top_k = 8
@@ -7226,6 +7269,7 @@ class AgentToolRuntime:
                     else chat_session_id
                 ),
                 top_k=min(20, max(1, top_k)),
+                **temporal_args,
             )
             return self._success(result, {"hit_count": len(result.get("hits") or [])}, [])
         if name == "read_conversation_segment":

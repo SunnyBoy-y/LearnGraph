@@ -13,6 +13,7 @@ from app.domain.memory_event_models import (
     MemoryScopeContext,
     MemorySearchDocument,
 )
+from app.services.memory_occurrence import OccurrenceWindow, temporal_recall_window
 from app.services.memory_projector import probe_memory_search_fts_capability
 from app.services.memory_retrieval import MemoryHybridRetriever, RetrievalResult
 
@@ -55,6 +56,7 @@ class MemoryRouteResult:
     signals: tuple[IntentSignal, ...] = ()
     trace_id: str | None = None
     policy_version: str = "memory-router-v3"
+    window: OccurrenceWindow | None = None
 
 
 # ── Intent patterns ────────────────────────────────────────────────────────────
@@ -206,10 +208,15 @@ class MemoryRouter:
         *,
         top_k: int = 6,
         min_score: float = 0.20,
+        timezone_name: str | None = None,
     ) -> MemoryRouteResult:
         t0 = time.monotonic()
         signals = _detect_intents(query)
+        window, topic = temporal_recall_window(query, timezone_name=timezone_name)
         routes = _routes_from_signals(signals)
+        if window is not None:
+            signals.append(IntentSignal("temporal_recall", 1.0, "occurrence_window"))
+            routes = tuple(dict.fromkeys(("episode", "memory", "learning_state", *routes)))
         layers: set[str] = set()
         for route in routes:
             layers.update(ROUTE_LAYER_MAP[route])
@@ -220,10 +227,11 @@ class MemoryRouter:
             allowed_layers=frozenset(layers),
             top_k=max(1, min(100, int(top_k))),
             min_score=max(0.0, min(1.0, float(min_score))),
+            **({"window": window, "temporal_topic": topic} if window is not None else {}),
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
         trace_id = self._persist_trace(scope, query, routes, signals, retrieval, latency_ms)
-        return MemoryRouteResult(routes, retrieval, tuple(signals), trace_id)
+        return MemoryRouteResult(routes, retrieval, tuple(signals), trace_id, window=window)
 
     def _persist_trace(
         self,

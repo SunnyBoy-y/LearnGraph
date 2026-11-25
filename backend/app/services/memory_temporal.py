@@ -10,13 +10,19 @@ from __future__ import annotations
 from app.services.temporal_normalizer import (
     NORMALIZER_VERSION,
     TemporalNormalizer,
+    TemporalQuery,
     TemporalSemantics,
+    parse_temporal_query,
+    temporal_overlap_score,
     temporal_semantics_payload,
 )
 
 __all__ = [
     "NORMALIZER_VERSION",
     "TemporalNormalizer",
+    "TemporalQuery",
     "TemporalSemantics",
+    "parse_temporal_query",
+    "temporal_overlap_score",
     "temporal_semantics_payload",
 ]

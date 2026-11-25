@@ -1228,8 +1228,8 @@ def _apply_sqlite_subapp_persistence_migration() -> None:
 # Current schema revision identifier.  Bump this whenever an additive or
 # destructive migration is applied (via apply_schema_migrations) so the startup
 # check catches stale databases before they cause data integrity issues.
-CURRENT_SCHEMA_REVISION = "v1.20.0"
-CURRENT_SCHEMA_DESCRIPTION = "Generic TURN username and isolated credential kind"
+CURRENT_SCHEMA_REVISION = "v1.21.0"
+CURRENT_SCHEMA_DESCRIPTION = "Temporal event_at projection and search index"
 
 
 def _compute_schema_checksum() -> str:
@@ -1931,6 +1931,7 @@ def _apply_sqlite_additive_migrations(connection: Any = None) -> None:
         "memory_search_documents": {
             "zone": "VARCHAR(16) NOT NULL DEFAULT 'recent'",
             "metadata_json": "JSON NOT NULL DEFAULT '{}'",
+            "event_at": "DATETIME",
         },
         "graphs": {
             "cover_svg": "TEXT",
@@ -2053,6 +2054,10 @@ def _apply_sqlite_additive_migrations(connection: Any = None) -> None:
         connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_memory_context_packages_message_id "
             "ON memory_context_packages(message_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_search_event_at "
+            "ON memory_search_documents(workspace_id, event_at)"
         )
         # B1-2: session-history reads filter by workspace+session and sort by
         # created_at; the composite index serves both the filter and the sort.

@@ -81,6 +81,7 @@ def memory_usage(
     same_conversation: bool = False, semantic: float = 0.0,
     preference_verified: bool = True,
     lexical_override: float = 0.0,
+    temporal_match: bool = False,
 ) -> UsageDecision:
     # Classify the text too: metadata may only narrow permissions, never turn
     # an obvious subject preference into a universal presentation rule.
@@ -104,6 +105,8 @@ def memory_usage(
             return UsageDecision(False, "personalization_disabled_by_current_request", relevance)
         if not preference_verified:
             return UsageDecision(False, "unconfirmed_preference", relevance)
+        if temporal_match:
+            return UsageDecision(True, "temporal_recall", max(relevance, 0.65), "context")
         if effect == "presentation":
             return UsageDecision(True, "presentation_only", max(relevance, 0.35), effect)
         # A request to use established tastes explicitly authorizes suggestions,
@@ -117,6 +120,8 @@ def memory_usage(
         if preference_recall or (recalling and lexical_relevance(query, content) >= 0.12):
             return UsageDecision(True, "explicit_preference_recall", max(relevance, 0.35), "context")
         return UsageDecision(False, "theme_requires_current_authorization", relevance)
+    if temporal_match:
+        return UsageDecision(True, "temporal_recall", max(relevance, 0.65), "context")
     if role == "task_episode" or effect == "task_context":
         if not recalling and not (same_task and relevance >= 0.2 and not _NEW_TASK.search(query)):
             return UsageDecision(False, "episode_requires_task_continuation", relevance)

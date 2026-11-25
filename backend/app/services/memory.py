@@ -13,11 +13,11 @@ from uuid import uuid4
 from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from sqlalchemy import select, update as sql_update
+from sqlalchemy import func, or_, select, update as sql_update
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
-from app.domain.memory_event_models import MemorySearchDocument
+from app.domain.memory_event_models import ConversationEpisode, MemorySearchDocument
 from app.domain.memory_types import (
     MEMORY_TYPE_REGISTRY,
     compute_memory_strength,
@@ -89,7 +89,9 @@ from app.services.memory_zones import ReconcileZonesReport, reconcile_memory_zon
 from app.services.memory_safety import (
     extraction_source_reason, profile_source_reason, record_source_reason, require_safe_memory, record_preference_verified,
 )
-from app.services.memory_usage import classify_memory, memory_usage, usage_instruction, UsageDecision
+from app.services.memory_usage import classify_memory, lexical_relevance, memory_usage, usage_instruction, UsageDecision
+from app.services.memory_occurrence import OccurrenceWindow, resolve_occurrence_window, temporal_metadata, temporal_recall_window
+from app.services.temporal_normalizer import TemporalNormalizer
 from app.services.token_estimate import estimate_tokens
 
 
@@ -640,11 +642,16 @@ class MemoryService:
             or "legacy_review",
             "valid_from": getattr(record, "valid_from", None),
             "valid_until": getattr(record, "valid_until", None),
-            "event_at": getattr(record, "event_at", None),
+            "event_at": _as_utc(record.event_at) if getattr(record, "event_at", None) is not None else None,
             "next_review_at": getattr(record, "next_review_at", None),
             "last_verified_at": getattr(record, "last_verified_at", None),
             "timezone_name": getattr(record, "timezone_name", "Asia/Shanghai")
             or "Asia/Shanghai",
+            "temporal_semantics": (
+                (getattr(record, "structured_payload", None) or {}).get("temporal_semantics")
+                if isinstance((getattr(record, "structured_payload", None) or {}).get("temporal_semantics"), dict)
+                else None
+            ),
             "evidence_ids": list(getattr(record, "evidence_ids", None) or []),
             "confidence": float(getattr(record, "confidence", 0.7) or 0.7),
             "importance": float(getattr(record, "importance", 0.5) or 0.5),
@@ -1053,39 +1060,68 @@ class MemoryService:
         zone: str | None = None,
         state: str = "active",
         include_content: bool = False,
+        window: OccurrenceWindow | None = None,
     ) -> list[MemoryView]:
-        """Unified visible memory list: v1 records plus v2 event projections.
-
-        v2-only memories are read-only views surfaced so the user can see every
-        active memory block even before a legacy record exists.
-        """
-
-        self.purge_expired()
-        views = self.list(
-            zone=zone,
-            state=state,
-            include_content=include_content,
-        )
-        if state != "active":
-            return views
-        record_ids = {view.id for view in views}
-        statement = select(MemorySearchDocument).where(
-            MemorySearchDocument.target_type == "memory",
-            MemorySearchDocument.workspace_id == self.workspace_id,
-            MemorySearchDocument.status == "active",
-        )
-        if record_ids:
-            statement = statement.where(~MemorySearchDocument.target_id.in_(record_ids))
-        if zone:
-            statement = statement.where(MemorySearchDocument.zone == zone)
-        documents = self.db.scalars(
-            statement.order_by(MemorySearchDocument.updated_at.desc())
-        ).all()
-        views.extend(
-            self._search_document_view(document, include_content=include_content)
-            for document in documents
-        )
+        """Return visible legacy records and unshadowed event projections."""
+        views = self.list(zone=zone, state=state, include_content=include_content)
+        if state == "active":
+            document = MemorySearchDocument
+            statement = select(document).where(
+                document.target_type == "memory",
+                document.tenant_id == self.workspace.tenant_id,
+                document.workspace_id == self.workspace_id,
+                document.status.in_(("active", "historical")) if window is not None else document.status == "active",
+                or_(document.subject_user_id.is_(None), document.subject_user_id == self.actor_id),
+                ~select(MemoryRecord.id).where(
+                    MemoryRecord.workspace_id == self.workspace_id,
+                    MemoryRecord.id == document.target_id,
+                ).exists(),
+            )
+            if zone:
+                statement = statement.where(document.zone == zone)
+            views.extend(
+                self._search_document_view(item, include_content=include_content)
+                for item in self.db.scalars(statement.order_by(document.updated_at.desc()))
+            )
+        if window is not None:
+            views = [item for item in views if item.subject_user_id in {None, self.actor_id}
+                     and item.temporal_status not in {"cancelled", "rescheduled", "lapsed_unverified", "expired"}
+                     and window.matches_memory(item.event_at, item.temporal_semantics or {})]
+            views.sort(key=lambda item: (_as_utc(item.event_at) if item.event_at else datetime.min.replace(tzinfo=timezone.utc), item.id), reverse=True)
         return views
+
+    def timeline(self, *, window: OccurrenceWindow, limit: int = 80) -> dict:
+        memories = self.list_views(window=window, include_content=True)[:limit]
+        episode = ConversationEpisode
+        start = func.coalesce(episode.started_at, episode.created_at)
+        statement = select(episode).where(
+            episode.tenant_id == self.workspace.tenant_id,
+            episode.workspace_id == self.workspace_id,
+            or_(episode.subject_user_id.is_(None), episode.subject_user_id == self.actor_id),
+            episode.status.in_(("open", "closed")),
+        )
+        if window.end_at is not None:
+            statement = statement.where(start < window.end_at)
+        if window.start_at is not None:
+            statement = statement.where(or_(start >= window.start_at, episode.ended_at > window.start_at))
+        episodes = []
+        for item in self.db.scalars(statement.order_by(start.desc(), episode.id)):
+            started_at = item.started_at or item.created_at
+            if not window.contains(started_at, item.ended_at):
+                continue
+            episodes.append({
+                "id": item.id, "conversation_id": item.conversation_id,
+                "title": item.title, "summary": item.summary,
+                "started_at": _as_utc(started_at).isoformat(),
+                "ended_at": _as_utc(item.ended_at).isoformat() if item.ended_at else None,
+            })
+            if len(episodes) >= limit:
+                break
+        return {
+            "time_window": window.as_dict(),
+            "memories": [item.model_dump(mode="json") for item in memories],
+            "episodes": episodes,
+        }
 
     def reconcile_zones(self) -> ReconcileZonesReport:
         report = reconcile_memory_zones(self.db, self.workspace_id)
@@ -1125,14 +1161,23 @@ class MemoryService:
             canonical_key=document.slot_key,
             atom_kind="fact",
             ledger_status="active",
-            temporal_status="timeless",
-            summary_eligibility="current",
+            temporal_status=str((document.metadata_json or {}).get("temporal_status") or "timeless"),
+            summary_eligibility=str((document.metadata_json or {}).get("summary_eligibility") or "current"),
             valid_from=document.valid_from,
             valid_until=document.valid_until,
-            event_at=document.updated_at,
+            event_at=_as_utc(document.event_at or document.valid_from or document.created_at),
             next_review_at=None,
             last_verified_at=None,
-            timezone_name="Asia/Shanghai",
+            timezone_name=str(
+                ((document.metadata_json or {}).get("temporal_semantics") or {}).get("timezone")
+                or (document.metadata_json or {}).get("timezone_name")
+                or "Asia/Shanghai"
+            ),
+            temporal_semantics=(
+                (document.metadata_json or {}).get("temporal_semantics")
+                if isinstance((document.metadata_json or {}).get("temporal_semantics"), dict)
+                else None
+            ),
             evidence_ids=[],
             confidence=float(document.confidence or 0.7),
             importance=float(document.importance or 0.5),
@@ -1212,6 +1257,24 @@ class MemoryService:
         elif scope_type == "node":
             scope_id = node_id
         now = utc_now()
+        tz_name = (payload.timezone_name or str(structured.get("timezone_name") or "Asia/Shanghai")).strip() or "Asia/Shanghai"
+        structured["timezone_name"] = tz_name
+        time_expr = payload.time_expression or ""
+        if time_expr.strip():
+            semantics = TemporalNormalizer().normalize(
+                time_expr,
+                observed_at=now,
+                timezone_name=tz_name,
+                prefer_past=structured.get("temporal_status", "timeless") in {"timeless", "completed", "historical"},
+            )
+            structured["timezone_name"] = semantics.timezone
+            structured["temporal_semantics"] = semantics.as_dict()
+            if semantics.start_at is not None:
+                structured["event_at"] = semantics.start_at.isoformat()
+        if payload.event_at is not None:
+            structured["event_at"] = payload.event_at.isoformat()
+        elif not structured.get("event_at") and not time_expr.strip():
+            structured["event_at"] = now.isoformat()
         atomic = _atomic_fields(
             structured,
             list(payload.source_ids),
@@ -1397,6 +1460,34 @@ class MemoryService:
                     "profile_eligible": True,
                 },
             }
+        previous_temporal = temporal_metadata(structured)
+        if payload.timezone_name:
+            structured["timezone_name"] = payload.timezone_name.strip()
+        if "time_expression" in payload.model_fields_set or payload.timezone_name:
+            raw_expression = (payload.time_expression if "time_expression" in payload.model_fields_set
+                              else previous_temporal.get("original_expression"))
+            if isinstance(raw_expression, str) and raw_expression.strip():
+                semantics = TemporalNormalizer().normalize(
+                    raw_expression,
+                    observed_at=(utc_now() if "time_expression" in payload.model_fields_set
+                                 else _structured_datetime(previous_temporal.get("observed_at")) or utc_now()),
+                    timezone_name=str(structured.get("timezone_name") or record.timezone_name or "Asia/Shanghai"),
+                    prefer_past=str(structured.get("temporal_status") or record.temporal_status) in {"timeless", "completed", "historical"},
+                )
+                structured["timezone_name"] = semantics.timezone
+                structured["temporal_semantics"] = semantics.as_dict()
+                if semantics.start_at is not None:
+                    structured["event_at"] = semantics.start_at.isoformat()
+                else:
+                    structured.pop("event_at", None)
+            elif "time_expression" in payload.model_fields_set:
+                structured.pop("temporal_semantics", None)
+                structured.pop("event_at", None)
+        if "event_at" in payload.model_fields_set:
+            if payload.event_at is None:
+                structured.pop("event_at", None)
+            else:
+                structured["event_at"] = payload.event_at.isoformat()
         atomic = _atomic_fields(
             structured,
             source_ids,
@@ -2336,6 +2427,7 @@ class MemoryService:
         mark_access: bool = False,
         query_text: str | None = None,
         prompt_token_budget: int | None = None,
+        timezone_name: str | None = None,
     ) -> EffectiveMemoryPackageView:
         # Recall reads only local records/revisions — it never contacts the
         # semantic provider, so provider availability must not gate (or add
@@ -2351,13 +2443,15 @@ class MemoryService:
             if session is not None and goal_id is None:
                 goal_id = session.goal_id
         now = utc_now()
+        window, temporal_topic = temporal_recall_window(query_text or "", timezone_name=timezone_name)
         statement = self.memories.query().where(
             MemoryRecord.state == "active",
             MemoryRecord.lifecycle_status == "active",
             MemoryRecord.auto_recall_suppressed.is_(False),
-            MemoryRecord.zone.in_(["hot", "recent", "topics"]),
+            or_(MemoryRecord.subject_user_id.is_(None), MemoryRecord.subject_user_id == self.actor_id),
+            MemoryRecord.zone.in_(["hot", "recent", "topics"]) if window is None else True,
         )
-        if session_id:
+        if session_id and window is None:
             statement = statement.where(
                 (MemoryRecord.namespace == "workspace")
                 | (
@@ -2365,7 +2459,7 @@ class MemoryService:
                     & (MemoryRecord.session_id == session_id)
                 )
             )
-        else:
+        elif window is None:
             statement = statement.where(MemoryRecord.namespace == "workspace")
         records = list(self.db.scalars(statement).all())
         # Filter by knowledge scope inheritance: workspace always; goal/node when matching or broader.
@@ -2375,8 +2469,13 @@ class MemoryService:
             revision = self._ensure_revision(record)
             if revision is None or not revision.content or record_source_reason(self.db, record, revision.content):
                 continue
+            if window is not None and not window.matches_memory(record.event_at, temporal_metadata(record.structured_payload)):
+                continue
+            if window is not None and temporal_topic and lexical_relevance(temporal_topic, f"{record.title} {revision.content}") < 0.12:
+                continue
             decision = memory_usage(
                 query_text or "", revision.content, memory_type=record.record_kind,
+                temporal_match=window is not None,
                 policy=(record.structured_payload or {}).get("usage_policy"),
                 same_conversation=bool(session_id and (record.conversation_id or record.session_id) == session_id),
                 preference_verified=(record_preference_verified(self.db, record, revision.content)
@@ -2396,7 +2495,10 @@ class MemoryService:
                 continue
             if int(getattr(record, "atom_schema_version", 0) or 0) >= 1 and (
                 getattr(record, "summary_eligibility", None) or "excluded"
-            ) in {"historical", "excluded"} and decision.allowed_effect != "task_context":
+            ) in ({"excluded"} if window else {"historical", "excluded"}) and decision.allowed_effect != "task_context":
+                continue
+            if window is not None:
+                eligible.append(record)
                 continue
             scope_type = getattr(record, "scope_type", None) or "workspace"
             if scope_type == "workspace":
@@ -2413,7 +2515,7 @@ class MemoryService:
             elif not goal_id and not node_id_set and scope_type in {"workspace", "session"}:
                 eligible.append(record)
         semantic_boosts: dict[str, float] = {}
-        if query_text and eligible:
+        if query_text and eligible and window is None:
             # Optional embedding plugin. Failure or absence of configuration
             # silently keeps the heuristic (no-embedding) recall pipeline.
             from app.core.config import get_settings
@@ -2426,15 +2528,21 @@ class MemoryService:
                 query_text,
                 eligible,
             )
-        selected, conflicts = self._merge_effective(
-            eligible,
-            goal_id=goal_id,
-            node_ids=node_id_set,
-            session_id=session_id,
-            now=now,
-            limit=limit,
-            semantic_boosts=semantic_boosts or None,
-        )
+        if window is not None:
+            selected = [(record, usage_by_id[record.id].relevance) for record in sorted(
+                eligible, key=lambda item: (_as_utc(item.event_at) if item.event_at else datetime.min.replace(tzinfo=timezone.utc), item.id), reverse=True,
+            )[:limit]]
+            conflicts = []
+        else:
+            selected, conflicts = self._merge_effective(
+                eligible,
+                goal_id=goal_id,
+                node_ids=node_id_set,
+                session_id=session_id,
+                now=now,
+                limit=limit,
+                semantic_boosts=semantic_boosts or None,
+            )
         views: list[MemoryView] = []
         entries: list[str] = []
         used_tokens = 0
@@ -2448,6 +2556,7 @@ class MemoryService:
                 f"scope={record.scope_type}:{record.scope_id or '-'} "
                 f"zone={record.zone} strength={record.strength:.2f} score={score:.2f}\n"
                 f"  usage={usage_by_id[record.id].allowed_effect}: {usage_instruction(usage_by_id[record.id].allowed_effect)}\n"
+                f"  occurrence={json.dumps({'event_at': view.event_at.isoformat() if view.event_at else None, 'temporal_semantics': view.temporal_semantics}, ensure_ascii=False)}\n"
                 f"  {record.title}: {body}"
             )
             if prompt_token_budget is not None:
@@ -2472,6 +2581,10 @@ class MemoryService:
             if entries
             else ""
         )
+        if window is not None:
+            prompt_block = ("发生时间筛选：" + json.dumps(window.as_dict(), ensure_ascii=False)
+                            + "\n只回答此时间范围内的记录，不用其他日期补齐；没有记录不代表事情没有发生。\n"
+                            + prompt_block)
         return EffectiveMemoryPackageView(
             session_id=session_id,
             goal_id=goal_id,
@@ -3129,11 +3242,19 @@ class MemoryService:
         include_descendant_branches: bool = True,
         top_k: int = 8,
         max_chars: int = 2_500,
+        time_query: str | None = None,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        timezone_name: str | None = None,
     ) -> dict:
-        """Phase 2 tool: keyword search over persisted messages (no silent full dump)."""
+        """Search persisted messages by topic or by message occurrence time."""
+        from app.services.memory_occurrence import temporal_recall_window
 
+        window = resolve_occurrence_window(time_query=time_query, start_at=start_at, end_at=end_at, timezone_name=timezone_name)
+        if window is None:
+            window, query = temporal_recall_window(query, timezone_name=timezone_name)
         q = (query or "").strip().casefold()
-        if not q:
+        if not q and window is None:
             raise AppError(422, "empty_query", "query is required")
         sessions = list(self.db.scalars(self.sessions.query()).all())
         if goal_id:
@@ -3148,16 +3269,17 @@ class MemoryService:
         session_ids = {item.id for item in sessions}
         if not session_ids:
             return {"summary": "No matching sessions.", "hits": [], "source_refs": []}
-        messages = self.db.scalars(
-            select(Message)
-            .where(
-                Message.workspace_id == self.workspace_id,
-                Message.session_id.in_(session_ids),
-                Message.status == "completed",
-            )
-            .order_by(Message.created_at.desc())
-            .limit(400)
-        ).all()
+        message_query = select(Message).where(
+            Message.workspace_id == self.workspace_id,
+            Message.session_id.in_(session_ids),
+            Message.status == "completed",
+        )
+        if window is not None:
+            if window.start_at is not None:
+                message_query = message_query.where(Message.created_at >= window.start_at)
+            if window.end_at is not None:
+                message_query = message_query.where(Message.created_at < window.end_at)
+        messages = self.db.scalars(message_query.order_by(Message.created_at.desc()).limit(400)).all()
         hits: list[dict] = []
         for message in messages:
             content = (message.content or "").strip()
