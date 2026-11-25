@@ -19,6 +19,7 @@ from app.domain.schemas.artifacts import (
     ArtifactCardShareManagementView,
     ArtifactCardShareTokenRevealed,
     ArtifactCardShareTokenView,
+    ArtifactCardUpdate,
     ArtifactCardVersionView,
     ArtifactCardView,
     ArtifactCreate,
@@ -277,13 +278,43 @@ def get_artifact_card_preview(
     ``version`` selects a frozen published snapshot instead of the live draft.
     """
     context.require_permission("workspace.read")
-    from app.services.artifact_cards import ArtifactCardService
+    from app.services.artifact_cards import ArtifactCardService, classify_artifact_kind
 
     card, snapshot = ArtifactCardService(
         db, context.workspace_id, context.principal.tenant_id
     ).get_preview(card_id, version=version)
     return ArtifactCardPreviewView.model_validate(
-        {**card.__dict__, "preview_snapshot": snapshot}
+        {
+            **card.__dict__,
+            "artifact_kind": classify_artifact_kind(
+                card.card_type, card.interactive, snapshot
+            ),
+            "preview_snapshot": snapshot,
+        }
+    )
+
+
+@router.patch("/artifacts/cards/{card_id}", response_model=ArtifactCardView)
+def update_artifact_card(
+    card_id: str,
+    payload: ArtifactCardUpdate,
+    db: DB,
+    context: CurrentWorkspace,
+) -> ArtifactCardView:
+    """Rename an indexed card without altering its published versions."""
+    context.require_permission("workspace.write")
+    from app.services.artifact_cards import ArtifactCardService, classify_artifact_kind
+
+    card = ArtifactCardService(
+        db, context.workspace_id, context.principal.tenant_id
+    ).update_card(card_id, title=payload.title)
+    return ArtifactCardView.model_validate(
+        {
+            **card.__dict__,
+            "artifact_kind": classify_artifact_kind(
+                card.card_type, card.interactive, card.preview_snapshot
+            ),
+        }
     )
 
 

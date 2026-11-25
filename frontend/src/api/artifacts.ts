@@ -80,6 +80,16 @@ export function getArtifactCardPreview(
   );
 }
 
+export function updateArtifactCard(
+  cardId: string,
+  payload: { title: string },
+): Promise<ArtifactCard> {
+  return apiClient.patch<ArtifactCard, typeof payload>(
+    `/artifacts/cards/${encodeURIComponent(cardId)}`,
+    payload,
+  );
+}
+
 export function deleteArtifactCard(cardId: string): Promise<ArtifactCard> {
   return apiClient.delete<ArtifactCard>(
     `/artifacts/cards/${encodeURIComponent(cardId)}`,

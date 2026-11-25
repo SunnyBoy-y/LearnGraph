@@ -48,16 +48,21 @@ export interface ArtifactShareTokenCreated extends ArtifactShareToken {
   token: string;
 }
 
+export type ArtifactCardKind = "svg" | "interactive" | "html" | "animation";
+
 /** Indexed chat card (magic_card / declarative component) in the artifacts page. */
 export interface ArtifactCard {
   id: string;
   card_id: string;
   card_instance_id: string;
   card_type: "magic_card" | "component";
+  artifact_kind?: ArtifactCardKind;
   interactive: boolean;
   title: string;
   status: "draft" | "published" | "deleted";
   chat_session_id: string | null;
+  chat_session_title?: string | null;
+  project_name?: string | null;
   message_id: string | null;
   version_count: number;
   latest_version: number;

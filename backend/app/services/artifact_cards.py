@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import secrets
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -26,6 +27,8 @@ from app.domain.models import (
     ArtifactCard,
     ArtifactCardShareToken,
     ArtifactCardVersion,
+    ChatSession,
+    Project,
     utc_now,
 )
 from app.services.provider_secrets import (
@@ -129,6 +132,57 @@ def _card_identity(part_type: str, data: dict[str, Any]) -> tuple[str, str] | No
     if isinstance(card_id, str) and card_id.strip():
         return card_id.strip()[:64], (instance_id if isinstance(instance_id, str) else card_id)[:64]
     return None
+
+
+_SVG_TAG_RE = re.compile(r"<svg\b", re.IGNORECASE)
+_INTERACTIVE_CONTROL_RE = re.compile(
+    r"<(?:button|input|select|textarea|form)\b|\bon(?:click|change|input|submit|pointerdown|keydown)\s*=|addEventListener",
+    re.IGNORECASE,
+)
+_SCRIPT_TAG_RE = re.compile(r"<script\b", re.IGNORECASE)
+_ANIMATION_RE = re.compile(
+    r"<(?:video|animate|animateTransform|animateMotion)\b|requestAnimationFrame|@keyframes|\banimation\s*:",
+    re.IGNORECASE,
+)
+_CANVAS_TAG_RE = re.compile(r"<canvas\b", re.IGNORECASE)
+
+
+def classify_artifact_kind(
+    card_type: str,
+    interactive: bool,
+    snapshot: dict[str, Any] | None,
+) -> str:
+    """Classify an indexed card into gallery categories: svg | interactive | html | animation."""
+    data = snapshot if isinstance(snapshot, dict) else {}
+    if interactive:
+        return "interactive"
+    runtime = data.get("runtime")
+    if isinstance(runtime, str) and runtime in BIDIRECTIONAL_RUNTIMES:
+        return "interactive"
+    if data.get("subapp_mode") is True or data.get("bundle_id") or (
+        data.get("origin_verified") is True and isinstance(data.get("artifact_url"), str) and data.get("artifact_url")
+    ):
+        return "interactive"
+
+    preview_html = data.get("preview_html")
+    if isinstance(preview_html, str) and preview_html.strip():
+        has_svg = bool(_SVG_TAG_RE.search(preview_html))
+        has_controls = bool(_INTERACTIVE_CONTROL_RE.search(preview_html))
+        has_script = bool(_SCRIPT_TAG_RE.search(preview_html))
+        has_anim = bool(_ANIMATION_RE.search(preview_html))
+        has_canvas = bool(_CANVAS_TAG_RE.search(preview_html))
+
+        if has_svg and not has_controls and not has_script and not has_canvas:
+            return "animation" if has_anim else "svg"
+        if (has_anim or has_canvas) and not has_controls:
+            return "animation"
+        if has_controls or has_script:
+            return "interactive"
+        return "html"
+
+    if card_type == CARD_TYPE_COMPONENT:
+        return "interactive"
+    return "html"
 
 
 def _is_interactive(part_type: str, data: dict[str, Any]) -> bool:
@@ -351,6 +405,27 @@ class ArtifactCardService:
                 "latest_version": int(max_version or 0),
                 "latest_version_at": latest_created,
             }
+        session_ids = [card.chat_session_id for card in cards if card.chat_session_id]
+        session_info: dict[str, tuple[str | None, str | None]] = {}
+        if session_ids:
+            session_rows = self.db.execute(
+                select(ChatSession.id, ChatSession.title, ChatSession.project_id).where(
+                    ChatSession.id.in_(session_ids),
+                    ChatSession.workspace_id == self.workspace_id,
+                )
+            ).all()
+            project_ids = [pid for _, _, pid in session_rows if pid]
+            project_titles: dict[str, str] = {}
+            if project_ids:
+                project_rows = self.db.execute(
+                    select(Project.id, Project.title).where(
+                        Project.id.in_(project_ids),
+                        Project.workspace_id == self.workspace_id,
+                    )
+                ).all()
+                project_titles = {pid: title for pid, title in project_rows}
+            for sid, stitle, pid in session_rows:
+                session_info[sid] = (stitle, project_titles.get(pid) if pid else None)
         views: list[dict[str, Any]] = []
         for card in cards:
             card_stats = stats.get(card.id) or {
@@ -358,9 +433,15 @@ class ArtifactCardService:
                 "latest_version": 0,
                 "latest_version_at": None,
             }
+            s_title, p_title = session_info.get(card.chat_session_id or "", (None, None))
             views.append(
                 {
                     **card.__dict__,
+                    "artifact_kind": classify_artifact_kind(
+                        card.card_type, card.interactive, card.preview_snapshot
+                    ),
+                    "chat_session_title": s_title,
+                    "project_name": p_title,
                     "version_count": card_stats["version_count"],
                     "latest_version": card_stats["latest_version"],
                     "draft_dirty": bool(
@@ -388,6 +469,16 @@ class ArtifactCardService:
             frozen = self._card_version_for_workspace(card_id, version)
             return row, dict(frozen.preview_snapshot or {})
         return row, dict(row.preview_snapshot or {})
+
+    def update_card(self, card_id: str, *, title: str) -> ArtifactCard:
+        """Rename an indexed card without creating a new draft revision."""
+        row = self._card_for_workspace(card_id)
+        if row.status == CARD_STATUS_DELETED:
+            raise AppError(404, "artifact_card_not_found", "Artifact card was not found")
+        row.title = _clean_title(title, fallback=row.title)
+        self.db.commit()
+        self.db.refresh(row)
+        return row
 
     def delete_card(self, card_id: str) -> ArtifactCard:
         """Soft-delete a card; a later agent re-emit revives it as a draft."""

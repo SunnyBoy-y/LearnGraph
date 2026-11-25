@@ -1,0 +1,21 @@
+/* Artifact Gallery layout & runtime overrides. */
+.artifact-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+  align-items: stretch;
+  gap: 20px;
+}
+
+.magic-card--fill,
+.dark .magic-card--fill {
+  margin: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  padding: 0;
+}
+
+.magic-card--fill .magic-card__frame {
+  border: 0;
+  border-radius: 8px;
+}

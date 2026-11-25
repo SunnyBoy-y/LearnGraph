@@ -38,6 +38,12 @@ class ArtifactShareTokenCreate(BaseModel):
     max_downloads: int | None = Field(default=None, ge=1)
 
 
+class ArtifactCardUpdate(BaseModel):
+    """Rename an indexed artifact card."""
+
+    title: str = Field(min_length=1, max_length=240)
+
+
 class ArtifactCardPublish(BaseModel):
     """Publish a card draft as the next immutable version."""
 
@@ -68,10 +74,13 @@ class ArtifactCardView(ORMModel):
     card_id: str
     card_instance_id: str
     card_type: str
+    artifact_kind: str = "html"
     interactive: bool
     title: str
     status: str
     chat_session_id: str | None = None
+    chat_session_title: str | None = None
+    project_name: str | None = None
     message_id: str | None = None
     version_count: int = 0
     latest_version: int = 0

@@ -90,7 +90,15 @@ function MagicCardFallback({
  * allowed. Any load, runtime, or heartbeat failure collapses to a local fallback
  * card.
  */
-export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
+export function MagicCardHost({
+  data,
+  hideHeader = false,
+  fillContainer = false,
+}: {
+  data: Record<string, unknown>;
+  hideHeader?: boolean;
+  fillContainer?: boolean;
+}) {
   const card = useMemo(() => asRecord(data), [data]);
   const title =
     (typeof card.title === "string" && card.title) ||
@@ -277,20 +285,25 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
   if (subappTrigger) {
     const hasSubappContent = Boolean(previewHtml || bundlePreviewUrl || canRenderRemote);
     return (
-      <section aria-label={title} className="magic-card">
-        <div className="magic-card__heading">
-          <Sparkles className="size-4" />
-          <div>
-            <strong>{title}</strong>
-            <span>双向交互子应用</span>
+      <section aria-label={title} className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}>
+        {!hideHeader ? (
+          <div className="magic-card__heading">
+            <Sparkles className="size-4" />
+            <div>
+              <strong>{title}</strong>
+              <span>双向交互子应用</span>
+            </div>
+            <Badge variant="secondary">subapp</Badge>
           </div>
-          <Badge variant="secondary">subapp</Badge>
-        </div>
+        ) : null}
         {hasSubappContent ? (
-          <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+          <FullscreenPreview
+            className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+            label={title}
+          >
             <iframe loading="lazy"
             allow=""
-              className="magic-card__frame"
+              className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
               onLoad={handleSubappLoad}
               ref={subappIframeRef}
               referrerPolicy="no-referrer"
@@ -301,7 +314,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
                   ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined))
                   : undefined
               }
-              style={{ height }}
+              style={fillContainer ? undefined : { height }}
               title={`${title} 子应用`}
             />
           </FullscreenPreview>
@@ -385,28 +398,33 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     return (
       <section
         aria-label={title}
-        className="magic-card"
-        style={{ maxHeight }}
+        className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}
+        style={fillContainer ? undefined : { maxHeight }}
       >
-        <div className="magic-card__heading">
-          <Sparkles className="size-4" />
-          <div>
-            <strong>{title}</strong>
-            <span>
-              {typeof card.card_id === "string" ? card.card_id : "magic-card"}
-              {card.version != null ? ` · v${card.version}` : ""}
-            </span>
+        {!hideHeader ? (
+          <div className="magic-card__heading">
+            <Sparkles className="size-4" />
+            <div>
+              <strong>{title}</strong>
+              <span>
+                {typeof card.card_id === "string" ? card.card_id : "magic-card"}
+                {card.version != null ? ` · v${card.version}` : ""}
+              </span>
+            </div>
+            <Badge variant="secondary">
+              {typeof card.runtime === "string"
+                ? card.runtime
+                : "react-sandbox-v1"}
+            </Badge>
           </div>
-          <Badge variant="secondary">
-            {typeof card.runtime === "string"
-              ? card.runtime
-              : "react-sandbox-v1"}
-          </Badge>
-        </div>
-        <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+        ) : null}
+        <FullscreenPreview
+          className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+          label={title}
+        >
           <iframe loading="lazy"
             allow=""
-            className="magic-card__frame"
+            className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
             onError={() => {
               setFailureReason("卡片 iframe 加载失败。");
               setFailed(true);
@@ -415,7 +433,7 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             src={artifactUrl}
-            style={{ height }}
+            style={fillContainer ? undefined : { height }}
             title={`${title} 隔离运行时`}
           />
         </FullscreenPreview>
@@ -429,22 +447,27 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     // natively. The gateway injects the runtime shim, and the host bridge
     // relays vfs.read / net.fetch for dynamic access.
     return (
-      <section aria-label={title} className="magic-card">
-        <div className="magic-card__heading">
-          <Box className="size-4" />
-          <div>
-            <strong>{title}</strong>
+      <section aria-label={title} className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}>
+        {!hideHeader ? (
+          <div className="magic-card__heading">
+            <Box className="size-4" />
+            <div>
+              <strong>{title}</strong>
+            </div>
           </div>
-        </div>
-        <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+        ) : null}
+        <FullscreenPreview
+          className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+          label={title}
+        >
           <iframe loading="lazy"
             allow=""
-            className="magic-card__frame"
+            className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
             ref={runtimeIframeRef}
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             src={bundlePreviewUrl}
-            style={{ height }}
+            style={fillContainer ? undefined : { height }}
             title={`${title} 多文件沙箱`}
           />
         </FullscreenPreview>
@@ -461,22 +484,27 @@ export function MagicCardHost({ data }: { data: Record<string, unknown> }) {
     // approval-free network relay through the host bridge.
     const srcDoc = sandboxedHtmlPreviewDocument(previewHtml, { runtimeShim: true });
     return (
-      <section aria-label={title} className="magic-card">
-        <div className="magic-card__heading">
-          <Box className="size-4" />
-          <div>
-            <strong>{title}</strong>
+      <section aria-label={title} className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}>
+        {!hideHeader ? (
+          <div className="magic-card__heading">
+            <Box className="size-4" />
+            <div>
+              <strong>{title}</strong>
+            </div>
           </div>
-        </div>
-        <FullscreenPreview className="magic-card__frame-wrap" label={title}>
+        ) : null}
+        <FullscreenPreview
+          className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+          label={title}
+        >
           <iframe loading="lazy"
             allow=""
-            className="magic-card__frame"
+            className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
             ref={runtimeIframeRef}
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             srcDoc={srcDoc}
-            style={{ height }}
+            style={fillContainer ? undefined : { height }}
             title={`${title} 动态预览`}
           />
         </FullscreenPreview>
