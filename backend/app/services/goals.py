@@ -68,6 +68,7 @@ from app.repositories.domain import (
 )
 from app.services.file_references import FileReferenceService
 from app.services.billing import BillingService
+from app.services.graph_cover import generate_automatic_graph_cover
 
 
 class GoalService:
@@ -999,6 +1000,9 @@ class GoalService:
                         relation="generation_material",
                     ),
                 )
+        graph.cover_svg = generate_automatic_graph_cover(
+            graph.title, node_labels=[node.label for node in created_nodes if node.node_type != "root"]
+        )
         goal.status = "candidate_ready"
         self.audit.record(
             actor_id=self.actor_id,
@@ -1616,6 +1620,15 @@ class GoalService:
                     expanded_branches += 1
 
         self._normalize_candidate_roots(graph)
+        # The candidate is already visible after the root preview. Do not
+        # overwrite a cover saved while the remaining nodes were generated.
+        self.db.execute(
+            update(Graph)
+            .where(Graph.workspace_id == self.workspace_id, Graph.id == graph.id, Graph.cover_svg.is_(None))
+            .values(cover_svg=generate_automatic_graph_cover(
+                graph.title, node_labels=[node.label for node in trunk_nodes]
+            ))
+        )
         goal.status = "candidate_ready"
         self.audit.record(
             actor_id=self.actor_id,

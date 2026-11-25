@@ -29,7 +29,9 @@ from app.domain.models import (
     GraphNode,
     Message,
 )
+from app.domain.schemas.goals import CandidateGraphRequest, CandidateGraphStreamRequest
 from app.repositories.domain import GraphNodeRepository
+from app.services.goals import GoalService
 from app.services.graph_changes import GraphChangeSetService
 
 PROPOSAL = {
@@ -156,3 +158,41 @@ def test_confirm_materializes_graph_with_an_eligibility_guard_per_node(db):
     graph = db.get(Graph, confirmed.graph_id)
     assert graph is not None and graph.status == "published"
     assert db.get(Goal, goal.id).status == "approved"
+    assert graph.cover_svg.startswith("data:image/svg+xml,")
+    assert "automatic" in graph.cover_svg
+    assert graph.cover_svg == confirmed.result["cover_svg"]
+
+
+@pytest.mark.parametrize("path", ["sync", "stream", "stream-with-manual-cover"])
+def test_candidate_generation_persists_cover(db, path):
+    from types import SimpleNamespace
+
+    goal = Goal(workspace_id="w", title="曲奇烘焙", raw_prompt="做一个图谱", status="confirmed")
+    db.add(goal)
+    db.commit()
+    service = GoalService(db, "w", "tester", SimpleNamespace(
+        available=True, remote_capability=False, provider_id="local-test"
+    ))
+    manual_cover = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22/%3E"
+
+    def save_manual_cover(event, payload):
+        if event == "graph.root" and path == "stream-with-manual-cover":
+            with sessionmaker(db.get_bind())() as writer:
+                writer.get(Graph, payload["graph_id"]).cover_svg = manual_cover
+                writer.commit()
+
+    if path == "sync":
+        graph = service.generate_candidate_graph(goal.id, CandidateGraphRequest())
+    else:
+        graph = service.stream_candidate_graph(
+            goal.id, CandidateGraphStreamRequest(mode="fast"), save_manual_cover
+        )
+
+    with sessionmaker(db.get_bind())() as reader:
+        saved = reader.get(Graph, graph.id)
+        assert saved.cover_svg.startswith("data:image/svg+xml,")
+        if path == "stream-with-manual-cover":
+            assert saved.cover_svg == manual_cover
+        else:
+            assert "automatic" in saved.cover_svg
+        assert saved.cover_svg == graph.cover_svg

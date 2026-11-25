@@ -180,6 +180,7 @@ describe("plan item projection", () => {
         action({ id: "b", node_id: "n2", day_index: 1, position: 1 }),
         action({ id: "a", node_id: "n1", day_index: 1, position: 0 }),
         action({ id: "d", status: "blocked", day_index: 0, position: 0 }),
+        action({ id: "archived", status: "archived", day_index: 1, position: 2 }),
       ],
     });
     const items = planItemViews(data, inputs(), TODAY);

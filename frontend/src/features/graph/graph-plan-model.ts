@@ -406,7 +406,7 @@ export function planItemViews(
 ): PlanItemView[] {
   if (!roadmap) return [];
   const planStartedAt = planStartDate(roadmap);
-  const items = [...roadmap.items].sort((left, right) => {
+  const items = roadmap.items.filter((item) => item.status !== "archived").sort((left, right) => {
     const leftBlocked = left.status === "blocked" ? 1 : 0;
     const rightBlocked = right.status === "blocked" ? 1 : 0;
     if (leftBlocked !== rightBlocked) return leftBlocked - rightBlocked;

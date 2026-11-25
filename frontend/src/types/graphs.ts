@@ -39,6 +39,9 @@ export interface GraphSummary {
   cover_svg?: string | null
   /** 该图谱有 AI 封面正在后台生成（书架显示「生成中」角标）。 */
   cover_ai_active?: boolean
+  node_count?: number | null
+  mastered_node_count?: number | null
+  last_studied_at?: IsoDateTime | null
 }
 
 export type GraphCoverMode = 'generated' | 'template' | 'image' | 'svg'

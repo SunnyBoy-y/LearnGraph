@@ -7,6 +7,7 @@ service.
 """
 from __future__ import annotations
 
+from hashlib import sha256
 from html import escape
 import base64
 import logging
@@ -106,6 +107,56 @@ def generate_graph_cover(
         return cover
     except Exception:
         logger.warning("Graph cover generation failed; using default cover", exc_info=True)
+        return default_graph_cover(title)
+
+
+def generate_automatic_graph_cover(title: str, *, node_labels: list[str]) -> str:
+    """Draw a compact, standalone vector cover when a new graph is generated."""
+    try:
+        title = _safe_title(title)
+        labels = list(dict.fromkeys(
+            label for raw in node_labels
+            if (label := " ".join(_safe_title(raw).split())) and label != title
+        ))[:3]
+        seed = sha256("\n".join([title, *labels]).encode("utf-8")).digest()
+        palettes = (
+            ("#0c2028", "#1a4c50", "#73e5ce", "#f5ce89"),
+            ("#14152c", "#463467", "#baaaff", "#ffd3a2"),
+            ("#22182a", "#66394f", "#ffb2bc", "#ffe1a3"),
+            ("#15231f", "#395534", "#c4eb98", "#ffce89"),
+            ("#121d35", "#2e4676", "#a6ceff", "#ffceaa"),
+        )
+        dark, glow, light, accent = palettes[seed[0] % len(palettes)]
+        points = [(x, y + seed[i + 1] % 21 - 10) for i, (x, y) in enumerate(
+            ((351, 92), (456, 57), (558, 94), (569, 196), (472, 247), (344, 204))
+        )]
+        links = "".join(f'<path d="M453 150L{x} {y}"/>' for x, y in points)
+        dots = "".join(
+            f'<circle cx="{x}" cy="{y}" r="{4 + seed[i + 7] % 5}"/>'
+            for i, (x, y) in enumerate(points)
+        )
+        captions = "".join(
+            f'<circle cx="83" cy="{y - 5}" r="3" fill="{accent}"/>'
+            f'<text x="98" y="{y}">{escape(label if len(label) <= 10 else label[:10] + "…")}</text>'
+            for y, label in zip((116, 156, 196), labels)
+        )
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300" data-cover-kind="automatic">
+<title>{escape(title)}</title>
+<defs><radialGradient id="glow" cx="71%"><stop stop-color="{glow}"/><stop offset="1" stop-color="{dark}"/></radialGradient></defs>
+<rect width="640" height="300" fill="url(#glow)"/>
+<g fill="none" stroke="{light}">
+<ellipse cx="453" cy="150" rx="152" ry="106" opacity=".22" transform="rotate(-22 453 150)"/>
+<ellipse cx="453" cy="150" rx="139" ry="82" opacity=".16" transform="rotate(29 453 150)"/>
+<circle cx="453" cy="150" r="53" opacity=".32" stroke-dasharray="3 6"/>
+<g opacity=".48" stroke-width="1.5">{links}</g></g>
+<g fill="{light}">{dots}</g>
+<circle cx="453" cy="150" r="26" fill="{dark}" stroke="{accent}" stroke-width="2"/>
+<path d="M453 137L466 150L453 163L440 150Z" fill="{accent}"/>
+<g fill="#f7f8ff" font-family="sans-serif" font-size="17">{captions}</g>
+</svg>'''
+        return f"data:image/svg+xml,{quote(svg)}"
+    except Exception:
+        logger.warning("Automatic graph cover generation failed; using default cover", exc_info=True)
         return default_graph_cover(title)
 
 

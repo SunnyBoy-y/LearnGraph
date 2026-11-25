@@ -68,6 +68,21 @@ def test_saved_custom_template_and_image_covers_are_preserved(stored):
     assert graph_cover.resolve_graph_cover(stored, "图谱") == stored
 
 
+def test_automatic_cover_is_standalone_vector_with_escaped_concept_labels():
+    title = "曲奇 & 烘焙\x00"
+    concepts = ["材料 < 配比", "温度", "温度"]
+    cover = graph_cover.generate_automatic_graph_cover(title, node_labels=concepts)
+    root = _root(cover)
+    assert root.tag == NS + "svg"
+    assert root.get("data-cover-kind") == "automatic"
+    assert root.find(NS + "title").text == "曲奇 & 烘焙"
+    assert [node.text for node in root.iter(NS + "text")] == ["材料 < 配比", "温度"]
+    assert not list(root.iter(NS + "image"))
+    assert cover == graph_cover.generate_automatic_graph_cover(title, node_labels=concepts)
+    assert cover != graph_cover.generate_automatic_graph_cover(title, node_labels=["整形"])
+    assert graph_cover.resolve_graph_cover(cover, title) == cover
+
+
 def test_unset_cover_and_missing_image_have_usable_offline_fallbacks(monkeypatch):
     monkeypatch.setattr(graph_cover, "_default_artwork_data_url", lambda title: "")
     root = _root(graph_cover.resolve_graph_cover(None, "图谱"))

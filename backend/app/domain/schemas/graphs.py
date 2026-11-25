@@ -50,6 +50,9 @@ class GraphSummary(ORMModel):
     # An AI cover generation is running for this graph. The bookshelf needs it to
     # keep the 「生成中」 badge after a reload, when no dialog is open to poll.
     cover_ai_active: bool = False
+    node_count: int | None = None
+    mastered_node_count: int | None = None
+    last_studied_at: datetime | None = None
 
 
 class GraphCoverUpdateRequest(BaseModel):

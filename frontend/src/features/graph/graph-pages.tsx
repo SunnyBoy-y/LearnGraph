@@ -4,8 +4,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type KeyboardEvent,
-  type PointerEvent,
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -26,18 +24,17 @@ import {
   GitCompareArrows,
   Layers,
   LayoutGrid,
+  List,
   Lock,
   ListTree,
   ListChecks,
   Minus,
   MoreHorizontal,
   MousePointer2,
-  Move,
   Network,
   Pencil,
   Play,
   Plus,
-  RotateCcw,
   Route,
   Save,
   Search,
@@ -46,8 +43,6 @@ import {
   Split,
   Target,
   Trash2,
-  ZoomIn,
-  ZoomOut,
 } from "lucide-react";
 import {
   Link,
@@ -68,6 +63,7 @@ import {
   getMastery,
   getMasteryAlignment,
   listGoals,
+  listGraphRevisions,
   listGraphs,
   studyMultipleNodes,
   updateGraphNode,
@@ -177,6 +173,7 @@ import type {
   MultiNodeStudyResponse,
 } from "@/types/graphs";
 import type { DeleteImpact } from "@/types/workflow";
+import "./graph-bookshelf.css";
 
 function downloadJsonFile(name: string, value: unknown) {
   const blob = new Blob([JSON.stringify(value, null, 2)], {
@@ -216,6 +213,10 @@ type ShelfBook = {
   /** 候选图谱：不可直接学习，需先经审核发布。 */
   needsReview: boolean;
   masteryProgress: number;
+  nodeCount?: number;
+  masteredCount?: number;
+  lastStudiedAt?: string | null;
+  revision?: number;
   cover: string;
   /** 该图谱有 AI 封面正在后台生成：书架显示角标并独立轮询。 */
   coverAiActive?: boolean;
@@ -319,6 +320,39 @@ function graphStatus(status: string) {
   return status || "草稿";
 }
 
+function shelfStatus(book: ShelfBook) {
+  if (!book.graphId) return "goal";
+  if (book.needsReview) return "review";
+  if (book.masteryProgress === 1) return "mastered";
+  return book.lastStudiedAt || book.masteryProgress > 0 ? "learning" : "new";
+}
+
+function shelfRecency(book: ShelfBook) {
+  if (book.needsReview) return "待审核";
+  if (!book.graphId) return "学习意向";
+  if (!book.lastStudiedAt) return shelfStatus(book) === "new" && book.nodeCount != null ? "尚未开始" : "暂无学习时间";
+  const date = new Date(book.lastStudiedAt);
+  const now = new Date();
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const label = date.toDateString() === now.toDateString() ? "今天"
+    : date.toDateString() === yesterday.toDateString() ? "昨天"
+    : date.toLocaleDateString("zh-CN");
+  return `最近学习 · ${label}`;
+}
+
+function shelfGraphMetrics(graph?: GraphSummary, currentGraph?: Graph) {
+  const nodes = graph?.id === currentGraph?.id ? currentGraph?.nodes : undefined;
+  const nodeCount = nodes?.length ?? graph?.node_count;
+  const masteredCount = nodes?.filter((node) => node.mastery_stars >= 3).length ?? graph?.mastered_node_count;
+  return {
+    nodeCount: nodeCount ?? undefined,
+    masteredCount: masteredCount ?? undefined,
+    masteryProgress: nodeCount && masteredCount != null ? masteredCount / nodeCount : 0,
+    lastStudiedAt: graph?.last_studied_at,
+    revision: graph?.revision,
+  };
+}
+
 function shelfBooks(
   graphs: GraphSummary[],
   goalBooks: GoalShelfEntry[],
@@ -334,10 +368,8 @@ function shelfBooks(
   const representedGoalIds = new Set(goalBooks.map((book) => book.goalId));
   const goalEntries = goalBooks.map((book) => {
     const graph = graphByGoalId.get(book.goalId);
-    const masteryProgress = graph?.id === currentGraph?.id && currentGraph?.nodes.length
-      ? currentGraph.nodes.filter((node) => node.mastery_stars >= 3).length / currentGraph.nodes.length
-      : 0;
     return {
+      ...shelfGraphMetrics(graph, currentGraph),
       id: book.id,
       goalId: book.goalId,
       graphId: graph?.id,
@@ -353,7 +385,6 @@ function shelfBooks(
       icon: graph ? Database : CircleDot,
       isGoalBook: !graph,
       needsReview: graph?.status === "candidate",
-      masteryProgress,
       cover: graph?.cover_svg || defaultGraphCover,
       coverAiActive: graph?.cover_ai_active,
     };
@@ -361,9 +392,7 @@ function shelfBooks(
   const graphEntries = graphSummaries
     .filter((graph) => !representedGoalIds.has(graph.goal_id))
     .map((graph) => ({
-      masteryProgress: graph.id === currentGraph?.id && currentGraph?.nodes.length
-        ? currentGraph.nodes.filter((node) => node.mastery_stars >= 3).length / currentGraph.nodes.length
-        : 0,
+      ...shelfGraphMetrics(graph, currentGraph),
       id: `graph-${graph.id}`,
       goalId: graph.goal_id,
       graphId: graph.id,
@@ -518,7 +547,7 @@ function GraphCoverEditor({ book, onClose }: { book?: ShelfBook; onClose: () => 
   );
 }
 
-function GraphBookshelf({
+export function GraphBookshelf({
   books,
   selectedId,
   onDelete,
@@ -535,347 +564,155 @@ function GraphBookshelf({
   onStartGoal: () => void;
   onStartLearning: (book: ShelfBook) => void;
 }) {
-  const [view, setView] = useState<"shelf" | "constellation">("shelf");
+  const [view, setView] = useState<"shelf" | "list">("shelf");
   const [coverBook, setCoverBook] = useState<ShelfBook>();
-  const [constellation, setConstellation] = useState({ scale: 1, x: 0, y: 0 });
-  const selectedBook = books.find((book) => book.id === selectedId);
-  const drag = useRef<{
-    pointerId: number;
-    startX: number;
-    startY: number;
-    x: number;
-    y: number;
-  } | null>(null);
-
-  function adjustScale(delta: number) {
-    setConstellation((current) => ({
-      ...current,
-      scale: Math.max(
-        0.55,
-        Math.min(2.2, Number((current.scale + delta).toFixed(2))),
-      ),
-    }));
+  const [historyBook, setHistoryBook] = useState<ShelfBook>();
+  const [search, setSearch] = useState("");
+  const [status, setStatus] = useState("all");
+  const [sort, setSort] = useState("default");
+  const { workspaceId = "" } = useParams();
+  const revisions = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "graph-revisions", historyBook?.graphId),
+    queryFn: () => listGraphRevisions(historyBook!.graphId!),
+    enabled: Boolean(historyBook?.graphId),
+  });
+  const term = search.trim().toLocaleLowerCase();
+  const visibleBooks = books.filter((book) => (
+    (status === "all" || shelfStatus(book) === status) &&
+    (!term || `${book.title} ${book.summary}`.toLocaleLowerCase().includes(term))
+  ));
+  if (sort === "recent") {
+    visibleBooks.sort((a, b) => (b.lastStudiedAt ? Date.parse(b.lastStudiedAt) : 0) - (a.lastStudiedAt ? Date.parse(a.lastStudiedAt) : 0));
   }
 
-  function startDrag(event: PointerEvent<HTMLDivElement>) {
-    if ((event.target as HTMLElement).closest("button")) return;
-    drag.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      x: constellation.x,
-      y: constellation.y,
-    };
-    event.currentTarget.setPointerCapture(event.pointerId);
+  async function shareBook(book: ShelfBook) {
+    const path = `/w/${encodeURIComponent(workspaceId)}/graphs/${encodeURIComponent(book.graphId!)}`;
+    try {
+      await navigator.clipboard.writeText(new URL(path, window.location.origin).href);
+      toast.success("图谱链接已复制，仅有权限的成员可以打开");
+    } catch {
+      toast.error("无法复制图谱链接");
+    }
   }
 
-  function moveDrag(event: PointerEvent<HTMLDivElement>) {
-    const activeDrag = drag.current;
-    if (!activeDrag || activeDrag.pointerId !== event.pointerId) return;
-    setConstellation((current) => ({
-      ...current,
-      x: activeDrag.x + event.clientX - activeDrag.startX,
-      y: activeDrag.y + event.clientY - activeDrag.startY,
-    }));
-  }
-
-  function endDrag(event: PointerEvent<HTMLDivElement>) {
-    if (drag.current?.pointerId !== event.pointerId) return;
-    drag.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId))
-      event.currentTarget.releasePointerCapture(event.pointerId);
-  }
-
-  function handleConstellationKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.target !== event.currentTarget) return;
-    const step = event.shiftKey ? 48 : 24;
-    switch (event.key) {
-      case "ArrowLeft":
-        event.preventDefault();
-        setConstellation((current) => ({ ...current, x: current.x - step }));
-        break;
-      case "ArrowRight":
-        event.preventDefault();
-        setConstellation((current) => ({ ...current, x: current.x + step }));
-        break;
-      case "ArrowUp":
-        event.preventDefault();
-        setConstellation((current) => ({ ...current, y: current.y - step }));
-        break;
-      case "ArrowDown":
-        event.preventDefault();
-        setConstellation((current) => ({ ...current, y: current.y + step }));
-        break;
-      case "+":
-      case "=":
-        event.preventDefault();
-        adjustScale(0.15);
-        break;
-      case "-":
-      case "_":
-        event.preventDefault();
-        adjustScale(-0.15);
-        break;
-      case "0":
-        event.preventDefault();
-        setConstellation({ scale: 1, x: 0, y: 0 });
-        break;
+  async function exportBook(book: ShelfBook) {
+    try {
+      const graph = await getGraph(book.graphId!);
+      downloadJsonFile(`${book.title.replace(/[\\/:*?"<>|]/g, "_")}.json`, graph);
+    } catch {
+      toast.error("无法导出图谱");
     }
   }
 
   return (
-    <section className="graph-library" aria-label="图谱书架">
+    <section className="graph-library graph-library--compact" aria-label="图谱书架">
       <GraphCoverEditor book={coverBook} onClose={() => setCoverBook(undefined)} />
       <header className="graph-library__header">
-        <div>
-          <h1>图谱书架</h1>
-          <p>选择图谱，查看与学习。</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button onClick={onStartGoal} size="sm">
-            <BookPlus className="size-4" />
-            新建学习意向
-          </Button>
-          <div
-            className="graph-library__view-switch"
-            role="group"
-            aria-label="图谱书架视图"
-          >
-            <Button
-              aria-label="书架视图"
-              onClick={() => setView("shelf")}
-              size="icon-sm"
-              title="书架视图"
-              variant={view === "shelf" ? "secondary" : "ghost"}
-            >
-              <LayoutGrid />
-            </Button>
-            <Button
-              aria-label="核心分布视图"
-              onClick={() => setView("constellation")}
-              size="icon-sm"
-              title="核心分布视图"
-              variant={view === "constellation" ? "secondary" : "ghost"}
-            >
-              <Network />
-            </Button>
-          </div>
-        </div>
+        <h1>图谱书架</h1>
+        <Button onClick={onStartGoal} size="sm"><BookPlus className="size-4" />新建学习意向</Button>
       </header>
-      {view === "shelf" ? (
-        <div className="graph-library__shelves">
-          {books.map((entry) => {
-            const Icon = entry.icon;
-            const selected = selectedId === entry.id;
-            return (
-              <div
-                className={
-                  selected
-                    ? "graph-library__book is-active"
-                    : "graph-library__book"
-                }
-                key={entry.id}
-                >
-                  <button
-                  aria-pressed={selected}
-                  className="graph-library__book-open"
-                  onClick={() => onOpen(entry)}
-                  type="button"
-                  >
-                  <span className="graph-library__spine" style={{ backgroundImage: `url("${entry.cover}"), url("${defaultGraphCover}")`, backgroundSize: "cover", backgroundPosition: "center" }}>
-                    <Icon />
-                    <span>{entry.title.slice(0, 1)}</span>
-                  </span>
-                  <span className="graph-library__book-copy">
-                    <strong>{entry.title}</strong>
-                    <small>{entry.summary}</small>
-                  </span>
-                  <span className="graph-library__book-meta">
-                    <b>{entry.status}</b>
-                    {entry.coverAiActive && entry.graphId ? <GraphCoverAIBadge graphId={entry.graphId} /> : null}
-                    <small>{entry.progress}</small>
-                    <span aria-label={`掌握进度 ${Math.round(entry.masteryProgress * 100)}%`} className="mt-1 block h-1.5 w-24 overflow-hidden rounded-full bg-muted"><span className="block h-full rounded-full bg-primary" style={{ width: `${Math.round(entry.masteryProgress * 100)}%` }} /></span>
-                  </span>
-                </button>
-                <div className="graph-library__book-actions">
-                  {entry.graphId ? (
-                    <Button onClick={() => setCoverBook(entry)} size="xs" variant="outline">
-                      封面
-                    </Button>
-                  ) : null}
-                  {entry.needsReview && entry.graphId ? (
-                    <Button
-                      onClick={() => onReview(entry)}
-                      size="xs"
-                      variant="secondary"
-                    >
-                      <ShieldCheck className="size-3.5" />
-                      去审核
-                    </Button>
-                  ) : (
-                    <Button
-                      onClick={() =>
-                        onStartLearning(entry)
-                      }
-                      size="xs"
-                      variant={entry.graphId ? "default" : "outline"}
-                    >
-                      {entry.graphId ? (
-                        <>
-                          <BookOpen className="size-3.5" />
-                          立即学习
-                        </>
-                      ) : (
-                        "继续澄清"
-                      )}
-                    </Button>
-                  )}
-                  <Button
-                    aria-label={`删除图谱书架条目 ${entry.title}`}
-                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                    onClick={() => onDelete(entry)}
-                    size="icon-xs"
-                    title={`删除「${entry.title}」`}
-                    variant="ghost"
-                  >
-                    <Trash2 className="size-3.5" />
-                  </Button>
+      <div className="graph-library__toolbar">
+        <div className="graph-library__search">
+          <Search aria-hidden="true" className="size-4" />
+          <Input type="search" aria-label="搜索学习图谱" placeholder="搜索学习图谱…" value={search} onChange={(event) => setSearch(event.target.value)} />
+        </div>
+        <Select value={status} onValueChange={setStatus}>
+          <SelectTrigger aria-label="按学习状态筛选" size="sm"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部状态</SelectItem>
+            <SelectItem value="new">尚未开始</SelectItem>
+            <SelectItem value="learning">正在学习</SelectItem>
+            <SelectItem value="mastered">已掌握</SelectItem>
+            <SelectItem value="review">待审核</SelectItem>
+            <SelectItem value="goal">学习意向</SelectItem>
+          </SelectContent>
+        </Select>
+        <Select value={sort} onValueChange={setSort}>
+          <SelectTrigger aria-label="书架排序" size="sm" className="graph-library__sort"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="default">默认排序</SelectItem>
+            <SelectItem value="recent">最近学习</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="graph-library__view-switch" role="group" aria-label="图谱书架视图">
+          <Button aria-label="卡片视图" aria-pressed={view === "shelf"} onClick={() => setView("shelf")} size="icon-sm" title="卡片视图" variant={view === "shelf" ? "secondary" : "ghost"}><LayoutGrid /></Button>
+          <Button aria-label="列表视图" aria-pressed={view === "list"} onClick={() => setView("list")} size="icon-sm" title="列表视图" variant={view === "list" ? "secondary" : "ghost"}><List /></Button>
+        </div>
+      </div>
+      <div className={cn("graph-library__shelves", view === "list" && "graph-library__shelves--list")}>
+        {visibleBooks.map((entry) => {
+          const selected = selectedId === entry.id;
+          const percent = Math.round(entry.masteryProgress * 100);
+          const state = shelfStatus(entry);
+          const showProgress = Boolean(entry.graphId && !entry.needsReview);
+          return (
+            <article className={cn("graph-library__book", selected && "is-active")} key={entry.id}>
+              <button aria-pressed={selected} aria-label={`打开「${entry.title}」`} className="graph-library__book-open" onClick={() => onOpen(entry)} type="button">
+                <span className="graph-library__spine" style={{ backgroundImage: `url("${entry.cover}"), url("${defaultGraphCover}")`, backgroundSize: "cover", backgroundPosition: "center" }} />
+                <span className="graph-library__book-copy">
+                  <strong title={entry.title}>{entry.title}</strong>
+                  <small title={entry.summary}>{entry.summary}</small>
+                </span>
+              </button>
+              <div className="graph-library__book-progress">
+                <div className="graph-library__progress-label">
+                  <span>{entry.needsReview ? "发布后可开始学习" : !entry.graphId ? "尚未生成图谱"
+                    : entry.nodeCount != null && entry.masteredCount != null ? `已掌握 ${entry.masteredCount} / ${entry.nodeCount} 个知识点` : "暂无掌握进度"}</span>
+                  {entry.coverAiActive && entry.graphId ? <GraphCoverAIBadge graphId={entry.graphId} /> : null}
+                  {showProgress && entry.nodeCount != null && entry.masteredCount != null && <span>{percent}%</span>}
                 </div>
+                {showProgress && <div
+                  aria-label="知识点掌握进度"
+                  aria-valuenow={entry.nodeCount != null && entry.masteredCount != null ? percent : undefined}
+                  className="h-1.5 overflow-hidden rounded-full bg-muted"
+                  role="progressbar"
+                ><div className="h-full rounded-full bg-primary" style={{ width: `${percent}%` }} /></div>}
               </div>
-            );
-          })}
-          {!books.length ? (
-            <button
-              className="graph-library__book is-locked"
-              onClick={onStartGoal}
-              type="button"
-            >
-              <span className="graph-library__spine">
-                <BookOpen />
-                <span>+</span>
-              </span>
-              <span className="graph-library__book-copy">
-                <strong>创建第一本图谱</strong>
-                <small>先告诉 AI 你要学什么</small>
-              </span>
-              <span className="graph-library__book-meta">
-                <small>待创建</small>
-              </span>
-            </button>
-          ) : null}
-        </div>
-      ) : (
-        <div className="graph-library__constellation-wrap">
-          <div
-            className="graph-library__constellation-tools"
-            aria-label="核心分布视图操作"
-          >
-            <span>
-              <Move className="size-3.5" />
-              拖动画布 · 方向键平移
-            </span>
-            <Button
-              aria-label="缩小核心分布图"
-              onClick={() => adjustScale(-0.15)}
-              size="icon-sm"
-              title="缩小"
-            >
-              <ZoomOut />
-            </Button>
-            <Button
-              aria-label="放大核心分布图"
-              onClick={() => adjustScale(0.15)}
-              size="icon-sm"
-              title="放大"
-            >
-              <ZoomIn />
-            </Button>
-            <Button
-              aria-label="重置核心分布图"
-              onClick={() => setConstellation({ scale: 1, x: 0, y: 0 })}
-              size="icon-sm"
-              title="重置"
-            >
-              <RotateCcw />
-            </Button>
-            {selectedBook?.needsReview && selectedBook.graphId ? (
-              <Button
-                aria-label={`审核图谱书架条目 ${selectedBook.title}`}
-                onClick={() => onReview(selectedBook)}
-                size="icon-sm"
-                title={`审核「${selectedBook.title}」并发布`}
-                variant="secondary"
-              >
-                <ShieldCheck />
-              </Button>
-            ) : null}
-            {selectedBook ? (
-              <Button
-                aria-label={`删除图谱书架条目 ${selectedBook.title}`}
-                className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                onClick={() => onDelete(selectedBook)}
-                size="icon-sm"
-                title={`删除「${selectedBook.title}」`}
-                variant="ghost"
-              >
-                <Trash2 />
-              </Button>
-            ) : null}
-          </div>
-          <div
-            className="graph-library__constellation"
-            aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown + - 0"
-            aria-label="以正在学习图谱为核心的分布视图"
-            onKeyDown={handleConstellationKeyDown}
-            onPointerCancel={endDrag}
-            onPointerDown={startDrag}
-            onPointerMove={moveDrag}
-            onPointerUp={endDrag}
-            onWheel={(event) => {
-              event.preventDefault();
-              adjustScale(event.deltaY > 0 ? -0.08 : 0.08);
-            }}
-            tabIndex={0}
-          >
-            <div
-              className="graph-library__constellation-stage"
-              style={{
-                transform: `translate(${constellation.x}px, ${constellation.y}px) scale(${constellation.scale})`,
-              }}
-            >
-              <span className="graph-library__orbit graph-library__orbit--one" />
-              <span className="graph-library__orbit graph-library__orbit--two" />
-              {books.map((entry, index) => {
-                const Icon = entry.icon;
-                const selected = selectedId === entry.id;
-                const angle = books.length
-                  ? (Math.PI * 2 * index) / books.length - Math.PI / 2
-                  : 0;
-                const style = selected
-                  ? { left: "50%", top: "50%" }
-                  : {
-                      left: `calc(50% + ${Math.round(Math.cos(angle) * 190)}px)`,
-                      top: `calc(50% + ${Math.round(Math.sin(angle) * 145)}px)`,
-                    };
-                return (
-                  <button
-                    aria-pressed={selected}
-                    className={`graph-library__planet${selected ? " is-active" : ""}`}
-                    key={entry.id}
-                    onClick={() => onOpen(entry)}
-                    style={style}
-                    type="button"
-                  >
-                    <Icon />
-                    <strong>{entry.title}</strong>
-                    <small>{entry.status}</small>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
+              <div className="graph-library__book-actions">
+                <small title={entry.lastStudiedAt ?? undefined}>{shelfRecency(entry)}</small>
+                <Button onClick={() => entry.needsReview ? onReview(entry) : onStartLearning(entry)} size="xs" variant={entry.needsReview || !entry.graphId ? "secondary" : "default"}>
+                  {entry.needsReview ? "去审核" : !entry.graphId ? "继续澄清" : state === "new" ? "开始学习" : "继续学习"}
+                  <ArrowRight className="size-3.5" />
+                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button aria-label={`「${entry.title}」的更多操作`} size="icon-sm" variant="ghost"><MoreHorizontal /></Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-36">
+                    {entry.graphId && <>
+                      <DropdownMenuItem disabled>重命名（暂未支持）</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => setCoverBook(entry)}>更换封面</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => setHistoryBook(entry)}>版本记录</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => void shareBook(entry)}>分享图谱链接</DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => void exportBook(entry)}>导出图谱（JSON）</DropdownMenuItem>
+                      <DropdownMenuItem disabled>归档（暂未支持）</DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                    </>}
+                    <DropdownMenuItem variant="destructive" onSelect={() => onDelete(entry)}><Trash2 />{entry.graphId ? "删除图谱" : "删除学习目标"}</DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            </article>
+          );
+        })}
+        {!books.length ? (
+          <div className="graph-library__empty"><p>还没有学习图谱</p><Button onClick={onStartGoal} size="sm" variant="outline">创建第一本图谱</Button></div>
+        ) : !visibleBooks.length ? (
+          <div className="graph-library__empty"><p>没有匹配的图谱</p><Button onClick={() => { setSearch(""); setStatus("all"); }} size="sm" variant="outline">清除搜索和筛选</Button></div>
+        ) : null}
+      </div>
+      <Dialog open={Boolean(historyBook)} onOpenChange={(open) => { if (!open) setHistoryBook(undefined); }}>
+        <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
+          <DialogHeader><DialogTitle>版本记录</DialogTitle><DialogDescription>{historyBook?.title}{historyBook?.revision != null && ` · 当前修订 ${historyBook.revision}`}</DialogDescription></DialogHeader>
+          {revisions.isPending ? <LoadingState label="正在读取版本记录…" /> : revisions.isError ? (
+            <ErrorState message="无法读取版本记录" onRetry={() => void revisions.refetch()} />
+          ) : revisions.data.length ? (
+            <ul className="divide-y text-sm">
+              {revisions.data.map((revision) => <li key={revision.id} className="flex flex-wrap justify-between gap-2 py-2"><span>修订 {revision.revision}</span><time dateTime={revision.created_at} className="text-muted-foreground">{new Date(revision.created_at).toLocaleString("zh-CN")}</time></li>)}
+            </ul>
+          ) : <p className="text-sm text-muted-foreground">暂无历史记录</p>}
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }
@@ -936,7 +773,7 @@ export function GraphWorkspacePage() {
   const goalBooks: GoalShelfEntry[] = (goals.data ?? []).map((goal) => ({
     id: `goal-${goal.id}`,
     title: goal.title,
-    summary: goal.intent || goal.raw_prompt,
+    summary: (goal.intent || goal.raw_prompt).trim() === "document_learning" ? "文档学习" : goal.intent || goal.raw_prompt,
     goalId: goal.id,
     status: goal.status === "approved" ? "正在学习" : "待确认",
     progress: "学习意向",

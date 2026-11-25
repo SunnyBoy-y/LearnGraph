@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import AppSettings, CurrentWorkspace, DB
 from app.providers.factory import model_provider_for_workspace
 from app.domain.schemas.common import ActionResponse
+from app.domain.memory_event_models import LearningNodeState
 from app.domain.models import GraphNode
 from app.domain.graph_cover_models import COVER_ACTIVE_STATUSES, GraphCoverJob
 from app.domain.schemas.graphs import (
@@ -65,6 +68,7 @@ def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> lis
     node_labels: dict[str, list[str]] = {}
     mastered_counts: dict[str, int] = {}
     ai_cover_active: set[str] = set()
+    last_studied: dict[str, datetime] = {}
     if graph_items:
         graph_ids = [item.id for item in graph_items]
         nodes = db.scalars(
@@ -77,6 +81,31 @@ def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> lis
             node_labels.setdefault(node.graph_id, []).append(node.label)
             if node.mastery_stars >= 3:
                 mastered_counts[node.graph_id] = mastered_counts.get(node.graph_id, 0) + 1
+        # Read personal learning evidence in one batch; graph edits and cover changes
+        # are not learning events. Assessment counts as learning activity too.
+        activity_rows = db.execute(
+            select(
+                GraphNode.graph_id,
+                func.max(LearningNodeState.last_studied_at),
+                func.max(LearningNodeState.last_assessed_at),
+            )
+            .join(LearningNodeState, LearningNodeState.knowledge_node_id == GraphNode.id)
+            .where(
+                GraphNode.workspace_id == context.workspace_id,
+                GraphNode.graph_id.in_(graph_ids),
+                LearningNodeState.workspace_id == context.workspace_id,
+                LearningNodeState.tenant_id == context.principal.tenant_id,
+                LearningNodeState.subject_user_id == context.principal.user_id,
+            )
+            .group_by(GraphNode.graph_id)
+        )
+        for graph_id, studied_at, assessed_at in activity_rows:
+            timestamps = [
+                value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+                for value in (studied_at, assessed_at) if value is not None
+            ]
+            if timestamps:
+                last_studied[graph_id] = max(timestamps)
         # One batched lookup keeps the shelf able to show an in-flight AI cover
         # after a reload, instead of polling every card.
         ai_cover_active = set(
@@ -97,6 +126,9 @@ def list_graphs(db: DB, context: CurrentWorkspace, settings: AppSettings) -> lis
                 progress=mastered_counts.get(item.id, 0) / max(1, len(node_labels.get(item.id, []))),
             ),
             "cover_ai_active": item.id in ai_cover_active,
+            "node_count": len(node_labels.get(item.id, [])),
+            "mastered_node_count": mastered_counts.get(item.id, 0),
+            "last_studied_at": last_studied.get(item.id),
         })
         for item in graph_items
     ]

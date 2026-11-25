@@ -998,8 +998,8 @@ class WorkflowService:
                 )
             target_status = values.get("status")
             allowed_transitions = {
-                "pending": {"pending", "in_progress", "completed"},
-                "in_progress": {"in_progress", "completed"},
+                "pending": {"pending", "in_progress", "completed", "archived"},
+                "in_progress": {"in_progress", "completed", "archived"},
                 "completed": {"completed"},
                 "archived": {"archived"},
                 "blocked": {"blocked"},

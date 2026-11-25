@@ -148,13 +148,34 @@ def test_goal_delete_impact(client, register_user, auth_headers):
 
 
 def test_graph_list_and_get(client, register_user, auth_headers):
-    token, ws, _, _ = register_user()
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from app.core.database import SessionLocal
+    from app.domain.memory_event_models import LearningNodeState
+    from app.domain.models import GraphNode, User
+
+    token, ws, username, _ = register_user()
     headers = auth_headers(token, ws)
     gid = _insert_goal_via_sql(ws)
     graph_id, node_id = _insert_graph_via_sql(ws, gid)
+    studied = datetime(2026, 6, 3, tzinfo=timezone.utc)
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.username == username))
+        db.get(GraphNode, node_id).mastery_stars = 3
+        db.add_all([
+            LearningNodeState(tenant_id=user.tenant_id, subject_user_id=user.id, workspace_id=ws,
+                              knowledge_node_id=node_id, last_assessed_at=studied, head_event_id="shelf-test"),
+            LearningNodeState(tenant_id=user.tenant_id, subject_user_id="another-user", workspace_id=ws,
+                              knowledge_node_id=node_id, last_studied_at=studied.replace(day=4), head_event_id="shelf-test-other"),
+        ])
+        db.commit()
     r = client.get("/api/v1/graphs", headers=headers)
-    assert r.status_code == 200
-    assert any(g["id"] == graph_id for g in r.json())
+    assert r.status_code == 200, r.text
+    listed = next(g for g in r.json() if g["id"] == graph_id)
+    assert (listed["mastered_node_count"], listed["node_count"]) == (1, 1)
+    assert datetime.fromisoformat(listed["last_studied_at"]) == studied
     r = client.get(f"/api/v1/graphs/{graph_id}", headers=headers)
     assert r.status_code == 200
     assert r.json()["title"] == "补测图谱"
@@ -256,6 +277,36 @@ def test_goal_graph_candidate_stream_root_first(client, register_user, auth_head
     assert complete_payload.get("graph_id") == root_payload.get("graph_id")
     assert complete_payload.get("nodes"), complete_payload
     assert complete_payload["status"] == "candidate", complete_payload
+
+
+
+def test_new_graph_saves_svg_for_the_bookshelf(client, register_user, auth_headers, monkeypatch, stub_goal_service):
+    from app.api.routers import goals as goals_router
+    from app.core.database import SessionLocal
+    from app.domain.models import Goal
+
+    def local_service(*args, **kwargs):
+        service = stub_goal_service(*args, **kwargs)
+        service.model_provider.remote_capability = False
+        return service
+
+    monkeypatch.setattr(goals_router, "service_with_model", local_service)
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    goal_id = _insert_goal_via_sql(ws)
+    with SessionLocal() as db:
+        db.get(Goal, goal_id).status = "confirmed"
+        db.commit()
+
+    response = client.post(f"/api/v1/goals/{goal_id}/candidate-graph", headers=headers, json={})
+    assert response.status_code == 201, response.text
+    graph = response.json()
+    assert graph["cover_svg"].startswith("data:image/svg+xml,")
+    assert "automatic" in graph["cover_svg"]
+    shelf = client.get("/api/v1/graphs", headers=headers)
+    assert shelf.status_code == 200, shelf.text
+    card = next(item for item in shelf.json() if item["id"] == graph["id"])
+    assert card["cover_svg"] == graph["cover_svg"]
 
 
 def test_goal_graph_candidate_stream_requires_confirmed(client, register_user, auth_headers):

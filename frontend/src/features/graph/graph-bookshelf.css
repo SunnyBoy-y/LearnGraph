@@ -1,0 +1,57 @@
+/* The existing grid and card covers are kept; align only the content below them. */
+.graph-library.graph-library--compact { container-type: inline-size; }
+.graph-library--compact .graph-library__header { align-items: center; gap: 10px; border: 0; padding-bottom: 14px; }
+.graph-library__toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.graph-library__search { position: relative; flex: 1 1 150px; max-width: 270px; min-width: 0; }
+.graph-library__search svg { position: absolute; inset-inline-start: 10px; top: 50%; transform: translateY(-50%); color: var(--muted-foreground); pointer-events: none; }
+.graph-library__search input { height: 32px; padding-inline-start: 32px; }
+.graph-library__sort { margin-inline-start: auto; }
+.graph-library--compact .graph-library__view-switch { border-color: var(--border); }
+.graph-library--compact .graph-library__shelves { grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); margin-top: 16px; }
+.graph-library--compact .graph-library__book {
+  min-width: 0;
+  gap: 0;
+  padding: 0;
+  border-color: var(--border);
+  background: var(--card);
+  color: var(--card-foreground);
+  transition: border-color .16s ease, box-shadow .16s ease;
+}
+.graph-library--compact .graph-library__book:is(:hover, .is-active) {
+  border-color: color-mix(in srgb, var(--foreground) 23%, var(--border));
+  box-shadow: 0 5px 18px rgb(0 0 0 / .08);
+}
+.graph-library--compact .graph-library__book-open { gap: 12px; overflow: hidden; }
+.graph-library--compact .graph-library__book-open:focus-visible { outline: 2px solid var(--ring); outline-offset: -3px; }
+.graph-library--compact .graph-library__spine { flex: none; }
+.graph-library--compact .graph-library__book-copy { gap: 4px; }
+.graph-library--compact .graph-library__book-copy > :is(strong, small) {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.graph-library--compact .graph-library__book-copy strong { block-size: 48px; font-size: 16px; font-weight: 600; line-height: 24px; }
+.graph-library--compact .graph-library__book-copy small { block-size: 36px; color: var(--muted-foreground); font-size: 13px; line-height: 18px; }
+.graph-library__book-progress { min-width: 0; min-height: 36px; margin-top: auto; padding: 8px 16px 0; }
+.graph-library__progress-label { display: flex; align-items: center; gap: 5px; min-width: 0; min-height: 18px; margin-bottom: 4px; color: var(--muted-foreground); font-size: 12px; font-variant-numeric: tabular-nums; }
+.graph-library__progress-label > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-inline-end: auto; }
+.graph-library__progress-label > span:not(:first-child) { flex: none; }
+.graph-library--compact .graph-library__book-actions { justify-content: flex-end; min-width: 0; margin: 12px 16px 0; padding: 8px 0 10px; border-top: 1px solid var(--border); }
+.graph-library__book-actions > small { min-width: 0; margin-inline-end: auto; color: var(--muted-foreground); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.graph-library__empty { grid-column: 1 / -1; display: grid; justify-items: center; gap: 12px; border: 1px dashed var(--border); border-radius: 12px; padding: 28px 16px; color: var(--muted-foreground); font-size: 14px; }
+.graph-library--compact .graph-library__shelves--list { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.graph-library--compact .graph-library__shelves--list .graph-library__book { display: grid; grid-template-columns: minmax(0, 1fr) minmax(130px, .55fr) minmax(205px, auto); align-items: center; gap: 12px; padding: 8px; border-radius: 12px; }
+.graph-library__shelves--list .graph-library__book-open { flex-direction: row; align-items: center; gap: 10px; }
+.graph-library__shelves--list .graph-library__spine { width: 68px; height: 36px; border-radius: 6px; }
+.graph-library__shelves--list .graph-library__book-copy { padding: 0; }
+.graph-library--compact .graph-library__shelves--list .graph-library__book-copy > :is(strong, small) { block-size: auto; -webkit-line-clamp: 1; }
+.graph-library__shelves--list .graph-library__book-progress, .graph-library--compact .graph-library__shelves--list .graph-library__book-actions { margin: 0; padding: 0; border: 0; }
+@container (max-width: 630px) {
+  .graph-library--compact .graph-library__shelves--list .graph-library__book { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .graph-library--compact .graph-library__shelves--list .graph-library__book-actions { border-top: 1px solid var(--border); padding-top: 4px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .graph-library--compact .graph-library__book { transition: none; }
+}
