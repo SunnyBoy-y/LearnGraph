@@ -10,11 +10,14 @@ import { CHAT_CONTEXT_USAGE_SETTING_KEY, CHAT_DEFAULT_RESPONSE_MODE_SETTING_KEY,
 import type { MemoryEnhancementUpdateRequest } from "@/types/memory";
 import type { WorkspaceSetting } from "@/types/settings";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useLocation, useSearchParams } from "react-router-dom";
 import { toast } from '@/lib/notifications';
+import { cn } from '@/lib/utils';
 import { AdvancedSettings, SettingRow, SettingsSection } from './settings-primitives';
 import { StickerSettingsPanel } from './sticker-settings';
+
 function useConversationSettingsPage() {
- const auth = useAuth();
+    const auth = useAuth();
     const queryClient = useQueryClient();
     const settingsQueryKey = workspaceQueryKey(auth.workspaceId, "settings");
     const settings = useQuery({
@@ -90,28 +93,131 @@ function useConversationSettingsPage() {
     const thinkingChainDefaultOpen = readChatThinkingChainDefault(settings.data);
     return { settings, memoryEnhancement, saveDefaultResponseMode, defaultResponseMode, suggestedPromptsEnabled, saveSuggestedPrompts, saveThinkingChainDefault, thinkingChainDefaultOpen, saveMemoryEnhancement, contextUsageEnabled, saveContextUsage, showStreamStats, setShowStreamStats, showCacheHit, setShowCacheHit };
 }
+
 export function ConversationSettingsPage() {
+    const location = useLocation();
+    const [params, setParams] = useSearchParams();
+    const tabParam = params.get("tab");
+    const hash = location.hash || (typeof window !== "undefined" ? window.location.hash : "");
+    const activeSection: "behavior" | "stickers" =
+        tabParam === "stickers" || tabParam === "market" || hash === "#stickers" || hash === "#sticker-market"
+            ? "stickers"
+            : "behavior";
+
+    const switchSection = (next: "behavior" | "stickers") => {
+        const updated = new URLSearchParams(params);
+        if (next === "stickers") {
+            updated.set("tab", "stickers");
+        } else {
+            updated.delete("tab");
+        }
+        setParams(updated, { replace: true });
+    };
+
     const { settings, memoryEnhancement, saveDefaultResponseMode, defaultResponseMode, suggestedPromptsEnabled, saveSuggestedPrompts, saveThinkingChainDefault, thinkingChainDefaultOpen, saveMemoryEnhancement, contextUsageEnabled, saveContextUsage, showStreamStats, setShowStreamStats, showCacheHit, setShowCacheHit } = useConversationSettingsPage();
     if (settings.isPending || memoryEnhancement.isPending)
         return <LoadingState />;
     const readError = settings.error ?? memoryEnhancement.error;
     if (readError)
-        return <ErrorState message={readError.message}/>;
-    return (<PageFrame><PageIntro title="对话与学习" description="设置新对话的默认行为、上下文管理与性能显示。"/><StickerSettingsPanel /><SettingsSection title="默认行为" description=""><SettingRow title="默认响应模式" description="新建对话时的默认状态：极速 / 智能体；已有会话仍记住各自上次选择"><Select disabled={saveDefaultResponseMode.isPending} onValueChange={(value) => saveDefaultResponseMode.mutate(value as ResponseMode)} value={defaultResponseMode}>
-              <SelectTrigger aria-label="默认响应模式" className="w-[8.5rem] shrink-0">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="fast">极速</SelectItem>
-                <SelectItem value="agentic">智能体</SelectItem>
-              </SelectContent>
-            </Select></SettingRow><SettingRow title="生成下一步问题提示" description="关闭后不会请求提示生成"><Switch aria-label="生成下一步问题提示" checked={suggestedPromptsEnabled} disabled={saveSuggestedPrompts.isPending} onCheckedChange={(enabled) => saveSuggestedPrompts.mutate(enabled)}/></SettingRow><SettingRow title="思考过程默认显示状态" description="默认折叠，可改为展开；最终回答开始时自动收起，也可随时手动展开查看。"><Select disabled={saveThinkingChainDefault.isPending} onValueChange={(value) => saveThinkingChainDefault.mutate(value as "open" | "collapsed")} value={thinkingChainDefaultOpen ? "open" : "collapsed"}>
-              <SelectTrigger aria-label="思维链处理中默认状态" className="w-[8.5rem] shrink-0">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="open">展开</SelectItem>
-                <SelectItem value="collapsed">折叠</SelectItem>
-              </SelectContent>
-            </Select></SettingRow></SettingsSection><SettingsSection title="上下文管理" description=""><SettingRow title="自动压缩长对话（会话摘要）" description="自动压缩长对话，与长期记忆整理共用模型。"><Switch aria-label="会话摘要" checked={memoryEnhancement.data?.summarization.enabled ?? false} disabled={memoryEnhancement.isPending || saveMemoryEnhancement.isPending} onCheckedChange={(enabled) => saveMemoryEnhancement.mutate({ summarization: { enabled } })}/></SettingRow><SettingRow title="上下文用量显示" description="在输入框下方显示会话统计，悬停或点击查看上下文用量详情。"><Switch aria-label="上下文用量显示" checked={contextUsageEnabled} disabled={saveContextUsage.isPending} onCheckedChange={(enabled) => saveContextUsage.mutate(enabled)}/></SettingRow></SettingsSection><AdvancedSettings title="高级诊断" description="响应性能指标 · 本设备即时生效"><SettingsSection title="响应性能指标" description=""><SettingRow title="显示流式指标" description="在回答中显示生成速度与 Token 用量（本设备）。"><Switch aria-label="显示流式指标" checked={showStreamStats} onCheckedChange={setShowStreamStats}/></SettingRow><SettingRow title="显示缓存命中" description="显示缓存读取比例（本设备）。"><Switch aria-label="显示缓存命中" checked={showCacheHit} onCheckedChange={setShowCacheHit}/></SettingRow></SettingsSection></AdvancedSettings></PageFrame>);
+        return <ErrorState message={readError.message} />;
+
+    const sectionSwitcher = (
+        <div
+            aria-label="对话与学习模块"
+            className="inline-flex rounded-lg bg-muted p-0.5 text-xs"
+            role="group"
+        >
+            <button
+                aria-pressed={activeSection === "behavior"}
+                className={cn(
+                    "rounded-md px-3 py-1.5 font-medium transition-colors",
+                    activeSection === "behavior"
+                        ? "bg-background text-foreground shadow-xs"
+                        : "text-muted-foreground hover:text-foreground",
+                )}
+                onClick={() => switchSection("behavior")}
+                type="button"
+            >
+                对话行为
+            </button>
+            <button
+                aria-pressed={activeSection === "stickers"}
+                className={cn(
+                    "rounded-md px-3 py-1.5 font-medium transition-colors",
+                    activeSection === "stickers"
+                        ? "bg-background text-foreground shadow-xs"
+                        : "text-muted-foreground hover:text-foreground",
+                )}
+                onClick={() => switchSection("stickers")}
+                type="button"
+            >
+                表情管理
+            </button>
+        </div>
+    );
+
+    return (
+        <PageFrame>
+            <PageIntro
+                actions={sectionSwitcher}
+                description={
+                    activeSection === "stickers"
+                        ? "管理 AI 对话中使用的表情与情绪反馈。"
+                        : "设置新对话的默认行为、上下文管理与性能显示。"
+                }
+                title={activeSection === "stickers" ? "表情管理" : "对话行为"}
+            />
+            {activeSection === "stickers" ? (
+                <StickerSettingsPanel />
+            ) : (
+                <>
+                    <SettingsSection title="默认行为" description="">
+                        <SettingRow title="默认响应模式" description="新建对话时的默认状态：极速 / 智能体；已有会话仍记住各自上次选择">
+                            <Select disabled={saveDefaultResponseMode.isPending} onValueChange={(value) => saveDefaultResponseMode.mutate(value as ResponseMode)} value={defaultResponseMode}>
+                                <SelectTrigger aria-label="默认响应模式" className="w-[8.5rem] shrink-0">
+                                    <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="fast">极速</SelectItem>
+                                    <SelectItem value="agentic">智能体</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </SettingRow>
+                        <SettingRow title="生成下一步问题提示" description="关闭后不会请求提示生成">
+                            <Switch aria-label="生成下一步问题提示" checked={suggestedPromptsEnabled} disabled={saveSuggestedPrompts.isPending} onCheckedChange={(enabled) => saveSuggestedPrompts.mutate(enabled)} />
+                        </SettingRow>
+                        <SettingRow title="思考过程默认显示状态" description="默认折叠，可改为展开；最终回答开始时自动收起，也可随时手动展开查看。">
+                            <Select disabled={saveThinkingChainDefault.isPending} onValueChange={(value) => saveThinkingChainDefault.mutate(value as "open" | "collapsed")} value={thinkingChainDefaultOpen ? "open" : "collapsed"}>
+                                <SelectTrigger aria-label="思维链处理中默认状态" className="w-[8.5rem] shrink-0">
+                                    <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="open">展开</SelectItem>
+                                    <SelectItem value="collapsed">折叠</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </SettingRow>
+                    </SettingsSection>
+                    <SettingsSection title="上下文管理" description="">
+                        <SettingRow title="自动压缩长对话（会话摘要）" description="自动压缩长对话，与长期记忆整理共用模型。">
+                            <Switch aria-label="会话摘要" checked={memoryEnhancement.data?.summarization.enabled ?? false} disabled={memoryEnhancement.isPending || saveMemoryEnhancement.isPending} onCheckedChange={(enabled) => saveMemoryEnhancement.mutate({ summarization: { enabled } })} />
+                        </SettingRow>
+                        <SettingRow title="上下文用量显示" description="在输入框下方显示会话统计，悬停或点击查看上下文用量详情。">
+                            <Switch aria-label="上下文用量显示" checked={contextUsageEnabled} disabled={saveContextUsage.isPending} onCheckedChange={(enabled) => saveContextUsage.mutate(enabled)} />
+                        </SettingRow>
+                    </SettingsSection>
+                    <AdvancedSettings title="高级诊断" description="响应性能指标 · 本设备即时生效">
+                        <SettingsSection title="响应性能指标" description="">
+                            <SettingRow title="显示流式指标" description="在回答中显示生成速度与 Token 用量（本设备）。">
+                                <Switch aria-label="显示流式指标" checked={showStreamStats} onCheckedChange={setShowStreamStats} />
+                            </SettingRow>
+                            <SettingRow title="显示缓存命中" description="显示缓存读取比例（本设备）。">
+                                <Switch aria-label="显示缓存命中" checked={showCacheHit} onCheckedChange={setShowCacheHit} />
+                            </SettingRow>
+                        </SettingsSection>
+                    </AdvancedSettings>
+                </>
+            )}
+        </PageFrame>
+    );
 }

@@ -30,6 +30,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { SettingsDirtyContext } from "@/lib/settings-dirty";
+import { SettingsModalContext } from "@/lib/settings-modal-context";
 import "@/features/settings/settings-center.css";
 import {
   isSettingsNavActive,
@@ -119,7 +120,10 @@ export function SettingsModal({
     }
   }
 
+  const aboutActive = pathname.endsWith("/settings/about");
+
   return (
+    <SettingsModalContext.Provider value={{ inSettingsModal: true, activeCategoryLabel: activeItem?.label }}>
     <SettingsDirtyContext.Provider value={registerDirty}>
     <Dialog onOpenChange={handleOpenChange} open={open}>
       <DialogContent
@@ -130,12 +134,12 @@ export function SettingsModal({
           // Override DialogContent's default top-1/2 left-1/2 -translate centering.
           "fixed inset-0 top-0 left-0 h-dvh max-h-dvh w-full max-w-none",
           "translate-x-0 translate-y-0 rounded-none border-0 shadow-none ring-0",
-          // ≥sm: ChatGPT-style centered secondary window.
+          // ≥sm: ChatGPT-style centered secondary window with balanced max-width.
           "sm:inset-auto sm:top-1/2 sm:left-1/2 sm:right-auto sm:bottom-auto",
-          "sm:h-[min(860px,86vh)] sm:max-h-[86vh]",
-          "sm:w-full sm:max-w-[min(1260px,94vw)]",
+          "sm:h-[min(760px,86vh)] sm:max-h-[86vh]",
+          "sm:w-full sm:max-w-[min(1020px,92vw)]",
           "sm:-translate-x-1/2 sm:-translate-y-1/2",
-          "sm:grid-cols-[256px_minmax(0,1fr)] sm:rounded-[16px]",
+          "sm:grid-cols-[228px_minmax(0,1fr)] sm:rounded-[16px]",
           "sm:border sm:shadow-lg sm:ring-1 sm:ring-black/5",
         )}
         showCloseButton={false}
@@ -145,13 +149,13 @@ export function SettingsModal({
 
         <nav
           aria-label="设置导航"
-          className="hidden min-h-0 flex-col border-r bg-muted/30 sm:flex"
+          className="hidden min-h-0 flex-col border-r bg-muted/35 sm:flex"
         >
           <div className="flex h-12 shrink-0 items-center px-4">
             <p className="text-sm font-semibold tracking-tight">设置</p>
           </div>
           <ScrollArea className="min-h-0 flex-1">
-            <ul className="flex flex-col gap-0.5 px-2 pb-3">
+            <ul className="flex flex-col gap-0.5 px-2.5 pb-3">
               {sections.filter(section => section.title).map((section, sectionIndex) => (
                 <li key={section.title ?? sectionIndex} className={!section.title ? "mt-6 border-t pt-2" : undefined}>
                   {section.title ? (
@@ -174,11 +178,11 @@ export function SettingsModal({
                             className={cn(
                               "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors",
                               active
-                                ? "bg-background font-medium text-foreground shadow-sm ring-1 ring-black/5 dark:ring-white/10"
-                                : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
+                                ? "bg-foreground/[0.07] font-semibold text-foreground dark:bg-white/10"
+                                : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
                             )}
                           >
-                            <Icon className="size-4 shrink-0" />
+                            <Icon className={cn("size-4 shrink-0", active ? "text-foreground" : "text-muted-foreground")} />
                             <span className="truncate">{item.label}</span>
                           </button>
                         </li>
@@ -189,7 +193,22 @@ export function SettingsModal({
               ))}
             </ul>
           </ScrollArea>
-          <div className="shrink-0 border-t p-2"><button type="button" onClick={() => navigateToSetting('settings/about')} aria-current={pathname.endsWith('/settings/about') ? 'page' : undefined} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-muted-foreground hover:bg-background hover:text-foreground"><Info className="size-4"/>关于</button></div>
+          <div className="shrink-0 border-t p-2.5">
+            <button
+              type="button"
+              onClick={() => navigateToSetting("settings/about")}
+              aria-current={aboutActive ? "page" : undefined}
+              className={cn(
+                "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors",
+                aboutActive
+                  ? "bg-foreground/[0.07] font-semibold text-foreground dark:bg-white/10"
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+              )}
+            >
+              <Info className={cn("size-4 shrink-0", aboutActive ? "text-foreground" : "text-muted-foreground")} />
+              <span>关于</span>
+            </button>
+          </div>
         </nav>
 
         <section className="flex min-h-0 min-w-0 flex-col">
@@ -197,7 +216,7 @@ export function SettingsModal({
             className={cn(
               "settings-modal__topbar flex shrink-0 items-center gap-2 border-b bg-background/90 px-3 backdrop-blur-xl",
               // Mobile: polished app-bar with notch-safe spacing and a large touch target.
-              "min-h-[4.5rem] py-2 pt-[max(0.5rem,env(safe-area-inset-top))] sm:h-12 sm:min-h-0 sm:py-0 sm:pt-0",
+              "min-h-[4.5rem] py-2 pt-[max(0.5rem,env(safe-area-inset-top))] sm:h-12 sm:min-h-0 sm:px-7 sm:py-0 sm:pt-0",
             )}
           >
             <div className="flex min-w-0 flex-1 items-center gap-2.5 sm:hidden">
@@ -324,5 +343,6 @@ export function SettingsModal({
       </DialogContent>
     </Dialog>
     </SettingsDirtyContext.Provider>
+    </SettingsModalContext.Provider>
   );
 }

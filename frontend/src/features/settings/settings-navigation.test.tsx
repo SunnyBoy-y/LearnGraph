@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { createMemoryRouter, RouterProvider, useLocation, useNavigate } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
 import { SettingsModal } from '@/components/layout/settings-modal'
+import { PageIntro } from '@/components/shared/page-elements'
 import { renderWithProviders } from '@/test/render'
 import { SettingsTabs } from './settings-tabs'
 import { useSettingsDirty } from '@/lib/settings-dirty'
@@ -95,5 +96,26 @@ describe('settings navigation', () => {
     fireEvent.click(screen.getByRole('button', { name: '语音与音频', exact: true }))
     await waitFor(() => expect(router.state.location.pathname).toBe('/w/ws/settings/voice'))
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+  })
+
+  it('suppresses duplicate category PageIntro inside SettingsModal while rendering specific feature titles', () => {
+    const router = createMemoryRouter([
+      {
+        path: '/w/:workspaceId/*',
+        element: (
+          <SettingsModal open onClose={() => {}}>
+            <div>
+              <PageIntro title="对话与学习" />
+              <PageIntro title="表情管理" description="管理 AI 对话中使用的表情与情绪反馈。" />
+            </div>
+          </SettingsModal>
+        ),
+      },
+    ], { initialEntries: ['/w/ws/settings/conversation'] })
+    render(<RouterProvider router={router}/>)
+    // Left nav + topbar have "对话与学习", but duplicate content-area heading is suppressed.
+    expect(screen.queryByRole('heading', { name: '对话与学习' })).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '表情管理' })).toBeInTheDocument()
+    expect(screen.getByText('管理 AI 对话中使用的表情与情绪反馈。')).toBeInTheDocument()
   })
 })

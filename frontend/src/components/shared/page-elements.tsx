@@ -5,6 +5,7 @@ import { AlertCircle, CheckCircle2, CircleDashed, LoaderCircle } from 'lucide-re
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useSettingsModalContext } from '@/lib/settings-modal-context'
 import { cn } from '@/lib/utils'
 
 export function PageFrame({ children, className }: { children: ReactNode; className?: string }) {
@@ -22,7 +23,7 @@ export function PageFrame({ children, className }: { children: ReactNode; classN
 
 export function PageIntro({
   title,
-  description: _description,
+  description,
   eyebrow: _eyebrow,
   actions,
 }: {
@@ -32,6 +33,30 @@ export function PageIntro({
   actions?: ReactNode
 }) {
   const Heading = useContext(PageHeadingLevelContext) === 2 ? 'h2' : 'h1'
+  const { inSettingsModal, activeCategoryLabel } = useSettingsModalContext()
+  if (inSettingsModal) {
+    const isDuplicateCategoryTitle = Boolean(activeCategoryLabel && title === activeCategoryLabel)
+    if (isDuplicateCategoryTitle && !actions) {
+      return null
+    }
+    return (
+      <header className="flex flex-col gap-2.5 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          {!isDuplicateCategoryTitle ? (
+            <Heading data-page-title className="break-words text-balance text-lg font-semibold tracking-tight sm:text-xl">
+              {title}
+            </Heading>
+          ) : null}
+          {description ? (
+            <p className={cn('text-xs leading-5 text-muted-foreground', !isDuplicateCategoryTitle && 'mt-0.5')}>
+              {description}
+            </p>
+          ) : null}
+        </div>
+        {actions ? <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
+      </header>
+    )
+  }
   return (
     <header className="flex flex-col gap-3 border-b pb-4 lg:flex-row lg:items-center lg:justify-between">
       <div className="min-w-0">

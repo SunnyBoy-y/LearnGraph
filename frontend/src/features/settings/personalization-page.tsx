@@ -72,8 +72,9 @@ export function PersonalizationPage() {
       <AppearanceSettings />
       <Surface className="p-5">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <SectionHeading description="基础人格决定默认表达策略，可被当前对话中的明确要求覆盖" title="回答风格"/>
-          <div className="flex shrink-0 flex-wrap items-center gap-2"><span role="status" className="text-xs text-muted-foreground">{dirty ? "有未保存的修改" : "已保存"}</span>
+          <SectionHeading title="回答风格"/>
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {dirty ? <span role="status" className="text-xs text-muted-foreground">有未保存的修改</span> : null}
             <Button disabled={stylesEqual(draft, DEFAULT_RESPONSE_STYLE) || save.isPending} onClick={() => setDraft({ ...DEFAULT_RESPONSE_STYLE })} size="sm" type="button" variant="outline">
               <RotateCcw className="size-4"/>
               恢复默认
