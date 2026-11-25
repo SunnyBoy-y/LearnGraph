@@ -161,6 +161,7 @@ export function MemoryPage() {
   const [forgetTarget, setForgetTarget] = useState<MemoryEntry[] | null>(null)
   const composerRef = useRef<HTMLTextAreaElement>(null)
   const composerModelInitialized = useRef(false)
+  const autoRefreshAttemptedRef = useRef(false)
   const [composerProviderId, setComposerProviderId] = useState('')
   const [composerModelId, setComposerModelId] = useState('')
 
@@ -171,6 +172,7 @@ export function MemoryPage() {
   const profile = useQuery({
     queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile'),
     queryFn: getMemoryProfile,
+    refetchOnMount: 'always',
   })
   const enhancement = useQuery({
     queryKey: workspaceQueryKey(workspaceId, 'memory', 'enhancement'),
@@ -312,32 +314,45 @@ export function MemoryPage() {
     },
   })
   const regenerateProfile = useMutation({
-    mutationFn: refreshMemoryProfile,
-    onSuccess: async (result) => {
+    mutationFn: (_vars?: { silent?: boolean } | void) => refreshMemoryProfile(),
+    onSuccess: async (result, vars) => {
+      const silent = Boolean(vars && vars.silent)
+      queryClient.setQueryData(workspaceQueryKey(workspaceId, 'memory', 'profile'), result)
       // 未配置提取/摘要模型时后端返回原子快照（200），此时不是“整篇重写”，
       // 只提示保持快照模式，配置模型后可一键生成正式报告。
-      if (result.status === 'atomic_snapshot') {
-        toast.info('未配置记忆摘要模型，当前保持原子快照；配置后可生成正式报告')
-      } else if (result.status === 'ready') {
-        toast.success('学习记忆报告已整篇重写')
-      } else if (result.status === 'empty') {
-        toast.info('当前还没有可用于生成学习报告的有效记忆')
-      } else {
-        toast.error('学习报告尚未生成成功，请稍后重试')
+      if (!silent) {
+        if (result.status === 'atomic_snapshot') {
+          toast.info('未配置记忆摘要模型，当前保持原子快照；配置后可生成正式报告')
+        } else if (result.status === 'ready') {
+          toast.success('学习记忆报告已整篇重写')
+        } else if (result.status === 'empty') {
+          toast.info('当前还没有可用于生成学习报告的有效记忆')
+        } else {
+          toast.error('学习报告尚未生成成功，请稍后重试')
+        }
       }
-      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile') })
+      if (result.status !== 'atomic_snapshot' && result.status !== 'empty') {
+        await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile') })
+      }
     },
-    onError: (error) => {
+    onError: async (error, vars) => {
+      const silent = Boolean(vars && vars.silent)
       // 后端用 `memory_profile_*` 系列错误码说明失败原因；统一翻成中文，并讲清楚
       // 「已保留上一版报告」，避免用户以为报告被清空。
-      if (error instanceof ApiError) {
-        // 未配置模型时页面会显示原子快照提示，这里不再重复弹窗。
-        if (error.code === 'memory_profile_model_unconfigured') return
+      if (!silent) {
+        if (error instanceof ApiError) {
+          // 未配置模型时页面会显示原子快照提示，这里不再重复弹窗。
+          if (error.code === 'memory_profile_model_unconfigured') {
+            await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile') })
+            return
+          }
+        }
+        toast.error(
+          memoryProfileErrorText(error, '刷新失败：模型这次没能完成整理，可稍后再试')
+            ?? error.message,
+        )
       }
-      toast.error(
-        memoryProfileErrorText(error, '刷新失败：模型这次没能完成整理，可稍后再试')
-          ?? error.message,
-      )
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, 'memory', 'profile') })
     },
   })
   const migrateAtoms = useMutation({
@@ -375,6 +390,39 @@ export function MemoryPage() {
     },
     onError: (error) => toast.error(error.message),
   })
+
+  const { mutate: triggerRefreshProfile, isPending: isRefreshingProfile } = regenerateProfile
+  const profileStatus = profile.data?.status
+  const profileWorkspaceId = profile.data?.workspace_id
+
+  useEffect(() => {
+    autoRefreshAttemptedRef.current = false
+  }, [workspaceId])
+
+  useEffect(() => {
+    if (tab !== 'report') {
+      autoRefreshAttemptedRef.current = false
+      return
+    }
+    if (autoRefreshAttemptedRef.current) return
+    if (profile.isPending || profile.isFetching) return
+    if (profileWorkspaceId && workspaceId && profileWorkspaceId !== workspaceId) return
+    if (profileStatus !== 'stale') return
+    if (isRefreshingProfile || editProfile.isPending || migrateAtoms.isPending) return
+    autoRefreshAttemptedRef.current = true
+    triggerRefreshProfile({ silent: true })
+  }, [
+    tab,
+    workspaceId,
+    profile.isPending,
+    profile.isFetching,
+    profileStatus,
+    profileWorkspaceId,
+    isRefreshingProfile,
+    editProfile.isPending,
+    migrateAtoms.isPending,
+    triggerRefreshProfile,
+  ])
 
   if (memories.isPending || profile.isPending || deleted.isPending || sessions.isPending) {
     return (
@@ -471,7 +519,7 @@ export function MemoryPage() {
   }
 
   return (
-    <PageFrame>
+    <PageFrame className={tab === 'report' ? 'pb-2' : undefined}>
       {/* 统一容器：页面标题、Tabs、报告、底部输入框共用同一个宽度基准。 */}
       <div className="mx-auto flex w-full max-w-[1040px] flex-col gap-5">
         <PageIntro
@@ -527,7 +575,17 @@ export function MemoryPage() {
           title="我的学习记忆报告"
         />
 
-        <Tabs onValueChange={(value) => setTab(value as MemoryTab)} value={tab}>
+        <Tabs
+          onValueChange={(value) => {
+            const nextTab = value as MemoryTab
+            setTab(nextTab)
+            if (nextTab === 'report') {
+              autoRefreshAttemptedRef.current = false
+              void profile.refetch()
+            }
+          }}
+          value={tab}
+        >
           <TabsList className="h-9 max-w-full justify-start overflow-x-auto">
             <TabsTrigger className="px-3" value="report">
               学习报告
@@ -606,7 +664,7 @@ export function MemoryPage() {
         </Tabs>
 
         {tab === 'report' ? (
-          <div className="sticky bottom-4 z-10 px-6 sm:px-10">
+          <div className="memory-report-dock sticky bottom-0 z-10 -mx-2 px-5 pb-4 pt-6 sm:px-8">
             <MemoryReportComposer
               busy={composerBusy}
               draft={draft}

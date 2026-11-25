@@ -148,7 +148,13 @@ class MemoryCommandService:
         return row
 
     def retract(
-        self, scope: MemoryScopeContext, memory_id: str, *, actor_id: str, reason: str
+        self,
+        scope: MemoryScopeContext,
+        memory_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        commit: bool = True,
     ) -> MemoryRecord:
         record = self._require_record(scope, memory_id)
         revision = self._active_revision(scope.workspace_id, memory_id)
@@ -172,7 +178,10 @@ class MemoryCommandService:
         if revision:
             revision.is_active = False
         self._clear_local_projections(memory_id)
-        self.db.commit()
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         return record
 
     def forget(

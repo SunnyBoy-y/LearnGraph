@@ -367,6 +367,17 @@ export interface MemoryDraftDecisionRequest {
   reason?: string
 }
 
+export interface MemoryDraftBatchDecisionRequest {
+  draft_ids: string[]
+  decision: MemoryDraftDecision
+  reason?: string
+}
+
+export interface MemoryDraftBatchDecisionResult {
+  processed_count: number
+  decision: MemoryDraftDecision
+}
+
 export interface MemoryProviderStatus {
   provider_id: string
   provider_type: string

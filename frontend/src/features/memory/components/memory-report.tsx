@@ -216,54 +216,84 @@ export function MemoryReport({
     selectionCallback.current(next)
   }
 
-  const statusLabel = (() => {
-    if (!profile) return null
-    const enabled = workspaceRecallEnabled(policy.data)
-    const parts: string[] = []
-    if (enabled !== null) parts.push(enabled ? '记忆已开启' : '记忆已暂停')
-    if (reportRefreshing) parts.push('报告更新中')
-    else if (profile.status === 'stale') parts.push('报告待更新')
-    else if (profile.status === 'atomic_snapshot') parts.push('原子快照模式')
-    else if (profile.status === 'ready') parts.push('报告为最新')
-    else if (profile.status === 'building') parts.push('报告生成中')
-    else if (profile.status === 'failed') parts.push('报告刷新失败')
-    return parts.length ? parts.join(' · ') : null
-  })()
+  const recallEnabled = workspaceRecallEnabled(policy.data)
+  const rawTimestamp = profile?.generated_at ?? profile?.updated_at ?? null
+  const exactUpdatedAt = useMemo(() => {
+    if (!rawTimestamp) return null
+    const date = new Date(rawTimestamp)
+    if (Number.isNaN(date.getTime())) return null
+    return date.toLocaleString('zh-CN', { hour12: false })
+  }, [rawTimestamp])
+  const displayUpdatedTime = updatedHint ?? (exactUpdatedAt ? `最后更新 ${exactUpdatedAt}` : null)
 
   return (
     <section className="surface flex flex-col overflow-hidden p-0 shadow-sm">
-      <header className="border-b px-6 pb-5 pt-6 sm:px-10">
-        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-primary">
-          <Sparkles className="size-3.5" />
-          AI Mentor Report
+      <header className="border-b px-6 py-5 sm:px-10">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-primary">
+            <Sparkles className="size-3.5" />
+            AI Mentor Report
+          </div>
+          {recallEnabled === false ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-50/70 px-2.5 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+              <span className="size-1.5 rounded-full bg-amber-500" />
+              记忆已暂停
+            </span>
+          ) : null}
         </div>
-        <h2 className="mt-2 text-xl font-semibold tracking-tight sm:text-2xl">
+        <h2 className="mt-1.5 text-xl font-semibold tracking-tight sm:text-2xl">
           AI 导师学习报告
         </h2>
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
           <span>{historicalReport ? `此版报告基于 ${profile?.source_count ?? 0} 条记忆` : `基于 ${profile?.source_count ?? 0} 条当前有效记忆`}</span>
-          {profile?.generated_at || profile?.updated_at ? (
+          {displayUpdatedTime ? (
             <>
               <span className="text-border">·</span>
-              <span>最后更新 {new Date(profile.generated_at ?? profile.updated_at ?? '').toLocaleString('zh-CN', { hour12: false })}</span>
-            </>
-          ) : null}
-          {updatedHint ? (
-            <>
-              <span className="text-border">·</span>
-              <span>{updatedHint}</span>
+              <span title={exactUpdatedAt ? `最后更新 ${exactUpdatedAt}` : undefined}>
+                {displayUpdatedTime}
+              </span>
             </>
           ) : null}
         </div>
-        {statusLabel ? (
-          <p className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-muted/40 px-2.5 py-1 text-[11px] text-muted-foreground">
-            <span className="size-1.5 rounded-full bg-primary/70" />
-            {statusLabel}
-          </p>
-        ) : null}
       </header>
 
-      <div className="px-6 py-7 sm:px-10 sm:py-9">
+      {reportRefreshing || profile?.status === 'stale' || profile?.status === 'failed' ? (
+        <div
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-3 border-b border-amber-500/20 bg-amber-50/70 px-6 py-2.5 text-xs text-amber-800 sm:px-10 dark:bg-amber-950/25 dark:text-amber-200"
+        >
+          <span className="flex items-center gap-2">
+            <span className="size-1.5 shrink-0 rounded-full bg-amber-500" />
+            <span>
+              {reportRefreshing
+                ? hasReportContent ? '正在更新学习报告，仍可查看上一版。' : '正在生成学习报告。'
+                : failure
+                  ? `上次刷新失败：${failure.message}${failure.at ? `（${failure.at}）` : ''}。${hasReportContent ? '仍可查看上一版报告。' : '可重新生成学习报告。'}`
+                  : profile?.status === 'failed'
+                    ? hasReportContent ? '报告刷新失败，仍可查看上一版。' : '报告暂时未能生成，可重新刷新报告。'
+                    : hasReportContent ? '记忆已有变化，当前显示上一版报告。' : '记忆已经有变化，刷新后会重新整理学习报告。'}
+            </span>
+          </span>
+          <Button
+            className="h-7 border-amber-500/30 bg-background/85 text-amber-900 hover:bg-background dark:border-amber-400/30 dark:text-amber-100"
+            disabled={busy || reportRefreshing}
+            onClick={() => void onRefresh()}
+            size="xs"
+            variant="outline"
+          >
+            {reportRefreshing ? '更新中…' : '立即刷新'}
+          </Button>
+        </div>
+      ) : profile?.status === 'atomic_snapshot' ? (
+        <div className="flex items-start gap-2 border-b border-primary/15 bg-primary/[0.04] px-6 py-2.5 text-xs leading-5 text-muted-foreground sm:px-10">
+          <Sparkles className="mt-0.5 size-3.5 shrink-0 text-primary" />
+          <span>
+            当前为原子快照：还没有配置记忆摘要模型，先把每条记忆清晰列出。配置提取/摘要模型后，点击右上角刷新即可生成正式报告。
+          </span>
+        </div>
+      ) : null}
+
+      <div className="px-6 py-6 sm:px-10 sm:py-7">
         <div className="w-full max-w-[800px]" onMouseUp={captureSelection} ref={documentRef}>
           <div className="relative">
             {selection && anchor ? (
@@ -302,30 +332,6 @@ export function MemoryReport({
               </div>
             ) : null}
 
-            {reportRefreshing || profile?.status === 'stale' || profile?.status === 'failed' ? (
-              <div role="status" className="mb-7 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/25 bg-amber-50/60 px-4 py-3 text-xs text-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
-                <span>
-                  {reportRefreshing
-                    ? hasReportContent ? '正在更新学习报告，仍可查看上一版。' : '正在生成学习报告。'
-                    : failure
-                      ? `上次刷新失败：${failure.message}${failure.at ? `（${failure.at}）` : ''}。${hasReportContent ? '仍可查看上一版报告。' : '可重新生成学习报告。'}`
-                      : profile?.status === 'failed'
-                        ? hasReportContent ? '报告刷新失败，仍可查看上一版。' : '报告暂时未能生成，可重新刷新报告。'
-                        : hasReportContent ? '记忆已有变化，当前显示上一版报告。' : '记忆已经有变化，刷新后会重新整理学习报告。'}
-                </span>
-                <Button disabled={busy || reportRefreshing} onClick={() => void onRefresh()} size="xs" variant="outline">
-                  {reportRefreshing ? '更新中…' : '立即刷新'}
-                </Button>
-              </div>
-            ) : profile?.status === 'atomic_snapshot' ? (
-              <div className="mb-7 flex items-start gap-2 rounded-xl border border-primary/20 bg-primary/[0.04] px-4 py-3 text-xs leading-5 text-muted-foreground">
-                <Sparkles className="mt-0.5 size-3.5 shrink-0 text-primary" />
-                <span>
-                  当前为原子快照：还没有配置记忆摘要模型，先把每条记忆清晰列出。配置提取/摘要模型后，点击右上角刷新即可生成正式报告。
-                </span>
-              </div>
-            ) : null}
-
               {sections.length || profile?.overview ? (
                 <article>
                   {profile?.overview ? (
@@ -353,11 +359,6 @@ export function MemoryReport({
                               {section.title}
                             </h3>
                           </div>
-                          {section.description ? (
-                            <p className="mt-1 pl-6 text-xs text-muted-foreground">
-                              {section.description}
-                            </p>
-                          ) : null}
                           <div className="mt-3">
                             <ReportBodyParagraphs dimensions={section.dimensions} changed={changed} />
                           </div>

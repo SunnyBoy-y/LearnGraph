@@ -1,6 +1,7 @@
-import { type RefObject, useMemo, useState } from 'react'
+import { type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import { useReducedMotionPreference } from '@/lib/motion-preferences'
+import { cn } from '@/lib/utils'
 import { ArrowUp, Check, ChevronDown, LoaderCircle, Pencil, Search } from 'lucide-react'
 
 import {
@@ -15,6 +16,7 @@ import {
   PromptInputSubmit,
   PromptInputTextarea,
 } from '@/components/ai-elements/prompt-input'
+import { InputGroupAddon } from '@/components/ui/input-group'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,6 +28,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
+import '../memory-report-composer.css'
 import type { MemoryReportSelection } from './memory-report'
 
 function modelValue(providerId: string, modelId: string) {
@@ -72,13 +75,13 @@ function MemoryModelPicker({
       <DropdownMenuTrigger asChild>
         <PromptInputButton
           aria-label="选择记忆整理模型"
-          className="chat-composer__mode memory-report-composer__mode"
+          className="chat-composer__mode"
           disabled={disabled}
           title={selected?.label || '按记忆设置选择模型'}
           type="button"
         >
-          <span className="max-w-28 truncate">{shortLabel}</span>
-          <ChevronDown aria-hidden="true" className="size-3.5" />
+          <span className="max-w-36 truncate">{shortLabel}</span>
+          <ChevronDown aria-hidden="true" className="size-4" />
         </PromptInputButton>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -170,8 +173,40 @@ export function MemoryReportComposer({
   selection: MemoryReportSelection | null
 }) {
   const reducedMotion = useReducedMotionPreference()
+  const localTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const [expanded, setExpanded] = useState(false)
+
+  useEffect(() => {
+    const el = localTextareaRef.current
+    if (!el) return
+    el.style.width = '100%'
+    const syncHeight = () => {
+      const styles = window.getComputedStyle(el)
+      const maxHeight = Number.parseFloat(styles.getPropertyValue('--composer-textarea-max')) || 210
+      const minHeight = Number.parseFloat(styles.getPropertyValue('--composer-textarea-min')) || 52
+      el.style.height = '0px'
+      const contentHeight = el.scrollHeight
+      const next = Math.min(maxHeight, Math.max(minHeight, contentHeight))
+      el.style.height = `${next}px`
+      el.style.overflowY = contentHeight > maxHeight + 1 ? 'auto' : 'hidden'
+      setExpanded(contentHeight > minHeight + 1)
+    }
+    syncHeight()
+    window.addEventListener('resize', syncHeight)
+    const group = el.closest("[data-slot='input-group']")
+    let observer: ResizeObserver | undefined
+    if (group && typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(syncHeight)
+      observer.observe(group)
+    }
+    return () => {
+      window.removeEventListener('resize', syncHeight)
+      observer?.disconnect()
+    }
+  }, [draft])
+
   return (
-    <div className="w-full max-w-[800px]">
+    <div className="w-full">
       <AnimatePresence initial={false}>
         {selection ? (
           <motion.div
@@ -195,7 +230,7 @@ export function MemoryReportComposer({
       </AnimatePresence>
 
       <PromptInput
-        className="chat-composer memory-report-composer"
+        className={cn('chat-composer memory-report-composer', expanded && 'is-expanded')}
         onSubmit={async ({ text }) => {
           if (!text.trim()) return false
           return (await onSubmit(text)) !== false
@@ -209,28 +244,29 @@ export function MemoryReportComposer({
             maxLength={2000}
             onChange={(event) => onDraftChange(event.currentTarget.value)}
             placeholder="告诉 AI 导师需要记住、修改或忘记什么……"
-            ref={inputRef}
+            ref={(node) => {
+              localTextareaRef.current = node
+              inputRef.current = node
+            }}
             value={draft}
           />
         </PromptInputBody>
-        <div className="memory-report-composer__actions" data-align="block-end">
-          <span className="memory-report-composer__controls">
-            <MemoryModelPicker
-              disabled={busy}
-              modelId={modelId}
-              onChange={onModelChange}
-              providerId={providerId}
-            />
-            <PromptInputSubmit
-              aria-label={busy ? '正在整理记忆' : '提交记忆'}
-              className="chat-composer__submit"
-              disabled={busy || !draft.trim()}
-              status={busy ? 'submitted' : 'ready'}
-            >
-              {busy ? <LoaderCircle className="size-4 animate-spin" /> : <ArrowUp className="size-4" />}
-            </PromptInputSubmit>
-          </span>
-        </div>
+        <InputGroupAddon align="inline-end" className="chat-composer__end">
+          <MemoryModelPicker
+            disabled={busy}
+            modelId={modelId}
+            onChange={onModelChange}
+            providerId={providerId}
+          />
+          <PromptInputSubmit
+            aria-label={busy ? '正在整理记忆' : '提交记忆'}
+            className="chat-composer__submit"
+            disabled={busy || !draft.trim()}
+            status={busy ? 'submitted' : 'ready'}
+          >
+            {busy ? <LoaderCircle className="size-3.5 animate-spin" /> : <ArrowUp className="size-4" />}
+          </PromptInputSubmit>
+        </InputGroupAddon>
       </PromptInput>
     </div>
   )

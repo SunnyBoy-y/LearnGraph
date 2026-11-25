@@ -1,0 +1,8 @@
+.memory-report-composer {
+  --composer-textarea-min: 72px;
+  --composer-textarea-max: 240px;
+}
+
+.memory-report-composer [data-slot='input-group'] {
+  min-height: 74px;
+}

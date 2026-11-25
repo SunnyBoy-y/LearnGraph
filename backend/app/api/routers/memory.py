@@ -23,6 +23,8 @@ from app.domain.schemas.management import (
     MemoryBatchDeleteRequest,
     MemoryBatchDeleteResult,
     MemoryCreateRequest,
+    MemoryDraftBatchDecisionRequest,
+    MemoryDraftBatchDecisionResult,
     MemoryDraftCreateRequest,
     MemoryDraftDecisionRequest,
     MemoryDraftView,
@@ -562,6 +564,21 @@ def create_memory_draft(
 ) -> MemoryDraftView:
     """Create a memory draft (INTERNAL API — used by the extraction pipeline)."""
     return service(db, context, settings).create_draft(payload)
+
+
+@router.post("/drafts/batch-decision", response_model=MemoryDraftBatchDecisionResult)
+def decide_memory_drafts_batch(
+    payload: MemoryDraftBatchDecisionRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> MemoryDraftBatchDecisionResult:
+    """Batch-decide pending memory drafts in a single atomic transaction."""
+    result = service(db, context, settings).decide_drafts_batch(
+        payload.draft_ids,
+        MemoryDraftDecisionRequest(decision=payload.decision, reason=payload.reason),
+    )
+    return MemoryDraftBatchDecisionResult(**result)
 
 
 @router.get("/drafts/{draft_id}", response_model=MemoryDraftView)

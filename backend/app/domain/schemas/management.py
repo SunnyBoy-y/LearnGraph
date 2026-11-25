@@ -235,6 +235,17 @@ class MemoryDraftDecisionRequest(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+class MemoryDraftBatchDecisionRequest(BaseModel):
+    draft_ids: list[str] = Field(min_length=1, max_length=10_000)
+    decision: Literal["commit", "reject"]
+    reason: str = Field(default="", max_length=500)
+
+
+class MemoryDraftBatchDecisionResult(BaseModel):
+    processed_count: int
+    decision: Literal["commit", "reject"]
+
+
 class MemoryDraftView(ORMModel):
     id: str
     workspace_id: str

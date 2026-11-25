@@ -74,6 +74,26 @@ class MemoryFeedbackRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class MemoryBatchFeedbackRequest(BaseModel):
+    memory_ids: list[str] = Field(min_length=1, max_length=10_000)
+    feedback_type: Literal[
+        "correct",
+        "stale",
+        "wrong",
+        "should_not_store",
+        "project_only",
+        "durable",
+        "deny_child",
+        "suppress_auto_recall",
+    ]
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryBatchRetractRequest(BaseModel):
+    memory_ids: list[str] = Field(min_length=1, max_length=10_000)
+    reason: str = Field(default="user_retracted", max_length=500)
+
+
 class MemorySupersedeRequest(BaseModel):
     title: str = Field(min_length=1, max_length=240)
     content: str = Field(min_length=1, max_length=50_000)

@@ -2827,6 +2827,17 @@ class MemoryService:
         with self.atomic_write():
             return self._decide_draft(draft_id, payload)
 
+    def decide_drafts_batch(
+        self,
+        draft_ids: list[str],
+        payload: MemoryDraftDecisionRequest,
+    ) -> dict[str, Any]:
+        ids = list(dict.fromkeys(draft_ids))
+        with self.atomic_write():
+            for draft_id in ids:
+                self._decide_draft(draft_id, payload)
+        return {"processed_count": len(ids), "decision": payload.decision}
+
     def _decide_draft(
         self,
         draft_id: str,

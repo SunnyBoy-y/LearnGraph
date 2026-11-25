@@ -38,6 +38,17 @@ export interface MemoryFeedbackRequest {
   payload?: Record<string, unknown>
 }
 
+export interface MemoryBatchFeedbackRequest {
+  memory_ids: string[]
+  feedback_type: MemoryFeedbackRequest['feedback_type']
+  payload?: Record<string, unknown>
+}
+
+export interface MemoryBatchRetractRequest {
+  memory_ids: string[]
+  reason?: string
+}
+
 export interface MemoryForgetRequest {
   confirmation: string
   reason?: string

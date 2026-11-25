@@ -1623,38 +1623,18 @@ body.is-resizing .workspace-resizer {
 .chat-composer__submit--stop:hover { background: #e3e3e3 !important; }
 .chat-composer__submit--stop svg { color: #111 !important; fill: #111 !important; stroke: none !important; }
 .chat-composer__submit:disabled { background: #ececec; color: #8b8b8b; opacity: 1; }
-.memory-report-composer [data-slot='input-group'] {
-  min-height: 96px;
-  align-items: stretch;
-  border-radius: 20px;
-  background: var(--card);
-  /* An empty draft disables Submit, not the whole composer. */
-  opacity: 1;
+.memory-report-dock {
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in srgb, var(--lg-panel-bg) 88%, transparent) 28%,
+    var(--lg-panel-bg) 56%
+  );
+  pointer-events: none;
 }
-.memory-report-composer__textarea {
-  min-height: 52px !important;
-  max-height: 132px !important;
-  padding: 14px 17px 5px !important;
-  font-size: 14px;
-  line-height: 1.55;
-}
-.memory-report-composer__actions {
-  display: flex;
-  width: 100%;
-  min-height: 40px;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 3px 8px 6px 17px;
-}
-.memory-report-composer__controls { display: inline-flex; flex: none; align-items: center; gap: 4px; }
-.memory-report-composer__mode { max-width: 156px; font-size: var(--lg-font-meta); }
-.memory-report-composer__mode:hover,
-.memory-report-composer__mode[data-state='open'] { background: color-mix(in srgb, var(--foreground) 7%, transparent); }
-.dark .memory-report-composer [data-slot='input-group'] { background: var(--card); }
-@media (max-width: 720px) {
-  .memory-report-composer__mode { max-width: 132px; }
-}
+.memory-report-dock > * { pointer-events: auto; }
+.memory-report-composer [data-slot='input-group'] { opacity: 1; }
+.memory-report-composer__textarea { padding-left: 18px !important; }
 .chat-send-queue {
   display: flex;
   width: 100%;
@@ -7734,22 +7714,6 @@ path.knowledge-plan-edge.is-selected { opacity: .7 !important; }
   .chat-composer.is-expanded .chat-composer__start,
   .chat-composer.is-expanded .chat-composer__end { align-self: center; padding-bottom: 0 !important; }
   .chat-plus-menu { min-width: min(236px, calc(100vw - 40px)); }
-
-  /* The memory composer has a block-end action row instead of the chat
-     composer's inline start/end addons. Keep those rows stacked on narrow
-     screens rather than inheriting the chat three-column grid. */
-  .memory-report-composer [data-slot='input-group'] {
-    display: flex !important;
-    grid-template-columns: none !important;
-    grid-template-areas: none !important;
-    flex-direction: column !important;
-    min-height: 96px;
-    padding: 0 !important;
-  }
-  .memory-report-composer__textarea,
-  .memory-report-composer__actions { grid-area: auto !important; }
-  .memory-report-composer__textarea { width: 100%; }
-  .memory-report-composer__actions { padding-left: 12px; }
 }
 
 /* --------------------------------------------------------------------------

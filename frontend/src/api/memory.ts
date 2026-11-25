@@ -5,6 +5,8 @@ import type {
   MemoryCreateRequest,
   MemoryBinding,
   MemoryDraft,
+  MemoryDraftBatchDecisionRequest,
+  MemoryDraftBatchDecisionResult,
   MemoryDraftDecisionRequest,
   MemoryEmbeddingPruneResult,
   MemoryEmbeddingReindexResult,
@@ -311,6 +313,15 @@ export function decideMemoryDraft(
 ): Promise<MemoryDraft> {
   return apiClient.post<MemoryDraft, MemoryDraftDecisionRequest>(
     `/memory/drafts/${encodeURIComponent(draftId)}/decision`,
+    payload,
+  )
+}
+
+export function decideMemoryDraftsBatch(
+  payload: MemoryDraftBatchDecisionRequest,
+): Promise<MemoryDraftBatchDecisionResult> {
+  return apiClient.post<MemoryDraftBatchDecisionResult, MemoryDraftBatchDecisionRequest>(
+    '/memory/drafts/batch-decision',
     payload,
   )
 }

@@ -16,6 +16,8 @@ from app.domain.memory_event_models import (
 from app.domain.models import ChatSession, MemoryRecord
 from app.domain.schemas.context_builds import ContextBuildRequest, ContextBuildView
 from app.domain.schemas.memory_v2 import (
+    MemoryBatchFeedbackRequest,
+    MemoryBatchRetractRequest,
     MemoryEventAppendRequest,
     MemoryEventView,
     MemoryFeedbackRequest,
@@ -256,6 +258,85 @@ def list_context_manifests(
         }
         for package in packages
     ]
+
+
+@router.post("/batch-feedback")
+def record_feedback_batch(
+    payload: MemoryBatchFeedbackRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    ids = list(dict.fromkeys(payload.memory_ids))
+    records = db.scalars(
+        select(MemoryRecord).where(
+            MemoryRecord.workspace_id == context.workspace.id,
+            MemoryRecord.id.in_(ids),
+        )
+    ).all()
+    by_id = {record.id: record for record in records}
+    for memory_id in ids:
+        record = by_id.get(memory_id)
+        if record is None or record.subject_user_id not in {None, context.principal.user_id}:
+            raise AppError(404, "memory_not_found", "Memory was not found")
+        if record.subject_user_id is None or payload.feedback_type == "project_only":
+            context.require_permission("workspace.manage")
+    commands = MemoryCommandService(db, event_store(db, settings))
+    scope = memory_scope(context)
+    try:
+        for memory_id in ids:
+            commands.feedback(
+                scope,
+                memory_id,
+                actor_id=context.principal.user_id,
+                feedback_type=payload.feedback_type,
+                payload=payload.payload,
+                commit=False,
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"processed_count": len(ids), "feedback_type": payload.feedback_type}
+
+
+@router.post("/batch-retract")
+def retract_memories_batch(
+    payload: MemoryBatchRetractRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> dict:
+    context.require_permission("workspace.manage")
+    ids = list(dict.fromkeys(payload.memory_ids))
+    records = db.scalars(
+        select(MemoryRecord).where(
+            MemoryRecord.workspace_id == context.workspace.id,
+            MemoryRecord.id.in_(ids),
+        )
+    ).all()
+    by_id = {record.id: record for record in records}
+    for memory_id in ids:
+        record = by_id.get(memory_id)
+        if record is None or record.subject_user_id not in {None, context.principal.user_id}:
+            raise AppError(404, "memory_not_found", "Memory was not found")
+    commands = MemoryCommandService(db, event_store(db, settings))
+    scope = memory_scope(context)
+    reason = str(payload.reason or "user_retracted")
+    try:
+        for memory_id in ids:
+            commands.retract(
+                scope,
+                memory_id,
+                actor_id=context.principal.user_id,
+                reason=reason,
+                commit=False,
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"processed_count": len(ids)}
 
 
 @router.post("/{memory_id}/feedback")

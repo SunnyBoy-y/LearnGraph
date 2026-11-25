@@ -132,49 +132,41 @@ export function memoryRefreshFailure(
 export const MEMORY_REPORT_SECTIONS: Array<{
   id: string
   title: string
-  description?: string
   keys: string[]
 }> = [
   {
     id: 'stage-review',
     title: '本阶段复盘',
-    description: 'AI 导师基于当前证据对最近阶段的回顾',
     keys: ['current_state'],
   },
   {
     id: 'direction',
     title: '你正在走向哪里',
-    description: '已经稳定下来的长期方向',
     keys: ['long_term_direction'],
   },
   {
     id: 'how-you-learn',
     title: '你是怎样学习的',
-    description: '学习方式与协作偏好',
     keys: ['learning_style', 'output_collaboration'],
   },
   {
     id: 'strengths',
     title: '你的优势与特点',
-    description: '已经有稳定证据支撑的特点',
     keys: ['stable_technical_preference'],
   },
   {
     id: 'growth',
     title: '当前值得突破的地方',
-    description: '下一步更值得投入的方向',
     keys: ['long_term_limit'],
   },
   {
     id: 'environment',
     title: '常用学习环境',
-    description: '你通常在哪里、用什么方式学习',
     keys: ['common_environment'],
   },
   {
     id: 'recent-state',
     title: '近期学习状态',
-    description: '最近这一段时间的状态变化',
     keys: ['recent_state', 'learning_progress'],
   },
 ]
@@ -182,7 +174,6 @@ export const MEMORY_REPORT_SECTIONS: Array<{
 export type MemoryReportSection = {
   id: string
   title: string
-  description?: string
   dimensions: MemoryProfileDimension[]
 }
 
@@ -216,7 +207,6 @@ export function buildMemoryReportSections(
       sections.push({
         id: section.id,
         title: section.title,
-        description: section.description,
         dimensions: matched,
       })
     }

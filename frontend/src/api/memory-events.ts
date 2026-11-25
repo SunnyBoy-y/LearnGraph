@@ -1,5 +1,7 @@
 import type {
   MemoryArchitectureStatus,
+  MemoryBatchFeedbackRequest,
+  MemoryBatchRetractRequest,
   MemoryFeedbackRequest,
   MemoryForgetRequest,
 } from '@/types/memory-events'
@@ -13,10 +15,24 @@ export function recordMemoryFeedback(memoryId: string, payload: MemoryFeedbackRe
   )
 }
 
+export function batchRecordMemoryFeedback(payload: MemoryBatchFeedbackRequest) {
+  return apiClient.post<{ processed_count: number; feedback_type: string }, MemoryBatchFeedbackRequest>(
+    '/memory/batch-feedback',
+    payload,
+  )
+}
+
 export function retractMemory(memoryId: string, reason: string) {
   return apiClient.post<{ memory_id: string; lifecycle_status: string }, MemoryFeedbackRequest>(
     `/memory/${encodeURIComponent(memoryId)}/retract`,
     { feedback_type: 'stale', payload: { reason } },
+  )
+}
+
+export function batchRetractMemories(memoryIds: string[], reason: string) {
+  return apiClient.post<{ processed_count: number }, MemoryBatchRetractRequest>(
+    '/memory/batch-retract',
+    { memory_ids: memoryIds, reason },
   )
 }
 

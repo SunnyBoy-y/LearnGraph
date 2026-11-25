@@ -126,3 +126,105 @@ def test_memory_context_build(client, register_user, auth_headers):
         json={"query": "学习目标", "workspace_id": ws},
     )
     assert r.status_code in (200, 400, 404, 422), r.text
+
+
+def test_memory_drafts_batch_decision_http(client, register_user, auth_headers):
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    draft_ids = []
+    for title in ("batch draft 1", "batch draft 2"):
+        r = client.post(
+            "/api/v1/memory/drafts",
+            headers=headers,
+            json={
+                "operation": "CREATE",
+                "memory_type": "learning_preference",
+                "title": title,
+                "content": f"{title} content",
+            },
+        )
+        assert r.status_code == 201, r.text
+        draft_ids.append(r.json()["id"])
+
+    # Missing target rolls back atomically.
+    r = client.post(
+        "/api/v1/memory/drafts/batch-decision",
+        headers=headers,
+        json={"draft_ids": draft_ids + ["missing"], "decision": "commit", "reason": "user_confirmed"},
+    )
+    assert r.status_code == 404, r.text
+    pending = client.get("/api/v1/memory/drafts?status=PENDING", headers=headers).json()
+    assert {item["id"] for item in pending} >= set(draft_ids)
+
+    # Batch commit all valid drafts.
+    r = client.post(
+        "/api/v1/memory/drafts/batch-decision",
+        headers=headers,
+        json={"draft_ids": draft_ids, "decision": "commit", "reason": "user_confirmed"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"processed_count": 2, "decision": "commit"}
+    remaining_pending = client.get("/api/v1/memory/drafts?status=PENDING", headers=headers).json()
+    assert not (set(draft_ids) & {item["id"] for item in remaining_pending})
+
+    # Batch reject another draft.
+    r = client.post(
+        "/api/v1/memory/drafts",
+        headers=headers,
+        json={
+            "operation": "CREATE",
+            "memory_type": "learning_preference",
+            "title": "batch draft reject",
+            "content": "to reject",
+        },
+    )
+    assert r.status_code == 201, r.text
+    reject_id = r.json()["id"]
+    r = client.post(
+        "/api/v1/memory/drafts/batch-decision",
+        headers=headers,
+        json={"draft_ids": [reject_id], "decision": "reject", "reason": "outdated"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"processed_count": 1, "decision": "reject"}
+
+
+def test_memory_batch_feedback_and_retract_http(client, register_user, auth_headers):
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    ids = []
+    for title in ("pending mem 1", "pending mem 2"):
+        r = client.post(
+            "/api/v1/memory",
+            headers=headers,
+            json={"title": title, "content": title},
+        )
+        assert r.status_code in (200, 201), r.text
+        ids.append(r.json()["id"])
+
+    r = client.post(
+        "/api/v1/memory/batch-feedback",
+        headers=headers,
+        json={"memory_ids": ids + ["missing"], "feedback_type": "correct"},
+    )
+    assert r.status_code == 404, r.text
+
+    r = client.post(
+        "/api/v1/memory/batch-feedback",
+        headers=headers,
+        json={"memory_ids": ids, "feedback_type": "correct"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"processed_count": 2, "feedback_type": "correct"}
+
+    r = client.post(
+        "/api/v1/memory/batch-retract",
+        headers=headers,
+        json={"memory_ids": ids, "reason": "user_says_incorrect"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"processed_count": 2}
+    for mid in ids:
+        detail = client.get(f"/api/v1/memory/{mid}", headers=headers)
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["lifecycle_status"] == "retracted"

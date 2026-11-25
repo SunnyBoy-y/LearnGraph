@@ -54,7 +54,6 @@ export function MemoryProcessRail({ workspaceId }: { workspaceId: string }) {
             <Brain className="size-3.5" />AI 导师过程
           </span>
           <h2>Agent 与工具调用</h2>
-          <p>显示记忆 Agent 的实际工具调用和执行结果。</p>
         </div>
         {process ? (
           <span className={`memory-process-rail__status is-${process.status}`}>
