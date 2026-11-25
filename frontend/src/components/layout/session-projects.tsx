@@ -19,6 +19,7 @@ import { branchRowDisplayTitle, flattenSidebarSessions, legacyBranchSiblingIndex
 function findProjectForSession(projects: SidebarProject[], id: string) { return projects.find(project => flattenSidebarSessions(project.sessions).some(item => item.id === id)) }
 
 const MAX_SELECTED_SESSIONS = 100;
+const ARCHIVED_SCOPE: SessionScope = { archived_only: true, roots_only: false, pinned_first: false };
 
 export function SessionProjects({
   navigator,
@@ -99,6 +100,9 @@ export function SessionProjects({
   const [renameValue, setRenameValue] = useState("");
   const [renamePending, setRenamePending] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  const archiveVisible = archivedOpen && !selectionMode;
+  const archivedScopeId = sessionScopeId(ARCHIVED_SCOPE);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -236,8 +240,9 @@ export function SessionProjects({
       scopes.add(`project:${project.id}`);
       retainChildren(project.sessions);
     }
+    if (archiveVisible) scopes.add(archivedScopeId);
     retainScopes(scopes);
-  }, [retainScopes, projectFolderOpen, projects, projectsOpen, recentOpen, sessionFolderOpen, ungroupedSessions]);
+  }, [archiveVisible, archivedScopeId, retainScopes, projectFolderOpen, projects, projectsOpen, recentOpen, sessionFolderOpen, ungroupedSessions]);
   const folderEntries = useMemo(
     () => [
       ...projects.map((project) => ({
@@ -765,7 +770,8 @@ export function SessionProjects({
 
   type NavigatorRow =
     | { key: string; kind: "project"; project: SidebarProject }
-    | { key: string; kind: "projects" | "recent" | "project-form" }
+    | { key: string; kind: "projects" | "recent" | "project-form" | "archive-header" }
+    | { key: string; kind: "archived-session"; session: SidebarSession; project?: SidebarProject }
     | { key: string; kind: "page"; scope: SessionScope; direction: "next" | "previous" }
     | { key: string; kind: "session"; session: SidebarSession; project?: SidebarProject; depth: number; legacyBranchIndex?: number };
   const rows = useMemo(() => {
@@ -790,6 +796,19 @@ export function SessionProjects({
         }
       });
     };
+    if (!selectionMode) result.push({ key: "archive-header", kind: "archive-header" });
+    if (archiveVisible) {
+      addPage(ARCHIVED_SCOPE, "previous");
+      const archivedPages = navigator.scopes.get(archivedScopeId)?.data?.pages ?? [];
+      const archivedSessions = new Map(archivedPages.flatMap(page => page.items).map(session => [session.id, session]));
+      const projectsById = new Map(projects.map(project => [project.id, project]));
+      for (const session of archivedSessions.values()) {
+        if (session.status !== "archived") continue;
+        result.push({ key: `archived:${session.id}`, kind: "archived-session", session,
+          project: session.project_id ? projectsById.get(session.project_id) : undefined });
+      }
+      addPage(ARCHIVED_SCOPE, "next");
+    }
     result.push({ key: "projects", kind: "projects" });
     if (projectsOpen) {
       if (creatingProject) result.push({ key: "project-form", kind: "project-form" });
@@ -807,7 +826,7 @@ export function SessionProjects({
       addPage(scope, "previous"); append(visibleUngroupedSessions); addPage(scope, "next");
     }
     return result;
-  }, [creatingProject, navigator.scopes, projectFolderOpen, projectsOpen, recentOpen, sessionFolderOpen, visibleProjects, visibleUngroupedSessions]);
+  }, [archiveVisible, archivedScopeId, creatingProject, navigator.scopes, projectFolderOpen, projects, projectsOpen, recentOpen, selectionMode, sessionFolderOpen, visibleProjects, visibleUngroupedSessions]);
   useEffect(() => () => {
     if (longPressRef.current.timer != null) window.clearTimeout(longPressRef.current.timer);
   }, []);
@@ -870,6 +889,30 @@ export function SessionProjects({
           pinnedKeys={[...([menuOpenFor, renamingSessionId].filter(Boolean).map(id => `session:${id}`)), ...(projectMenuOpenFor ? [`project:${projectMenuOpenFor}`] : []), ...(creatingProject ? ["project-form"] : [])]}
           renderRow={row => {
             if (row.kind === "projects" || row.kind === "recent") return renderSectionHeader(row.kind);
+            if (row.kind === "archive-header") return (
+              <section className="sidebar-section" aria-label="已归档会话">
+                <div className="sidebar-section__heading">
+                  <button aria-expanded={archiveVisible} className="sidebar-section__toggle" type="button" onClick={() => setArchivedOpen(open => !open)}>
+                    <Archive aria-hidden="true" className="mr-1.5 inline size-3.5" />
+                    已归档会话
+                  </button>
+                </div>
+              </section>
+            );
+            if (row.kind === "archived-session") return (
+              <div className="sidebar-project__session group flex min-w-0 items-center gap-1 px-2">
+                <button aria-current={activeSessionId === row.session.id ? "page" : undefined}
+                  aria-label={row.project ? `${row.session.title || "新会话"}，${row.project.title}` : undefined}
+                  className="sidebar-project__session-title min-w-0 flex-1 text-left"
+                  title={row.session.title || "新会话"} type="button"
+                  onClick={() => onSelectSession(row.session.id, row.project)}>
+                  <span className="block truncate">{row.session.title || "新会话"}</span>
+                  {row.project ? <small className="block truncate text-muted-foreground">{row.project.title}</small> : null}
+                </button>
+                <Button aria-label={`恢复会话 ${row.session.title || "新会话"}`} size="xs" type="button" variant="ghost"
+                  onClick={() => onToggleSessionArchive(row.session)}>恢复</Button>
+              </div>
+            );
             if (row.kind === "project") return renderProjectHeader(row.project);
             if (row.kind === "session") return renderSessionRow(row.session, { project: row.project, ungrouped: !row.project, depth: row.depth, legacyBranchIndex: row.legacyBranchIndex });
             if (row.kind === "page") return <SessionPageSentinel scope={row.scope} navigator={navigator} direction={row.direction} />;

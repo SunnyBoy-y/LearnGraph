@@ -35,6 +35,41 @@ def test_browser_http_page_detail_summary_and_legacy(client, register_user, auth
     assert client.get('/api/v1/sessions/page').status_code == 401
 
 
+def test_archived_page_includes_branches_and_excludes_restored_sessions(client, register_user, auth_headers):
+    token, workspace, *_ = register_user('browserarchives')
+    _, other_workspace, *_ = register_user('browserarchiveother')
+    headers = auth_headers(token, workspace)
+    with SessionLocal() as db:
+        parent = ChatSession(workspace_id=workspace, title='Parent', status='active')
+        db.add(parent)
+        db.flush()
+        branch = ChatSession(workspace_id=workspace, title='Archived branch', status='archived', parent_session_id=parent.id)
+        root = ChatSession(workspace_id=workspace, title='Archived root', status='archived')
+        db.add_all([branch, root, ChatSession(workspace_id=other_workspace, title='Foreign', status='archived')])
+        db.flush()
+        branch_id, root_id = branch.id, root.id
+        db.commit()
+
+    path = '/api/v1/sessions/page'
+    params = {'archived_only': 'true', 'roots_only': 'false', 'limit': 1}
+    first = client.get(path, params=params, headers=headers)
+    assert first.status_code == 200, first.text
+    first_page = first.json()
+    assert first_page['has_more']
+    second = client.get(path, params={**params, 'cursor': first_page['next_cursor']}, headers=headers)
+    assert second.status_code == 200, second.text
+    assert not second.json()['has_more']
+    assert {row['id'] for row in first_page['items'] + second.json()['items']} == {branch_id, root_id}
+    assert client.get(path, params={**params, 'archived_only': 'false', 'cursor': first_page['next_cursor']}, headers=headers).status_code == 422
+    assert client.get(f'/api/v1/sessions/{branch_id}', headers=headers).status_code == 200
+
+    restored = client.post(f'/api/v1/sessions/{branch_id}/restore', headers=headers)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()['status'] == 'active'
+    remaining = client.get(path, params=params, headers=headers).json()
+    assert [row['id'] for row in remaining['items']] == [root_id]
+
+
 def test_detail_cannot_cross_workspace(client, register_user, auth_headers):
     token, workspace, *_ = register_user('browserforeign')
     other_token, other_workspace, *_ = register_user('browserother')

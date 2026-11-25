@@ -80,6 +80,7 @@ export class SessionNavigatorStore {
     const items = new Map<string, SessionSummary>()
     for (const [key, entry] of this.entries) {
       scopes.set(key, entry.result)
+      if (entry.scope.archived_only) continue
       const data = entry.result.data
       if (!data) continue
       let flat = this.flattened.get(data)

@@ -153,7 +153,7 @@ class SessionBrowser:
         return SessionCountsView(total=sum(counts.values()), active=sum(value for key, value in counts.items() if key != "archived"), archived=counts.get("archived", 0), memory_enabled=memory_enabled)
 
     def page(self, *, limit=20, cursor=None, project_id=None, ungrouped=False,
-             parent_session_id=None, roots_only=True, include_archived=False,
+             parent_session_id=None, roots_only=True, include_archived=False, archived_only=False,
              graph_id=None, node_id=None, session_kind=None, query=None, direction="next", created_after=None, created_before=None, pinned_first=True) -> SessionPageView:
         if project_id and ungrouped:
             raise AppError(422, "invalid_session_scope", "project_id and ungrouped are mutually exclusive")
@@ -163,9 +163,11 @@ class SessionBrowser:
             if (project_id and parent.project_id != project_id) or (ungrouped and parent.project_id is not None):
                 raise AppError(404, "session_not_found", "Session not found")
             project_id, ungrouped = parent.project_id, parent.project_id is None
-        scope = dict(project_id=project_id, ungrouped=ungrouped, include_archived=include_archived)
+        scope = dict(project_id=project_id, ungrouped=ungrouped, include_archived=include_archived or archived_only)
         def display_scope(model=ChatSession):
             filters = self.scope(model, **scope)
+            if archived_only:
+                filters.append(model.status == "archived")
             if created_after:
                 filters.append(model.created_at >= created_after)
             if created_before:
@@ -201,6 +203,7 @@ class SessionBrowser:
             project_id, ungrouped, parent_session_id, roots_only, include_archived,
             graph_id, node_id, session_kind, query, pinned_first,
             created_after.isoformat() if created_after else None, created_before.isoformat() if created_before else None,
+            *(["archived_only"] if archived_only else []),
         ], separators=(",", ":")).encode()).hexdigest()[:24]
         if cursor:
             try:

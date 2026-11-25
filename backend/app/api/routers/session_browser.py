@@ -25,6 +25,7 @@ def page_sessions(
     project_id: str | None = Query(None, min_length=1, max_length=64), ungrouped: bool = False,
     parent_session_id: str | None = Query(None, min_length=1, max_length=64),
     roots_only: bool = True, include_archived: bool = False, pinned_first: bool = True,
+    archived_only: bool = False,
     graph_id: str | None = Query(None, min_length=1, max_length=64),
     node_id: str | None = Query(None, min_length=1, max_length=64),
     session_kind: str | None = Query(None, min_length=1, max_length=32),
@@ -35,7 +36,8 @@ def page_sessions(
     return browser(db, context).page(
         limit=limit, cursor=cursor, project_id=project_id, ungrouped=ungrouped,
         parent_session_id=parent_session_id, roots_only=roots_only,
-        include_archived=include_archived, graph_id=graph_id, node_id=node_id, session_kind=session_kind, query=q, direction=direction,
+        include_archived=include_archived, archived_only=archived_only,
+        graph_id=graph_id, node_id=node_id, session_kind=session_kind, query=q, direction=direction,
         created_after=created_after, created_before=created_before, pinned_first=pinned_first,
     )
 

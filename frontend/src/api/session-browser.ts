@@ -10,6 +10,7 @@ export type SessionScope = {
   parent_session_id?: string
   roots_only?: boolean
   include_archived?: boolean
+  archived_only?: boolean
   pinned_first?: boolean
   graph_id?: string
   node_id?: string
