@@ -106,6 +106,63 @@ def test_same_durable_renderer_lane_in_all_modes(client, register_user, auth_hea
         assert "不要把查不到或下载失败说成没有图库权限" in notes[0]
 
 
+@pytest.mark.parametrize("mode", ["fast", "legacy", "agent"])
+def test_native_svg_streams_nodes_in_place_and_retries(client, register_user, auth_headers, monkeypatch, mode):
+    from app.api.routers import chat as router
+
+    class SvgProvider(RichProvider):
+        def stream_answer(self, prompt):
+            assert ":::svg" in prompt
+            yield from (
+                '图前说明。\n:::svg flow\n'
+                '{"viewBox":[0,0,320,180],"title":"流程图"}\n'
+                '{"id":"group","tag":"g"}\n'
+                '{"id":"box","parent_id":"group","tag":"rect","attrs":{"width":90,"height":30}}\n'
+                '{"id":"label","parent_id":"group","tag":"text","attrs":{"y":20},"text":"开始"}\n'
+                ':::\n图后说明。'
+            )
+
+        def stream_chat(self, messages, **kwargs):
+            prompt = "\n".join(message.content or "" for message in messages if message.role == "system")
+            for chunk in self.stream_answer(prompt):
+                yield ProviderStreamEvent("text_delta", content=chunk)
+            yield ProviderStreamEvent("completed", finish_reason="stop")
+
+    provider = SvgProvider(mode)
+
+    def factory(db, context, settings, **kwargs):
+        service = ChatService(db, context.workspace_id, context.principal.user_id, provider, settings=settings)
+        service._build_fast_preface_provider = lambda: None
+        return service
+
+    monkeypatch.setattr(router, "service", factory)
+    token, workspace, _, _ = register_user()
+    headers = auth_headers(token, workspace)
+    sid = client.post("/api/v1/sessions", headers=headers, json={"title": "native SVG"}).json()["id"]
+
+    def stream(url, payload):
+        response = client.post(url, headers=headers, json=payload)
+        assert response.status_code == 200, response.text
+        events = [json.loads(line[5:]) for line in response.text.splitlines() if line.startswith("data:")]
+        assert events[-1]["type"] == "message.completed", response.text[-5000:]
+        ops = [event["payload"] for event in events if event.get("payload", {}).get("svg_operation")]
+        assert [event["svg_operation"] for event in ops] == ["svg.start", "svg.node", "svg.node", "svg.node", "svg.end"]
+        assert [len(event["part"]["data"]["nodes"]) for event in ops] == [0, 1, 2, 3, 3]
+        assert len({event["part"]["id"] for event in ops}) == 1
+        return events[-1]["message_id"], ops[-1]["part"]["id"]
+
+    mid, svg_id = stream(f"/api/v1/sessions/{sid}/messages/stream", {"content": "画简图", "agent_mode": mode == "agent"})
+    message = next(item for item in client.get(f"/api/v1/sessions/{sid}/messages", headers=headers).json()["items"] if item["id"] == mid)
+    parts = [part for part in sorted(message["parts"], key=lambda part: part["sequence"]) if part["type"] in {"svg", "text"} and part.get("content", "").strip()]
+    assert [part["type"] for part in parts] == ["text", "svg", "text"]
+    assert [part["content"].strip() for part in parts] == ["图前说明。", "流程图", "图后说明。"]
+    assert parts[1]["id"] == svg_id and parts[1]["data"]["nodes"][-1]["parent_id"] == "group"
+    assert ":::svg" not in message["content"] and "[[artifact:" not in message["content"]
+    replay = client.get(f"/api/v1/sessions/{sid}/messages/{mid}/events", headers=headers)
+    assert replay.status_code == 200 and "svg.node" in replay.text and svg_id in replay.text
+    assert stream(f"/api/v1/sessions/{sid}/messages/{mid}/retry", {})[1] != svg_id
+
+
 @pytest.mark.parametrize("lock_once", [False, True])
 def test_fast_mode_resolves_images_without_an_agent_runtime(client, register_user, auth_headers, monkeypatch, lock_once):
     from app.api.routers import chat as router

@@ -14,7 +14,7 @@ function numbers(value: string): number[] {
 const color = /^(?:none|transparent|currentColor|#[0-9a-fA-F]{3,8}|[a-zA-Z]{1,24}|(?:rgb|rgba|hsl|hsla)\([0-9.,%\s+-]+\))$/;
 const attrNames: Record<string, string> = {"stroke-width":"strokeWidth","font-size":"fontSize","font-family":"fontFamily","font-weight":"fontWeight","text-anchor":"textAnchor","dominant-baseline":"dominantBaseline","stroke-linecap":"strokeLinecap","stroke-linejoin":"strokeLinejoin","stroke-dasharray":"strokeDasharray","fill-opacity":"fillOpacity","stroke-opacity":"strokeOpacity","fill-rule":"fillRule","vector-effect":"vectorEffect","letter-spacing":"letterSpacing"};
 
-export function parseIllustrationSvg(value: string): IllustrationNode | null {
+export function parseIllustrationSvg(value: string, allowTextOnly = false): IllustrationNode | null {
   if (!value || new TextEncoder().encode(value).length > 24000 || /<!|<\?/.test(value)) return null;
   try {
     const doc = new DOMParser().parseFromString(value, "image/svg+xml");
@@ -25,7 +25,7 @@ export function parseIllustrationSvg(value: string): IllustrationNode | null {
       const tag = node.localName;
       if (++count > 96 || depth > 8 || !tags.has(tag) || (tag === "svg" && depth !== 0)
         || (node.namespaceURI && node.namespaceURI !== "http://www.w3.org/2000/svg")) throw Error("Unsupported SVG element");
-      drawable ||= ["path", "rect", "circle", "ellipse", "line", "polyline", "polygon"].includes(tag);
+      drawable ||= (allowTextOnly && tag === "text") || ["path", "rect", "circle", "ellipse", "line", "polyline", "polygon"].includes(tag);
       if (node.attributes.length > 25) throw Error("Too many SVG attributes");
       const attrs: Record<string, string> = {};
       for (const attr of Array.from(node.attributes)) {

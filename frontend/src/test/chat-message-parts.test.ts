@@ -419,6 +419,18 @@ describe('groupPartsForDisplay chain/answer split', () => {
       'a1',
     ])
   })
+
+  it('always places the thinking chain above the answer body even when delivering a primary artifact', () => {
+    const parts: MessagePart[] = [
+      part({ id: 'r1', type: 'reasoning_content', content: '思考中…', sequence: 0 }),
+      part({ id: 't1', type: 'tool_call', sequence: 1, data: { tool_name: 'svg_emit' } }),
+      part({ id: 'svg1', type: 'svg', sequence: 2, data: { block_id: 'b1', view_box: '0 0 100 100', state: 'complete' } }),
+      part({ id: 'a1', type: 'text', content: '整体说明。', sequence: 3, data: { kind: 'final_answer' } }),
+    ]
+
+    const segments = groupPartsForDisplay(parts)
+    expect(segments.map((s) => s.kind)).toEqual(['chain', 'parts'])
+  })
 })
 
 describe('artifact layout hints', () => {

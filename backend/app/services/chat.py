@@ -4014,6 +4014,11 @@ class ChatService:
                                 for chunk in self.model_provider.stream_answer(prompt + "\n\n" + CAPABILITY_CATALOG)), allow_tool_calls=False)
 
     def _apply_inline_ui(self, command, *, session_id, message_id, version_id, streamed_parts, ordinal, sequence):
+        if "_svg" in command:
+            return self._apply_svg_command(
+                command["_svg"], session_id=session_id, message_id=message_id, version_id=version_id,
+                streamed_parts=streamed_parts, ordinal=ordinal, sequence=sequence,
+            )
         from app.services.stream_ui import prepare_command, prepare_preview
         try:
             prepare = prepare_preview if "_preview" in command else prepare_command
@@ -4031,6 +4036,42 @@ class ChatService:
         except AppError:
             logging.getLogger(__name__).warning("Inline UI declaration rejected", exc_info=False)
             return []
+
+    def _apply_svg_command(self, command, *, session_id, message_id, version_id, streamed_parts, ordinal, sequence):
+        from app.services.stream_svg import render_svg_markup
+
+        block_id, op = command["block_id"], command["op"]
+        part = next((item for item in streamed_parts if item.part_type == "svg"
+                     and item.data.get("block_id") == block_id), None)
+        if op == "start":
+            if part is not None:
+                return []
+            part = self.message_parts.add(MessagePartRecord(
+                workspace_id=self.workspace_id, message_version_id=version_id,
+                ordinal=ordinal, part_type="svg", status="streaming", content=command["title"],
+                data={"block_id": block_id, "view_box": command["view_box"], "title": command["title"],
+                      "nodes": [], "state": "streaming", "layout": "inline"},
+            ))
+            streamed_parts.append(part)
+        elif part is None or (op == "node" and part.status != "streaming"):
+            return []
+        elif op == "node":
+            part.data = {**part.data, "nodes": [*part.data["nodes"], command["node"]]}
+        elif op == "end":
+            state = command["state"]
+            part.status = "completed"
+            part.data = {**part.data, "state": state, "svg_markup": (
+                render_svg_markup(part.data) if state in {"complete", "partial"} else None
+            )}
+        else:
+            return []
+        event = self._append_event(
+            session_id=session_id, message_id=message_id, message_version_id=version_id,
+            part_id=part.id, sequence=sequence, event_type="part.started" if op == "start" else "part.replaced",
+            payload={"part": self._part_snapshot(part.id, "svg", part.status, part.content, part.data, sequence=part.ordinal),
+                     "svg_operation": "svg." + op},
+        )
+        return [self._encode_event(event)]
 
     def _web_tool_metadata(self, name, arguments):
         from types import SimpleNamespace
@@ -4750,6 +4791,7 @@ class ChatService:
             "magic_card",
             "component",
             "chart",
+            "svg",
             "ui",
         }
     )

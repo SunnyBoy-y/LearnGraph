@@ -39,6 +39,7 @@ export const ARTIFACT_PART_TYPES = new Set<MessagePart["type"]>([
   "magic_card",
   "component",
   "chart",
+  "svg",
   "ui",
 ]);
 
@@ -298,7 +299,7 @@ export interface DisplayGroupOptions {
  * Frozen segment ids depend on source offsets, never on arriving token count.
  */
 export function placeRichResponseParts(parts: MessagePart[]): MessagePart[] {
-  const byBlock = new Map(parts.filter(part => part.type === "ui").map(part => [part.data?.block_id, part]));
+  const byBlock = new Map(parts.filter(part => part.type === "ui" || part.type === "svg").map(part => [part.data?.block_id, part]));
   if (!byBlock.size) return parts;
   const moved = new Set<string>();
   const expanded = parts.flatMap(part => {

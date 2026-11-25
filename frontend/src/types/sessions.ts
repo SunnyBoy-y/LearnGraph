@@ -17,6 +17,7 @@ export type MessagePartType =
   | 'graph_context'
   | 'quiz'
   | 'chart'
+  | 'svg'
   | 'ui'
   | 'sandbox'
   | 'sandbox_artifact'
