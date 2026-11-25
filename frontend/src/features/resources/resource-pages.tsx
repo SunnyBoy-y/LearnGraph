@@ -11,6 +11,8 @@ import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
+  ArrowDownWideNarrow,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -98,8 +100,10 @@ import type { SearchResponse } from "@/types/search";
 import type { SearchResult } from "@/types/search";
 import type { FileParserCapability, FileRecord } from "@/types/files";
 import type { SourceRecord } from "@/types/workflow";
+import "./file-library.css";
 
 const FILE_PAGE_SIZE = 20;
+const MAX_BATCH_DELETE_FILES = 100; // FileBatchSelection API limit.
 
 function bytes(value: number) {
   if (value < 1024) return `${value} B`;
@@ -107,15 +111,39 @@ function bytes(value: number) {
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
-type FileFilter = "all" | "indexed" | "pending" | "attachment" | "failed";
+type IndexStatus = "indexed" | "pending" | "attachment" | "processing" | "failed" | "unavailable";
+type FileFilter = "all" | IndexStatus;
 
-const fileFilters: Array<{ value: FileFilter; label: string }> = [
-  { value: "all", label: "全部" },
-  { value: "indexed", label: "可问答" },
-  { value: "pending", label: "未建索引" },
-  { value: "attachment", label: "仅附件" },
-  { value: "failed", label: "解析失败" },
-];
+const indexStatuses: Record<IndexStatus, { label: string; description: string; color: string }> = {
+  indexed: { label: "可问答", description: "已建立知识索引，可以被 Agent 检索。", color: "text-emerald-700 dark:text-emerald-400" },
+  attachment: { label: "仅附件", description: "文件已保存，但不进入知识检索范围。", color: "text-muted-foreground" },
+  pending: { label: "未建索引", description: "尚未建立知识索引，可按需建立。", color: "text-amber-700 dark:text-amber-400" },
+  processing: { label: "解析中", description: "已排队或正在提取内容、建立索引。", color: "text-blue-700 dark:text-blue-400" },
+  failed: { label: "解析失败", description: "请查看失败原因，或重新解析文件。", color: "text-destructive" },
+  unavailable: { label: "缺少解析器", description: "当前环境缺少此格式所需的解析器。", color: "text-amber-700 dark:text-amber-400" },
+};
+
+const fileFilters: FileFilter[] = ["all", "indexed", "attachment", "pending", "processing", "failed", "unavailable"];
+
+const fileSorts = [
+  ["recent", "最近上传"], ["oldest", "最早上传"],
+  ["name-asc", "名称正序"], ["name-desc", "名称倒序"],
+  ["size-desc", "大小从大到小"], ["size-asc", "大小从小到大"],
+] as const;
+type FileSort = typeof fileSorts[number][0];
+const fileNameCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+
+function compareFiles(a: FileRecord, b: FileRecord, sort: FileSort) {
+  const recent = () => (Date.parse(b.created_at) || 0) - (Date.parse(a.created_at) || 0);
+  switch (sort) {
+    case "oldest": return -recent();
+    case "name-asc": return fileNameCollator.compare(a.original_name, b.original_name) || recent();
+    case "name-desc": return fileNameCollator.compare(b.original_name, a.original_name) || recent();
+    case "size-desc": return b.size_bytes - a.size_bytes || recent();
+    case "size-asc": return a.size_bytes - b.size_bytes || recent();
+    default: return recent();
+  }
+}
 
 function fileType(file: Pick<FileRecord, "original_name" | "mime_type">) {
   const extension = file.original_name.split(".").pop()?.toLowerCase();
@@ -158,27 +186,26 @@ function isAttachmentOnlyFile(file: FileRecord) {
   return ATTACHMENT_ONLY_CATEGORIES.has(fileCategory(file));
 }
 
-function fileStatus(file: FileRecord) {
-  if (file.parse_status === "indexed")
-    return { label: "可问答", status: "approved" };
-  if (file.parse_status === "failed")
-    return { label: "解析失败", status: "failed" };
-  if (file.parse_status === "processor_required")
-    return { label: "缺少解析器", status: "pending" };
-  if (["queued", "running", "processing"].includes(file.parse_status))
-    return { label: "解析中", status: "pending" };
-  if (isAttachmentOnlyFile(file)) return { label: "仅附件", status: "consumed" };
-  return { label: "未建索引", status: "pending" };
+function fileStatus(file: FileRecord, active = false): IndexStatus {
+  if (active || ["queued", "running", "processing"].includes(file.parse_status)) return "processing";
+  if (file.parse_status === "indexed") return "indexed";
+  if (file.parse_status === "failed") return "failed";
+  if (file.parse_status === "processor_required") return "unavailable";
+  return isAttachmentOnlyFile(file) ? "attachment" : "pending";
 }
 
-function matchesFileFilter(file: FileRecord, filter: FileFilter) {
-  if (filter === "all") return true;
-  if (filter === "indexed") return file.parse_status === "indexed";
-  if (filter === "failed") return file.parse_status === "failed";
-  if (filter === "attachment") return isAttachmentOnlyFile(file);
+function IndexStatusButton({ status, onClick }: { status: IndexStatus; onClick: () => void }) {
+  const { label, color } = indexStatuses[status];
   return (
-    !["indexed", "failed"].includes(file.parse_status) &&
-    !isAttachmentOnlyFile(file)
+    <button
+      aria-label={`${label}：查看索引详情`}
+      className={`inline-flex min-h-7 items-center gap-1.5 whitespace-nowrap rounded-sm text-xs hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${color}`}
+      onClick={onClick}
+      type="button"
+    >
+      <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
+      {label}
+    </button>
   );
 }
 
@@ -218,26 +245,43 @@ function fileCategory(file: FileRecord): FileCategory {
   return "other";
 }
 
-function FileIcon({ file, large = false }: { file: FileRecord; large?: boolean }) {
+const fileTones: Record<FileCategory, string> = {
+  all: "slate", other: "slate", image: "violet", document: "blue", spreadsheet: "green",
+  powerpoint: "amber", pdf: "rose", audio: "violet", video: "violet", archive: "amber",
+};
+
+function FileIcon({ file }: { file: FileRecord }) {
   const category = fileCategory(file);
   const Icon = { image: FileImage, document: FileText, spreadsheet: FileSpreadsheet,
     powerpoint: Presentation, pdf: FileText, audio: Music, video: Video,
     archive: Archive, other: File, all: File }[category];
-  const color = { image: "text-purple-500", document: "text-blue-500", spreadsheet: "text-emerald-600",
-    powerpoint: "text-orange-500", pdf: "text-red-500", audio: "text-violet-500",
-    video: "text-pink-500", archive: "text-amber-600", other: "text-muted-foreground", all: "" }[category];
   const DisplayIcon = /\.(html?|jsx?|tsx?|py|json|css)$/i.test(file.original_name) ? FileCode : Icon;
-  return <DisplayIcon aria-hidden="true" className={`${large ? "size-12" : "size-5"} shrink-0 ${color}`} />;
+  return <span aria-hidden="true" className={`file-library-tone file-library-tone--${fileTones[category]} grid size-8 shrink-0 place-items-center rounded-md`}><DisplayIcon className="size-4" /></span>;
 }
 
-function FileThumbnail({ file, large = false }: { file: FileRecord; large?: boolean }) {
+function FileThumbnail({ file }: { file: FileRecord }) {
   const isImage = fileCategory(file) === "image";
   const { source: url, failed: streamFailed } = useFileStreamUrl(isImage ? file.id : undefined);
   const [failedId, setFailedId] = useState("");
   const failed = failedId === file.id || streamFailed;
-  return <span className={`flex shrink-0 items-center justify-center overflow-hidden ${large ? `w-full rounded-xl bg-muted/30 ${isImage ? "min-h-40" : "h-40"}` : "size-9 rounded-lg border bg-background"}`}>
-    {url && !failed ? <img alt={file.original_name} className={large ? "h-auto max-h-[28rem] w-full object-contain" : "size-full object-cover"} onError={() => setFailedId(file.id)} src={url} /> : <FileIcon file={file} large={large} />}
-  </span>;
+  const format = uploadExtension(file.original_name).slice(1).toUpperCase();
+  const archive = fileCategory(file) === "archive";
+  return (
+    <span className={`file-library-tone file-library-tone--${fileTones[fileCategory(file)]} grid h-27 w-full place-items-center overflow-hidden rounded-md`}>
+      {url && !failed ? (
+        <img alt="" className="size-full min-h-0 object-contain" decoding="async" loading="lazy" onError={() => setFailedId(file.id)} src={url} />
+      ) : (
+        <span aria-hidden="true" className="relative grid h-18 w-14 place-items-center">
+          <svg className="size-full" fill="none" viewBox="0 0 56 72">
+            <path className="fill-card stroke-current" d="M8 3h27l13 13v49H8z" strokeWidth="1.25" />
+            <path d="M35 3v13h13" stroke="currentColor" strokeWidth="1.25" />
+            {archive ? <path d="M25 13v4m5 1v4m-5 1v4m5 1v4m-5 1v4m5 1v4" stroke="currentColor" strokeWidth="4" opacity=".55" /> : <path d="M16 25h23m-23 8h23m-23 8h16" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" opacity=".5" />}
+          </svg>
+          <span className="file-library-format absolute bottom-0 max-w-full truncate rounded px-1.5 text-[10px] leading-4 font-semibold">{format || fileType(file)}</span>
+        </span>
+      )}
+    </span>
+  );
 }
 
 function parserCapabilityForFile(
@@ -290,7 +334,8 @@ export function SourcesPage() {
   const [supportOpen, setSupportOpen] = useState(false);
   const [fileFilter, setFileFilter] = useState<FileFilter>("all");
   const [typeFilter, setTypeFilter] = useState<FileCategory>("all");
-  const [viewMode, setViewMode] = useState<"list" | "grid">("grid");
+  const [viewMode, setViewMode] = useState<"list" | "grid">("list");
+  const [fileSort, setFileSort] = useState<FileSort>("recent");
   const [fileSearch, setFileSearch] = useState("");
   const [filePage, setFilePage] = useState(1);
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(
@@ -346,78 +391,82 @@ export function SourcesPage() {
       uploadRef.current(file);
     }
   }, []);
+  const downloadFile = async (file: FileRecord) => {
+    if (downloadViaNative(
+      toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.id)}/content`),
+      file.original_name || "download",
+    )) return;
+    const url = await fileStreamUrl(file.id);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = file.original_name || "download";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  };
   const download = useMutation({
-    mutationFn: async (file: FileRecord) => {
-      // 移动端 WebView：真实 URL 交给原生下载器
-      if (
-        downloadViaNative(
-          toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.id)}/content`),
-          file.original_name || "download",
-        )
-      ) {
-        return;
-      }
-      const url = await fileStreamUrl(file.id);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = file.original_name || "download";
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      return file;
-    },
+    mutationFn: downloadFile,
     onError: (error) => toast.error(error.message),
   });
+  const batchDownload = useMutation({
+    mutationFn: async (selected: FileRecord[]) => {
+      let requested = 0;
+      for (const file of selected) {
+        try {
+          await downloadFile(file);
+          requested++;
+        } catch {
+          // Continue requesting the other selected files if a ticket request fails.
+        }
+      }
+      return { requested, failed: selected.length - requested };
+    },
+    onSuccess: ({ requested, failed }) => {
+      if (failed) toast.warning(`已请求下载 ${requested} 项，${failed} 项无法发起下载`);
+      else toast.info(`已请求下载 ${requested} 项。如有提示，请允许此站点下载多个文件。`);
+    },
+  });
+  const invalidateFileIndex = (fileId: string) => Promise.all([
+    queryClient.invalidateQueries({ queryKey: ["file-chunks", fileId] }),
+    queryClient.invalidateQueries({ queryKey: ["file-references", fileId] }),
+    queryClient.invalidateQueries({ queryKey: ["document-revisions", fileId] }),
+  ]);
   const parse = useMutation({
-    // B1-8: parse runs on the durable queue; poll until terminal.
-    mutationFn: async (fileId: string) => {
-      const job = await parseFile(fileId);
-      return pollParseJob(job);
-    },
-    onSuccess: (job) => {
-      toast.success("解析任务已完成");
-      void Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["files"] }),
-        queryClient.invalidateQueries({ queryKey: ["file-chunks", job.file_id] }),
-        queryClient.invalidateQueries({ queryKey: ["file-references", job.file_id] }),
-      ]);
-    },
+    mutationFn: async (fileId: string) => pollParseJob(await parseFile(fileId)),
+    onSuccess: () => toast.success("解析任务已完成"),
     onError: (error) => toast.error(error.message),
+    onSettled: async (_job, _error, fileId) => {
+      await Promise.all([invalidateFileIndex(fileId), queryClient.invalidateQueries({ queryKey: ["files"] })]);
+    },
   });
   const batchParse = useMutation({
     mutationFn: async (fileIds: string[]) => {
-      const outcomes = await Promise.all(
-        fileIds.map(async (fileId) => {
+      const failed: string[] = [];
+      // Bound concurrent submissions and polling when selections span multiple pages.
+      let cursor = 0;
+      await Promise.all(Array.from({ length: Math.min(4, fileIds.length) }, async () => {
+        while (cursor < fileIds.length) {
+          const fileId = fileIds[cursor++];
           try {
-            const job = await parseFile(fileId);
-            await pollParseJob(job);
-            return { fileId, ok: true, error: null as string | null };
+            await pollParseJob(await parseFile(fileId));
           } catch (error) {
-            return {
-              fileId,
-              ok: false,
-              error: error instanceof Error ? error.message : "解析任务失败",
-            };
+            failed.push(error instanceof Error ? error.message : "解析任务失败");
           }
-        }),
-      );
-      const failed = outcomes.filter((outcome) => !outcome.ok);
-      return { completed: outcomes.length - failed.length, failed };
+        }
+      }));
+      return { completed: fileIds.length - failed.length, failed };
     },
-    onSuccess: (result) => {
-      setSelectedFileIds(new Set());
-      void queryClient.invalidateQueries({ queryKey: ["files"] });
-      if (result.failed.length === 0) {
-        toast.success(`已完成 ${result.completed} 个文件索引`);
-      } else if (result.completed > 0) {
-        toast.warning(
-          `已完成 ${result.completed} 个文件索引，${result.failed.length} 个失败`,
-        );
-      } else {
-        toast.error(`批量索引失败：${result.failed[0]?.error ?? "解析任务失败"}`);
-      }
+    onSuccess: ({ completed, failed }) => {
+      if (!failed.length) toast.success(`已完成 ${completed} 个文件索引`);
+      else if (completed) toast.warning(`已完成 ${completed} 个文件索引，${failed.length} 个失败`);
+      else toast.error(`批量索引失败：${failed[0]}`);
     },
-    onError: (error) => toast.error(error.message),
+    onSettled: async (_result, _error, fileIds) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["files"] }),
+        ...fileIds.map(invalidateFileIndex),
+      ]);
+    },
   });
   const deleteImpact = useQuery({
     enabled: Boolean(deleteTarget),
@@ -504,7 +553,7 @@ export function SourcesPage() {
 
   useEffect(() => {
     setFilePage(1);
-  }, [fileFilter, fileSearch, typeFilter]);
+  }, [fileFilter, fileSearch, fileSort, typeFilter]);
 
   useEffect(() => {
     // 资料库整页接管拖入：dragover/drop 默认行为必须拦掉，否则浏览器会直接打开文件
@@ -573,26 +622,18 @@ export function SourcesPage() {
         <ErrorState message={files.error.message} />
       </PageFrame>
     );
-  const indexed = files.data.filter(
-    (file) => file.parse_status === "indexed",
-  ).length;
-  const failed = files.data.filter(
-    (file) => file.parse_status === "failed",
-  ).length;
-  const pending = files.data.filter(
-    (file) =>
-      !["indexed", "failed"].includes(file.parse_status) &&
-      !isAttachmentOnlyFile(file),
-  ).length;
-  const attachmentOnly = files.data.filter(isAttachmentOnlyFile).length;
+  const activeFileIds = new Set(batchParse.isPending ? batchParse.variables : []);
+  if (parse.isPending) activeFileIds.add(parse.variables);
+  const indexStatus = (file: FileRecord) => fileStatus(file, activeFileIds.has(file.id));
+  const counts: Record<FileFilter, number> = { all: files.data.length, indexed: 0, attachment: 0, pending: 0, processing: 0, failed: 0, unavailable: 0 };
   const normalizedFileSearch = fileSearch.trim().toLocaleLowerCase();
-  const filteredFiles = files.data.filter(
-    (file) =>
-      matchesFileFilter(file, fileFilter) &&
+  const filteredFiles = files.data.filter((file) => {
+    const status = indexStatus(file);
+    counts[status]++;
+    return (fileFilter === "all" || status === fileFilter) &&
       (typeFilter === "all" || fileCategory(file) === typeFilter) &&
-      (!normalizedFileSearch ||
-        file.original_name.toLocaleLowerCase().includes(normalizedFileSearch)),
-  );
+      (!normalizedFileSearch || file.original_name.toLocaleLowerCase().includes(normalizedFileSearch));
+  }).sort((a, b) => compareFiles(a, b, fileSort));
   const totalPages = Math.max(
     1,
     Math.ceil(filteredFiles.length / FILE_PAGE_SIZE),
@@ -611,22 +652,32 @@ export function SourcesPage() {
     pageFileIds.length > 0 && selectedOnPageCount === pageFileIds.length;
   const somePageSelected =
     selectedOnPageCount > 0 && selectedOnPageCount < pageFileIds.length;
-  const selectedIndexableFileIds = files.data
-    .filter((file) => {
-      const capability = parserCapabilityForFile(
-        file,
-        parserCapabilities.data,
-      );
-      return (
-        selectedFileIds.has(file.id) &&
-        !["indexed", "queued", "running", "processing"].includes(
-          file.parse_status,
-        ) &&
-        !isAttachmentOnlyFile(file) &&
-        capability?.available !== false
-      );
-    })
-    .map((file) => file.id);
+  const indexBusy = parse.isPending || batchParse.isPending;
+  const canIndex = (file: FileRecord, status = indexStatus(file)) => {
+    const available = parserCapabilityForFile(file, parserCapabilities.data)?.available;
+    return !isAttachmentOnlyFile(file) && available !== false &&
+      (status === "pending" || status === "failed" || (status === "unavailable" && available === true));
+  };
+  const selectedFiles = files.data.filter((file) => selectedFileIds.has(file.id));
+  const selectedToIndex = selectedFiles.filter((file) => ["pending", "unavailable"].includes(indexStatus(file)) && canIndex(file));
+  const selectedToRetry = selectedFiles.filter((file) => indexStatus(file) === "failed" && canIndex(file));
+  const currentDiagnosticFile = files.data.find((file) => file.id === diagnosticFile?.id);
+  const storageBytes = storageSummary.data?.total_bytes ?? files.data.reduce((sum, file) => sum + file.size_bytes, 0);
+  const fileActions = (file: FileRecord) => (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button aria-label={`打开 ${file.original_name} 的更多操作`} size="icon-sm" variant="ghost"><MoreHorizontal className="size-4" /></Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuItem onSelect={() => navigate(`../documents/${file.id}`)}><FileText />打开学习</DropdownMenuItem>
+        <DropdownMenuItem disabled={download.isPending || batchDownload.isPending} onSelect={() => download.mutate(file)}><Download />下载文件</DropdownMenuItem>
+        {canIndex(file) ? <DropdownMenuItem disabled={indexBusy} onSelect={() => parse.mutate(file.id)}><RefreshCcw />{indexStatus(file) === "failed" ? "重新解析" : "建立索引"}</DropdownMenuItem> : null}
+        <DropdownMenuItem onSelect={() => setDiagnosticFile(file)}><Search />解析与引用诊断</DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem disabled={remove.isPending || activeFileIds.has(file.id)} onSelect={() => setDeleteTarget(file)} variant="destructive"><Trash2 />删除文件</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
   const chooseFiles = () => inputRef.current?.click();
   const toggleFileSelected = (fileId: string, checked: boolean) => {
     setSelectedFileIds((current) => {
@@ -647,7 +698,7 @@ export function SourcesPage() {
     });
   };
   return (
-    <PageFrame className="max-w-[1600px] gap-4 pb-16">
+    <PageFrame className="file-library-page max-w-[1600px] gap-3 pb-16">
       {dropActive
         ? createPortal(
             <div
@@ -676,20 +727,7 @@ export function SourcesPage() {
             document.body,
           )
         : null}
-      <PageIntro
-        actions={
-          <Button disabled={upload.isPending} onClick={chooseFiles} size="sm">
-            {upload.isPending ? (
-              <LoaderCircle className="size-4 animate-spin" />
-            ) : (
-              <UploadCloud className="size-4" />
-            )}
-            {upload.isPending ? "上传中…" : "上传资料"}
-          </Button>
-        }
-        description="管理当前工作区中可用于阅读、问答和引用的文件与网页。"
-        title="资料库"
-      />
+      <PageIntro title="资料库" />
       <Input
         className="hidden"
         multiple
@@ -701,61 +739,28 @@ export function SourcesPage() {
         type="file"
       />
 
-      {/* 概况：一行纯文本，层级靠字重与字号；不再单独套 Card。 */}
-      <div
-        aria-label="资料库概况"
-        className="flex flex-wrap items-center gap-x-5 gap-y-2 text-[13px] text-muted-foreground"
-      >
-        <span>
-          <strong className="font-semibold tabular-nums text-foreground">
-            {files.data.length}
-          </strong>{" "}
-          个文件
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b pb-3">
+        <div aria-label="资料状态筛选" className="flex min-w-0 flex-wrap gap-1" role="group">
+          {fileFilters.filter((filter) => filter !== "unavailable" || counts[filter] > 0 || fileFilter === filter).map((filter) => (
+            <Button
+              aria-pressed={fileFilter === filter}
+              className="h-8 shrink-0 rounded-md px-2.5"
+              key={filter}
+              onClick={() => setFileFilter(filter)}
+              size="sm"
+              variant={fileFilter === filter ? "secondary" : "ghost"}
+            >
+              {filter === "all" ? "全部" : indexStatuses[filter].label}
+              <span className="text-xs font-normal tabular-nums text-muted-foreground">{counts[filter]}</span>
+            </Button>
+          ))}
+        </div>
+        <span aria-label={`上传资料占用 ${bytes(storageBytes)}`} className="inline-flex shrink-0 items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
+          <HardDrive aria-hidden="true" className="size-3.5" /> {bytes(storageBytes)}
         </span>
-        <span>
-          <strong className="font-semibold tabular-nums text-foreground">
-            {indexed}
-          </strong>{" "}
-          个可问答
-        </span>
-        <span>
-          <strong className="font-semibold tabular-nums text-foreground">
-            {attachmentOnly}
-          </strong>{" "}
-          个仅附件
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <HardDrive aria-hidden="true" className="size-3.5" />
-          <strong className="font-semibold tabular-nums text-foreground">
-            {bytes(
-              storageSummary.data?.total_bytes ??
-                files.data.reduce(
-                  (sum, file) => sum + (file.size_bytes || 0),
-                  0,
-                ),
-            )}
-          </strong>
-        </span>
-        {/* 未建索引 / 解析失败只在确有其事时出现，避免 0 值长期与核心数字同权重。 */}
-        {pending > 0 ? (
-          <span>
-            <strong className="font-semibold tabular-nums text-foreground">
-              {pending}
-            </strong>{" "}
-            个未建索引
-          </span>
-        ) : null}
-        {failed > 0 ? (
-          <span className="text-destructive">
-            <strong className="font-semibold tabular-nums">{failed}</strong>{" "}
-            个解析失败
-          </span>
-        ) : null}
       </div>
 
-      {/* 扁平工具栏：搜索 + 类型一行，状态 chips 一行；外层没有 Card。 */}
-      <div className="flex flex-col gap-3">
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
           <div className="relative min-w-[180px] flex-1">
             <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
@@ -786,283 +791,121 @@ export function SourcesPage() {
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
-        </div>
-        <div
-          aria-label="资料状态筛选"
-          className="no-scrollbar -mx-1 flex max-w-full gap-1 overflow-x-auto overflow-y-hidden px-1 pb-0.5"
-          role="group"
-        >
-          {fileFilters.map((filter) => (
-            <Button
-              aria-pressed={fileFilter === filter.value}
-              className="h-8 shrink-0 rounded-full px-3"
-              key={filter.value}
-              onClick={() => setFileFilter(filter.value)}
-              size="sm"
-              variant={fileFilter === filter.value ? "secondary" : "ghost"}
-            >
-              {filter.label}
-            </Button>
-          ))}
-        </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button aria-label={`排序：${fileSorts.find(([value]) => value === fileSort)?.[1]}`} className="h-9 shrink-0" variant="outline">
+                <ArrowDownWideNarrow className="size-4" />
+                {fileSorts.find(([value]) => value === fileSort)?.[1]}
+                <ChevronDown className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {fileSorts.map(([value, label]) => (
+                <DropdownMenuItem key={value} onSelect={() => setFileSort(value)}>
+                  <span className="flex-1">{label}</span>
+                  {fileSort === value ? <span aria-label="已选">✓</span> : null}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <div role="group" aria-label="资料显示方式" className="flex shrink-0 gap-0.5 rounded-lg border p-0.5">
+            <Button aria-label="列表视图" aria-pressed={viewMode === "list"} size="icon-sm" variant={viewMode === "list" ? "secondary" : "ghost"} onClick={() => setViewMode("list")}><List className="size-4" /></Button>
+            <Button aria-label="网格视图" aria-pressed={viewMode === "grid"} size="icon-sm" variant={viewMode === "grid" ? "secondary" : "ghost"} onClick={() => setViewMode("grid")}><LayoutGrid className="size-4" /></Button>
+          </div>
+          <Button className="ml-auto h-9 shrink-0" disabled={upload.isPending} onClick={chooseFiles} size="sm">
+            {upload.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <UploadCloud className="size-4" />}
+            {upload.isPending ? "上传中…" : "上传资料"}
+          </Button>
       </div>
 
-      {/* 结果头部：计数 / 视图切换 / 批量操作都在这条扁平行上，与内容只隔一条细线。 */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
-        <p className="text-[13px] text-muted-foreground">
-          共{" "}
-          <strong className="font-semibold tabular-nums text-foreground">
-            {filteredFiles.length}
-          </strong>{" "}
-          个资料
-        </p>
-        <div className="flex flex-wrap items-center gap-2">
-          {selectedFileIds.size > 0 ? (
-            <>
-              <span className="text-xs text-muted-foreground">
-                已选 {selectedFileIds.size} 项
-              </span>
-              <Button
-                disabled={removeBatch.isPending}
-                onClick={() => setBatchDeleteOpen(true)}
-                size="xs"
-                variant="destructive"
-              >
-                <Trash2 className="size-3.5" />
-                批量删除
-              </Button>
-              <Button
-                disabled={
-                  batchParse.isPending || selectedIndexableFileIds.length === 0
-                }
-                onClick={() => {
-                  if (!selectedIndexableFileIds.length) {
-                    toast.info("所选资料中没有可建立索引的文件");
-                    return;
-                  }
-                  batchParse.mutate(selectedIndexableFileIds);
-                }}
-                size="xs"
-                variant="outline"
-              >
-                {batchParse.isPending ? (
-                  <LoaderCircle className="size-3.5 animate-spin" />
-                ) : (
-                  <RefreshCcw className="size-3.5" />
-                )}
-                {batchParse.isPending
-                  ? "批量索引中…"
-                  : `批量索引${selectedIndexableFileIds.length ? ` (${selectedIndexableFileIds.length})` : ""}`}
-              </Button>
-              <Button
-                onClick={() => setSelectedFileIds(new Set())}
-                size="xs"
-                variant="ghost"
-              >
-                取消选择
-              </Button>
-            </>
-          ) : null}
-          <div role="group" aria-label="资料显示方式" className="flex gap-1">
-            <Button aria-label="网格视图" aria-pressed={viewMode === "grid"} size="icon-sm" variant={viewMode === "grid" ? "secondary" : "ghost"} onClick={() => setViewMode("grid")}><LayoutGrid className="size-4" /></Button>
-            <Button aria-label="列表视图" aria-pressed={viewMode === "list"} size="icon-sm" variant={viewMode === "list" ? "secondary" : "ghost"} onClick={() => setViewMode("list")}><List className="size-4" /></Button>
-          </div>
+      {selectedFiles.length > 0 ? (
+        <div aria-label="批量操作" className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/35 px-3 py-2">
+          <span aria-live="polite" className="mr-1 text-xs font-medium tabular-nums">已选 {selectedFiles.length} 项</span>
+          <Button disabled={download.isPending || batchDownload.isPending} onClick={() => batchDownload.mutate(selectedFiles)} size="xs" variant="outline">
+            {batchDownload.isPending ? <LoaderCircle className="animate-spin" /> : <Download />} 批量下载
+          </Button>
+          <Button disabled={indexBusy || !selectedToIndex.length} onClick={() => batchParse.mutate(selectedToIndex.map((file) => file.id))} size="xs" variant="outline">
+            <RefreshCcw className={batchParse.isPending ? "animate-spin" : ""} /> 批量建索引{selectedToIndex.length ? ` (${selectedToIndex.length})` : ""}
+          </Button>
+          <Button disabled={indexBusy || !selectedToRetry.length} onClick={() => batchParse.mutate(selectedToRetry.map((file) => file.id))} size="xs" variant="outline">
+            <RefreshCcw className={batchParse.isPending ? "animate-spin" : ""} /> 批量重新解析{selectedToRetry.length ? ` (${selectedToRetry.length})` : ""}
+          </Button>
+          <Button disabled={removeBatch.isPending || batchFileIds.length > MAX_BATCH_DELETE_FILES || selectedFiles.some((file) => activeFileIds.has(file.id))} onClick={() => setBatchDeleteOpen(true)} size="xs" variant="destructive">
+            <Trash2 /> 批量删除
+          </Button>
+          {batchFileIds.length > MAX_BATCH_DELETE_FILES ? <span className="text-xs text-muted-foreground">每次最多删除 {MAX_BATCH_DELETE_FILES} 个文件</span> : null}
+          <Button onClick={() => setSelectedFileIds(new Set())} size="xs" variant="ghost">取消选择</Button>
         </div>
-      </div>
+      ) : null}
 
       <div>
-        {viewMode === "grid" ? (
-          /* auto-fill：卡片最小 240px，宽屏自然铺满，窄屏自动单列。 */
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4">
-            {pagedFiles.map((file) => (
-              <article key={file.id} className={`flex min-w-0 flex-col rounded-xl border bg-card p-4 transition-colors ${selectedFileIds.has(file.id) ? "border-ring bg-muted/40" : "hover:border-foreground/20"}`} style={{ contentVisibility: "auto", containIntrinsicSize: "320px" }}>
-                <div className="flex items-start gap-2">
-                  <button type="button" className="min-w-0 flex-1 truncate text-left text-sm font-medium hover:underline" title={file.original_name} onClick={() => setDiagnosticFile(file)}>{file.original_name}</button>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild><Button aria-label={`打开 ${file.original_name} 的更多操作`} size="icon-sm" variant="ghost"><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onSelect={() => navigate(`../documents/${file.id}`)}><FileText />打开学习</DropdownMenuItem>
-                      <DropdownMenuItem disabled={download.isPending} onSelect={() => download.mutate(file)}><Download />下载文件</DropdownMenuItem>
-                      <DropdownMenuItem onSelect={() => setDiagnosticFile(file)}><Search />解析与引用诊断</DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem disabled={remove.isPending} onSelect={() => setDeleteTarget(file)} variant="destructive"><Trash2 />删除文件</DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-                <button type="button" aria-label={`查看 ${file.original_name}`} className="mt-3 block w-full overflow-hidden rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => navigate(`../documents/${file.id}`)}><FileThumbnail file={file} large /></button>
-                <p className="mt-3 text-xs text-muted-foreground">{fileType(file)} · {bytes(file.size_bytes)}</p>
-                <div className="mt-1.5 flex items-center justify-between gap-2">
-                  <span className="text-xs text-muted-foreground">{formatUploadTime(file.created_at)}</span>
-                  <span className="flex items-center gap-2">
-                    <StatePill {...fileStatus(file)} />
-                    <Checkbox className="opacity-70" aria-label={`选择 ${file.original_name}`} checked={selectedFileIds.has(file.id)} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
-                  </span>
-                </div>
-              </article>
-            ))}
+        {pagedFiles.length > 0 && (viewMode === "grid" ? (
+          <div className="file-library-grid grid gap-3">
+            {pagedFiles.map((file) => {
+              const isSelected = selectedFileIds.has(file.id);
+              return (
+                <article key={file.id} className={`group relative flex min-w-0 flex-col rounded-xl border bg-card p-2 transition-colors ${isSelected ? "border-ring" : "hover:border-foreground/25"}`}>
+                  <Checkbox className="file-library-card-checkbox absolute left-4 top-4 z-10 bg-background" aria-label={`选择 ${file.original_name}`} checked={isSelected} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
+                  <button type="button" aria-label={`查看 ${file.original_name}`} className="block w-full rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => navigate(`../documents/${file.id}`)}><FileThumbnail file={file} /></button>
+                  <div className="flex min-w-0 items-start gap-1 px-1 pt-1.5">
+                    <button type="button" className="file-library-name line-clamp-2 min-h-10 min-w-0 flex-1 text-left text-sm leading-5 font-medium hover:underline" title={file.original_name} onClick={() => setDiagnosticFile(file)}>{file.original_name}</button>
+                    {fileActions(file)}
+                  </div>
+                  <p className="truncate px-1 text-xs text-muted-foreground">{uploadExtension(file.original_name).slice(1).toUpperCase() || fileType(file)} · {bytes(file.size_bytes)}</p>
+                  <div className="mx-1 mt-2 flex items-center justify-between gap-2 border-t pt-1">
+                    <time className="min-w-0 truncate text-xs text-muted-foreground" dateTime={file.created_at} title={file.created_at}>{formatUploadTime(file.created_at)}</time>
+                    <IndexStatusButton status={indexStatus(file)} onClick={() => setDiagnosticFile(file)} />
+                  </div>
+                </article>
+              );
+            })}
           </div>
-        ) : <div className="resource-file-table-wrap overflow-x-auto">
-          <table className="resource-file-table w-full min-w-[760px] text-left text-sm">
+        ) : <div className="file-library-table-wrap rounded-xl border bg-card">
+          <table className="file-library-table w-full table-fixed text-left text-sm">
             <thead className="bg-muted/35 text-xs text-muted-foreground">
               <tr>
-                <th className="w-12 px-4 py-3">
-                  <Checkbox
-                    aria-label="全选当前页"
-                    checked={
-                      allPageSelected
-                        ? true
-                        : somePageSelected
-                          ? "indeterminate"
-                          : false
-                    }
-                    disabled={!pageFileIds.length}
-                    onCheckedChange={(value) =>
-                      togglePageSelection(value === true)
-                    }
-                  />
+                <th className="w-11 rounded-tl-xl px-3 py-2.5" scope="col">
+                  <label className="inline-flex items-center gap-2 font-normal">
+                    <Checkbox aria-label="全选当前页" checked={allPageSelected || (somePageSelected ? "indeterminate" : false)} onCheckedChange={(value) => togglePageSelection(value === true)} />
+                    <span className="file-library-mobile-select">全选当前页</span>
+                  </label>
                 </th>
-                <th className="px-5 py-3">文件</th>
-                <th className="px-5 py-3">类型</th>
-                <th className="px-5 py-3">大小</th>
-                <th className="px-5 py-3">状态</th>
-                <th className="px-5 py-3">上传时间</th>
-                <th className="sticky right-0 z-10 w-16 border-l bg-muted px-5 py-3 text-right">
-                  更多
-                </th>
+                <th className="px-2 py-2.5 font-medium" scope="col">文件名称</th>
+                <th className="w-23 px-2 py-2.5 font-medium" scope="col">类型</th>
+                <th className="w-23 px-2 py-2.5 font-medium" scope="col">大小</th>
+                <th className="w-25 px-2 py-2.5 font-medium" scope="col">索引状态</th>
+                <th className="w-31 px-2 py-2.5 font-medium" scope="col">上传时间</th>
+                <th className="w-11 rounded-tr-xl" scope="col"><span className="sr-only">更多操作</span></th>
               </tr>
             </thead>
             <tbody className="divide-y">
               {pagedFiles.map((file) => {
-                const capability = parserCapabilityForFile(
-                  file,
-                  parserCapabilities.data,
-                );
-                const parserUnavailable =
-                  capability?.available === false ||
-                  file.parse_capability === "attachment_only";
-                const status = fileStatus(file);
                 const isSelected = selectedFileIds.has(file.id);
+                const openFile = () => navigate(`../documents/${file.id}`);
                 return (
-                  <tr
-                    aria-label={`打开 ${file.original_name} 的学习预览`}
-                    className={`group cursor-pointer transition-colors hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
-                      isSelected ? "bg-muted/25" : ""
-                    }`}
-                    key={file.id}
-                    onClick={() => navigate(`../documents/${file.id}`)}
-                    onKeyDown={(event) => {
-                      if (event.target !== event.currentTarget) return;
-                      if (event.key !== "Enter" && event.key !== " ") return;
-                      event.preventDefault();
-                      navigate(`../documents/${file.id}`);
-                    }}
-                    tabIndex={0}
-                  >
-                    <td
-                      className="px-4 py-4"
-                      onClick={(event) => event.stopPropagation()}
-                    >
-                      <Checkbox
-                        aria-label={`选择 ${file.original_name}`}
-                        checked={isSelected}
-                        onCheckedChange={(value) =>
-                          toggleFileSelected(file.id, value === true)
-                        }
-                      />
+                  <tr className={`h-[52px] cursor-pointer transition-colors hover:bg-muted/40 ${isSelected ? "bg-muted/35" : ""}`} key={file.id} onClick={openFile}>
+                    <td className="px-3 py-1" onClick={(event) => event.stopPropagation()}>
+                      <Checkbox aria-label={`选择 ${file.original_name}`} checked={isSelected} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
                     </td>
-                    <td className="px-5 py-4">
-                      <div className="flex max-w-full items-center gap-2 text-left group-hover:underline">
-                        <FileThumbnail file={file} />
-                        <span className="max-w-64 truncate font-medium">
-                          {file.original_name}
-                        </span>
-                      </div>
+                    <td className="px-2 py-1">
+                      <button className="flex w-full min-w-0 items-center gap-2 rounded-sm text-left font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={(event) => { event.stopPropagation(); openFile(); }} title={file.original_name} type="button">
+                        <FileIcon file={file} />
+                        <span className="file-library-name line-clamp-2 min-w-0 leading-5">{file.original_name}</span>
+                      </button>
                     </td>
-                    <td className="px-5 py-4 text-xs text-muted-foreground">
-                      {fileType(file)}
+                    <td className="truncate px-2 py-1 text-xs text-muted-foreground" title={fileType(file)}>{fileType(file)}</td>
+                    <td className="whitespace-nowrap px-2 py-1 text-xs tabular-nums text-muted-foreground">{bytes(file.size_bytes)}</td>
+                    <td className="px-2 py-1" onClick={(event) => event.stopPropagation()}>
+                      <IndexStatusButton status={indexStatus(file)} onClick={() => setDiagnosticFile(file)} />
                     </td>
-                    <td className="px-5 py-4 font-mono text-xs">
-                      {bytes(file.size_bytes)}
-                    </td>
-                    <td className="px-5 py-4">
-                      <StatePill label={status.label} status={status.status} />
-                    </td>
-                    <td className="px-5 py-4 text-xs text-muted-foreground">
-                      {formatUploadTime(file.created_at)}
-                    </td>
-                    <td
-                      className="sticky right-0 z-10 border-l bg-card px-5 py-4"
-                      onClick={(event) => event.stopPropagation()}
-                    >
-                      <div className="flex justify-end">
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              aria-label={`打开 ${file.original_name} 的更多操作`}
-                              size="icon-sm"
-                              variant="ghost"
-                            >
-                              <MoreHorizontal />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="w-48">
-                            <DropdownMenuItem
-                              onSelect={() => navigate(`../documents/${file.id}`)}
-                            >
-                              <FileText />
-                              打开学习
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              disabled={download.isPending}
-                              onSelect={() => download.mutate(file)}
-                            >
-                              <Download />
-                              下载文件
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              disabled={
-                                parse.isPending ||
-                                file.parse_status === "indexed" ||
-                                parserUnavailable
-                              }
-                              onSelect={() => parse.mutate(file.id)}
-                            >
-                              <RefreshCcw />
-                              {file.parse_status === "failed"
-                                ? "重新解析"
-                                : file.parse_status === "indexed"
-                                  ? "已可问答"
-                                  : file.parse_capability === "attachment_only"
-                                    ? "仅附件，无需解析"
-                                    : parserUnavailable
-                                      ? "缺少解析器"
-                                      : "解析文件"}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onSelect={() => setDiagnosticFile(file)}
-                            >
-                              <Search />
-                              解析与引用诊断
-                            </DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem
-                              disabled={remove.isPending}
-                              onSelect={() => setDeleteTarget(file)}
-                              variant="destructive"
-                            >
-                              <Trash2 />
-                              删除文件
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </div>
-                    </td>
+                    <td className="whitespace-nowrap px-2 py-1 text-xs tabular-nums text-muted-foreground"><time dateTime={file.created_at} title={file.created_at}>{formatUploadTime(file.created_at)}</time></td>
+                    <td className="px-1 py-1 text-right" onClick={(event) => event.stopPropagation()}>{fileActions(file)}</td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
-        </div>}
+        </div>)}
         {!files.data.length ? (
           <div className="grid min-h-48 place-items-center p-6 text-center">
             <div>
@@ -1096,15 +939,14 @@ export function SourcesPage() {
             </div>
           </div>
         ) : (
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-4">
-            <p className="text-xs text-muted-foreground">
-              第 {safePage} / {totalPages} 页 · 共 {filteredFiles.length} 项 ·
-              每页 {FILE_PAGE_SIZE} 项
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+            <p aria-live="polite" className="text-xs tabular-nums text-muted-foreground">
+              第 {pageStart + 1}–{pageStart + pagedFiles.length} 项 · 共 {filteredFiles.length} 项
             </p>
             <div className="flex items-center gap-1">
               <Button
                 disabled={safePage <= 1}
-                onClick={() => setFilePage((page) => Math.max(1, page - 1))}
+                onClick={() => setFilePage(safePage - 1)}
                 size="sm"
                 variant="outline"
               >
@@ -1113,9 +955,7 @@ export function SourcesPage() {
               </Button>
               <Button
                 disabled={safePage >= totalPages}
-                onClick={() =>
-                  setFilePage((page) => Math.min(totalPages, page + 1))
-                }
+                onClick={() => setFilePage(safePage + 1)}
                 size="sm"
                 variant="outline"
               >
@@ -1166,17 +1006,21 @@ export function SourcesPage() {
         open={batchDeleteOpen}
         title={`永久删除选中的 ${batchFileIds.length} 个文件？`}
       />
-      {diagnosticFile ? (
+      {currentDiagnosticFile ? (
         <FileDiagnosticsDialog
-          capability={parserCapabilityForFile(
-            diagnosticFile,
-            parserCapabilities.data,
-          )}
-          file={diagnosticFile}
+          capability={parserCapabilityForFile(currentDiagnosticFile, parserCapabilities.data)}
+          file={currentDiagnosticFile}
+          indexStatus={indexStatuses[indexStatus(currentDiagnosticFile)]}
+          isIndexing={activeFileIds.has(currentDiagnosticFile.id)}
+          indexAction={canIndex(currentDiagnosticFile) ? {
+            label: indexStatus(currentDiagnosticFile) === "failed" ? "重新解析" : "建立索引",
+            disabled: indexBusy,
+            run: () => parse.mutate(currentDiagnosticFile.id),
+          } : undefined}
           onOpenChange={(open) => {
             if (!open) setDiagnosticFile(null);
           }}
-          open={Boolean(diagnosticFile)}
+          open
         />
       ) : null}
       {sources.data?.length ? (

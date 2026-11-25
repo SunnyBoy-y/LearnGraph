@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { FileSearch, Link2, TextSearch } from "lucide-react";
+import { FileSearch, Link2, LoaderCircle, RefreshCcw, TextSearch } from "lucide-react";
 
-import { listFileChunks, listFileReferences } from "@/api";
+import { listDocumentRevisions, listFileChunks, listFileReferences } from "@/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,6 +21,9 @@ import type {
 type FileDiagnosticsDialogProps = {
   capability?: FileParserCapability;
   file: FileRecord;
+  indexStatus: { label: string; description: string };
+  isIndexing: boolean;
+  indexAction?: { label: string; disabled: boolean; run: () => void };
   onOpenChange: (open: boolean) => void;
   open: boolean;
 };
@@ -47,6 +50,9 @@ function ReferenceMetadata({ reference }: { reference: FileReference }) {
 export function FileDiagnosticsDialog({
   capability,
   file,
+  indexStatus,
+  isIndexing,
+  indexAction,
   onOpenChange,
   open,
 }: FileDiagnosticsDialogProps) {
@@ -63,6 +69,15 @@ export function FileDiagnosticsDialog({
 
   const allChunks = chunks.data ?? [];
   const visibleChunks = allChunks.slice(0, visibleChunkCount);
+  const revisions = useQuery({
+    queryKey: ["document-revisions", file.id],
+    queryFn: () => listDocumentRevisions(file.id),
+    enabled: open,
+  });
+  const lastParsedAt = (revisions.data ?? []).reduce<string | null>((latest, revision) => {
+    const completedAt = revision.completed_at;
+    return completedAt && (!latest || Date.parse(completedAt) > Date.parse(latest)) ? completedAt : latest;
+  }, null);
   const references = useQuery({
     queryKey: ["file-references", file.id],
     queryFn: () => listFileReferences(file.id),
@@ -84,7 +99,8 @@ export function FileDiagnosticsDialog({
           <div className="flex items-start gap-3">
             <FileSearch className="mt-0.5 size-4 text-primary" />
             <div className="min-w-0 flex-1">
-              <p className="font-medium">{file.original_name}</p>
+              <p className="break-words font-medium">{file.original_name}</p>
+              <p className="mt-1 text-sm text-muted-foreground">{indexStatus.description}</p>
               <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
                 {file.mime_type} · SHA-256 {file.sha256}
               </p>
@@ -92,8 +108,16 @@ export function FileDiagnosticsDialog({
           </div>
           <dl className="mt-4 grid gap-x-5 gap-y-3 text-sm sm:grid-cols-2">
             <div>
-              <dt className="text-xs text-muted-foreground">解析状态</dt>
-              <dd className="mt-1 font-medium">{file.parse_status}</dd>
+              <dt className="text-xs text-muted-foreground">索引状态</dt>
+              <dd className="mt-1 font-medium">{indexStatus.label}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-muted-foreground">最近一次解析结束时间</dt>
+              <dd className="mt-1 font-medium">{revisions.isPending ? "读取中…" : revisions.isError ? "无法读取" : lastParsedAt ? formattedDate(lastParsedAt) : "暂无记录"}</dd>
+            </div>
+            <div>
+              <dt className="text-xs text-muted-foreground">文档分块数量</dt>
+              <dd className="mt-1 font-medium">{chunks.isPending ? "读取中…" : chunks.isError ? "无法读取" : `${allChunks.length} 段`}</dd>
             </div>
             <div>
               <dt className="text-xs text-muted-foreground">解析器</dt>
@@ -121,7 +145,13 @@ export function FileDiagnosticsDialog({
               {capability.reason}
             </p>
           ) : null}
-          {file.error_message ? (
+          {indexAction || isIndexing ? (
+            <Button className="mt-3" disabled={isIndexing || indexAction?.disabled} onClick={indexAction?.run} size="sm" variant="outline">
+              {isIndexing ? <LoaderCircle className="animate-spin" /> : <RefreshCcw />}
+              {isIndexing ? "解析中…" : indexAction?.label}
+            </Button>
+          ) : null}
+          {file.error_message && !isIndexing ? (
             <p className="mt-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
               服务端解析错误：{file.error_message}
             </p>
