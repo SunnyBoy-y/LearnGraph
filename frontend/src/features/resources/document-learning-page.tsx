@@ -41,8 +41,10 @@ import { listProviders } from "@/api/providers";
 import { ApiError } from "@/api/client";
 import { listGoals } from "@/api/goals";
 import { createSession } from "@/api/sessions";
-import { createConceptBranch } from "@/api/sessions";
+import { createConceptBranch, listDocumentConceptBranches } from "@/api/sessions";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { cacheCreatedSession } from "@/lib/session-queries";
+import type { Session } from "@/types/sessions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -269,7 +271,16 @@ export function DocumentLearningPage() {
   const [chatQuestion, setChatQuestion] = useState<{ id: string; text: string }>();
   const [selectionMenu, setSelectionMenu] = useState<{ left: number; top: number } | null>(null);
   const [embeddedImages, setEmbeddedImages] = useState<Array<{ id: string; blob: Blob; filename: string; locator: Record<string, unknown> }>>([]);
-  const [conceptBranches, setConceptBranches] = useState<string[]>([]);
+  const [dismissedBranches, setDismissedBranches] = useState<string[]>([]);
+  const conceptBranchesKey = workspaceQueryKey(workspaceId, "sessions", "document-concept-branches", fileId);
+  const savedBranches = useQuery({
+    queryKey: conceptBranchesKey,
+    queryFn: ({ signal }) => listDocumentConceptBranches(fileId, { signal }),
+    enabled: Boolean(fileId),
+  });
+  const conceptBranches = (savedBranches.data ?? [])
+    .map((branch) => branch.id)
+    .filter((id) => !dismissedBranches.includes(id));
 
   function setActiveJobId(nextJobId: string) {
     const next = new URLSearchParams(searchParams);
@@ -467,8 +478,12 @@ export function DocumentLearningPage() {
       surrounding_text: selected?.chunk?.content.slice(0, 8_000) ?? "",
       source_title: file.original_name,
     });
-    await queryClient.invalidateQueries({ queryKey: ["sessions"] });
-    setConceptBranches((current) => [...current.filter((id) => id !== branch.id), branch.id]);
+    await queryClient.cancelQueries({ queryKey: conceptBranchesKey, exact: true });
+    cacheCreatedSession(queryClient, workspaceId, branch);
+    queryClient.setQueryData<Session[]>(conceptBranchesKey, (current) => [
+      ...(current ?? []).filter((item) => item.id !== branch.id), branch,
+    ]);
+    void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "sessions") });
     setSelectionMenu(null);
   }
 
@@ -686,6 +701,16 @@ export function DocumentLearningPage() {
           <PanelLeft className="size-3.5" />
           {outlineOpen ? "隐藏目录" : "显示目录"}
         </Button>
+        {(savedBranches.data?.length ?? 0) > conceptBranches.length ? (
+          <Button onClick={() => setDismissedBranches((current) => current.filter((id) => !savedBranches.data?.some((branch) => branch.id === id)))} size="sm" variant="ghost">
+            重新打开概念分支
+          </Button>
+        ) : null}
+        {savedBranches.isError ? (
+          <Button onClick={() => void savedBranches.refetch()} size="sm" variant="ghost">
+            重试加载概念分支
+          </Button>
+        ) : null}
         {file.parse_status !== "indexed" && !jobId && indexRequired ? (
           <Button disabled={startJob.isPending} onClick={() => startJob.mutate()} size="sm">
             {startJob.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
@@ -1220,7 +1245,7 @@ export function DocumentLearningPage() {
         <ConceptBranchWorkspace
           branchIds={conceptBranches}
           file={file}
-          onCloseBranch={(id) => setConceptBranches((current) => current.filter((branchId) => branchId !== id))}
+          onCloseBranch={(id) => setDismissedBranches((current) => [...current, id])}
           selection={pendingSelection}
           workspaceId={workspaceId}
         />

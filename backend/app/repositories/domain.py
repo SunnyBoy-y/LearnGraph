@@ -110,6 +110,14 @@ class SessionRepository(ScopedRepository[ChatSession]):
     def __init__(self, db: Session, workspace_id: str) -> None:
         super().__init__(db, ChatSession, workspace_id)
 
+    def list_document_concept_branches(self, file_id: str) -> list[ChatSession]:
+        statement = self.query().where(
+            ChatSession.session_kind == "concept_branch",
+            ChatSession.status != "archived",
+            ChatSession.context_capsule["anchor"]["file_id"].as_string() == file_id,
+        ).order_by(ChatSession.created_at, ChatSession.id)
+        return list(self.db.scalars(statement).all())
+
 
 class MessageRepository(ScopedRepository[Message]):
     def __init__(self, db: Session, workspace_id: str) -> None:

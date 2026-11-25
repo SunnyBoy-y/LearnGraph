@@ -333,6 +333,10 @@ export function branchSession(
   )
 }
 
+export function listDocumentConceptBranches(fileId: string, options: ApiRequestOptions = {}): Promise<Session[]> {
+  return apiClient.get<Session[]>(`/sessions/document-concept-branches/${encodeURIComponent(fileId)}`, options)
+}
+
 export function createConceptBranch(
   sessionId: string,
   payload: ConceptBranchCreateRequest,

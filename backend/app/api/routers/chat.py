@@ -38,6 +38,7 @@ from app.core.admission import (
     snapshot_admission_metrics,
 )
 from app.core.errors import AppError
+from app.repositories.domain import SessionRepository
 from app.domain.models import (
     Message,
     Workspace,
@@ -1670,6 +1671,18 @@ def branch_session(
     settings: AppSettings,
 ) -> SessionView:
     return SessionView.model_validate(service(db, context, settings).branch(session_id, message_id, payload))
+
+
+@router.get("/document-concept-branches/{file_id}", response_model=list[SessionView])
+def list_document_concept_branches(file_id: str, db: DB, context: CurrentWorkspace) -> list[SessionView]:
+    authz = AuthorizationService(db, context.principal)
+    if not authz.can_access_resource(context.workspace, "file", file_id, "read"):
+        raise AppError(404, "not_found", "File not found in this workspace")
+    items = SessionRepository(db, context.workspace_id).list_document_concept_branches(file_id)
+    accessible = authz.filter_accessible_ids(
+        context.workspace, "session", [item.id for item in items], "read"
+    )
+    return [SessionView.model_validate(item) for item in items if item.id in accessible]
 
 
 @router.post(

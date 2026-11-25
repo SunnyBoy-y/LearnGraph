@@ -43,3 +43,30 @@ def test_detail_cannot_cross_workspace(client, register_user, auth_headers):
         db.commit()
     assert client.get(f'/api/v1/sessions/{other_workspace[:20]}-private', headers=auth_headers(token, workspace)).status_code == 404
     assert client.get(f'/api/v1/sessions/{other_workspace[:20]}-private', headers=auth_headers(other_token, other_workspace)).status_code == 200
+
+
+def test_document_concept_branches_restore_only_readable_matches(client, register_user, auth_headers):
+    token, workspace, *_ = register_user('documentbranch')
+    other_token, other_workspace, *_ = register_user('documentbranchother')
+    headers = auth_headers(token, workspace)
+    upload = client.post('/api/v1/files', headers=headers, files={'file': ('notes.txt', b'notes', 'text/plain')})
+    assert upload.status_code == 201, upload.text
+    file_id = upload.json()['id']
+    with SessionLocal() as db:
+        for ws, kind, status, anchor in [
+            (workspace, 'concept_branch', 'active', file_id),
+            (workspace, 'concept_branch', 'active', 'another-file'),
+            (workspace, 'concept_branch', 'archived', file_id),
+            (workspace, 'standalone', 'active', file_id),
+            (other_workspace, 'concept_branch', 'active', file_id),
+        ]:
+            db.add(ChatSession(workspace_id=ws, title='Saved branch', session_kind=kind,
+                status=status, context_capsule={'anchor': {'file_id': anchor}}))
+        db.commit()
+    path = f'/api/v1/sessions/document-concept-branches/{file_id}'
+    response = client.get(path, headers=headers)
+    assert response.status_code == 200, response.text
+    [branch] = response.json()
+    assert branch['title'] == 'Saved branch'
+    assert branch['context_capsule']['anchor']['file_id'] == file_id
+    assert client.get(path, headers=auth_headers(other_token, other_workspace)).status_code == 404
