@@ -1,4 +1,8 @@
 import { webActivityLabel } from "@/lib/web-activity";
+import {
+  composeAnswerOrdering,
+  reconcileArtifacts,
+} from "@/features/chat/response-composer";
 import type { UnknownRecord } from "@/types/common";
 import type { MessagePart } from "@/types/sessions";
 
@@ -251,7 +255,8 @@ export function partitionMessageParts(parts: MessagePart[]): {
   chainParts: MessagePart[];
   answerParts: MessagePart[];
 } {
-  const ordered = orderedMessageParts(parts);
+  const { parts: reconciled, entriesByPartId } = reconcileArtifacts(parts);
+  const ordered = orderedMessageParts(reconciled);
   const chainParts: MessagePart[] = [];
   const answerParts: MessagePart[] = [];
   const deferredGraphProposals: MessagePart[] = [];
@@ -275,8 +280,9 @@ export function partitionMessageParts(parts: MessagePart[]): {
     }
     answerParts.push(part);
   }
-  answerParts.push(...deferredGraphProposals);
-  return { chainParts, answerParts };
+  const composed = composeAnswerOrdering(answerParts, entriesByPartId);
+  composed.push(...deferredGraphProposals);
+  return { chainParts, answerParts: composed };
 }
 
 /**
@@ -403,7 +409,8 @@ export function groupPartsForDisplay(
   parts: MessagePart[],
   options?: DisplayGroupOptions,
 ): DisplaySegment[] {
-  const ordered = placeRichResponseParts(orderedMessageParts(parts));
+  const { parts: reconciled, entriesByPartId } = reconcileArtifacts(parts);
+  const ordered = placeRichResponseParts(orderedMessageParts(reconciled));
   const boundaryIndex = findFinalAnswerBoundaryIndex(ordered, options?.boundary);
   // New-protocol messages carry a live boundary, durable `kind` marks on
   // text parts, or the streaming flag. Old history has none of these
@@ -486,13 +493,14 @@ export function groupPartsForDisplay(
     answerParts.push(part);
   }
 
-  answerParts.push(...deferredGraphProposals);
+  const composedAnswer = composeAnswerOrdering(answerParts, entriesByPartId);
+  composedAnswer.push(...deferredGraphProposals);
   const segments: DisplaySegment[] = [];
   if (processParts.length) {
     segments.push({ kind: "chain", parts: orderChainParts(processParts) });
   }
-  if (answerParts.length) {
-    segments.push({ kind: "parts", parts: answerParts });
+  if (composedAnswer.length) {
+    segments.push({ kind: "parts", parts: composedAnswer });
   }
   return segments;
 }

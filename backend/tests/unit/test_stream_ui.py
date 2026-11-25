@@ -308,3 +308,36 @@ def test_weight_image_variant_fit_and_catalog_checks():
     # Reject invalid check rule arguments
     with pytest.raises(AppError):
         compile_command(mount(checks=[{"id": "bad", "fn": "range", "path": "@/x", "args": [10, 5], "message": "bad range"}]))
+
+
+def test_stream_ui_tolerates_composer_envelope_metadata():
+    from app.services.stream_ui import strip_part_envelope
+
+    base = compile_command(mount(component="chart", props={
+        "title": "趋势图",
+        "columns": [{"key": "v", "label": "值"}],
+    })).model_dump(mode="json")
+    enveloped = {
+        **base,
+        "title": "趋势图",
+        "artifact_registry": {
+            "canonical_id": "demo",
+            "artifact_type": "ui",
+            "title": "趋势图",
+            "placement": "referenced",
+        },
+    }
+
+    stripped = strip_part_envelope(enveloped)
+    assert "artifact_registry" not in stripped and "title" not in stripped
+
+    completed = compile_command({"op": "complete", "block_id": "demo", "base_revision": 0}, enveloped)
+    assert completed.state == "completed" and completed.revision == 1
+
+    # Unexpected non-envelope keys must still be rejected.
+    with pytest.raises(AppError):
+        compile_command(
+            {"op": "complete", "block_id": "demo", "base_revision": 0},
+            {**base, "unexpected_key": True},
+        )
+

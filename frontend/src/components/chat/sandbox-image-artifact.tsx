@@ -19,8 +19,15 @@ export function isSandboxImageArtifactPart(part: MessagePart): boolean {
     (part.type === "sandbox" &&
       (data.kind === "file" || typeof data.file_id === "string"));
   if (!isFileArtifact) return false;
-  const mime = typeof data.mime_type === "string" ? data.mime_type : "";
-  return mime.trim().toLowerCase().startsWith("image/");
+  const mime = typeof data.mime_type === "string" ? data.mime_type.trim().toLowerCase() : "";
+  const path = typeof data.path === "string" ? data.path.trim().toLowerCase() : "";
+  const title = typeof data.title === "string" ? data.title.trim().toLowerCase() : "";
+  // Vector SVG files render through UnifiedArtifactCard (full-width diagram
+  // preview + metadata + download + fullscreen), never as a photo strip thumb.
+  if (mime.startsWith("image/svg") || path.endsWith(".svg") || title.endsWith(".svg")) {
+    return false;
+  }
+  return mime.startsWith("image/");
 }
 
 function formatSize(sizeBytes: unknown): string {

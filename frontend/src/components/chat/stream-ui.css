@@ -66,14 +66,42 @@
     background: var(--genui-accent);
     animation: stream-ui-pulse 1.5s infinite;
   }
-  .stream-ui__toolbar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; padding: 8px 0; font-size: 13px; }
-  .stream-ui__toolbar label, .stream-ui__control { display: flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 13px; }
-  .stream-ui .stream-ui__search { width: min(240px, 100%); height: 32px; font-size: 13px; }
-  .stream-ui__toolbar input[type="range"] { width: 80px; accent-color: var(--genui-accent); }
-  .stream-ui__segmented { display: flex; background: var(--muted); border-radius: 6px; padding: 2px; }
-  .stream-ui__segmented [aria-pressed="true"] { background: var(--background); }
+  :where(.stream-ui .stream-ui__toolbar) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 0;
+    font-size: 13px;
+  }
+  :where(.stream-ui .stream-ui__toolbar label, .stream-ui .stream-ui__control) {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--muted-foreground);
+    font-size: 13px;
+  }
+  .stream-ui .stream-ui__toolbar button,
+  .stream-ui .stream-ui__legend button,
+  .stream-ui .stream-ui__toolbar select,
+  .stream-ui .stream-ui__toolbar input {
+    min-height: 32px;
+    border-radius: 9px;
+  }
+  .stream-ui .stream-ui__toolbar button:focus-visible,
+  .stream-ui .stream-ui__legend button:focus-visible,
+  .stream-ui .stream-ui__toolbar select:focus-visible,
+  .stream-ui .stream-ui__toolbar input:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  .stream-ui .stream-ui__search { width: min(240px, 100%); height: 34px; font-size: 13px; }
+  .stream-ui__toolbar input[type="range"] { width: 96px; accent-color: var(--genui-accent); }
+  .stream-ui__segmented { display: inline-flex; background: var(--muted); border-radius: 10px; padding: 3px; }
+  .stream-ui__segmented [aria-pressed="true"] { background: var(--background); box-shadow: 0 1px 2px rgb(15 23 42 / .08); }
   .stream-ui__legend { display: flex; gap: 6px; flex-wrap: wrap; padding: 4px 0; }
-  .stream-ui__legend [aria-pressed="false"] { opacity: .4; text-decoration: line-through; }
+  .stream-ui__legend [aria-pressed="false"] { opacity: .45; text-decoration: line-through; }
   .stream-ui__legend i { width: 8px; height: 8px; border-radius: 50%; }
   .stream-ui__chart-context { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted-foreground); font-size: 13px; margin-top: -6px; }
   .stream-ui__chart-context strong { font-size: 24px; color: var(--foreground); font-weight: 600; letter-spacing: -.04em; }

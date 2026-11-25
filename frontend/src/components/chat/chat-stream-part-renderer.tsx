@@ -473,6 +473,14 @@ export function ChatStreamPartRenderer({
   siblingParts?: MessagePart[];
   streaming?: boolean;
 }) {
+  if (
+    part.data?.artifact_registry &&
+    typeof part.data.artifact_registry === "object" &&
+    !Array.isArray(part.data.artifact_registry) &&
+    (part.data.artifact_registry as Record<string, unknown>).suppressed === true
+  ) {
+    return null;
+  }
   if (part.type === "image" && !isFailedArtifactPart(part)) {
     return <ChatImagePart part={part} />;
   }

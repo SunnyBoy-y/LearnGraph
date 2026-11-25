@@ -65,6 +65,8 @@ import {
 } from "@/components/chat/sandbox-image-artifact";
 import { SandboxArtifact } from "@/components/chat/sandbox-artifact";
 import { SandboxFileArtifact } from "@/components/chat/sandbox-file-artifact";
+import { UnifiedArtifactCard } from "@/components/chat/unified-artifact-card";
+import { resolveArtifactMeta } from "@/features/chat/response-composer";
 import { FilePreviewDialog } from "@/components/resources/file-preview-dialog";
 import { fileStreamUrl } from "@/api/files";
 import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
@@ -1836,6 +1838,14 @@ export function MessagePartRenderer({
   siblingParts?: MessagePart[];
   streaming?: boolean;
 }) {
+  if (
+    part.data?.artifact_registry &&
+    typeof part.data.artifact_registry === "object" &&
+    !Array.isArray(part.data.artifact_registry) &&
+    (part.data.artifact_registry as Record<string, unknown>).suppressed === true
+  ) {
+    return null;
+  }
   const rawContent = part.content ?? part.content_delta ?? "";
   // Also clean historical answers and streams whose artifact has not arrived yet.
   const content = part.type === "text"
@@ -1860,6 +1870,8 @@ export function MessagePartRenderer({
       return (
         <AcknowledgementPart content={content} partId={part.id} streaming={streaming} />
       );
+    case "svg":
+      return part.data?.state === "removed" ? null : <UnifiedArtifactCard part={part} siblingParts={siblingParts} />;
     case "text":
       return content ? (
         <TextWithCitations
@@ -1954,13 +1966,25 @@ export function MessagePartRenderer({
       );
     case "subapp_event":
       return <SubappEventPart data={part.data} />;
-    case "magic_card":
+    case "magic_card": {
+      const meta = resolveArtifactMeta(part, siblingParts);
+      if (meta.artifactType === "svg") {
+        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} />;
+      }
       return <MagicCardHost data={part.data ?? {}} />;
+    }
     case "sandbox": {
       // Published image files render as inline embedded previews (no manual
       // 预览 click needed); the strip groups adjacent ones side by side.
       if (isSandboxImageArtifactPart(part)) {
         return <SandboxImageArtifact part={part} />;
+      }
+      const meta = resolveArtifactMeta(part, siblingParts);
+      if (
+        meta.artifactType === "svg" ||
+        (meta.artifactType === "html" && (meta.fileId || meta.previewHtml))
+      ) {
+        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} />;
       }
       const kind = part.data?.kind;
       if (kind === "file" || typeof part.data?.file_id === "string") {
@@ -1977,11 +2001,19 @@ export function MessagePartRenderer({
     }
     case "subapp_artifact":
       return <SandboxArtifact data={part.data ?? {}} />;
-    case "sandbox_artifact":
+    case "sandbox_artifact": {
       if (isSandboxImageArtifactPart(part)) {
         return <SandboxImageArtifact part={part} />;
       }
+      const meta = resolveArtifactMeta(part, siblingParts);
+      if (
+        meta.artifactType === "svg" ||
+        (meta.artifactType === "html" && (meta.fileId || meta.previewHtml))
+      ) {
+        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} />;
+      }
       return <SandboxFileArtifact data={part.data ?? {}} />;
+    }
     case "skill_trigger": {
       const skillName =
         typeof part.data?.skill_name === "string" && part.data.skill_name

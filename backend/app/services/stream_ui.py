@@ -32,6 +32,13 @@ from app.domain.schemas.stream_ui import (
 MAX_UI_BYTES = 192_000
 MAX_UI_BLOCKS = 20
 IMAGE_NODE_TYPES = {"image", "image_group", "gallery"}
+ENVELOPE_METADATA_KEYS = ("artifact_registry", "title")
+
+
+def strip_part_envelope(data: dict) -> dict:
+    if not isinstance(data, dict) or not any(key in data for key in ENVELOPE_METADATA_KEYS):
+        return data
+    return {key: value for key, value in data.items() if key not in ENVELOPE_METADATA_KEYS}
 
 
 def stream_ui_constraints() -> dict:
@@ -196,7 +203,7 @@ def compile_command(raw: dict, current: dict | None = None) -> Snapshot:
         else:
             if current is None:
                 raise AppError(404, "ui_block_not_found", "Mount this block first")
-            old = Snapshot.model_validate(current)
+            old = Snapshot.model_validate(strip_part_envelope(current))
             if old.block_id != command.block_id or old.revision != command.base_revision:
                 raise AppError(409, "ui_revision_conflict", "Refresh the snapshot and retry",
                                {"revision": old.revision})
@@ -474,7 +481,7 @@ def action_prompt(db, workspace_id: str, session_id: str, action: UIAction, *, d
     if not row:
         raise AppError(404, "ui_block_not_found", "UI block not found")
     part, message = row
-    snapshot = Snapshot.model_validate(part.data)
+    snapshot = Snapshot.model_validate(strip_part_envelope(part.data))
     if snapshot.revision != action.revision:
         raise AppError(409, "ui_revision_conflict", "图表已更新，请刷新消息后重试")
     # A sealed block remains usable if later narration fails or is interrupted.

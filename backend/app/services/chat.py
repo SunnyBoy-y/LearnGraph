@@ -165,6 +165,7 @@ from app.services.context_compaction import (
 )
 from app.services.token_estimate import estimate_tokens
 from app.services.text_utils import truncate_without_splitting_urls
+from app.services.response_composer import ResponseComposer
 
 
 SSE_SCHEMA_VERSION = "1.0"
@@ -4943,6 +4944,36 @@ class ChatService:
             and (forward.data or {}).get("kind") == "plan_narration"
         )
 
+    @staticmethod
+    def _is_suppressed_part(part: object) -> bool:
+        data = part.get("data") if isinstance(part, dict) else getattr(part, "data", None)
+        if not isinstance(data, dict):
+            return False
+        reg = data.get("artifact_registry")
+        return isinstance(reg, dict) and reg.get("suppressed") is True
+
+    def _finalized_message_parts_snapshot(self, message_version_id: str) -> list[dict]:
+        part_records = self.db.scalars(
+            select(MessagePartRecord)
+            .where(
+                MessagePartRecord.workspace_id == self.workspace_id,
+                MessagePartRecord.message_version_id == message_version_id,
+            )
+            .order_by(MessagePartRecord.ordinal)
+        ).all()
+        return [
+            self._part_snapshot(
+                record.id,
+                record.part_type,
+                record.status,
+                record.content,
+                record.data,
+                sequence=record.ordinal,
+            )
+            for record in part_records
+            if not self._is_suppressed_part(record)
+        ]
+
     def _splice_answer_parts(
         self,
         *,
@@ -4955,26 +4986,7 @@ class ChatService:
         list[MessagePartRecord],
         list[tuple[MessagePartRecord, str]],
     ]:
-        """Finalize answer parts with artifact-reference orchestration.
-
-        Precedence:
-          1. explicit ``[[artifact:...]]`` reference → artifact rendered at
-             the tag position (tag stripped, layout applied);
-          2. implicit anchoring (plan-narration adjacency) → artifact keeps
-             its in-stream ordinal (frontend interleaving);
-          3. fallback → unreferenced / unanchored artifacts sink to the end of
-             the answer body.
-
-        Inline ``![alt](sandbox:path)`` images keep the existing splice
-        behavior (new image parts interleaved with text segments).
-
-        Returns ``(first_segment, clean_full_text, extra_records,
-        moved_records)``. ``extra_records`` are newly created parts (text
-        segments + inline images) that need ``part.completed`` events;
-        ``moved_records`` are ``(part, reason)`` pairs whose ordinal was
-        relocated (``artifact_reference`` / ``artifact_sink``) and need
-        ``part.replaced`` events.
-        """
+        """Finalize answer parts via ArtifactRegistry + ResponseComposer."""
         segments, markers = self._resolve_answer_markers(
             final_text, message_version_id
         )
@@ -4989,110 +5001,57 @@ class ChatService:
         )
         all_parts.sort(key=lambda item: item.ordinal)
 
-        referenced_ids: set[str] = set()
-        referenced_parts: list[MessagePartRecord] = []
-        for marker in markers:
-            if marker["kind"] != "artifact":
-                continue
-            part = marker["part"]
-            if part.id in referenced_ids:
-                continue
-            referenced_ids.add(part.id)
-            referenced_parts.append(part)
-            layout = marker["layout"]
-            if layout:
-                part.data = {**(part.data or {}), "layout": layout}
-
-        artifact_parts = [
-            part
-            for part in all_parts
-            if part.id != text_record.id
-            and part.part_type in self._ARTIFACT_PART_KINDS
-        ]
-        anchored_ids = {
-            part.id
-            for part in artifact_parts
-            if part.id not in referenced_ids
-            and self._is_implicitly_anchored_artifact(
-                part, all_parts, text_record.id
+        def _create_image_record(
+            data: dict[str, Any], temp_ordinal: int
+        ) -> MessagePartRecord:
+            return self.message_parts.add(
+                MessagePartRecord(
+                    workspace_id=self.workspace_id,
+                    message_version_id=message_version_id,
+                    ordinal=temp_ordinal,
+                    part_type="image",
+                    status="completed",
+                    content=str(data.get("title") or "已下载的图片"),
+                    data=data,
+                )
             )
-        }
-        sink_ids = {
-            part.id
-            for part in artifact_parts
-            if part.id not in referenced_ids and part.id not in anchored_ids
-        }
 
-        # Phase A: process parts (ack / chain / plan narration / anchored
-        # artifacts) keep their relative stream order ahead of the answer.
-        new_sequence: list[MessagePartRecord] = []
-        for part in all_parts:
-            if (
-                part.id == text_record.id
-                or part.id in referenced_ids
-                or part.id in sink_ids
-            ):
-                continue
-            new_sequence.append(part)
-        # Answer body: first text segment (text_record), then markers and
-        # text segments interleaved.
-        new_sequence.append(text_record)
-        extra_records: list[MessagePartRecord] = []
-        appended_referenced: set[str] = set()
-        for index, marker in enumerate(markers):
-            if marker["kind"] == "image":
-                image_record = self.message_parts.add(
-                    MessagePartRecord(
-                        workspace_id=self.workspace_id,
-                        message_version_id=message_version_id,
-                        ordinal=(-1_000_000 - len(new_sequence) - len(extra_records)),
-                        part_type="image",
-                        status="completed",
-                        content=str(
-                            marker["data"].get("title") or "已下载的图片"
-                        ),
-                        data=marker["data"],
-                    )
+        def _create_segment_record(
+            segment: str, temp_ordinal: int
+        ) -> MessagePartRecord:
+            return self.message_parts.add(
+                MessagePartRecord(
+                    workspace_id=self.workspace_id,
+                    message_version_id=message_version_id,
+                    ordinal=temp_ordinal,
+                    part_type="text",
+                    status="completed",
+                    content=segment,
                 )
-                extra_records.append(image_record)
-                new_sequence.append(image_record)
-            elif marker["kind"] == "artifact":
-                part = marker["part"]
-                if part.id not in appended_referenced:
-                    appended_referenced.add(part.id)
-                    new_sequence.append(part)
-            segment = segments[index + 1]
-            if segment:
-                segment_record = self.message_parts.add(
-                    MessagePartRecord(
-                        workspace_id=self.workspace_id,
-                        message_version_id=message_version_id,
-                        ordinal=(-1_000_000 - len(new_sequence) - len(extra_records)),
-                        part_type="text",
-                        status="completed",
-                        content=segment,
-                    )
-                )
-                extra_records.append(segment_record)
-                new_sequence.append(segment_record)
-        # Sink: unreferenced / unanchored artifacts at the very end.
-        sink_parts = [part for part in all_parts if part.id in sink_ids]
-        new_sequence.extend(sink_parts)
+            )
+
+        plan = ResponseComposer().plan_answer_sequence(
+            all_parts=all_parts,
+            text_record=text_record,
+            markers=markers,
+            segments=segments,
+            is_implicitly_anchored=lambda part: self._is_implicitly_anchored_artifact(
+                part, all_parts, text_record.id
+            ),
+            create_image_record=_create_image_record,
+            create_segment_record=_create_segment_record,
+        )
 
         # Two-phase ordinal reassignment so the UNIQUE
         # (workspace_id, message_version_id, ordinal) constraint never fires.
-        for index, part in enumerate(new_sequence):
+        for index, part in enumerate(plan.new_sequence):
             part.ordinal = -(index + 1)
         self.db.flush()
-        for index, part in enumerate(new_sequence):
+        for index, part in enumerate(plan.new_sequence):
             part.ordinal = index
         self.db.flush()
 
-        moved_records: list[tuple[MessagePartRecord, str]] = [
-            (part, "artifact_reference") for part in referenced_parts
-        ]
-        moved_records.extend((part, "artifact_sink") for part in sink_parts)
-        return segments[0], clean_full_text, extra_records, moved_records
+        return segments[0], clean_full_text, plan.extra_records, plan.moved_records
 
     def _rich_media_provider(self):
         provider = getattr(self.agent_tool_runtime, "image_search_provider", None)
@@ -5473,7 +5432,7 @@ class ChatService:
 
     def _poll_rich_media_parts(self, *, session_id, message_id, version_id, sequence_start, finish=False):
         from app.domain.schemas.stream_ui import Snapshot
-        from app.services.stream_ui import find_block
+        from app.services.stream_ui import ENVELOPE_METADATA_KEYS, find_block, strip_part_envelope
         jobs = getattr(self, "_rich_media_jobs", None)
         if jobs is None:
             return
@@ -5482,6 +5441,7 @@ class ChatService:
             part = find_block(self.db, self.workspace_id, version_id, block_id)
             if part is None or part.data.get("state") == "removed":
                 continue
+            envelope = {k: part.data[k] for k in ENVELOPE_METADATA_KEYS if k in (part.data or {})}
             data = {**part.data, "blocks": [dict(node) for node in part.data.get("blocks", [])]}
             node = next((node for node in data["blocks"] if node["id"] == node_id and node["query"] == query
                          and tuple(node.get("query_alternatives", [])) == alternatives
@@ -5501,7 +5461,8 @@ class ChatService:
                 reason = "ready" if media else "storage_failed"
             node.update(media=media, resource_state="ready" if media else "unavailable", resource_reason=reason)
             data["resource_revision"] = data.get("resource_revision", 0) + 1
-            part.data = Snapshot.model_validate(data).model_dump(mode="json")
+            validated = Snapshot.model_validate(strip_part_envelope(data)).model_dump(mode="json")
+            part.data = {**validated, **envelope} if envelope else validated
             if not hasattr(self, "_rich_media_published"):
                 self._rich_media_published = {}
             published = self._rich_media_published.setdefault(block_id, {"blocks": [], "resource_revision": 0})
@@ -5539,15 +5500,18 @@ class ChatService:
         for part in streamed_parts:
             if part.part_type != "ui" or (part.status != "streaming" and not part.data.get("preview")):
                 continue
-            from app.services.stream_ui import compile_command
+            from app.services.stream_ui import ENVELOPE_METADATA_KEYS, compile_command
+            envelope = {k: part.data[k] for k in ENVELOPE_METADATA_KEYS if k in (part.data or {})}
             if part.data.get("preview"):
                 # A failed/missing final tool call cannot certify partial input.
                 base = part.data["preview"]["base"]
-                part.data = base or {**part.data, "preview": None, "state": "removed"}
+                next_data = base or {**part.data, "preview": None, "state": "removed"}
+                part.data = {**next_data, **envelope} if envelope else next_data
                 part.status = "completed" if part.data["state"] != "streaming" else "streaming"
             if part.data["state"] == "streaming":
-                part.data = compile_command({"op": "complete", "block_id": part.data["block_id"],
-                                             "base_revision": part.data["revision"]}, part.data).model_dump(mode="json")
+                completed_data = compile_command({"op": "complete", "block_id": part.data["block_id"],
+                                                  "base_revision": part.data["revision"]}, part.data).model_dump(mode="json")
+                part.data = {**completed_data, **envelope} if envelope else completed_data
             part.status = "completed"
             event = self._append_event(
                 session_id=session_id, message_id=message_id, message_version_id=version_id,
@@ -10265,7 +10229,10 @@ class ChatService:
         }
 
     def _message_list_item(self, message: Message, *, compact: bool) -> dict[str, Any]:
-        parts = list(message.parts or [])
+        parts = [
+            part for part in (message.parts or [])
+            if not self._is_suppressed_part(part)
+        ]
         provider_trace = dict(message.provider_trace or {})
         content = message.content or ""
         if compact:
@@ -11590,6 +11557,7 @@ class ChatService:
                     data=part.data or {},
                 )
                 for part in part_records
+                if not self._is_suppressed_part(part)
             ],
             provider_trace=version.provider_trace or message.provider_trace or {},
             last_event_id=last_event.id if last_event else None,
@@ -11642,6 +11610,7 @@ class ChatService:
                 sequence=part.ordinal,
             )
             for part in part_records
+            if not self._is_suppressed_part(part)
         ]
         for submission in self.db.scalars(
             self.submissions.query().where(
@@ -13686,20 +13655,9 @@ class ChatService:
                     **(text_record.data or {}),
                     "kind": "final_answer",
                 }
+                self.db.flush()
                 message.content = clean_full_text
-                message.parts = assembled_parts("completed", first_segment)
-                if extra_records:
-                    message.parts.extend(
-                        self._part_snapshot(
-                            record.id,
-                            record.part_type,
-                            "completed",
-                            record.content,
-                            record.data,
-                            sequence=record.ordinal,
-                        )
-                        for record in extra_records
-                    )
+                message.parts = self._finalized_message_parts_snapshot(version.id)
                 final_answer_snapshot = (clean_full_text, first_segment, list(message.parts))
                 version.status = "completed"
                 version.provider_trace = dict(provider_trace)
@@ -17441,20 +17399,9 @@ class ChatService:
                     **(text_record.data or {}),
                     "kind": "final_answer",
                 }
+                self.db.flush()
                 assistant_message.content = clean_full_text
-                parts = assembled_parts("completed", first_segment)
-                if extra_records:
-                    parts.extend(
-                        self._part_snapshot(
-                            record.id,
-                            record.part_type,
-                            "completed",
-                            record.content,
-                            record.data,
-                            sequence=record.ordinal,
-                        )
-                        for record in extra_records
-                    )
+                parts = self._finalized_message_parts_snapshot(assistant_version.id)
                 assistant_message.parts = parts
                 final_answer_snapshot = (clean_full_text, first_segment, list(parts))
                 part_completed_event = self._append_event(

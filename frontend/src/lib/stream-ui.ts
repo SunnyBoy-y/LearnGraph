@@ -293,11 +293,20 @@ export type UIActionRequest = {
   view_state?: Record<string, unknown>;
 };
 
+function stripComposerMetadata(data: unknown): unknown {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+  const record = data as Record<string, unknown>;
+  if (!("artifact_registry" in record) && !("title" in record)) return data;
+  const { artifact_registry: _artifactRegistry, title: _title, ...snapshot } = record;
+  return snapshot;
+}
+
 /** A snapshot is the recovery boundary: never parse unfinished JSON on the client. */
 export function parseUISnapshot(data: unknown): UISnapshot | null {
   try {
-    if (new TextEncoder().encode(JSON.stringify(data)).byteLength > 192_000) return null;
-    const parsed = uiSnapshotSchema.safeParse(data);
+    const candidate = stripComposerMetadata(data);
+    if (new TextEncoder().encode(JSON.stringify(candidate)).byteLength > 192_000) return null;
+    const parsed = uiSnapshotSchema.safeParse(candidate);
     return parsed.success ? parsed.data : null;
   } catch {
     return null;

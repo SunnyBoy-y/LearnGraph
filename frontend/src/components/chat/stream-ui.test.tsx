@@ -291,6 +291,33 @@ describe("stream UI", () => {
         nodes: [{ id: "__proto__", label: "X" }],
       }),
     ).toBeNull();
+    expect(
+      parseUISnapshot({
+        ...snapshot(),
+        unexpected_key: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("renders UI snapshots stamped with response-composer envelope metadata", () => {
+    const enveloped = {
+      ...snapshot(),
+      state: "completed",
+      title: "仓库周提交量",
+      artifact_registry: {
+        canonical_id: "git-activity",
+        artifact_type: "ui",
+        title: "仓库周提交量",
+        placement: "referenced",
+      },
+    };
+    const parsed = parseUISnapshot(enveloped);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.props.title).toBe("项目活跃度");
+
+    render(<StreamUI partId="p" data={enveloped} />);
+    expect(screen.getByText("项目活跃度")).toBeInTheDocument();
+    expect(screen.queryByText("交互图表数据无效")).not.toBeInTheDocument();
   });
 
   it("keeps narration and UI in the answer flow, outside the thinking chain", () => {
