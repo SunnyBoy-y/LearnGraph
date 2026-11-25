@@ -19,7 +19,9 @@ export function AnswerParts({ parts, siblingParts = parts, interactive = true, o
   return <>{groupAnswerParts(parts).map((group) => {
     if (group.kind === "question_set") return <QuestionSetPager
       key={`question-set-${group.parts.map(part => part.id).join("-")}`}
+      interactive={interactive}
       questions={group.questions}
+      storageKey={group.parts.map(part => part.id).join(":")}
       onSubmit={submission => void onAction?.({
         componentId: group.questions[0]?.componentId ?? group.parts[0].id,
         componentType: group.questions.length > 1 ? "question_set" : group.questions[0]?.componentType ?? "question_set",

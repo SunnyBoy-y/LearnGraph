@@ -55,6 +55,8 @@ from app.domain.schemas.chat import (
     MessageSnapshotView,
     MessageView,
     MessageVersionView,
+    PartUIStateUpdateRequest,
+    PartUIStateView,
     SSEEventEnvelope,
     SessionActivitySummaryRequest,
     SessionAutoTitleRequest,
@@ -1402,6 +1404,35 @@ def get_message_snapshot(
 @router.get("/{session_id}/messages/{message_id}/versions", response_model=list[MessageVersionView])
 def list_message_versions(session_id: str, message_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> list[MessageVersionView]:
     return [MessageVersionView.model_validate(item) for item in service(db, context, settings).list_message_versions(session_id, message_id)]
+
+
+@router.put("/{session_id}/parts/{part_id}/ui-state", response_model=PartUIStateView)
+def put_part_ui_state(
+    session_id: str,
+    part_id: str,
+    payload: PartUIStateUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> PartUIStateView:
+    from app.services.part_ui_state import update_part_ui_state
+
+    require_session_access(session_id, "write", db, context)
+    chat_service = service(db, context, settings, agent_mode=False)
+    result = update_part_ui_state(
+        db,
+        workspace_id=context.workspace_id,
+        session_id=session_id,
+        part_id=part_id,
+        ui_state=payload.ui_state,
+        timeline_message_ids=lambda sid: {
+            item.id for item in chat_service._session_timeline(sid)
+        },
+        verify_session_write=lambda sid: require_session_access(
+            sid, "write", db, context
+        ),
+    )
+    return PartUIStateView.model_validate(result)
 
 
 @router.post("/{session_id}/messages/stream")

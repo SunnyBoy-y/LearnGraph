@@ -68,6 +68,7 @@ import { workspaceQueryKey } from "@/lib/query-keys";
 import { getSession } from "@/api/session-browser";
 import { ApiError } from "@/api/client";
 import { useSessionDetail, useSessionPicker, sessionDetailKey, cacheCreatedSession } from "@/lib/session-queries";
+import { PartUIStateProvider } from "@/lib/part-ui-state";
 import { readChatThinkingChainDefault } from "@/lib/workspace-settings";
 import { resolveFilePreviewKind, type FilePreviewKind } from "@/lib/file-preview";
 import type {
@@ -871,22 +872,24 @@ export function SideConversationRail({
             </div>
           ) : null}
           <Conversation className="right-rail-conversation__messages-shell">
-            <ConversationContent
-              aria-live="polite"
-              className="right-rail-conversation__messages"
-            >
-              {messages.isPending && activeSessionId ? (
-                <div className="right-rail-empty"><LoaderCircle className="size-4 animate-spin" />正在读取对话…</div>
-              ) : messages.isError ? (
-                <div className="right-rail-empty is-error">对话读取失败，请稍后重试。</div>
-              ) : messages.data?.length ? (
-                messages.data.map((message) => (
-                  <RailConversationMessage key={message.id} message={message} onAction={handleRailAction} thinkingChainDefaultOpen={thinkingChainDefaultOpen} />
-                ))
-              ) : (
-                <div className="right-rail-empty"><MessageCircle className="size-4" /><strong>这个会话还没有消息</strong><span>在下方输入问题即可开始侧边问答。</span></div>
-              )}
-            </ConversationContent>
+            <PartUIStateProvider sessionId={activeSessionId} workspaceId={workspaceId}>
+              <ConversationContent
+                aria-live="polite"
+                className="right-rail-conversation__messages"
+              >
+                {messages.isPending && activeSessionId ? (
+                  <div className="right-rail-empty"><LoaderCircle className="size-4 animate-spin" />正在读取对话…</div>
+                ) : messages.isError ? (
+                  <div className="right-rail-empty is-error">对话读取失败，请稍后重试。</div>
+                ) : messages.data?.length ? (
+                  messages.data.map((message) => (
+                    <RailConversationMessage key={message.id} message={message} onAction={handleRailAction} thinkingChainDefaultOpen={thinkingChainDefaultOpen} />
+                  ))
+                ) : (
+                  <div className="right-rail-empty"><MessageCircle className="size-4" /><strong>这个会话还没有消息</strong><span>在下方输入问题即可开始侧边问答。</span></div>
+                )}
+              </ConversationContent>
+            </PartUIStateProvider>
             <ConversationScrollButton />
           </Conversation>
           <RailConversationComposer

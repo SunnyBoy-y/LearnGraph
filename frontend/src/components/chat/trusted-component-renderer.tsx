@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -21,6 +21,7 @@ import { z } from "zod";
 import {
   OptionGroup,
   type OptionGroupSubmission,
+  type PersistedOptionGroupState,
 } from "@/components/chat/option-group";
 import { StatePill } from "@/components/shared/page-elements";
 import { ExpandableContent } from "@/components/shared/expandable-content";
@@ -33,6 +34,11 @@ import { DateScheduleCalendar } from "@/components/chat/date-schedule-calendar";
 import { StepperCard, type StepperProps } from "@/components/chat/stepper-renderer";
 import { CodeTrainer } from "@/components/chat/code-trainer";
 import { trainerComponentSchema } from "@/lib/code-trainer";
+import {
+  readQuestionChoiceState,
+  writeQuestionChoiceState,
+} from "@/lib/question-choice-state";
+import { usePartUIStatePersistence } from "@/lib/part-ui-state";
 import { StreamUIStateScope } from "@/lib/stream-ui-local-state";
 
 const optionSchema = z.object({
@@ -323,8 +329,58 @@ export function TrustedComponentRenderer({
   interactive?: boolean;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
 }) {
+  const persistence = usePartUIStatePersistence();
   const parsed = useMemo(() => trustedComponentSchema.safeParse(data), [data]);
-  const [textValue, setTextValue] = useState("");
+  const textStorageKey = fallbackId ? `text:${fallbackId}` : "";
+  const batchStorageKey = fallbackId ? `batch:${fallbackId}` : "";
+  const rawUiState =
+    data.ui_state && typeof data.ui_state === "object" && !Array.isArray(data.ui_state)
+      ? (data.ui_state as Record<string, unknown>)
+      : null;
+  const backendUiStateKey = useMemo(
+    () => (rawUiState ? JSON.stringify(rawUiState) : ""),
+    [rawUiState],
+  );
+
+  const initialText = useMemo(() => {
+    if (rawUiState && typeof rawUiState.value === "string") {
+      return rawUiState.value;
+    }
+    return textStorageKey
+      ? readQuestionChoiceState<{ value: string }>(textStorageKey)?.value ?? ""
+      : "";
+    // Hydrate on mount / storage key change only; backend updates sync below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [textStorageKey]);
+  const initialBatch = useMemo(() => {
+    const saved = rawUiState
+      ? (rawUiState as {
+          activeQuestionIndex?: number;
+          batchAnswers?: Record<string, { labels: string[]; values: string[]; text?: string }>;
+          batchDrafts?: Record<string, string[]>;
+          batchSubmitted?: boolean;
+        })
+      : batchStorageKey
+        ? readQuestionChoiceState<{
+            activeQuestionIndex?: number;
+            batchAnswers?: Record<string, { labels: string[]; values: string[]; text?: string }>;
+            batchDrafts?: Record<string, string[]>;
+            batchSubmitted?: boolean;
+          }>(batchStorageKey)
+        : null;
+    return {
+      hasSaved: Boolean(saved),
+      activeQuestionIndex:
+        typeof saved?.activeQuestionIndex === "number" ? saved.activeQuestionIndex : 0,
+      batchAnswers: saved?.batchAnswers ?? {},
+      batchDrafts: saved?.batchDrafts ?? {},
+      batchSubmitted: Boolean(saved?.batchSubmitted),
+    };
+    // Hydrate on mount / storage key change only; backend updates sync below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchStorageKey]);
+
+  const [textValue, setTextValue] = useState(initialText);
   const [goalDraftValue, setGoalDraftValue] = useState<{
     title: string;
     intent: string;
@@ -333,9 +389,78 @@ export function TrustedComponentRenderer({
   }>({ title: "", intent: "", time_limit: "", desired_outcome: "" });
   const [batchAnswers, setBatchAnswers] = useState<
     Record<string, { labels: string[]; values: string[]; text?: string }>
-  >({});
+  >(initialBatch.batchAnswers);
+  const [batchDrafts, setBatchDrafts] = useState<Record<string, string[]>>(
+    initialBatch.batchDrafts,
+  );
+  const [batchSubmitted, setBatchSubmitted] = useState(initialBatch.batchSubmitted);
   /** Tabbed-paging index for the aggregated question card (question_batch). */
-  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
+  const [activeQuestionIndex, setActiveQuestionIndex] = useState(
+    initialBatch.activeQuestionIndex,
+  );
+  const batchDirtyRef = useRef(initialBatch.hasSaved);
+  const lastPersistedKeyRef = useRef("");
+  const lastBackendKeyRef = useRef(backendUiStateKey);
+
+  useEffect(() => {
+    if (backendUiStateKey === lastBackendKeyRef.current) return;
+    lastBackendKeyRef.current = backendUiStateKey;
+    if (!rawUiState) return;
+    if (backendUiStateKey === lastPersistedKeyRef.current) return;
+    if (typeof rawUiState.value === "string") {
+      lastPersistedKeyRef.current = backendUiStateKey;
+      setTextValue(rawUiState.value);
+    }
+    if (
+      typeof rawUiState.activeQuestionIndex === "number" ||
+      rawUiState.batchAnswers !== undefined ||
+      rawUiState.batchDrafts !== undefined
+    ) {
+      const saved = rawUiState as {
+        activeQuestionIndex?: number;
+        batchAnswers?: Record<string, { labels: string[]; values: string[]; text?: string }>;
+        batchDrafts?: Record<string, string[]>;
+        batchSubmitted?: boolean;
+      };
+      lastPersistedKeyRef.current = backendUiStateKey;
+      batchDirtyRef.current = true;
+      setActiveQuestionIndex(
+        typeof saved.activeQuestionIndex === "number" ? saved.activeQuestionIndex : 0,
+      );
+      setBatchAnswers(saved.batchAnswers ?? {});
+      setBatchDrafts(saved.batchDrafts ?? {});
+      setBatchSubmitted(Boolean(saved.batchSubmitted));
+    }
+  }, [backendUiStateKey, rawUiState]);
+
+  useEffect(() => {
+    if (!batchDirtyRef.current) return;
+    const payload = {
+      activeQuestionIndex,
+      batchAnswers,
+      batchDrafts,
+      batchSubmitted,
+    };
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastPersistedKeyRef.current) return;
+    lastPersistedKeyRef.current = serialized;
+    if (batchStorageKey) {
+      writeQuestionChoiceState(batchStorageKey, payload);
+    }
+    if (fallbackId) {
+      persistence?.persistPartUIState(fallbackId, payload, {
+        immediate: batchSubmitted,
+      });
+    }
+  }, [
+    activeQuestionIndex,
+    batchAnswers,
+    batchDrafts,
+    batchStorageKey,
+    batchSubmitted,
+    fallbackId,
+    persistence,
+  ]);
 
   // Third-party components are delivered with delivery_mode="sandbox_artifact".
   // They never match the built-in declarative schema below; delegate them to
@@ -400,12 +525,33 @@ export function TrustedComponentRenderer({
   ) {
     const mode =
       component.component_type === "multiple_choice" ? "multiple" : "single";
+    const initialOptionState: PersistedOptionGroupState | null =
+      rawUiState &&
+      (Array.isArray(rawUiState.values) || typeof rawUiState.customValue === "string")
+        ? {
+            values: Array.isArray(rawUiState.values)
+              ? rawUiState.values.filter((item): item is string => typeof item === "string")
+              : [],
+            customValue:
+              typeof rawUiState.customValue === "string" ? rawUiState.customValue : "",
+            submitted: Boolean(rawUiState.submitted),
+          }
+        : null;
     return (
       <OptionGroup
         allowCustom={component.props.allow_custom}
         allowSkip={component.props.allow_skip}
         description={component.props.description ?? undefined}
+        disabled={!interactive}
+        initialState={initialOptionState}
         mode={mode}
+        onStateChange={(nextState) => {
+          if (fallbackId) {
+            persistence?.persistPartUIState(fallbackId, nextState, {
+              immediate: Boolean(nextState.submitted),
+            });
+          }
+        }}
         onSubmit={(submission: OptionGroupSubmission) =>
           emit("submit", { ...submission })
         }
@@ -413,6 +559,7 @@ export function TrustedComponentRenderer({
           ...option,
           description: option.description ?? undefined,
         }))}
+        storageKey={fallbackId ? `component:${fallbackId}` : undefined}
         submitLabel={component.props.submit_label ?? undefined}
         title={component.props.title}
       />
@@ -425,6 +572,17 @@ export function TrustedComponentRenderer({
   ) {
     const multiline =
       component.component_type === "short_answer_table" || component.props.multiline;
+    const handleTextChange = (next: string) => {
+      setTextValue(next);
+      const payload = { value: next };
+      lastPersistedKeyRef.current = JSON.stringify(payload);
+      if (textStorageKey) {
+        writeQuestionChoiceState(textStorageKey, payload);
+      }
+      if (fallbackId) {
+        persistence?.persistPartUIState(fallbackId, payload);
+      }
+    };
     return (
       <section className="message-component" aria-label={component.props.title}>
         <div className="message-component__heading">
@@ -438,14 +596,14 @@ export function TrustedComponentRenderer({
         {multiline ? (
           <Textarea
             aria-label={component.props.title}
-            onChange={(event) => setTextValue(event.currentTarget.value)}
+            onChange={(event) => handleTextChange(event.currentTarget.value)}
             placeholder={component.props.placeholder ?? undefined}
             value={textValue}
           />
         ) : (
           <Input
             aria-label={component.props.title}
-            onChange={(event) => setTextValue(event.currentTarget.value)}
+            onChange={(event) => handleTextChange(event.currentTarget.value)}
             placeholder={component.props.placeholder ?? undefined}
             value={textValue}
           />
@@ -664,6 +822,8 @@ export function TrustedComponentRenderer({
       text: string,
       labels: string[] = [],
     ) => {
+      batchDirtyRef.current = true;
+      setBatchSubmitted(false);
       setBatchAnswers((current) => ({
         ...current,
         [questionKey]: {
@@ -697,7 +857,10 @@ export function TrustedComponentRenderer({
       key: string,
       answer: { labels: string[]; values: string[]; text?: string },
     ) {
+      batchDirtyRef.current = true;
+      setBatchSubmitted(false);
       setBatchAnswers((current) => ({ ...current, [key]: answer }));
+      setBatchDrafts((current) => ({ ...current, [key]: answer.values }));
       if (!isLast) setActiveQuestionIndex(activeIndex + 1);
     }
 
@@ -743,10 +906,19 @@ export function TrustedComponentRenderer({
               allowCustom={question.allow_custom ?? true}
               allowSkip={question.allow_skip ?? true}
               description={undefined}
+              disabled={!interactive}
               key={question.key}
               mode={
                 question.input_type === "multiple_choice" ? "multiple" : "single"
               }
+              onChange={(submission) => {
+                batchDirtyRef.current = true;
+                setBatchSubmitted(false);
+                setBatchDrafts((current) => ({
+                  ...current,
+                  [question.key]: submission.values,
+                }));
+              }}
               onSubmit={(submission) =>
                 recordAndAdvance(question.key, {
                   labels: submission.labels,
@@ -766,7 +938,7 @@ export function TrustedComponentRenderer({
                   : "确认本题"
               }
               title={question.prompt}
-              value={currentAnswer?.values ?? undefined}
+              value={currentAnswer?.values ?? batchDrafts[question.key] ?? undefined}
             />
           ) : (
             <div className="goal-quiz-card__open">
@@ -859,7 +1031,10 @@ export function TrustedComponentRenderer({
           <Button
             aria-label="上一个澄清问题"
             disabled={activeIndex === 0 || !interactive}
-            onClick={() => setActiveQuestionIndex(activeIndex - 1)}
+            onClick={() => {
+              batchDirtyRef.current = true;
+              setActiveQuestionIndex(activeIndex - 1);
+            }}
             size="icon-sm"
             variant="ghost"
           >
@@ -871,7 +1046,10 @@ export function TrustedComponentRenderer({
           <Button
             aria-label="下一个澄清问题"
             disabled={isLast || !interactive}
-            onClick={() => setActiveQuestionIndex(activeIndex + 1)}
+            onClick={() => {
+              batchDirtyRef.current = true;
+              setActiveQuestionIndex(activeIndex + 1);
+            }}
             size="icon-sm"
             variant="ghost"
           >
@@ -879,7 +1057,9 @@ export function TrustedComponentRenderer({
           </Button>
           <Button
             disabled={!canSubmit}
-            onClick={() =>
+            onClick={() => {
+              batchDirtyRef.current = true;
+              setBatchSubmitted(true);
               emit("submit", {
                 answers: batch.questions.map((item) => {
                   const answer = batchAnswers[item.key];
@@ -894,12 +1074,16 @@ export function TrustedComponentRenderer({
                     skipped: !value && !label,
                   };
                 }),
-              })
-            }
+              });
+            }}
             size="sm"
           >
-            <Send className="size-3.5" />
-            {batch.submit_label ?? "一次提交全部答案"}
+            {batchSubmitted ? (
+              <CheckCircle2 className="size-3.5" />
+            ) : (
+              <Send className="size-3.5" />
+            )}
+            {batchSubmitted ? "已提交（可重新提交）" : batch.submit_label ?? "一次提交全部答案"}
           </Button>
         </div>
       </section>

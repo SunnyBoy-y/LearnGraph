@@ -17,6 +17,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { AuthContext, type AuthContextValue } from '@/features/auth/auth-context-value'
 import { registerAuthInvalidationHandler } from '@/lib/auth-query-cache'
+import { PartUIStateProvider, patchMessagePartsUIState } from '@/lib/part-ui-state'
 import type { MessagePart } from '@/types/sessions'
 import { dispatchRendererAction, type GraphReviewResult } from './actions'
 import { installRendererDrawer } from './drawer'
@@ -28,6 +29,7 @@ import 'katex/dist/katex.min.css'
 import 'streamdown/styles.css'
 import '@/index.css'
 import '@/styles/motion-feedback.css'
+import '@/styles/question-choices.css'
 import './renderer.css'
 
 const previewParts: MessagePart[] = [
@@ -240,11 +242,24 @@ function NativeRenderer() {
             onSelect={content => send({ content, graph_action: 'none', generation_mode: 'text' })}
             onConfigureProvider={() => navigate(`/w/${encodeURIComponent(current.workspaceId)}/settings/providers`)}
           /></RendererBoundary></section> : <section className="chat-canvas-page"><div className="is-assistant"><div data-message-content><div className="message-answer-segment">
+          <PartUIStateProvider
+            enabled={native && Boolean(current.sessionId) && current.sessionId !== 'preview-session'}
+            onLocalPartUIStateChange={(partId, uiState) => {
+              publish({
+                ...payload,
+                parts: patchMessagePartsUIState(payload.parts, partId, uiState),
+                siblingParts: patchMessagePartsUIState(payload.siblingParts, partId, uiState),
+              })
+            }}
+            sessionId={current.sessionId}
+            workspaceId={current.workspaceId}
+          >
           <RendererBoundary>{current.thinkingChain ? <NativeProcessChain parts={current.parts} siblingParts={current.siblingParts}
             providerTrace={current.providerTrace} state={current.thinkingChain}
             renderPart={part => <ChatStreamPartRenderer key={part.id} part={part} siblingParts={current.siblingParts} interactive={!current.streaming} onAction={onAction} streaming={current.streaming && (part.status === 'streaming' || part.status === 'pending')} />} />
             : <AnswerParts parts={current.parts} siblingParts={current.siblingParts} interactive={!current.streaming} onAction={onAction}
               renderPart={part => <ChatStreamPartRenderer key={part.id} part={part} siblingParts={current.siblingParts} interactive={!current.streaming} onAction={onAction} streaming={current.streaming && (part.status === 'streaming' || part.status === 'pending')} />} />}</RendererBoundary>
+          </PartUIStateProvider>
         </div></div>
           {current.showStreamIndicator && <StreamStatsBadge messageId={current.messageId} status={current.streaming ? 'streaming' : 'completed'} providerTrace={current.providerTrace ?? {}} />}
         </div></section>}

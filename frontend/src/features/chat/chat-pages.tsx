@@ -221,6 +221,10 @@ import {
   chime as nativeChime,
 } from "@/lib/native-bridge";
 import { AnswerParts } from "@/components/chat/answer-parts";
+import {
+  PartUIStateProvider,
+  patchMessagesUIState,
+} from "@/lib/part-ui-state";
 import type { TrustedComponentAction } from "@/components/chat/trusted-component-renderer";
 import {
   readVoiceCaptionParts,
@@ -2016,7 +2020,15 @@ function AssistantMessageInner({
     }
     return rendered;
   };
-  const renderAnswerParts = (parts: MessagePart[]) => <AnswerParts parts={parts} siblingParts={orderedParts} onAction={onComponentAction} renderPart={renderPart} />;
+  const renderAnswerParts = (parts: MessagePart[]) => (
+    <AnswerParts
+      interactive={componentsInteractive}
+      onAction={onComponentAction}
+      parts={parts}
+      renderPart={renderPart}
+      siblingParts={orderedParts}
+    />
+  );
 
   useEffect(() => {
     if (selectedVersionId || !messageContentRef.current) return;
@@ -9478,6 +9490,15 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         className={cn("min-h-0 flex-1", showNewChatWelcome && "new-chat-conversation")}
         controller={conversationScroll}
       >
+        <PartUIStateProvider
+          onLocalPartUIStateChange={(partId, uiState) =>
+            setLocalMessages((current) =>
+              patchMessagesUIState(current, partId, uiState),
+            )
+          }
+          sessionId={sessionId}
+          workspaceId={workspaceId}
+        >
         <ConversationContent
           className="chat-messages-content mx-auto w-full max-w-4xl gap-7 px-4 py-6 sm:px-7 sm:py-7"
           onMouseUp={() => {
@@ -9822,6 +9843,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           )}
         </ConversationContent>
         <ConversationScrollButton portalTarget={composerDockElement} />
+        </PartUIStateProvider>
       </Conversation>
 
       {selectionMenu ? (

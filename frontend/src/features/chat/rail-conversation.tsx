@@ -62,7 +62,9 @@ function RailMessageContent({
       if (group.kind === "question_set") {
         return (
           <QuestionSetPager
+            interactive={message.status !== "streaming"}
             key={`question-set-${group.parts.map((part) => part.id).join("-")}`}
+            storageKey={group.parts.map((part) => part.id).join(":")}
             onSubmit={
               onAction
                 ? (submission) =>
@@ -113,9 +115,9 @@ function RailMessageContent({
 
   return (
     <div className="right-rail-rich-message__content">
-      {displaySegments.map((segment, index) =>
+      {displaySegments.map(segment =>
         segment.kind === "chain" ? (
-          <div className="right-rail-rich-message__chain" key={`chain-${message.id}-${index}`}>
+          <div className="right-rail-rich-message__chain" key={`chain-${message.id}`}>
             <ThinkingChain
               chainParts={segment.parts}
               completedDurationSec={thinkingDurationSeconds(message.provider_trace)}
@@ -144,7 +146,7 @@ function RailMessageContent({
             </ThinkingChain>
           </div>
         ) : (
-          <div className="message-answer-segment" key={`answer-${message.id}-${index}`}>
+          <div className="message-answer-segment" key={`answer-${message.id}`}>
             {renderAnswerParts(segment.parts)}
           </div>
         ),

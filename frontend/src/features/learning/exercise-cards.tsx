@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleHelp, ListChecks, ToggleLeft } from "lucide-react";
+import { CheckCircle2, CircleHelp, ListChecks, ToggleLeft, XCircle } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -73,7 +73,10 @@ export function ExerciseResponseInput({
           const checked = selected.includes(option);
           return (
             <Label
-              className="flex items-center gap-3 rounded-xl border p-3 text-sm"
+              className={cn(
+                "flex cursor-pointer items-center gap-3 rounded-xl border p-3 text-sm transition-colors hover:bg-muted/40",
+                checked && "border-foreground/30 bg-muted/50",
+              )}
               htmlFor={`${idPrefix}-mc-${index}`}
               key={option}
             >
@@ -107,22 +110,28 @@ export function ExerciseResponseInput({
         onValueChange={onAnswerChange}
         value={typeof answer === "string" ? answer : ""}
       >
-        {choiceOptions.map((option, index) => (
-          <div
-            className="flex items-center gap-3 rounded-xl border p-3 text-sm focus-within:border-primary"
-            key={option}
-          >
-            <RadioGroupItem id={`${idPrefix}-sc-${index}`} value={option} />
-            <Label
-              className="flex-1 cursor-pointer font-normal"
-              htmlFor={`${idPrefix}-sc-${index}`}
+        {choiceOptions.map((option, index) => {
+          const checked = typeof answer === "string" && answer === option;
+          return (
+            <div
+              className={cn(
+                "flex items-center gap-3 rounded-xl border p-3 text-sm transition-colors hover:bg-muted/40 focus-within:border-primary",
+                checked && "border-foreground/30 bg-muted/50",
+              )}
+              key={option}
             >
-              {questionType === "true_false"
-                ? option
-                : `${String.fromCharCode(65 + index)}. ${option}`}
-            </Label>
-          </div>
-        ))}
+              <RadioGroupItem id={`${idPrefix}-sc-${index}`} value={option} />
+              <Label
+                className="flex-1 cursor-pointer font-normal"
+                htmlFor={`${idPrefix}-sc-${index}`}
+              >
+                {questionType === "true_false"
+                  ? option
+                  : `${String.fromCharCode(65 + index)}. ${option}`}
+              </Label>
+            </div>
+          );
+        })}
         {!choiceOptions.length ? (
           <p className="text-xs text-muted-foreground">该题缺少选项，无法作答。</p>
         ) : null}
@@ -231,7 +240,14 @@ export function ExerciseAnswerCard({
 
       {result ? (
         <div className="mt-4 rounded-xl border bg-muted/25 p-4">
-          <p className="text-sm font-semibold">批改结果</p>
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            {result.is_correct ? (
+              <CheckCircle2 aria-hidden="true" className="size-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+            ) : (
+              <XCircle aria-hidden="true" className="size-5 shrink-0 text-red-600 dark:text-red-400" />
+            )}
+            <span>{result.is_correct ? "回答正确" : "回答错误"}</span>
+          </div>
           <p className="mt-2 text-sm leading-6">{result.feedback}</p>
           {result.covered_points?.length ? (
             <p className="mt-2 text-xs leading-5 text-primary">

@@ -8,7 +8,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { StickerPart } from "./sticker-image";
 import {
-  Check,
+  CheckCircle2,
   ChevronDown,
   Download,
   ExternalLink,
@@ -19,8 +19,10 @@ import {
   Maximize2,
   Network,
   Quote,
+  RotateCcw,
   ShieldAlert,
   Sparkles,
+  XCircle,
 } from "lucide-react";
 
 import { Citation, type CitationSource } from "@/components/chat/citation";
@@ -104,6 +106,11 @@ import { decodeUrlForDisplay } from "@/lib/url-display";
 import { resolveFilePreviewKind } from "@/lib/file-preview";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { cn } from "@/lib/utils";
+import {
+  readQuestionChoiceState,
+  writeQuestionChoiceState,
+} from "@/lib/question-choice-state";
+import { usePartUIStatePersistence } from "@/lib/part-ui-state";
 import type { MessagePart } from "@/types/sessions";
 import type { FetchAuthorizationData, FetchAuthorizationDecision } from "@/types/fetch-authorization";
 import type { EgressAuthorizationCardData, EgressAuthorizationDecision } from "@/types/egress";
@@ -522,7 +529,7 @@ function GraphContextPart({ data }: { data: PartData }) {
   );
 }
 
-type QuizOption = { id: string; label: string };
+type QuizOption = { id: string; label: string; isCorrect?: boolean };
 
 function quizOptions(value: unknown): QuizOption[] {
   if (!Array.isArray(value)) return [];
@@ -535,9 +542,15 @@ function quizOptions(value: unknown): QuizOption[] {
       {
         id: typeof record.id === "string" ? record.id : String(index),
         label: record.label,
+        isCorrect: record.is_correct === true,
       },
     ];
   });
+}
+
+function formatQuizOptionLabel(label: string, index: number): string {
+  if (/^[A-Z][.、)）]\s*/.test(label.trim())) return label;
+  return `${String.fromCharCode(65 + index)}. ${label}`;
 }
 
 function QuizPart({
@@ -549,14 +562,106 @@ function QuizPart({
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
   partId: string;
 }) {
+  const persistence = usePartUIStatePersistence();
   const options = useMemo(() => quizOptions(data?.options), [data?.options]);
-  const [answer, setAnswer] = useState("");
-  const [submitted, setSubmitted] = useState(false);
+  const storageKey = partId ? `quiz:${partId}` : "";
+  const backendUiState = useMemo(() => {
+    const raw = data?.ui_state;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const record = raw as Record<string, unknown>;
+    const savedAnswer =
+      typeof record.answer === "string" &&
+      options.some((option) => option.id === record.answer)
+        ? record.answer
+        : "";
+    return {
+      answer: savedAnswer,
+      submitted: Boolean(record.submitted && savedAnswer),
+    };
+  }, [data?.ui_state, options]);
+  const backendStateKey = useMemo(
+    () => (backendUiState ? JSON.stringify(backendUiState) : ""),
+    [backendUiState],
+  );
+  const initial = useMemo(() => {
+    if (backendUiState) return backendUiState;
+    const saved = storageKey
+      ? readQuestionChoiceState<{ answer?: string; submitted?: boolean }>(storageKey)
+      : null;
+    const savedAnswer =
+      typeof saved?.answer === "string" &&
+      options.some((option) => option.id === saved.answer)
+        ? saved.answer
+        : "";
+    return {
+      answer: savedAnswer,
+      submitted: Boolean(saved?.submitted && savedAnswer),
+    };
+    // Hydrate on mount / storage key change only; external backend updates sync below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [options, storageKey]);
+
+  const [answer, setAnswer] = useState(initial.answer);
+  const [submitted, setSubmitted] = useState(initial.submitted);
+  const lastPersistedKeyRef = useRef("");
+  const lastBackendKeyRef = useRef(backendStateKey);
+  useEffect(() => {
+    if (backendStateKey === lastBackendKeyRef.current) return;
+    lastBackendKeyRef.current = backendStateKey;
+    if (!backendUiState) return;
+    const canonical = JSON.stringify(backendUiState);
+    if (canonical === lastPersistedKeyRef.current) return;
+    lastPersistedKeyRef.current = canonical;
+    setAnswer(backendUiState.answer);
+    setSubmitted(backendUiState.submitted);
+  }, [backendStateKey, backendUiState]);
   const prompt = typeof data?.prompt === "string" ? data.prompt.trim() : "";
+
+  const correctIds = useMemo(() => {
+    const fromProp = Array.isArray(data?.correct_option_ids)
+      ? data.correct_option_ids.filter((item): item is string => typeof item === "string")
+      : [];
+    if (fromProp.length) return fromProp;
+    return options.filter((option) => option.isCorrect).map((option) => option.id);
+  }, [data?.correct_option_ids, options]);
+
+  const explanation =
+    typeof data?.explanation === "string" && data.explanation.trim()
+      ? data.explanation.trim()
+      : "";
 
   if (!prompt || !options.length) {
     return <EmptyPart>习题数据不完整，已停止渲染交互项。</EmptyPart>;
   }
+
+  const hasAnswerKey = correctIds.length > 0;
+  const isCorrect =
+    submitted && hasAnswerKey ? correctIds.includes(answer) : null;
+  const correctLabels = correctIds
+    .map((id) => {
+      const idx = options.findIndex((option) => option.id === id);
+      return idx >= 0 ? formatQuizOptionLabel(options[idx].label, idx) : id;
+    })
+    .filter(Boolean);
+  const selectedOption = options.find((option) => option.id === answer);
+
+  const persistQuizState = (
+    nextState: { answer: string; submitted: boolean },
+    options?: { immediate?: boolean },
+  ) => {
+    lastPersistedKeyRef.current = JSON.stringify(nextState);
+    if (storageKey) {
+      writeQuestionChoiceState(storageKey, nextState);
+    }
+    if (partId) {
+      persistence?.persistPartUIState(partId, nextState, options);
+    }
+  };
+
+  const handleSelect = (nextAnswer: string) => {
+    setAnswer(nextAnswer);
+    persistQuizState({ answer: nextAnswer, submitted: false });
+  };
 
   return (
     <section className="message-quiz" aria-label="即时验收题">
@@ -568,44 +673,135 @@ function QuizPart({
       <RadioGroup
         className="message-quiz__options"
         disabled={submitted}
-        onValueChange={setAnswer}
+        onValueChange={handleSelect}
         value={answer}
       >
-        {options.map((option, index) => (
-          <Label
-            className={cn("message-quiz__option", answer === option.id && "is-selected")}
-            htmlFor={`quiz-${partId}-${option.id}`}
-            key={option.id}
-          >
-            <RadioGroupItem
-              id={`quiz-${partId}-${option.id}`}
-              value={option.id}
-            />
-            <span>{String.fromCharCode(65 + index)}. {option.label}</span>
-            {submitted && answer === option.id ? <Check className="size-3.5" /> : null}
-          </Label>
-        ))}
+        {options.map((option, index) => {
+          const isSelected = answer === option.id;
+          const optionCorrect =
+            submitted && hasAnswerKey && correctIds.includes(option.id);
+          const optionWrong =
+            submitted && hasAnswerKey && isSelected && !correctIds.includes(option.id);
+          return (
+            <Label
+              className={cn(
+                "message-quiz__option",
+                isSelected && "is-selected",
+                optionCorrect && "is-correct",
+                optionWrong && "is-wrong",
+              )}
+              htmlFor={`quiz-${partId}-${option.id}`}
+              key={option.id}
+            >
+              <RadioGroupItem
+                disabled={submitted}
+                id={`quiz-${partId}-${option.id}`}
+                value={option.id}
+              />
+              <span>{formatQuizOptionLabel(option.label, index)}</span>
+              {optionCorrect ? (
+                <CheckCircle2
+                  aria-hidden="true"
+                  className="option-group__status-icon is-correct size-4"
+                />
+              ) : optionWrong ? (
+                <XCircle
+                  aria-hidden="true"
+                  className="option-group__status-icon is-wrong size-4"
+                />
+              ) : null}
+            </Label>
+          );
+        })}
       </RadioGroup>
-      <div className="message-quiz__actions">
-        <Button
-          disabled={!answer || submitted || !onAction}
-          onClick={() => {
-            const selected = options.find((option) => option.id === answer);
-            if (!selected) return;
-            setSubmitted(true);
-            void onAction?.({
-              componentId: partId,
-              componentType: "quiz",
-              event: "submit",
-              payload: { answer_id: answer, answer: selected.label },
-            });
-          }}
-          size="sm"
-        >
-          提交答案
-        </Button>
-        {submitted ? <span>答案已提交到当前会话。</span> : null}
-      </div>
+
+      {submitted ? (
+        <>
+          <div
+            className={cn(
+              "question-set-pager__verdict-banner",
+              isCorrect === true && "is-correct",
+              isCorrect === false && "is-wrong",
+              isCorrect == null && "is-submitted",
+            )}
+            role="status"
+          >
+            <div className="question-set-pager__verdict-row">
+              {isCorrect === true ? (
+                <>
+                  <CheckCircle2
+                    aria-hidden="true"
+                    className="question-set-pager__verdict-icon is-correct size-5"
+                  />
+                  <strong>回答正确</strong>
+                </>
+              ) : isCorrect === false ? (
+                <>
+                  <XCircle
+                    aria-hidden="true"
+                    className="question-set-pager__verdict-icon is-wrong size-5"
+                  />
+                  <strong>
+                    回答错误
+                    {correctLabels.length
+                      ? `，正确答案是 ${correctLabels.join("、")}`
+                      : ""}
+                  </strong>
+                </>
+              ) : (
+                <>
+                  <CheckCircle2
+                    aria-hidden="true"
+                    className="question-set-pager__verdict-icon is-submitted size-5"
+                  />
+                  <strong>
+                    已提交选择：{selectedOption?.label ?? answer}
+                  </strong>
+                </>
+              )}
+            </div>
+            {explanation ? (
+              <p className="question-set-pager__explanation">{explanation}</p>
+            ) : null}
+          </div>
+          <div className="message-quiz__actions message-quiz__actions--submitted">
+            <Button
+              onClick={() => {
+                setSubmitted(false);
+                persistQuizState({ answer, submitted: false }, { immediate: true });
+              }}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              <RotateCcw className="size-3.5" />
+              重新作答
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className="message-quiz__actions">
+          <Button
+            className="message-quiz__submit-pill"
+            disabled={!answer || !onAction}
+            onClick={() => {
+              if (!selectedOption) return;
+              setSubmitted(true);
+              persistQuizState({ answer, submitted: true }, { immediate: true });
+              void onAction?.({
+                componentId: partId,
+                componentType: "quiz",
+                event: "submit",
+                payload: { answer_id: answer, answer: selectedOption.label },
+              });
+            }}
+            size="sm"
+            type="button"
+          >
+            提交答案
+          </Button>
+        </div>
+      )}
     </section>
   );
 }

@@ -4,6 +4,7 @@ import type { ApiErrorEnvelope, ValidationIssue } from '@/types/common'
 import { authStore } from './auth-store'
 import { clearAuthenticatedClientState } from '@/lib/auth-query-cache'
 import { clearSelectionExplanations } from '@/features/chat/selection-explanation'
+import { clearQuestionChoiceState } from '@/lib/question-choice-state'
 import { parseSseResponse } from './sse'
 import type { SseEvent, SseParseOptions } from './sse'
 
@@ -225,6 +226,7 @@ export class ApiClient {
           // R-017: drop the failed account's private selection history (partitioned
           // by user+workspace) while the auth store still resolves the partition.
           clearSelectionExplanations()
+          clearQuestionChoiceState()
           await clearAuthenticatedClientState()
           authStore.clear()
           if (

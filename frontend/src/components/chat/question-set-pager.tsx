@@ -1,23 +1,30 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Check,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   CircleHelp,
+  RotateCcw,
   XCircle,
 } from "lucide-react";
 
 import { isSandboxImageArtifactPart } from "@/components/chat/sandbox-image-artifact";
 import { isSideLayoutArtifactPart } from "@/features/chat/chat-message-parts";
+import { reconcileArtifacts } from "@/features/chat/response-composer";
 import {
   OptionGroup,
+  type OptionChoiceVerdict,
   type OptionGroupChoice,
   type OptionGroupSubmission,
 } from "@/components/chat/option-group";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  readQuestionChoiceState,
+  writeQuestionChoiceState,
+} from "@/lib/question-choice-state";
+import { usePartUIStatePersistence } from "@/lib/part-ui-state";
 import { cn } from "@/lib/utils";
 import type { MessagePart } from "@/types/sessions";
 
@@ -30,6 +37,7 @@ export type QuestionAnswerKey = {
 };
 
 export type QuestionItem = {
+  partId?: string;
   componentId: string;
   componentType: string;
   title: string;
@@ -42,6 +50,7 @@ export type QuestionItem = {
   placeholder?: string;
   multiline: boolean;
   answerKey: QuestionAnswerKey;
+  uiState?: Record<string, unknown>;
 };
 
 export type QuestionResult = {
@@ -103,6 +112,13 @@ function readProps(data: Record<string, unknown> | undefined) {
   return data;
 }
 
+function readUiStateObject(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
+}
+
 export function questionItemFromPart(part: MessagePart): QuestionItem | null {
   if (part.type === "quiz") {
     const data = part.data ?? {};
@@ -139,6 +155,7 @@ export function questionItemFromPart(part: MessagePart): QuestionItem | null {
     });
     if (!options.length) return null;
     return {
+      partId: part.id,
       componentId: part.id,
       componentType: "quiz",
       title: prompt,
@@ -150,6 +167,7 @@ export function questionItemFromPart(part: MessagePart): QuestionItem | null {
       submitLabel: "提交答案",
       multiline: false,
       answerKey: extractAnswerKey(data, options),
+      uiState: readUiStateObject(data.ui_state),
     };
   }
 
@@ -176,6 +194,7 @@ export function questionItemFromPart(part: MessagePart): QuestionItem | null {
     componentType === "short_answer_table"
   ) {
     return {
+      partId: part.id,
       componentId,
       componentType,
       title,
@@ -195,6 +214,7 @@ export function questionItemFromPart(part: MessagePart): QuestionItem | null {
       multiline:
         componentType === "short_answer_table" || props.multiline === true,
       answerKey: extractAnswerKey(props, []),
+      uiState: readUiStateObject(data.ui_state),
     };
   }
 
@@ -225,6 +245,7 @@ export function questionItemFromPart(part: MessagePart): QuestionItem | null {
   });
 
   return {
+    partId: part.id,
     componentId,
     componentType,
     title,
@@ -237,6 +258,7 @@ export function questionItemFromPart(part: MessagePart): QuestionItem | null {
       typeof props.submit_label === "string" ? props.submit_label : undefined,
     multiline: false,
     answerKey: extractAnswerKey(props, options),
+    uiState: readUiStateObject(data.ui_state),
   };
 }
 
@@ -318,7 +340,7 @@ function gradeQuestion(
   if (isCorrect === true) {
     feedback = key.feedbackCorrect ?? "回答正确";
   } else if (isCorrect === false) {
-    feedback = key.feedbackIncorrect ?? "需要复习";
+    feedback = key.feedbackIncorrect ?? "回答错误";
   } else {
     feedback = "已提交，等待模型批改";
   }
@@ -334,6 +356,19 @@ function gradeQuestion(
     feedback,
     explanation: key.explanation,
   };
+}
+
+function correctAnswerDisplay(question: QuestionItem): string {
+  if (question.mode === "text") {
+    return question.answerKey.correctAnswers.join("、");
+  }
+  const optionMap = new Map(
+    question.options.map((option) => [option.id, option.label]),
+  );
+  return question.answerKey.correctOptionIds
+    .map((id) => optionMap.get(id) ?? id)
+    .filter(Boolean)
+    .join("、");
 }
 
 function formatSubmissionText(results: QuestionResult[]): string {
@@ -375,6 +410,75 @@ type DraftAnswer = {
   answered: boolean;
 };
 
+type PersistedQuestionSetState = {
+  storageKey?: string;
+  page: number;
+  drafts: DraftAnswer[];
+  results: QuestionResult[] | null;
+  resultPage: number;
+};
+
+function parsePersistedQuestionSetState(
+  raw: unknown,
+  expectedStorageKey: string,
+  questionCount: number,
+): {
+  hasSaved: boolean;
+  page: number;
+  drafts: DraftAnswer[];
+  results: QuestionResult[] | null;
+  resultPage: number;
+} {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      hasSaved: false,
+      page: 0,
+      drafts: normalizeDrafts(undefined, questionCount),
+      results: null,
+      resultPage: 0,
+    };
+  }
+  const saved = raw as Partial<PersistedQuestionSetState>;
+  if (
+    typeof saved.storageKey === "string" &&
+    expectedStorageKey &&
+    saved.storageKey !== expectedStorageKey
+  ) {
+    return {
+      hasSaved: false,
+      page: 0,
+      drafts: normalizeDrafts(undefined, questionCount),
+      results: null,
+      resultPage: 0,
+    };
+  }
+  const clampedPage = Math.max(
+    0,
+    Math.min(
+      typeof saved.page === "number" ? saved.page : 0,
+      Math.max(0, questionCount - 1),
+    ),
+  );
+  const validResults =
+    Array.isArray(saved.results) && saved.results.length === questionCount
+      ? saved.results
+      : null;
+  const clampedResultPage = Math.max(
+    0,
+    Math.min(
+      typeof saved.resultPage === "number" ? saved.resultPage : 0,
+      Math.max(0, questionCount - 1),
+    ),
+  );
+  return {
+    hasSaved: true,
+    page: clampedPage,
+    drafts: normalizeDrafts(saved.drafts, questionCount),
+    results: validResults,
+    resultPage: clampedResultPage,
+  };
+}
+
 function emptyDraft(): DraftAnswer {
   return {
     values: [],
@@ -386,19 +490,121 @@ function emptyDraft(): DraftAnswer {
   };
 }
 
+function normalizeDrafts(
+  saved: DraftAnswer[] | undefined,
+  count: number,
+): DraftAnswer[] {
+  return Array.from({ length: count }, (_, index) => {
+    const item = saved?.[index];
+    if (!item || typeof item !== "object") return emptyDraft();
+    return {
+      values: Array.isArray(item.values) ? item.values : [],
+      labels: Array.isArray(item.labels) ? item.labels : [],
+      customValue: typeof item.customValue === "string" ? item.customValue : "",
+      textValue: typeof item.textValue === "string" ? item.textValue : "",
+      skipped: Boolean(item.skipped),
+      answered: Boolean(item.answered),
+    };
+  });
+}
+
 export function QuestionSetPager({
-  questions,
+  interactive = true,
   onSubmit,
+  questions,
+  storageKey,
 }: {
-  questions: QuestionItem[];
+  interactive?: boolean;
   onSubmit?: (submission: QuestionSetSubmission) => void | Promise<void>;
+  questions: QuestionItem[];
+  storageKey?: string;
 }) {
-  const [page, setPage] = useState(0);
-  const [drafts, setDrafts] = useState<DraftAnswer[]>(() =>
-    questions.map(() => emptyDraft()),
+  const persistence = usePartUIStatePersistence();
+  const anchorPartId = questions[0]?.partId;
+  const effectiveStorageKey = useMemo(() => {
+    const raw =
+      storageKey?.trim() ||
+      questions.map((item) => item.partId ?? item.componentId).join(":");
+    return raw ? `pager:${raw}` : "";
+  }, [questions, storageKey]);
+
+  const backendUiState = questions[0]?.uiState;
+  const backendStateKey = useMemo(
+    () => (backendUiState ? JSON.stringify(backendUiState) : ""),
+    [backendUiState],
   );
-  const [results, setResults] = useState<QuestionResult[] | null>(null);
-  const [resultPage, setResultPage] = useState(0);
+
+  const initialPersisted = useMemo(() => {
+    const backendParsed = parsePersistedQuestionSetState(
+      backendUiState,
+      effectiveStorageKey,
+      questions.length,
+    );
+    if (backendParsed.hasSaved) {
+      return backendParsed;
+    }
+    const localSaved = effectiveStorageKey
+      ? readQuestionChoiceState<PersistedQuestionSetState>(effectiveStorageKey)
+      : null;
+    return parsePersistedQuestionSetState(
+      localSaved,
+      effectiveStorageKey,
+      questions.length,
+    );
+    // Hydrate on mount / storage key change only; in-progress edits live in state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectiveStorageKey]);
+
+  const [page, setPage] = useState(initialPersisted.page);
+  const [drafts, setDrafts] = useState<DraftAnswer[]>(initialPersisted.drafts);
+  const [results, setResults] = useState<QuestionResult[] | null>(
+    initialPersisted.results,
+  );
+  const [resultPage, setResultPage] = useState(initialPersisted.resultPage);
+  const shouldPersistRef = useRef(initialPersisted.hasSaved);
+  const lastPersistedJsonRef = useRef<string>("");
+  const lastBackendKeyRef = useRef(backendStateKey);
+
+  // Sync persisted state when storageKey changes without remount.
+  const prevKeyRef = useRef(effectiveStorageKey);
+  useEffect(() => {
+    if (prevKeyRef.current === effectiveStorageKey) return;
+    prevKeyRef.current = effectiveStorageKey;
+    lastBackendKeyRef.current = backendStateKey;
+    lastPersistedJsonRef.current = "";
+    shouldPersistRef.current = initialPersisted.hasSaved;
+    setPage(initialPersisted.page);
+    setDrafts(initialPersisted.drafts);
+    setResults(initialPersisted.results);
+    setResultPage(initialPersisted.resultPage);
+  }, [backendStateKey, effectiveStorageKey, initialPersisted]);
+
+  // Sync if backend ui_state arrives/updates externally (e.g. query refetch).
+  useEffect(() => {
+    if (backendStateKey === lastBackendKeyRef.current) return;
+    lastBackendKeyRef.current = backendStateKey;
+    if (!backendUiState) return;
+    const parsed = parsePersistedQuestionSetState(
+      backendUiState,
+      effectiveStorageKey,
+      questions.length,
+    );
+    if (!parsed.hasSaved) return;
+    const canonical = JSON.stringify({
+      ...(effectiveStorageKey ? { storageKey: effectiveStorageKey } : {}),
+      page: parsed.page,
+      drafts: parsed.drafts,
+      results: parsed.results,
+      resultPage: parsed.resultPage,
+    });
+    if (canonical === lastPersistedJsonRef.current) return;
+    lastPersistedJsonRef.current = canonical;
+    shouldPersistRef.current = true;
+    setPage(parsed.page);
+    setDrafts(parsed.drafts);
+    setResults(parsed.results);
+    setResultPage(parsed.resultPage);
+  }, [backendStateKey, backendUiState, effectiveStorageKey, questions.length]);
 
   // Grow draft slots if the model streams more questions into the same set.
   useEffect(() => {
@@ -415,6 +621,63 @@ export function QuestionSetPager({
     setPage((value) => Math.min(value, Math.max(0, questions.length - 1)));
   }, [questions.length]);
 
+  function persistState(
+    nextState: PersistedQuestionSetState,
+    options?: { immediate?: boolean },
+  ) {
+    const payload: PersistedQuestionSetState = {
+      ...(effectiveStorageKey ? { storageKey: effectiveStorageKey } : {}),
+      page: nextState.page,
+      drafts: nextState.drafts,
+      results: nextState.results,
+      resultPage: nextState.resultPage,
+    };
+    const serialized = JSON.stringify(payload);
+    lastPersistedJsonRef.current = serialized;
+    if (effectiveStorageKey) {
+      writeQuestionChoiceState<PersistedQuestionSetState>(
+        effectiveStorageKey,
+        payload,
+      );
+    }
+    if (anchorPartId) {
+      persistence?.persistPartUIState(anchorPartId, payload, options);
+    }
+  }
+
+  useEffect(() => {
+    if (!shouldPersistRef.current) return;
+    const payload: PersistedQuestionSetState = {
+      ...(effectiveStorageKey ? { storageKey: effectiveStorageKey } : {}),
+      page,
+      drafts,
+      results,
+      resultPage,
+    };
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastPersistedJsonRef.current) return;
+    lastPersistedJsonRef.current = serialized;
+    if (effectiveStorageKey) {
+      writeQuestionChoiceState<PersistedQuestionSetState>(
+        effectiveStorageKey,
+        payload,
+      );
+    }
+    if (anchorPartId) {
+      persistence?.persistPartUIState(anchorPartId, payload, {
+        immediate: false,
+      });
+    }
+  }, [
+    anchorPartId,
+    drafts,
+    effectiveStorageKey,
+    page,
+    persistence,
+    resultPage,
+    results,
+  ]);
+
   const total = questions.length;
   const current = questions[Math.min(page, total - 1)];
   const draft = drafts[Math.min(page, total - 1)] ?? emptyDraft();
@@ -427,17 +690,16 @@ export function QuestionSetPager({
   const canPrimary = currentPageReady();
   // Last page: confirm only when every question is answered/skipped (current counts live).
   const primaryDisabled =
-    page < total - 1
+    !interactive ||
+    (page < total - 1
       ? !canPrimary
       : !drafts.every((item, index) =>
-          index === page
-            ? canPrimary
-            : item.answered || item.skipped,
-        );
+          index === page ? canPrimary : item.answered || item.skipped,
+        ));
 
   function primaryLabel() {
     if (page < total - 1) return "下一题";
-    return "确认并查看批改";
+    return current?.submitLabel ?? "提交答案";
   }
 
   const resultSummary = useMemo(() => {
@@ -448,6 +710,7 @@ export function QuestionSetPager({
   }, [results]);
 
   function updateDraft(index: number, patch: Partial<DraftAnswer>) {
+    shouldPersistRef.current = true;
     setDrafts((prev) =>
       prev.map((item, itemIndex) =>
         itemIndex === index ? { ...item, ...patch } : item,
@@ -460,10 +723,9 @@ export function QuestionSetPager({
     next: DraftAnswer,
     options?: { advance?: boolean },
   ) {
+    shouldPersistRef.current = true;
     setDrafts((prev) =>
-      prev.map((item, itemIndex) =>
-        itemIndex === index ? next : item,
-      ),
+      prev.map((item, itemIndex) => (itemIndex === index ? next : item)),
     );
     if (options?.advance && index < total - 1) {
       setPage(index + 1);
@@ -471,6 +733,7 @@ export function QuestionSetPager({
   }
 
   function confirmWithDrafts(source: DraftAnswer[]) {
+    shouldPersistRef.current = true;
     const graded = questions.map((question, index) => {
       const item = source[index] ?? emptyDraft();
       if (item.skipped || !item.answered) {
@@ -480,10 +743,18 @@ export function QuestionSetPager({
     });
     setResults(graded);
     setResultPage(0);
+    persistState(
+      {
+        page,
+        drafts: source,
+        results: graded,
+        resultPage: 0,
+      },
+      { immediate: true },
+    );
     const summaryText = formatSubmissionText(graded);
     const gradedCount = graded.filter((item) => item.isCorrect !== null).length;
-    const correctCount = graded.filter((item) => item.isCorrect === true)
-      .length;
+    const correctCount = graded.filter((item) => item.isCorrect === true).length;
     void onSubmit?.({
       results: graded,
       summaryText,
@@ -544,14 +815,16 @@ export function QuestionSetPager({
   }
 
   function handlePrimaryAction() {
-    if (!canPrimary) return;
+    if (!canPrimary || !interactive) return;
 
     if (page < total - 1) {
+      shouldPersistRef.current = true;
       setDrafts((prev) => markCurrentAnswered(prev));
       setPage(page + 1);
       return;
     }
 
+    shouldPersistRef.current = true;
     setDrafts((prev) => {
       const updated = markCurrentAnswered(prev);
       const complete = updated.every((item) => item.answered || item.skipped);
@@ -562,108 +835,229 @@ export function QuestionSetPager({
     });
   }
 
+  function handleRetry() {
+    shouldPersistRef.current = true;
+    setPage(resultPage);
+    setResults(null);
+    persistState(
+      {
+        page: resultPage,
+        drafts,
+        results: null,
+        resultPage,
+      },
+      { immediate: true },
+    );
+  }
+
   if (!current) return null;
 
   if (results) {
-    const currentResult = results[Math.min(resultPage, results.length - 1)];
+    const safeResultPage = Math.min(resultPage, Math.max(0, results.length - 1));
+    const currentResult = results[safeResultPage];
+    const currentQuestion = questions[safeResultPage] ?? current;
+    const currentDraft = drafts[safeResultPage] ?? emptyDraft();
+    const correctDisplay = correctAnswerDisplay(currentQuestion);
+
+    const optionStates: Record<string, OptionChoiceVerdict> | undefined =
+      currentResult &&
+      currentResult.isCorrect !== null &&
+      currentQuestion.mode !== "text"
+        ? (() => {
+            const states: Record<string, OptionChoiceVerdict> = {};
+            const expected = new Set(currentQuestion.answerKey.correctOptionIds);
+            for (const id of expected) {
+              states[id] = "correct";
+            }
+            for (const id of currentResult.values) {
+              if (!expected.has(id)) {
+                states[id] = "wrong";
+              }
+            }
+            return states;
+          })()
+        : undefined;
+
+    const showCustomFeedback =
+      currentResult &&
+      currentResult.feedback &&
+      !["回答正确", "回答错误", "已跳过", "已提交，等待模型批改"].includes(
+        currentResult.feedback,
+      );
+
     return (
       <section
         aria-label="练习批改结果"
         className="question-set-pager question-set-pager--result"
       >
-        <div className="question-set-pager__chrome">
-          <div className="question-set-pager__meta">
-            <strong>批改结果</strong>
-            <span>
-              {resultSummary
-                ? resultSummary.graded > 0
-                  ? `${resultSummary.correct}/${resultSummary.graded} 正确 · 共 ${resultSummary.total} 题`
-                  : `共 ${resultSummary.total} 题已提交`
-                : null}
-            </span>
+        {total > 1 ? (
+          <div className="question-set-pager__chrome">
+            <div className="question-set-pager__meta">
+              <strong>
+                第 {safeResultPage + 1} / {total} 题
+              </strong>
+              <span>
+                {resultSummary
+                  ? resultSummary.graded > 0
+                    ? `${resultSummary.correct}/${resultSummary.graded} 正确`
+                    : `共 ${resultSummary.total} 题已提交`
+                  : null}
+              </span>
+            </div>
           </div>
+        ) : null}
+
+        <div className="question-set-pager__stage">
+          {currentQuestion.mode === "text" ? (
+            <section className="option-group" aria-label={currentQuestion.title}>
+              <div className="option-group__heading">
+                <div>
+                  <p>{currentQuestion.title}</p>
+                  {currentQuestion.description ? (
+                    <span>{currentQuestion.description}</span>
+                  ) : null}
+                </div>
+                <span className="option-group__badge">简答</span>
+              </div>
+              <div className="question-set-pager__submitted-text">
+                {currentResult?.skipped
+                  ? "（已跳过）"
+                  : currentResult?.labels.join("、") ||
+                    currentDraft.textValue ||
+                    "（未作答）"}
+              </div>
+            </section>
+          ) : (
+            <OptionGroup
+              key={`result-${currentQuestion.partId ?? currentQuestion.componentId}-${safeResultPage}`}
+              allowCustom={false}
+              allowSkip={false}
+              description={currentQuestion.description}
+              disabled
+              hideActions
+              mode={currentQuestion.mode}
+              optionStates={optionStates}
+              options={currentQuestion.options}
+              title={currentQuestion.title}
+              value={
+                currentResult?.values.length
+                  ? currentResult.values
+                  : currentDraft.values
+              }
+            />
+          )}
         </div>
 
         {currentResult ? (
-          <article className="question-set-pager__result-card">
-            <div className="question-set-pager__result-heading">
-              <div>
-                <p>
-                  {total > 1 ? `第 ${resultPage + 1} 题 · ` : null}
-                  {currentResult.title}
-                </p>
-                <span>
-                  {currentResult.skipped
-                    ? "已跳过"
-                    : currentResult.labels.join("、") || "未作答"}
-                </span>
-              </div>
-              <span
-                className={cn(
-                  "question-set-pager__verdict",
-                  currentResult.isCorrect === true && "is-correct",
-                  currentResult.isCorrect === false && "is-wrong",
-                  currentResult.isCorrect == null && "is-pending",
-                )}
-              >
-                {currentResult.isCorrect === true ? (
-                  <>
-                    <CheckCircle2 className="size-3.5" />
-                    正确
-                  </>
-                ) : currentResult.isCorrect === false ? (
-                  <>
-                    <XCircle className="size-3.5" />
-                    需复习
-                  </>
-                ) : (
-                  <>
-                    <CircleHelp className="size-3.5" />
-                    {currentResult.skipped ? "已跳过" : "待批改"}
-                  </>
-                )}
-              </span>
+          <div
+            className={cn(
+              "question-set-pager__verdict-banner",
+              currentResult.isCorrect === true && "is-correct",
+              currentResult.isCorrect === false && "is-wrong",
+              currentResult.isCorrect == null &&
+                (currentResult.skipped ? "is-pending" : "is-submitted"),
+            )}
+            role="status"
+          >
+            <div className="question-set-pager__verdict-row">
+              {currentResult.isCorrect === true ? (
+                <>
+                  <CheckCircle2
+                    aria-hidden="true"
+                    className="question-set-pager__verdict-icon is-correct size-5"
+                  />
+                  <strong>回答正确</strong>
+                </>
+              ) : currentResult.isCorrect === false ? (
+                <>
+                  <XCircle
+                    aria-hidden="true"
+                    className="question-set-pager__verdict-icon is-wrong size-5"
+                  />
+                  <strong>
+                    回答错误
+                    {correctDisplay ? `，正确答案是 ${correctDisplay}` : ""}
+                  </strong>
+                </>
+              ) : currentResult.skipped ? (
+                <>
+                  <CircleHelp
+                    aria-hidden="true"
+                    className="question-set-pager__verdict-icon is-pending size-5"
+                  />
+                  <strong>已跳过该题</strong>
+                </>
+              ) : (
+                <>
+                  <CheckCircle2
+                    aria-hidden="true"
+                    className="question-set-pager__verdict-icon is-submitted size-5"
+                  />
+                  <strong>
+                    已提交选择：
+                    {currentResult.labels.join("、") || "已选择"}
+                  </strong>
+                </>
+              )}
             </div>
-            <p className="question-set-pager__feedback">
-              {currentResult.feedback}
-            </p>
+            {showCustomFeedback ? (
+              <p className="question-set-pager__feedback">
+                {currentResult.feedback}
+              </p>
+            ) : null}
             {currentResult.explanation ? (
               <p className="question-set-pager__explanation">
                 {currentResult.explanation}
               </p>
             ) : null}
-          </article>
-        ) : null}
-
-        {total > 1 ? (
-          <div className="question-set-pager__nav">
-            <Button
-              disabled={resultPage <= 0}
-              onClick={() => setResultPage((value) => Math.max(0, value - 1))}
-              size="sm"
-              type="button"
-              variant="ghost"
-            >
-              <ChevronLeft className="size-3.5" />
-              上一题
-            </Button>
-            <span>
-              {resultPage + 1} / {total}
-            </span>
-            <Button
-              disabled={resultPage >= total - 1}
-              onClick={() =>
-                setResultPage((value) => Math.min(total - 1, value + 1))
-              }
-              size="sm"
-              type="button"
-              variant="ghost"
-            >
-              下一题
-              <ChevronRight className="size-3.5" />
-            </Button>
           </div>
         ) : null}
+
+        <div className="question-set-pager__footer">
+          {total > 1 ? (
+            <div className="question-set-pager__nav">
+              <Button
+                disabled={safeResultPage <= 0}
+                onClick={() => setResultPage((value) => Math.max(0, value - 1))}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                <ChevronLeft className="size-3.5" />
+                上一题
+              </Button>
+              <span>
+                {safeResultPage + 1} / {total}
+              </span>
+              <Button
+                disabled={safeResultPage >= total - 1}
+                onClick={() =>
+                  setResultPage((value) => Math.min(total - 1, value + 1))
+                }
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                下一题
+                <ChevronRight className="size-3.5" />
+              </Button>
+            </div>
+          ) : (
+            <span />
+          )}
+          <div className="question-set-pager__actions">
+            <Button
+              disabled={!interactive}
+              onClick={handleRetry}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              <RotateCcw className="size-3.5" />
+              重新作答
+            </Button>
+          </div>
+        </div>
       </section>
     );
   }
@@ -678,12 +1072,13 @@ export function QuestionSetPager({
                 <p>{current.title}</p>
                 {current.description ? <span>{current.description}</span> : null}
               </div>
-              <span>简答</span>
+              <span className="option-group__badge">简答</span>
             </div>
             {current.multiline ? (
               <Textarea
                 aria-label={current.title}
                 className="min-h-24"
+                disabled={!interactive}
                 onChange={(event) =>
                   updateDraft(page, {
                     textValue: event.currentTarget.value,
@@ -703,6 +1098,7 @@ export function QuestionSetPager({
             ) : (
               <Input
                 aria-label={current.title}
+                disabled={!interactive}
                 onChange={(event) =>
                   updateDraft(page, {
                     textValue: event.currentTarget.value,
@@ -723,10 +1119,11 @@ export function QuestionSetPager({
           </section>
         ) : (
           <OptionGroup
-            key={current.componentId}
+            key={`${current.partId ?? current.componentId}-${page}`}
             allowCustom={current.allowCustom}
             allowSkip={false}
             description={current.description}
+            disabled={!interactive}
             hideActions
             mode={current.mode}
             onChange={handleOptionChange}
@@ -737,51 +1134,72 @@ export function QuestionSetPager({
         )}
       </div>
 
-      <div className="question-set-pager__footer">
-        <div className="question-set-pager__nav">
-          {total > 1 ? (
-            <>
-              <Button
-                disabled={page <= 0}
-                onClick={() => setPage((value) => Math.max(0, value - 1))}
-                size="sm"
-                type="button"
-                variant="ghost"
-              >
-                <ChevronLeft className="size-3.5" />
-                上一题
-              </Button>
-              <span>
-                {page + 1} / {total}
-              </span>
-              <Button
-                aria-label="下一题"
-                disabled={page >= total - 1}
-                onClick={() => setPage((value) => Math.min(total - 1, value + 1))}
-                size="icon-sm"
-                type="button"
-                variant="ghost"
-              >
-                <ChevronRight className="size-3.5" />
-              </Button>
-            </>
-          ) : (
-            <span />
+      <div
+        className={cn(
+          "question-set-pager__footer",
+          total === 1 && "question-set-pager__footer--single",
+        )}
+      >
+        {total > 1 ? (
+          <div className="question-set-pager__nav">
+            <Button
+              disabled={page <= 0}
+              onClick={() => {
+                shouldPersistRef.current = true;
+                setPage((value) => Math.max(0, value - 1));
+              }}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
+              <ChevronLeft className="size-3.5" />
+              上一题
+            </Button>
+            <span>
+              {page + 1} / {total}
+            </span>
+            <Button
+              aria-label="下一题"
+              disabled={page >= total - 1}
+              onClick={() => {
+                shouldPersistRef.current = true;
+                setPage((value) => Math.min(total - 1, value + 1));
+              }}
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            >
+              <ChevronRight className="size-3.5" />
+            </Button>
+          </div>
+        ) : null}
+        <div
+          className={cn(
+            "question-set-pager__actions",
+            total === 1 && "question-set-pager__actions--single",
           )}
-        </div>
-        <div className="question-set-pager__actions">
+        >
           {current.allowSkip ? (
-            <Button onClick={handleSkip} size="sm" type="button" variant="ghost">
+            <Button
+              disabled={!interactive}
+              onClick={handleSkip}
+              size="sm"
+              type="button"
+              variant="ghost"
+            >
               跳过
             </Button>
           ) : null}
           <Button
+            className={cn(
+              "question-set-pager__submit-pill",
+              total === 1 && !current.allowSkip && "is-full",
+            )}
             disabled={primaryDisabled}
             onClick={handlePrimaryAction}
             size="sm"
             type="button"
           >
-            {page >= total - 1 ? <Check className="size-3.5" /> : null}
             {primaryLabel()}
             {page < total - 1 ? <ChevronRight className="size-3.5" /> : null}
           </Button>
@@ -856,7 +1274,8 @@ export type AnswerGroup =
     };
 
 export function groupAnswerParts(parts: MessagePart[]): AnswerGroup[] {
-  const groups = groupQuestionParts(parts);
+  const { parts: reconciled } = reconcileArtifacts(parts);
+  const groups = groupQuestionParts(reconciled);
   const result: AnswerGroup[] = [];
   for (const group of groups) {
     if (group.kind === "part" && isSandboxImageArtifactPart(group.part)) {

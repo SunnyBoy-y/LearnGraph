@@ -274,6 +274,24 @@ export function listMessageVersions(sessionId: string, messageId: string): Promi
   return apiClient.get<MessageVersion[]>(`/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/versions`)
 }
 
+export interface PartUIStateResult {
+  part_id: string
+  session_id: string
+  message_id: string
+  ui_state: Record<string, unknown>
+}
+
+export function updateSessionPartUIState(
+  sessionId: string,
+  partId: string,
+  uiState: Record<string, unknown>,
+): Promise<PartUIStateResult> {
+  return apiClient.put<PartUIStateResult, { ui_state: Record<string, unknown> }>(
+    `/sessions/${encodeURIComponent(sessionId)}/parts/${encodeURIComponent(partId)}/ui-state`,
+    { ui_state: uiState },
+  )
+}
+
 export function getMessageSnapshot(
   sessionId: string,
   messageId: string,

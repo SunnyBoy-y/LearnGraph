@@ -11,6 +11,7 @@ import '@/index.css'
 import '@/styles/chat-answer-alignment.css'
 import '@/styles/motion-feedback.css'
 import '@/styles/mobile-hit-areas.css'
+import '@/styles/question-choices.css'
 import { registerWebShellCache, updateWebShellCache } from '@/lib/web-shell-cache'
 
 try {

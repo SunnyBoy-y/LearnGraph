@@ -548,6 +548,17 @@ class MessageVersionView(ORMModel):
     updated_at: datetime
 
 
+class PartUIStateUpdateRequest(BaseModel):
+    ui_state: dict[str, Any] = Field(default_factory=dict)
+
+
+class PartUIStateView(BaseModel):
+    part_id: str
+    session_id: str
+    message_id: str
+    ui_state: dict[str, Any]
+
+
 class SSEEventEnvelope(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     event_id: str

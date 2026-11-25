@@ -42,6 +42,7 @@ import {
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
 import { migrateThinkingPreference } from "@/lib/thinking-effort-migration";
+import { PartUIStateProvider, patchMessagesUIState } from "@/lib/part-ui-state";
 import {
   ThinkingSlider,
   supportedThinkingStops,
@@ -1113,6 +1114,15 @@ export function DocumentChatPanel({
       ) : null}
 
       <Conversation className="min-h-0 flex-1">
+        <PartUIStateProvider
+          onLocalPartUIStateChange={(partId, uiState) =>
+            setLocalMessages((current) =>
+              patchMessagesUIState(current, partId, uiState),
+            )
+          }
+          sessionId={sessionId}
+          workspaceId={workspaceId}
+        >
         <ConversationContent className="gap-5 px-3 py-4">
           {history.isPending && sessionId ? (
             <div className="grid min-h-32 place-items-center">
@@ -1152,8 +1162,10 @@ export function DocumentChatPanel({
                 if (group.kind === "question_set") {
                   return (
                     <QuestionSetPager
+                      interactive={!streaming}
                       key={`question-set-${group.parts.map((part) => part.id).join("-")}`}
                       questions={group.questions}
+                      storageKey={group.parts.map((part) => part.id).join(":")}
                     />
                   );
                 }
@@ -1185,7 +1197,7 @@ export function DocumentChatPanel({
                   {groupPartsForDisplay(parts, {
                     boundary: message.finalAnswerStarted,
                     live: message.status === "streaming",
-                  }).map((segment, index) =>
+                  }).map(segment =>
                     segment.kind === "chain" ? (
                       <ThinkingChain
                         chainParts={segment.parts}
@@ -1195,7 +1207,7 @@ export function DocumentChatPanel({
                         finalAnswerStarted={Boolean(
                           message.finalAnswerStarted,
                         )}
-                        key={`chain-${message.id}-${index}`}
+                        key={`chain-${message.id}`}
                         messageStatus={message.status}
                         startedAt={
                           typeof message.provider_trace.generation_started_at ===
@@ -1223,7 +1235,7 @@ export function DocumentChatPanel({
                     ) : (
                       <div
                         className="message-answer-segment"
-                        key={`parts-${message.id}-${index}`}
+                        key={`parts-${message.id}`}
                       >
                         {renderAnswerParts(segment.parts)}
                       </div>
@@ -1235,6 +1247,7 @@ export function DocumentChatPanel({
             );
           })}
         </ConversationContent>
+        </PartUIStateProvider>
         <ConversationScrollButton />
       </Conversation>
 
