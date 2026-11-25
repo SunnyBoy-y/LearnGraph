@@ -8,6 +8,7 @@ import { WorkspaceOverview } from './workspace-overview'
 import { TaskModelSettings } from './task-model-settings'
 import { LocalDataSettings } from './local-data-settings'
 import { SiteBackupPanel } from './site-backup-panel'
+import { IMChannelsSettings } from './im-channels-settings'
 
 const AboutPage = lazy(() => import('./about-page').then(m => ({ default: m.AboutPage })))
 const UpdatesPage = lazy(() => import('./updates-page').then(m => ({ default: m.UpdatesPage })))
@@ -44,6 +45,7 @@ export function ToolsSettingsPage() {
     <SettingsTabs items={[
       { id: 'extensions', label: '已安装工具与扩展', content: <ExtensionsPage/> },
       { id: 'search', label: '搜索与网页抓取', content: <SearchFetchPage/> },
+      { id: 'im', label: '消息渠道', content: <IMChannelsSettings/> },
     ]}/></PageFrame>
 }
 

@@ -414,6 +414,17 @@ def _execute_claimed_job(queue, job, settings, on_heartbeat):
 
                 run_chat_continue_once(job.payload)
                 queue.complete(job)
+            elif job.kind in {"im.process", "im.send"}:
+                from app.services.im_channels import deliver, process
+
+                row_id = str(job.payload["id"])
+                if job.kind == "im.send":
+                    deliver(db, row_id)
+                    queue.complete(job)
+                elif process(db, settings, row_id):
+                    queue.complete(job)
+                else:
+                    queue.rearm(job, delay_seconds=2)
             elif job.kind == "sticker.semantic":
                 from app.services.sticker_pipeline import run_sticker_semantics
 

@@ -21,6 +21,7 @@ from app.api.routers import (
     graphs,
     health,
     image_generations,
+    im,
     learning_state,
     memory,
     memory_eval,
@@ -68,6 +69,7 @@ for router in (
     # Static browser endpoints precede the session-id detail route; legacy list stays intact.
     session_browser.router,
     chat.router,
+    im.router,
     image_generations.router,
     files.router,
     document_learning.router,

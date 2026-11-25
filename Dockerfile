@@ -47,7 +47,7 @@ COPY backend/pyproject.toml backend/uv.lock ./
 # which previously left the optional voice stack (pipecat-ai) unpinned at
 # image build time.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-install-project --no-dev --extra voice --extra database-migration --frozen
+    uv sync --no-install-project --no-dev --extra voice --extra database-migration --extra feishu --frozen
 
 ARG SOURCE_CACHE_BUST=dev
 RUN echo "LearnGraph backend source cache: ${SOURCE_CACHE_BUST}"

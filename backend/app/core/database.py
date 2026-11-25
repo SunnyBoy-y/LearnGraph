@@ -872,6 +872,7 @@ def describe_pending_sqlite_migrations() -> list[str]:
     from app.domain import (  # noqa: F401
         extension_models,
         graph_cover_models,
+        im_models,
         memory_event_models,
         migration_models,
         models,
@@ -1080,6 +1081,7 @@ def _init_database_under_route_lease() -> None:
     from app.domain import (  # noqa: F401
         extension_models,
         graph_cover_models,
+        im_models,
         memory_event_models,
         migration_models,
         models,
@@ -1232,7 +1234,7 @@ CURRENT_SCHEMA_DESCRIPTION = "Generic TURN username and isolated credential kind
 
 def _compute_schema_checksum() -> str:
     """Hash of all table/schema metadata for drift detection."""
-    from app.domain import extension_models, graph_cover_models, migration_models, models, learning_package_models  # noqa: F401
+    from app.domain import extension_models, graph_cover_models, im_models, migration_models, models, learning_package_models  # noqa: F401
 
     h = hashlib.sha256()
     for table_name in sorted(Base.metadata.tables):

@@ -167,6 +167,8 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       <<: *app-environment
+      LEARNGRAPH_FEISHU_APP_ID: ${LEARNGRAPH_FEISHU_APP_ID:-}
+      LEARNGRAPH_FEISHU_APP_SECRET: ${LEARNGRAPH_FEISHU_APP_SECRET:-}
       # Bridge bearer token mounted from the real machine (written by
       # scripts/host-bridge.mjs). The backend sends it as
       # X-LearnGraph-Host-Bridge-Token on outbound bridge calls. If the file
@@ -214,6 +216,23 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  feishu-listener:
+    profiles: ["feishu"]
+    image: ${LEARNGRAPH_IMAGE:-learngraph:local}
+    entrypoint: ["tini", "--", "python", "-m", "app.services.im_feishu"]
+    environment:
+      LEARNGRAPH_FEISHU_APP_ID: ${LEARNGRAPH_FEISHU_APP_ID:-}
+      LEARNGRAPH_FEISHU_APP_SECRET: ${LEARNGRAPH_FEISHU_APP_SECRET:-}
+      LEARNGRAPH_DATA_ROOT: /data
+      LEARNGRAPH_DATABASE_URL: sqlite:////data/learngraph.db
+      LEARNGRAPH_DATABASE_MIGRATION_STATE_DIR: ${LEARNGRAPH_DATABASE_MIGRATION_STATE_DIR:-/data/database-migration}
+    volumes:
+      - "${LEARNGRAPH_DATA_DIR:-learngraph-data}:/data"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
 
   egress-proxy:
     # The only component with sandbox internet egress. Attached to the
