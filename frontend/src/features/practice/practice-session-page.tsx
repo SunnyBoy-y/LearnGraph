@@ -57,7 +57,7 @@ export function PracticeSessionPage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [answer, setAnswer] = useState<string | string[]>("");
   const [feedback, setFeedback] = useState<PracticeAnswerResult | null>(null);
-  const [hint, setHint] = useState<string | null>(null);
+  const [latestHint, setLatestHint] = useState<{ exerciseId: string; text: string } | null>(null);
   const [reveal, setReveal] = useState<PracticeReveal | null>(null);
   const [exitOpen, setExitOpen] = useState(false);
   const startedAtRef = useRef<number>(Date.now());
@@ -81,11 +81,13 @@ export function PracticeSessionPage() {
     setReveal(null);
   }, [current?.exercise_id, current?.question_type]);
 
-  useEffect(() => {
-    if (current?.hints?.length) {
-      setHint(current.hints[current.hints.length - 1]);
-    }
-  }, [current?.exercise_id, current?.hints]);
+  const hint = latestHint && latestHint.exerciseId === current?.exercise_id
+    ? latestHint.text
+    : current?.hints?.at(-1) ?? null;
+
+  const invalidateReport = () => queryClient.invalidateQueries({
+    queryKey: workspaceQueryKey(workspaceId, "practice-learning-report"),
+  });
 
   const invalidateSession = async () => {
     await queryClient.invalidateQueries({
@@ -110,7 +112,7 @@ export function PracticeSessionPage() {
       // 提交后必须停留在当前题：会话刷新会把未作答指针推进到下一题，
       // 不钉住的话用户就看不到错误诊断 / 重试 / 讲解。
       setActiveId(current.exercise_id);
-      await invalidateSession();
+      await Promise.all([invalidateSession(), invalidateReport()]);
       if (result.is_correct && current?.explanation_available) {
         try {
           setReveal(await revealPracticeItem(practiceSessionId, current.exercise_id));
@@ -124,9 +126,9 @@ export function PracticeSessionPage() {
   });
 
   const hintMutation = useMutation({
-    mutationFn: () => requestPracticeHint(practiceSessionId, current.exercise_id),
-    onSuccess: async (result) => {
-      setHint(result.hint);
+    mutationFn: (exerciseId: string) => requestPracticeHint(practiceSessionId, exerciseId),
+    onSuccess: async (result, exerciseId) => {
+      setLatestHint({ exerciseId, text: result.hint });
       await invalidateSession();
     },
     onError: (error) =>
@@ -144,10 +146,13 @@ export function PracticeSessionPage() {
     mutationFn: (abandon: boolean) =>
       completePracticeSession(practiceSessionId, abandon),
     onSuccess: async (report, abandon) => {
-      await invalidateSession();
-      await queryClient.invalidateQueries({
-        queryKey: workspaceQueryKey(workspaceId, "practice-wrong-book"),
-      });
+      await Promise.all([
+        invalidateSession(),
+        invalidateReport(),
+        queryClient.invalidateQueries({
+          queryKey: workspaceQueryKey(workspaceId, "practice-wrong-book"),
+        }),
+      ]);
       if (abandon) {
         toast.message("已退出本次练习，作答记录会保留");
         navigate(`/w/${workspaceId}/practice`);
@@ -430,7 +435,7 @@ export function PracticeSessionPage() {
                     </span>
                     <Button
                       disabled={hintMutation.isPending}
-                      onClick={() => hintMutation.mutate()}
+                      onClick={() => hintMutation.mutate(current.exercise_id)}
                       size="sm"
                       variant="outline"
                     >
