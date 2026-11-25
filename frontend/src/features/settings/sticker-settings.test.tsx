@@ -7,7 +7,7 @@ import * as api from '@/api/stickers';
 import type { Sticker, StickerStatus } from '@/api/stickers';
 
 vi.mock('@/api', () => ({ listProviders: vi.fn(async () => []) }));
-vi.mock('@/api/stickers', () => ({ getStickerStatus: vi.fn(), searchStickers: vi.fn(), configureStickers: vi.fn(), rebuildStickerIndex: vi.fn(), reorderStickerPacks: vi.fn(), importStickerPack: vi.fn(), updateSticker: vi.fn(), setStickerPackEnabled: vi.fn(), getStickerPipeline: vi.fn(), configureStickerPipeline: vi.fn(), analyzeStickerPack: vi.fn(), downloadStickerPack: vi.fn(), getStickerMarket: vi.fn(), installMarketPack: vi.fn(), removeMarketPack: vi.fn(), marketStickerBlob: vi.fn(), getSticker: vi.fn(), analyzeSticker: vi.fn() }));
+vi.mock('@/api/stickers', () => ({ getStickerStatus: vi.fn(), searchStickers: vi.fn(), configureStickers: vi.fn(), rebuildStickerIndex: vi.fn(), reorderStickerPacks: vi.fn(), importStickerPack: vi.fn(), updateSticker: vi.fn(), deleteSticker: vi.fn(), setStickerPackEnabled: vi.fn(), getStickerPipeline: vi.fn(), configureStickerPipeline: vi.fn(), analyzeStickerPack: vi.fn(), downloadStickerPack: vi.fn(), getStickerMarket: vi.fn(), installMarketPack: vi.fn(), removeMarketPack: vi.fn(), marketStickerBlob: vi.fn(), getSticker: vi.fn(), analyzeSticker: vi.fn() }));
 vi.mock('@/features/auth/auth-context-value', () => ({ useAuth: () => ({ workspaceId: 'ws-stickers', userId: 'owner', effectivePermissions: ['workspace.manage'] }) }));
 vi.mock('@/components/chat/sticker-image', () => ({ StickerImage: ({ alt }: { alt: string }) => <img alt={alt} /> }));
 
@@ -22,6 +22,7 @@ beforeEach(() => {
   vi.mocked(api.configureStickers).mockImplementation(async patch => ({ ...status, ...patch }));
   vi.mocked(api.importStickerPack).mockResolvedValue({ pack_id: 'new', imported: 1, duplicates: 0, private: true });
   vi.mocked(api.updateSticker).mockImplementation(async value => value);
+  vi.mocked(api.deleteSticker).mockResolvedValue({ deleted: true, id: 'cat' });
   vi.mocked(api.getStickerPipeline).mockResolvedValue({ auto_analyze: false, available: false, model_id: null, queued: 0, completed: 0, failed: 0, packs: [] });
   vi.mocked(api.getSticker).mockResolvedValue(sticker);
   vi.mocked(api.analyzeSticker).mockResolvedValue({ queued: 1 });
@@ -138,5 +139,21 @@ describe('sticker integration', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存语义描述' }));
     await waitFor(() => expect(api.updateSticker).toHaveBeenCalledWith(expect.objectContaining({ semantics: expect.objectContaining({ description: '小得意，适合熟人调侃' }) }), expect.anything()));
     expect(api.analyzeSticker).not.toHaveBeenCalled();
+  });
+
+  it('supports deleting a private sticker and grouping stickers by pack', async () => {
+    status.packs.push({ id: 'builtin', name: '内置回应', builtin: true, enabled: true, license: 'MIT', source: 'builtin', count: 1, active_count: 1 });
+    const builtinSticker: Sticker = { id: 'wave', pack_id: 'builtin', name: '挥手', content_hash: 'h2', mime_type: 'image/png', needs_description: false, semantics: { description: '打招呼', ocr: '', tags: ['挥手'], emotion: [], intent: ['问候'], use_when: [], avoid_when: [], standalone: true } };
+    vi.mocked(api.searchStickers).mockResolvedValue({ method: 'keyword', total: 2, candidates: [sticker, builtinSticker] });
+    renderWithProviders(<StickerSettingsPanel />);
+    await screen.findByText('坏笑猫');
+    fireEvent.click(screen.getByRole('button', { name: '按包分组' }));
+    expect(screen.getByRole('button', { name: '按包分组' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getAllByText('我的猫咪').length).toBeGreaterThanOrEqual(3);
+    expect(screen.getAllByText('内置回应').length).toBeGreaterThanOrEqual(3);
+    const deleteButtons = screen.getAllByRole('button', { name: '删除' });
+    expect(deleteButtons).toHaveLength(1);
+    fireEvent.click(deleteButtons[0]!);
+    await waitFor(() => expect(api.deleteSticker).toHaveBeenCalledWith('cat', expect.anything()));
   });
 });

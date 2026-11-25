@@ -699,6 +699,17 @@ class StickerService:
         self.reconcile()
         return self.view(asset)
 
+    def delete_asset(self, sticker_id: str) -> dict[str, Any]:
+        asset = self.require_asset(sticker_id)
+        pack = self.db.get(StickerPack, asset.pack_id)
+        if pack.builtin or pack.owner_id != self.actor_id:
+            raise AppError(403, "sticker_read_only", "内置表情由应用管理，请仅删除自己导入的表情")
+        self.db.execute(delete(StickerVector).where(StickerVector.sticker_id == asset.id))
+        self.db.delete(asset)
+        self.db.flush()
+        self.reconcile()
+        return {"deleted": True, "id": sticker_id}
+
     def set_pack_enabled(self, pack_id: str, enabled: bool) -> None:
         pack = self.db.scalar(select(StickerPack).where(StickerPack.id == pack_id, StickerPack.workspace_id == self.workspace_id, or_(StickerPack.builtin.is_(True), StickerPack.owner_id == self.actor_id)))
         if pack is None:

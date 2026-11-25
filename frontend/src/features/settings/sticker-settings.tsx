@@ -1,10 +1,10 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Upload, RefreshCw, Search, Pencil, ImagePlus } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { ChevronLeft, ChevronRight, Eye, ImagePlus, Layers, Pencil, Plus, RefreshCw, Search, Trash2 } from 'lucide-react';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { toast } from '@/lib/notifications';
 import { listProviders } from '@/api';
-import { configureStickers, getStickerStatus, importStickerPack, rebuildStickerIndex, reorderStickerPacks, searchStickers, setStickerPackEnabled, updateSticker, type Sticker } from '@/api/stickers';
+import { configureStickers, deleteSticker, getStickerStatus, importStickerPack, rebuildStickerIndex, reorderStickerPacks, searchStickers, setStickerPackEnabled, updateSticker, type Sticker } from '@/api/stickers';
 import { useAuth } from '@/features/auth/auth-context-value';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -12,7 +12,8 @@ import { Textarea } from '@/components/ui/textarea';
 import { Switch } from '@/components/ui/switch';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { StickerImage } from '@/components/chat/sticker-image';
-import { AdvancedSettings, SettingsSection, SettingRow } from './settings-primitives';
+import { cn } from '@/lib/utils';
+import { AdvancedSettings, SettingRow } from './settings-primitives';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { StickerMarketPanel, StickerPipelinePanel } from './sticker-market';
 import { StickerPackList } from './sticker-pack-list';
@@ -22,10 +23,21 @@ import { StickerAnalysisDialog } from '@/components/chat/sticker-analysis-dialog
 export function StickerSettingsPanel() {
   const auth = useAuth();
   const client = useQueryClient();
+  const location = useLocation();
+  const [params] = useSearchParams();
   const prefix = ['stickers', auth.workspaceId, auth.userId];
   const [query, setQuery] = useState('');
-  const [tab, setTab] = useState(window.location.hash === '#sticker-market' ? 'market' : 'library');
+  const initialMarket = location.hash === '#sticker-market' || (typeof window !== 'undefined' && window.location.hash === '#sticker-market') || params.get('tab') === 'market';
+  const [tab, setTab] = useState(initialMarket ? 'market' : 'library');
+  useEffect(() => {
+    if (location.hash === '#sticker-market' || params.get('tab') === 'market') {
+      setTab('market');
+    } else if (location.hash === '#stickers') {
+      setTab('library');
+    }
+  }, [location.hash, params]);
   const [packFilter, setPackFilter] = useState('all');
+  const [grouped, setGrouped] = useState(false);
   const [page, setPage] = useState(0);
   const [editing, setEditing] = useState<Sticker | null>(null);
   const [analyzing, setAnalyzing] = useState<Sticker | null>(null);
@@ -41,36 +53,195 @@ export function StickerSettingsPanel() {
   const reorder = useMutation({ mutationFn: reorderStickerPacks, onSuccess: refresh, onError: failure });
   const upload = useMutation({ mutationFn: (files: File[]) => importStickerPack(files, ''), onSuccess: data => { toast.success(data.imported ? `已导入 ${data.imported} 张表情，按排序启用前 100 张` : '这套表情已经导入'); void refresh(); }, onError: failure });
   const save = useMutation({ mutationFn: updateSticker, onSuccess: () => { setEditing(null); void refresh(); toast.success('表情描述已更新'); }, onError: failure });
+  const removeSticker = useMutation({ mutationFn: deleteSticker, onSuccess: () => { void refresh(); toast.success('表情已删除'); }, onError: failure });
   const download = useMutation({ mutationFn: ({ id, name }: { id: string; name: string }) => saveStickerArchive(id, name), onError: failure });
   const data = status.data;
   const canManage = auth.effectivePermissions?.includes('workspace.manage') ?? false;
   const filtered = result.data?.candidates.filter(sticker => packFilter === 'all' || sticker.pack_id === packFilter) ?? [];
-  return <SettingsSection id="stickers">
-    <Tabs onValueChange={setTab} value={tab}><TabsList className="mb-5"><TabsTrigger value="library">我的表情</TabsTrigger><TabsTrigger value="market">表情市场</TabsTrigger></TabsList><TabsContent value="market"><StickerMarketPanel onOpenLibrary={id => { setPackFilter(id); setPage(0); setTab('library'); }} /></TabsContent><TabsContent value="library">
-    <div className="space-y-5">
-      <input accept="image/png,image/jpeg,image/webp,image/gif,.apng,.zip" aria-label="选择要导入的表情文件" className="sr-only" multiple onChange={event => { const files = Array.from(event.target.files ?? []); if (files.length) upload.mutate(files); event.target.value = ''; }} ref={input} type="file" />
-      <div><div className="mb-3 flex flex-wrap items-center gap-2"><div className="relative min-w-48 flex-1"><Search className="absolute left-2.5 top-2.5 size-4 text-muted-foreground" /><Input aria-label="搜索表情素材" className="pl-9" onChange={event => { setQuery(event.target.value); setPage(0); }} placeholder="搜索心情、名称、配字或使用场景" value={query} /></div><select aria-label="筛选表情包" className="h-9 min-w-0 flex-1 rounded-md border bg-background px-2 text-xs sm:max-w-48" onChange={event => { setPackFilter(event.target.value); setPage(0); }} value={packFilter}><option value="all">全部表情包</option>{data?.packs.map(pack => <option key={pack.id} value={pack.id}>{pack.name}</option>)}</select><Button disabled={upload.isPending} onClick={() => input.current?.click()} size="sm" variant="outline"><Upload className="mr-2 size-4" />{upload.isPending ? '正在导入…' : '导入表情包'}</Button></div>
-        <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 lg:grid-cols-6">{filtered.map(sticker => <button className="group flex min-w-0 flex-col items-center rounded-xl border border-transparent px-2 py-3 hover:border-border hover:bg-muted/30 focus-visible:outline-2 focus-visible:outline-ring" key={sticker.id} onClick={() => sticker.needs_description ? setAnalyzing(sticker) : setEditing(sticker)} title={sticker.semantics.description} type="button"><StickerImage alt={sticker.name} className="size-16" id={sticker.id} poster version={sticker.content_hash} /><span className="mt-2 max-w-full truncate text-xs">{sticker.name}</span><span className="mt-1 text-[10px] text-muted-foreground">{sticker.needs_description ? '待分析 · 点击识别' : sticker.semantics.intent[0] ?? '日常回应'}</span></button>)}</div>
-        {result.isPending ? <p className="py-8 text-center text-sm text-muted-foreground">正在加载表情…</p> : result.error ? <p className="py-6 text-sm text-destructive" role="alert">{result.error.message}</p> : !filtered.length ? <div className="py-8 text-center text-sm text-muted-foreground"><ImagePlus className="mx-auto mb-2 size-6" />没有匹配的表情，换个关键词或导入自己的收藏。</div> : null}
-        {(result.data?.total ?? 0) > 24 ? <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground"><Button disabled={page === 0} onClick={() => setPage(value => value - 1)} size="sm" variant="ghost">上一页</Button><span>第 {page + 1} 页 · 共 {result.data?.total} 张</span><Button disabled={(page + 1) * 24 >= (result.data?.total ?? 0)} onClick={() => setPage(value => value + 1)} size="sm" variant="ghost">下一页</Button></div> : null}
+  const totalCount = result.data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(totalCount / 24));
+
+  const renderStickerCard = (sticker: Sticker) => {
+    const isBuiltin = data?.packs.find(pack => pack.id === sticker.pack_id)?.builtin ?? true;
+    return (
+      <div className="group relative flex min-w-0 flex-col rounded-xl border border-border/70 bg-card/60 transition-all hover:border-border hover:bg-muted/35" key={sticker.id}>
+        <button
+          className="flex min-w-0 flex-1 flex-col items-center rounded-xl px-2.5 py-2.5 text-center focus-visible:outline-2 focus-visible:outline-ring"
+          onClick={() => { if (sticker.needs_description) setAnalyzing(sticker); else setEditing(sticker); }}
+          title={sticker.semantics.description || sticker.name}
+          type="button"
+        >
+          <StickerImage alt={sticker.name} className="size-12 sm:size-[52px]" id={sticker.id} poster version={sticker.content_hash} />
+          <span className="mt-2 max-w-full truncate text-[13px] font-medium leading-tight text-foreground">{sticker.name}</span>
+          <span className={cn("mt-0.5 max-w-full truncate text-[11px] leading-tight", sticker.needs_description ? "text-primary" : "text-muted-foreground")}>
+            {sticker.needs_description ? '待分析 · 点击识别' : sticker.semantics.intent[0] ?? '日常回应'}
+          </span>
+        </button>
+        <div className="pointer-events-none absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded-md border bg-background/95 p-0.5 opacity-0 shadow-xs backdrop-blur-xs transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+          <button
+            aria-label="预览"
+            className="grid size-6 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+            onClick={event => { event.stopPropagation(); setEditing(sticker); }}
+            title="预览"
+            type="button"
+          >
+            <Eye className="size-3.5" />
+          </button>
+          {!isBuiltin ? (
+            <>
+              <button
+                aria-label="编辑"
+                className="grid size-6 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={event => { event.stopPropagation(); if (sticker.needs_description) setAnalyzing(sticker); else setEditing(sticker); }}
+                title="编辑"
+                type="button"
+              >
+                <Pencil className="size-3.5" />
+              </button>
+              <button
+                aria-label="删除"
+                className="grid size-6 place-items-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+                disabled={removeSticker.isPending}
+                onClick={event => { event.stopPropagation(); removeSticker.mutate(sticker.id); }}
+                title="删除"
+                type="button"
+              >
+                <Trash2 className="size-3.5" />
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
-      <div aria-live="polite" className="flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"><span>已启用 {data?.active_count ?? data?.index.total ?? 0} / {data?.active_limit ?? 100} 张</span><span>库中共 {data?.stored_count ?? data?.index.total ?? 0} 张，超出部分保留</span></div>
-      <StickerPackList busy={togglePack.isPending || reorder.isPending} downloading={download.isPending} onDownload={pack => download.mutate({ id: pack.id, name: pack.name })} onReorder={ids => reorder.mutate(ids)} onToggle={(id, enabled) => togglePack.mutate({ id, enabled })} packs={data?.packs ?? []} />
-      <p className="text-[11px] leading-5 text-muted-foreground">支持多张图片或 ZIP，保留单图及 ZIP 安全检查。按排序启用前 100 张，可逐包开关，边界包允许部分启用。导入仅自己可见；远程语义检索会发送描述给所选 Provider。</p>
-      <AdvancedSettings description="管理 AI 语义分析、主动使用与检索模型。" title="表情设置">
-        <StickerPipelinePanel />
-        <SettingRow title="AI 主动使用表情包" description="由对话语境决定是否使用；严肃任务优先完整文字。"><Switch aria-label="AI 主动使用表情包" checked={data?.ai_enabled ?? true} disabled={!data || !canManage || configure.isPending} onCheckedChange={ai_enabled => configure.mutate({ ai_enabled })} /></SettingRow>
-        <div className="flex flex-wrap items-center gap-2"><label className="text-xs text-muted-foreground" htmlFor="sticker-retrieval-mode">检索方式</label><select className="h-8 max-w-full rounded-md border bg-background px-2 text-xs" disabled={!data || !canManage || configure.isPending} id="sticker-retrieval-mode" onChange={event => configure.mutate({ mode: event.target.value as 'follow' | 'independent' | 'keyword' })} value={data?.mode ?? 'follow'}><option value="follow">跟随平台 Embedding 配置</option><option value="independent">使用独立检索模型</option><option value="keyword">仅关键词检索</option></select><Button asChild size="sm" variant="ghost"><Link to={`/w/${auth.workspaceId}/settings/models?tab=tasks`}>配置检索模型</Link></Button>{data?.index.model_id && canManage ? <Button disabled={rebuild.isPending} onClick={() => rebuild.mutate()} size="sm" variant="ghost"><RefreshCw className="mr-1.5 size-3.5" />重建索引</Button> : null}</div>
-        {data?.mode === 'independent' ? <div className="grid gap-2 sm:grid-cols-2"><select aria-label="表情包 Embedding Provider" className="h-9 min-w-0 rounded-md border bg-background px-2 text-sm" disabled={!canManage} onChange={event => configure.mutate({ provider_id: event.target.value })} value={data.provider_id}><option value="">选择已有 Provider</option>{providers.data?.filter(provider => provider.enabled).map(provider => <option key={provider.id} value={provider.id}>{provider.display_name}</option>)}</select><Input aria-label="表情包 Embedding 模型" defaultValue={data.model_id} disabled={!canManage} key={data.provider_id} onBlur={event => { if (event.target.value.trim() !== data.model_id) configure.mutate({ model_id: event.target.value.trim() }); }} placeholder="输入 Embedding 模型 ID" /></div> : null}
-        {data && ['queued', 'building'].includes(data.index.status) ? <div aria-live="polite" className="space-y-2"><div className="flex justify-between text-xs text-muted-foreground"><span>语义索引构建中</span><span>{data.index.completed} / {data.index.total}</span></div><progress aria-label="语义索引构建进度" className="h-1.5 w-full accent-primary" max={Math.max(1, data.index.total)} value={data.index.completed} /></div> : null}
-        {data?.index.error ? <p className="text-xs text-destructive" role="alert">{data.index.error}。关键词检索不受影响。</p> : null}
-        {status.error ? <p className="text-xs text-destructive" role="alert">{status.error.message}</p> : null}
-      </AdvancedSettings>
+    );
+  };
+
+  const groupedPacks = (() => {
+    if (!grouped || packFilter !== 'all') return null;
+    const map = new Map<string, Sticker[]>();
+    for (const sticker of filtered) {
+      const list = map.get(sticker.pack_id) ?? [];
+      list.push(sticker);
+      map.set(sticker.pack_id, list);
+    }
+    const ordered: Array<{ id: string; name: string; builtin: boolean; items: Sticker[] }> = [];
+    for (const pack of data?.packs ?? []) {
+      const items = map.get(pack.id);
+      if (items?.length) {
+        ordered.push({ id: pack.id, name: pack.name, builtin: pack.builtin, items });
+        map.delete(pack.id);
+      }
+    }
+    for (const [id, items] of map.entries()) {
+      ordered.push({ id, name: '未分组表情', builtin: false, items });
+    }
+    return ordered;
+  })();
+
+  return (
+    <div className="space-y-4" id="stickers">
+      <Tabs onValueChange={setTab} value={tab}>
+        <TabsList className="mb-4 w-full justify-start gap-6 border-b border-border px-0" variant="line">
+          <TabsTrigger className="flex-none px-0 pb-2.5 pt-1 text-sm" value="library">我的表情</TabsTrigger>
+          <TabsTrigger className="flex-none px-0 pb-2.5 pt-1 text-sm" value="market">表情市场</TabsTrigger>
+        </TabsList>
+        <TabsContent value="market">
+          <StickerMarketPanel onOpenLibrary={id => { setPackFilter(id); setPage(0); setTab('library'); }} />
+        </TabsContent>
+        <TabsContent value="library">
+          <div className="space-y-4">
+            <input accept="image/png,image/jpeg,image/webp,image/gif,.apng,.zip" aria-label="选择要导入的表情文件" className="sr-only" multiple onChange={event => { const files = Array.from(event.target.files ?? []); if (files.length) upload.mutate(files); event.target.value = ''; }} ref={input} type="file" />
+            <div className="flex flex-wrap items-center gap-2.5">
+              <div className="relative min-w-52 flex-1">
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input aria-label="搜索表情素材" className="h-9 pl-9" onChange={event => { setQuery(event.target.value); setPage(0); }} placeholder="搜索心情、名称、配字或使用场景" value={query} />
+              </div>
+              <select aria-label="筛选表情包" className="h-9 min-w-0 rounded-md border bg-background px-3 text-xs text-foreground sm:max-w-44" onChange={event => { setPackFilter(event.target.value); setPage(0); }} value={packFilter}>
+                <option value="all">全部表情包</option>
+                {data?.packs.map(pack => <option key={pack.id} value={pack.id}>{pack.name}</option>)}
+              </select>
+              <Button aria-pressed={grouped} className="h-9 shrink-0 gap-1.5 text-xs" onClick={() => setGrouped(value => !value)} size="sm" type="button" variant={grouped ? 'secondary' : 'outline'}>
+                <Layers className="size-3.5" />
+                按包分组
+              </Button>
+              <Button className="h-9 shrink-0" disabled={upload.isPending} onClick={() => input.current?.click()} size="sm" variant="default">
+                <Plus className="mr-1.5 size-4" />
+                {upload.isPending ? '正在导入…' : '导入表情包'}
+              </Button>
+            </div>
+
+            {groupedPacks ? (
+              <div className="space-y-4">
+                {groupedPacks.map(group => (
+                  <div className="space-y-2" key={group.id}>
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-medium text-foreground">{group.name}<span className="ml-2 font-normal text-muted-foreground">{group.builtin ? '内置' : '私有'}</span></span>
+                      <span className="text-muted-foreground">{group.items.length} 张</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-4 md:grid-cols-6">
+                      {group.items.map(renderStickerCard)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-4 md:grid-cols-6">
+                {filtered.map(renderStickerCard)}
+              </div>
+            )}
+
+            {result.isPending ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">正在加载表情…</p>
+            ) : result.error ? (
+              <p className="py-6 text-sm text-destructive" role="alert">{result.error.message}</p>
+            ) : !filtered.length ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">
+                <ImagePlus className="mx-auto mb-2 size-6" />
+                没有匹配的表情，换个关键词或导入自己的收藏。
+              </div>
+            ) : null}
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-3">
+              <div aria-live="polite" className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span>共 {totalCount} 张表情</span>
+                <span>已启用 {data?.active_count ?? data?.index.total ?? 0} / {data?.active_limit ?? 100} 张</span>
+                <span>库中共 {data?.stored_count ?? data?.index.total ?? 0} 张，超出部分保留</span>
+              </div>
+              {totalCount > 24 ? (
+                <div className="flex items-center gap-1.5">
+                  <Button aria-label="上一页" disabled={page === 0} onClick={() => setPage(value => value - 1)} size="icon-sm" type="button" variant="outline">
+                    <ChevronLeft className="size-4" />
+                  </Button>
+                  <span className="min-w-10 text-center text-xs tabular-nums text-muted-foreground">{page + 1} / {totalPages}</span>
+                  <Button aria-label="下一页" disabled={(page + 1) * 24 >= totalCount} onClick={() => setPage(value => value + 1)} size="icon-sm" type="button" variant="outline">
+                    <ChevronRight className="size-4" />
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+
+            <StickerPackList busy={togglePack.isPending || reorder.isPending} downloading={download.isPending} onDownload={pack => download.mutate({ id: pack.id, name: pack.name })} onReorder={ids => reorder.mutate(ids)} onToggle={(id, enabled) => togglePack.mutate({ id, enabled })} packs={data?.packs ?? []} />
+            <p className="text-[11px] leading-5 text-muted-foreground">支持多张图片或 ZIP，保留单图及 ZIP 安全检查。按排序启用前 100 张，可逐包开关，边界包允许部分启用。导入仅自己可见；远程语义检索会发送描述给所选 Provider。</p>
+            <AdvancedSettings description="管理 AI 语义分析、主动使用与检索模型。" title="表情设置">
+              <StickerPipelinePanel />
+              <SettingRow title="AI 主动使用表情包" description="由对话语境决定是否使用；严肃任务优先完整文字。"><Switch aria-label="AI 主动使用表情包" checked={data?.ai_enabled ?? true} disabled={!data || !canManage || configure.isPending} onCheckedChange={ai_enabled => configure.mutate({ ai_enabled })} /></SettingRow>
+              <div className="flex flex-wrap items-center gap-2"><label className="text-xs text-muted-foreground" htmlFor="sticker-retrieval-mode">检索方式</label><select className="h-8 max-w-full rounded-md border bg-background px-2 text-xs" disabled={!data || !canManage || configure.isPending} id="sticker-retrieval-mode" onChange={event => configure.mutate({ mode: event.target.value as 'follow' | 'independent' | 'keyword' })} value={data?.mode ?? 'follow'}><option value="follow">跟随平台 Embedding 配置</option><option value="independent">使用独立检索模型</option><option value="keyword">仅关键词检索</option></select><Button asChild size="sm" variant="ghost"><Link to={`/w/${auth.workspaceId}/settings/models?tab=tasks`}>配置检索模型</Link></Button>{data?.index.model_id && canManage ? <Button disabled={rebuild.isPending} onClick={() => rebuild.mutate()} size="sm" variant="ghost"><RefreshCw className="mr-1.5 size-3.5" />重建索引</Button> : null}</div>
+              {data?.mode === 'independent' ? <div className="grid gap-2 sm:grid-cols-2"><select aria-label="表情包 Embedding Provider" className="h-9 min-w-0 rounded-md border bg-background px-2 text-sm" disabled={!canManage} onChange={event => configure.mutate({ provider_id: event.target.value })} value={data.provider_id}><option value="">选择已有 Provider</option>{providers.data?.filter(provider => provider.enabled).map(provider => <option key={provider.id} value={provider.id}>{provider.display_name}</option>)}</select><Input aria-label="表情包 Embedding 模型" defaultValue={data.model_id} disabled={!canManage} key={data.provider_id} onBlur={event => { if (event.target.value.trim() !== data.model_id) configure.mutate({ model_id: event.target.value.trim() }); }} placeholder="输入 Embedding 模型 ID" /></div> : null}
+              {data && ['queued', 'building'].includes(data.index.status) ? <div aria-live="polite" className="space-y-2"><div className="flex justify-between text-xs text-muted-foreground"><span>语义索引构建中</span><span>{data.index.completed} / {data.index.total}</span></div><progress aria-label="语义索引构建进度" className="h-1.5 w-full accent-primary" max={Math.max(1, data.index.total)} value={data.index.completed} /></div> : null}
+              {data?.index.error ? <p className="text-xs text-destructive" role="alert">{data.index.error}。关键词检索不受影响。</p> : null}
+              {status.error ? <p className="text-xs text-destructive" role="alert">{status.error.message}</p> : null}
+            </AdvancedSettings>
+          </div>
+        </TabsContent>
+      </Tabs>
+      <StickerAnalysisDialog onClose={() => setAnalyzing(null)} sticker={analyzing} />
+      <Dialog open={editing !== null} onOpenChange={open => { if (!open) setEditing(null); }}>
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md">
+          <DialogHeader><DialogTitle>表情详情</DialogTitle></DialogHeader>
+          {editing ? <StickerEditor key={editing.id} onSave={value => save.mutate(value)} pending={save.isPending} readOnly={data?.packs.find(pack => pack.id === editing.pack_id)?.builtin ?? true} sticker={editing} /> : null}
+        </DialogContent>
+      </Dialog>
     </div>
-    </TabsContent></Tabs>
-    <StickerAnalysisDialog onClose={() => setAnalyzing(null)} sticker={analyzing} />
-    <Dialog open={editing !== null} onOpenChange={open => { if (!open) setEditing(null); }}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md"><DialogHeader><DialogTitle>表情详情</DialogTitle></DialogHeader>{editing ? <StickerEditor key={editing.id} onSave={value => save.mutate(value)} pending={save.isPending} readOnly={data?.packs.find(pack => pack.id === editing.pack_id)?.builtin ?? true} sticker={editing} /> : null}</DialogContent></Dialog>
-  </SettingsSection>;
+  );
 }
 
 function StickerEditor({ sticker, readOnly, pending, onSave }: { sticker: Sticker; readOnly: boolean; pending: boolean; onSave: (value: Sticker) => void }) {

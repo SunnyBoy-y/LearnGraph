@@ -223,6 +223,11 @@ def update_asset(sticker_id: str, payload: StickerUpdate, db: DB, context: Curre
     return service(db, context, settings).update_asset(sticker_id, payload.model_dump())
 
 
+@router.delete("/{sticker_id}")
+def delete_asset(sticker_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings):
+    return service(db, context, settings).delete_asset(sticker_id)
+
+
 @router.get("/{sticker_id}")
 def get_asset(sticker_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings):
     current = service(db, context, settings)

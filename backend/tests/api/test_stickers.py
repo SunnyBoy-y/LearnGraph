@@ -1117,3 +1117,23 @@ def test_semantic_pipeline_only_queues_active_images(client, register_user, monk
         active = {asset.id for asset in StickerService(db, workspace, actor).visible_assets()}
         jobs = db.scalars(select(DurableJob).where(DurableJob.workspace_id == workspace, DurableJob.kind == "sticker.semantic")).all()
         assert all(job.payload["sticker_id"] in active for job in jobs)
+
+
+def test_delete_private_sticker_and_reject_builtin_deletion(client, register_user):
+    workspace, headers, _ = identity(client, register_user)
+    uploaded = client.post("/api/v1/stickers/import", headers=headers, files=[("files", ("mine.png", image_bytes("purple")))])
+    assert uploaded.status_code == 201
+    pack_id = uploaded.json()["pack_id"]
+    search = client.get("/api/v1/stickers/search", headers=headers, params={"pack_id": pack_id}).json()
+    private_id = search["candidates"][0]["id"]
+    deleted = client.delete(f"/api/v1/stickers/{private_id}", headers=headers)
+    assert deleted.status_code == 200 and deleted.json()["deleted"] is True
+    after = client.get("/api/v1/stickers/search", headers=headers, params={"pack_id": pack_id}).json()
+    assert after["total"] == 0
+
+    builtin_pack_id = next(pack["id"] for pack in client.get("/api/v1/stickers", headers=headers).json()["packs"] if pack["builtin"])
+    builtin_search = client.get("/api/v1/stickers/search", headers=headers, params={"pack_id": builtin_pack_id}).json()
+    builtin_id = builtin_search["candidates"][0]["id"]
+    rejected = client.delete(f"/api/v1/stickers/{builtin_id}", headers=headers)
+    assert rejected.status_code == 403
+

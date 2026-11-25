@@ -52,6 +52,7 @@ export const rebuildStickerIndex = () => apiClient.post<StickerStatus>('/sticker
 export const setStickerPackEnabled = (id: string, enabled: boolean) => apiClient.put<StickerStatus>(`/stickers/library/packs/${encodeURIComponent(id)}`, { enabled });
 export const reorderStickerPacks = (pack_ids: string[]) => apiClient.put<StickerStatus>('/stickers/library/order', { pack_ids });
 export const updateSticker = (sticker: Sticker) => apiClient.put<Sticker>(`/stickers/${encodeURIComponent(sticker.id)}`, { name: sticker.name, semantics: sticker.semantics });
+export const deleteSticker = (id: string) => apiClient.delete<{ deleted: boolean; id: string }>(`/stickers/${encodeURIComponent(id)}`);
 export const stickerBlob = (id: string, poster: boolean) => apiClient.getBlob(`/stickers/${encodeURIComponent(id)}/content`, { query: { poster } }, 5 * 1024 * 1024);
 
 export interface StickerMarketPack {
