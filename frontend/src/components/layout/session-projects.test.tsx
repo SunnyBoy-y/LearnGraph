@@ -56,28 +56,6 @@ async function enterBatchMode(trigger = '管理项目分组') {
   await waitFor(() => expect(screen.getByRole('button', { name: '退出批量管理' })).toBeVisible())
 }
 
-describe('sidebar archived sessions', () => {
-  it('opens archived branches and gives each row a restore action', () => {
-    const archived = { id: 'branch', parent_session_id: 's1', project_id: 'p1', title: '旧分支', status: 'archived', pinned: false }
-    const scopes = new Map([['archived', { isSuccess: true, data: { pages: [{ items: [archived] }] } }]])
-    const { props, retainScopes, update } = fixture()
-    update({ navigator: { ...props.navigator, scopes } as SessionNavigator })
-    const toggle = screen.getByRole('button', { name: '已归档会话' })
-    expect(screen.queryByText('旧分支')).not.toBeInTheDocument()
-    fireEvent.click(toggle)
-    expect(toggle).toHaveAttribute('aria-expanded', 'true')
-    expect(retainScopes.mock.lastCall?.[0].has('archived')).toBe(true)
-    fireEvent.click(screen.getByRole('button', { name: '旧分支，计算机网络' }))
-    expect(props.onSelectSession).toHaveBeenCalledWith('branch', props.projects[0])
-    fireEvent.click(screen.getByRole('button', { name: '恢复会话 旧分支' }))
-    expect(props.onToggleSessionArchive).toHaveBeenCalledWith(archived)
-    update({ navigator: { ...props.navigator, scopes: new Map() } })
-    expect(screen.queryByText('旧分支')).not.toBeInTheDocument()
-    fireEvent.click(toggle)
-    expect(toggle).toHaveAttribute('aria-expanded', 'false')
-  })
-})
-
 describe('sidebar generation status', () => {
   it.each(['s1', 'r1'])('replaces the trailing spinner with a completion dot for %s and clears it when viewed', sessionId => {
     seedSessionActivity(new Map())

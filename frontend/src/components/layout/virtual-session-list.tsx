@@ -182,6 +182,6 @@ export function SessionPageSentinel({ scope, navigator, direction = 'next' }: {
     {failed ? <button type="button" onClick={() => void navigator.load(scope, direction, true)}>加载失败，点击重试</button>
       : pending ? <span role="status">加载中…</span>
       : hasMore ? <button type="button" onClick={() => void load(scope, direction)}>{direction === 'previous' ? '加载较新的会话' : '加载更多'}</button>
-      : state?.data?.pages.every(page => page.items.length === 0) ? <span>{scope.archived_only ? '暂无已归档会话' : '暂无会话'}</span> : null}
+      : state?.data?.pages.every(page => page.items.length === 0) ? <span>暂无会话</span> : null}
   </div>
 }

@@ -48,6 +48,7 @@ const ToolsSettingsPage = lazy(() => import('@/features/settings/settings-center
 const WorkspaceSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.WorkspaceSettingsPage })))
 const DataSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.DataSettingsPage })))
 const MemorySettingsPage = lazy(() => import('@/features/settings/memory-settings-page').then(m => ({ default: m.MemorySettingsPage })))
+const ArchivedSessionsPage = lazy(() => import('@/features/settings/archived-sessions-page').then(m => ({ default: m.ArchivedSessionsPage })))
 const ConversationSettingsPage = lazy(() => import('@/features/settings/conversation-settings-page').then(m => ({ default: m.ConversationSettingsPage })))
 const AccountSettingsPage = lazy(() => import('@/features/settings/account-settings-page').then(m => ({ default: m.AccountSettingsPage })))
 const AboutPage = lazy(() => import('@/features/settings/settings-center-pages').then((module) => ({ default: module.AboutSettingsPage })))
@@ -185,6 +186,7 @@ function AppRoutes() {
         <Route element={<Navigate replace to="general" />} path="settings" />
         <Route element={<PersonalizationPage />} path="settings/general" />
         <Route element={<ConversationSettingsPage />} path="settings/conversation" />
+        <Route element={<ArchivedSessionsPage />} path="settings/archived-sessions" />
         <Route element={<MemorySettingsPage />} path="settings/memory" />
         <Route element={<VoiceSettingsPage />} path="settings/voice" />
         <Route element={<ModelSettingsPage />} path="settings/models" />

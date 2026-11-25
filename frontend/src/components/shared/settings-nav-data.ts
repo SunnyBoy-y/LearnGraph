@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 
 import {
+  Archive,
   Bot,
   Brain,
   Database,
@@ -25,6 +26,7 @@ export type SettingsNavItem = {
 export const settingsNav: SettingsNavItem[] = [
   { label: "通用与个性化", icon: Palette, path: "settings/general", section: "使用体验" },
   { label: "对话与学习", icon: MessageSquareText, path: "settings/conversation", section: "使用体验" },
+  { label: "已归档会话", icon: Archive, path: "settings/archived-sessions", section: "使用体验" },
   { label: "记忆与检索", icon: Brain, path: "settings/memory", section: "使用体验" },
   { label: "语音与音频", icon: RadioTower, path: "settings/voice", section: "使用体验" },
   { label: "模型与服务", icon: Bot, path: "settings/models", section: "能力配置" },

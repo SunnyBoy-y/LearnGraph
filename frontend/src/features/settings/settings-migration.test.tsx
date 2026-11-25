@@ -274,8 +274,8 @@ describe('settings information architecture', () => {
     expect(updateMemoryEnhancement).not.toHaveBeenCalled()
   })
 
-  it('has nine categories plus About and unique configuration ownership metadata', () => {
-    expect(settingsNav).toHaveLength(10)
+  it('has an archive category and unique configuration ownership metadata', () => {
+    expect(settingsNav).toContainEqual(expect.objectContaining({ label: '已归档会话', path: 'settings/archived-sessions', section: '使用体验' }))
     expect(settingsNav.at(-1)?.label).toBe('关于')
     expect(new Set(settingsNav.map(item => item.section).filter(Boolean))).toEqual(new Set(['使用体验', '能力配置', '管理']))
     expect(new Set(settingsCatalog.map(item => item.settingId)).size).toBe(settingsCatalog.length)

@@ -6,7 +6,7 @@ import { workspaceQueryKey } from './query-keys'
 
 export const sessionDetailKey = (workspaceId: string, id: string) => workspaceQueryKey(workspaceId, 'sessions', 'detail', id)
 export const sessionBrowserKey = (workspaceId: string) => workspaceQueryKey(workspaceId, 'sessions', 'browser')
-export const sessionScopeId = (scope: SessionScope) => scope.archived_only ? 'archived' : scope.parent_session_id ? `session:${scope.parent_session_id}` : scope.project_id ? `project:${scope.project_id}` : 'recent'
+export const sessionScopeId = (scope: SessionScope) => scope.parent_session_id ? `session:${scope.parent_session_id}` : scope.project_id ? `project:${scope.project_id}` : 'recent'
 
 export function useSessionDetail(workspaceId: string, id?: string, enabled = true) {
   const client = useQueryClient()
