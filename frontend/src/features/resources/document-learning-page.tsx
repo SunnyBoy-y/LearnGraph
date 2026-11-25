@@ -42,6 +42,7 @@ import { ApiError } from "@/api/client";
 import { listGoals } from "@/api/goals";
 import { createSession } from "@/api/sessions";
 import { createConceptBranch } from "@/api/sessions";
+import { workspaceQueryKey } from "@/lib/query-keys";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -294,7 +295,7 @@ export function DocumentLearningPage() {
     setScopeFileIds([fileId]);
   }, [fileId]);
 
-  const files = useQuery({ queryKey: ["files"], queryFn: () => listFiles() });
+  const files = useQuery({ queryKey: workspaceQueryKey(workspaceId, "files"), queryFn: () => listFiles() });
   const file = files.data?.find((item) => item.id === fileId);
   const chunks = useQuery({
     queryKey: ["file-chunks", fileId],
@@ -355,7 +356,7 @@ export function DocumentLearningPage() {
 
   useEffect(() => {
     if (job.data?.status !== "completed" || job.data.file_id !== fileId) return;
-    void queryClient.invalidateQueries({ queryKey: ["files"] });
+    void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
     void queryClient.invalidateQueries({ queryKey: ["file-chunks", fileId] });
     void queryClient.invalidateQueries({ queryKey: ["document-revisions", fileId] });
     void queryClient.invalidateQueries({ queryKey: ["document-job-events", jobId] });
@@ -364,7 +365,7 @@ export function DocumentLearningPage() {
     // revision, which now degrades gracefully instead of erroring).
     setSelected(null);
     setSelectionMenu(null);
-  }, [fileId, job.data?.file_id, job.data?.status, jobId, queryClient]);
+  }, [workspaceId, fileId, job.data?.file_id, job.data?.status, jobId, queryClient]);
 
   const activeChunk = chunks.data?.find((item) => item.id === activeChunkId);
   useEffect(() => {

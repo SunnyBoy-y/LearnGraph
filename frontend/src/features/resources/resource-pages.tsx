@@ -327,6 +327,7 @@ function uploadExtension(name: string) {
 }
 
 export function SourcesPage() {
+  const { workspaceId = "" } = useParams();
   const inputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -351,9 +352,9 @@ export function SourcesPage() {
     useState<SourceRecord | null>(null);
   // 全局拖入检测：鼠标松开前显示整页“拖入文件”遮罩
   const [dropActive, setDropActive] = useState(false);
-  const files = useQuery({ queryKey: ["files"], queryFn: () => listFiles() });
+  const files = useQuery({ queryKey: workspaceQueryKey(workspaceId, "files"), queryFn: () => listFiles() });
   const storageSummary = useQuery({
-    queryKey: ["files-storage-summary"],
+    queryKey: workspaceQueryKey(workspaceId, "files-storage-summary"),
     queryFn: getFileStorageSummary,
   });
   const parserCapabilities = useQuery({
@@ -369,8 +370,8 @@ export function SourcesPage() {
     onSuccess: (file) => {
       toast.success(`${file.original_name} 已安全存储`);
       void Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["files"] }),
-        queryClient.invalidateQueries({ queryKey: ["files-storage-summary"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files-storage-summary") }),
       ]);
     },
     onError: (error) => toast.error(error.message),
@@ -436,7 +437,7 @@ export function SourcesPage() {
     onSuccess: () => toast.success("解析任务已完成"),
     onError: (error) => toast.error(error.message),
     onSettled: async (_job, _error, fileId) => {
-      await Promise.all([invalidateFileIndex(fileId), queryClient.invalidateQueries({ queryKey: ["files"] })]);
+      await Promise.all([invalidateFileIndex(fileId), queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") })]);
     },
   });
   const batchParse = useMutation({
@@ -463,7 +464,7 @@ export function SourcesPage() {
     },
     onSettled: async (_result, _error, fileIds) => {
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["files"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") }),
         ...fileIds.map(invalidateFileIndex),
       ]);
     },
@@ -490,8 +491,8 @@ export function SourcesPage() {
         return next;
       });
       void Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["files"] }),
-        queryClient.invalidateQueries({ queryKey: ["files-storage-summary"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files-storage-summary") }),
       ]);
     },
     onError: (error) => toast.error(error.message),
@@ -518,8 +519,8 @@ export function SourcesPage() {
       setBatchDeleteOpen(false);
       setSelectedFileIds(new Set());
       void Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["files"] }),
-        queryClient.invalidateQueries({ queryKey: ["files-storage-summary"] }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files-storage-summary") }),
       ]);
     },
     onError: (error) => toast.error(error.message),

@@ -1269,11 +1269,11 @@ function PublishVersionDialog({
 
   const uploadMutation = useMutation({
     mutationFn: (file: File) => uploadFile(file),
-    onSuccess: (file) => {
+    onSuccess: async (file) => {
       setSelectedFileId(file.id);
       queryClient.setQueryData<FileRecord[]>(
         workspaceQueryKey(workspaceId, "files"),
-        (current) => [file, ...(current ?? [])],
+        (current) => current && [file, ...current.filter((item) => item.id !== file.id)],
       );
       toast.success("文件已上传");
     },
@@ -1292,6 +1292,10 @@ function PublishVersionDialog({
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files-storage-summary") }),
+      ]);
     if (file) uploadMutation.mutate(file);
     event.target.value = "";
   };
