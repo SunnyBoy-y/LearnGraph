@@ -1,4 +1,9 @@
 import { readByteRange } from "@/lib/byte-range"
+import {
+  adaptiveTimeoutMs,
+  computeJitteredBackoffMs,
+  networkQualityStore,
+} from '@/lib/network-quality'
 import type { ApiErrorEnvelope, ValidationIssue } from '@/types/common'
 
 import { authStore } from './auth-store'
@@ -17,6 +22,10 @@ export interface ApiRequestOptions {
   query?: QueryParams
   auth?: boolean
   workspace?: boolean
+  /** Request timeout in milliseconds; scales on weak networks. Pass `0` to disable. */
+  timeoutMs?: number
+  /** Disable automatic retry even for idempotent requests. */
+  noRetry?: boolean
 }
 
 export interface ApiStreamOptions extends ApiRequestOptions, SseParseOptions {}
@@ -138,7 +147,11 @@ function isAbort(error: unknown, signal?: AbortSignal): boolean {
  */
 const RETRYABLE_METHODS = new Set(['GET', 'HEAD'])
 const RETRYABLE_STATUSES = new Set([502, 503, 504])
-const RETRY_BACKOFF_MS = [500, 1000, 2000]
+const MAX_RETRY_ATTEMPTS = 3
+const BASE_RETRY_DELAY_MS = 500
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const DEFAULT_TRANSFER_TIMEOUT_MS = 120_000
+const DEFAULT_SSE_CONNECT_TIMEOUT_MS = 45_000
 
 function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -146,16 +159,20 @@ function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
       reject(new DOMException('Aborted', 'AbortError'))
       return
     }
-    const timer = window.setTimeout(() => {
+    const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort)
       resolve()
     }, ms)
     const onAbort = () => {
-      window.clearTimeout(timer)
+      clearTimeout(timer)
       reject(new DOMException('Aborted', 'AbortError'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now()
 }
 
 export class ApiClient {
@@ -200,21 +217,77 @@ export class ApiClient {
       requestBody = body.value as BodyInit
     }
 
-    const retryable = RETRYABLE_METHODS.has(method)
+    const isSseStream = headers.get('Accept')?.includes('text/event-stream') ?? false
+    // Safe to retry: GET/HEAD, or mutating requests explicitly guarded by an
+    // Idempotency-Key (excluding SSE streams, which run their own Last-Event-ID loop).
+    const retryable =
+      !options.noRetry &&
+      !isSseStream &&
+      (RETRYABLE_METHODS.has(method) || headers.has('Idempotency-Key'))
+    const defaultTimeout = isSseStream
+      ? DEFAULT_SSE_CONNECT_TIMEOUT_MS
+      : body?.kind === 'raw'
+        ? DEFAULT_TRANSFER_TIMEOUT_MS
+        : DEFAULT_REQUEST_TIMEOUT_MS
     let attempt = 0
     for (;;) {
       attempt += 1
-      const backoff = attempt <= RETRY_BACKOFF_MS.length ? RETRY_BACKOFF_MS[attempt - 1] : null
+      const hasMoreAttempts = attempt <= MAX_RETRY_ATTEMPTS
+      const rawTimeout = options.timeoutMs === undefined ? defaultTimeout : options.timeoutMs
+      const effectiveTimeoutMs = rawTimeout > 0 ? adaptiveTimeoutMs(rawTimeout) : 0
+      const startedAt = nowMs()
+
+      let attemptController: AbortController | null = null
+      let timedOut = false
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+      let detachCallerAbort: (() => void) | undefined
+
+      if (effectiveTimeoutMs > 0) {
+        attemptController = new AbortController()
+        if (options.signal) {
+          if (options.signal.aborted) {
+            attemptController.abort(options.signal.reason)
+          } else {
+            const onCallerAbort = () => attemptController?.abort(options.signal?.reason)
+            options.signal.addEventListener('abort', onCallerAbort, { once: true })
+            detachCallerAbort = () => options.signal?.removeEventListener('abort', onCallerAbort)
+          }
+        }
+        timeoutTimer = setTimeout(() => {
+          timedOut = true
+          attemptController?.abort(new DOMException('Request timeout', 'TimeoutError'))
+        }, effectiveTimeoutMs)
+      }
+
+      const clearAttemptTimer = () => {
+        if (timeoutTimer !== undefined) {
+          clearTimeout(timeoutTimer)
+          timeoutTimer = undefined
+        }
+        detachCallerAbort?.()
+        detachCallerAbort = undefined
+      }
+
       try {
         const response = await this.fetcher(url, {
           method,
           headers,
           body: requestBody,
-          signal: options.signal,
+          signal: attemptController ? attemptController.signal : options.signal,
         })
-        if (response.ok || (allowNotModified && response.status === 304)) return response
+        clearAttemptTimer()
+        const durationMs = nowMs() - startedAt
+        if (response.ok || (allowNotModified && response.status === 304)) {
+          networkQualityStore.recordSample({ ok: true, durationMs })
+          return response
+        }
 
-        if (retryable && backoff !== null && RETRYABLE_STATUSES.has(response.status)) {
+        if (RETRYABLE_STATUSES.has(response.status)) {
+          networkQualityStore.recordSample({ ok: false, durationMs, networkError: true })
+        }
+
+        if (retryable && hasMoreAttempts && RETRYABLE_STATUSES.has(response.status)) {
+          const backoff = computeJitteredBackoffMs(BASE_RETRY_DELAY_MS, attempt - 1, 8_000)
           await delayWithAbort(backoff, options.signal)
           continue
         }
@@ -249,16 +322,30 @@ export class ApiClient {
           responseBody,
         })
       } catch (error) {
-        if (error instanceof ApiError || isAbort(error, options.signal)) throw error
-        if (retryable && backoff !== null) {
+        clearAttemptTimer()
+        const durationMs = nowMs() - startedAt
+        if (error instanceof ApiError) throw error
+        if (!timedOut && isAbort(error, options.signal)) throw error
+        networkQualityStore.recordSample({
+          ok: false,
+          durationMs,
+          networkError: !timedOut,
+          timedOut,
+        })
+        if (retryable && hasMoreAttempts) {
+          const backoff = computeJitteredBackoffMs(BASE_RETRY_DELAY_MS, attempt - 1, 8_000)
           await delayWithAbort(backoff, options.signal)
           continue
         }
         throw new ApiError({
           status: 0,
-          code: 'network_error',
-          message: error instanceof Error ? error.message : 'Network request failed',
-          details: null,
+          code: timedOut ? 'request_timeout' : 'network_error',
+          message: timedOut
+            ? `请求超时（>${Math.round(effectiveTimeoutMs / 1000)}s），请检查网络连接`
+            : error instanceof Error
+              ? error.message
+              : 'Network request failed',
+          details: timedOut ? { timeout_ms: effectiveTimeoutMs } : null,
           method,
           url,
           cause: error,
@@ -291,7 +378,10 @@ export class ApiClient {
   }
 
   async getBlob(path: string, options: ApiRequestOptions = {}, maxBytes?: number): Promise<Blob> {
-    const response = await this.fetchResponse('GET', path, options)
+    const response = await this.fetchResponse('GET', path, {
+      timeoutMs: options.timeoutMs ?? DEFAULT_TRANSFER_TIMEOUT_MS,
+      ...options,
+    })
     if (maxBytes === undefined) return response.blob()
     if (Number(response.headers.get('Content-Length')) > maxBytes) {
       await response.body?.cancel()
@@ -317,7 +407,12 @@ export class ApiClient {
   }
 
   async postBlob<TBody>(path: string, body: TBody, options: ApiRequestOptions = {}): Promise<Blob> {
-    const response = await this.fetchResponse('POST', path, options, { value: body, kind: 'json' })
+    const response = await this.fetchResponse(
+      'POST',
+      path,
+      { timeoutMs: options.timeoutMs ?? DEFAULT_TRANSFER_TIMEOUT_MS, ...options },
+      { value: body, kind: 'json' },
+    )
     return response.blob()
   }
 
@@ -387,6 +482,10 @@ export class ApiClient {
 
   upload<TResponse>(path: string, formData: FormData, options: ApiRequestOptions = {}): Promise<TResponse> {
     return this.request<TResponse>('POST', path, options, { value: formData, kind: 'raw' })
+  }
+
+  putRaw<TResponse>(path: string, body: BodyInit, options: ApiRequestOptions = {}): Promise<TResponse> {
+    return this.request<TResponse>('PUT', path, options, { value: body, kind: 'raw' })
   }
 
   async *postSse<TData = unknown, TBody = unknown>(

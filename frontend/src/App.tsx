@@ -1,5 +1,5 @@
 import { legacySettingsRoutes } from '@/components/shared/settings-nav-data'
-import { lazy, Suspense } from 'react'
+import { Suspense } from 'react'
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { createBrowserRouter, RouterProvider, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import { Network } from 'lucide-react'
@@ -15,51 +15,54 @@ import { AuthProvider, RequireAuth } from '@/features/auth/auth-context'
 import { RouteLoading, WorkspaceRouteGuard } from '@/features/auth/workspace-route-guard'
 import { useAuth } from '@/features/auth/auth-context-value'
 import { registerAuthQueryClient } from '@/lib/auth-query-cache'
+import { lazyWithRetry } from '@/lib/lazy-with-retry'
+import { offlineOutbox } from '@/lib/offline-outbox'
 import { hydratePersistedQueryCache, startPersistedQueryCache } from '@/lib/query-persistence'
 import { VoiceSessionProvider } from '@/features/voice/voice-session-controller'
 
-const LoginPage = lazy(() => import('@/features/auth/login-page').then((module) => ({ default: module.LoginPage })))
-const ChangePasswordPage = lazy(() => import('@/features/auth/change-password-page').then((module) => ({ default: module.ChangePasswordPage })))
-const DashboardPage = lazy(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.DashboardPage })))
-const LearningSessionsPage = lazy(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.LearningSessionsPage })))
-const LearningPlanPage = lazy(() => import('@/features/dashboard/learning-workspace-pages').then((module) => ({ default: module.LearningPlanPage })))
-const LearningReportPage = lazy(() => import('@/features/dashboard/learning-workspace-pages').then((module) => ({ default: module.LearningReportPage })))
-const GoalConfirmPage = lazy(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GoalConfirmPage })))
-const GraphReviewPage = lazy(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GraphReviewPage })))
-const CapabilityGraphPage = lazy(() => import('@/features/graph/graph-pages').then((module) => ({ default: module.CapabilityGraphPage })))
-const GraphWorkspacePage = lazy(() => import('@/features/graph/graph-pages').then((module) => ({ default: module.GraphWorkspacePage })))
-const JointStudyPage = lazy(() => import('@/features/graph/graph-pages').then((module) => ({ default: module.JointStudyPage })))
-const ChatCanvasPage = lazy(() => import('@/features/chat/chat-pages').then((module) => ({ default: module.ChatCanvasPage })))
-const VersionsPage = lazy(() => import('@/features/chat/chat-pages').then((module) => ({ default: module.VersionsPage })))
-const EvidenceReviewPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.EvidenceReviewPage })))
-const ExerciseAnswerPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.ExerciseAnswerPage })))
-const NodeLearningPage = lazy(() => import('@/features/learning/retired-learning-redirect').then((module) => ({ default: module.NodeLearningPage })))
-const PracticeCenterPage = lazy(() => import('@/features/practice/practice-center-page').then((module) => ({ default: module.PracticeCenterPage })))
-const PracticeSessionPage = lazy(() => import('@/features/practice/practice-session-page').then((module) => ({ default: module.PracticeSessionPage })))
-const PracticeReportPage = lazy(() => import('@/features/practice/practice-report-page').then((module) => ({ default: module.PracticeReportPage })))
-const RoadmapPage = lazy(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.RoadmapPage })))
-const SourcesPage = lazy(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SourcesPage })))
-const DocumentLearningPage = lazy(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
-const MemoryPage = lazy(() => import('@/features/memory/memory-page').then((module) => ({ default: module.MemoryPage })))
-const PersonalizationPage = lazy(() => import('@/features/settings/personalization-page').then((module) => ({ default: module.PersonalizationPage })))
-const ModelSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.ModelSettingsPage })))
-const VoiceSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.VoiceSettingsPage })))
-const ToolsSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.ToolsSettingsPage })))
-const WorkspaceSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.WorkspaceSettingsPage })))
-const DataSettingsPage = lazy(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.DataSettingsPage })))
-const MemorySettingsPage = lazy(() => import('@/features/settings/memory-settings-page').then(m => ({ default: m.MemorySettingsPage })))
-const ArchivedSessionsPage = lazy(() => import('@/features/settings/archived-sessions-page').then(m => ({ default: m.ArchivedSessionsPage })))
-const ConversationSettingsPage = lazy(() => import('@/features/settings/conversation-settings-page').then(m => ({ default: m.ConversationSettingsPage })))
-const AccountSettingsPage = lazy(() => import('@/features/settings/account-settings-page').then(m => ({ default: m.AccountSettingsPage })))
-const AboutPage = lazy(() => import('@/features/settings/settings-center-pages').then((module) => ({ default: module.AboutSettingsPage })))
-const SchedulesPage = lazy(() => import('@/features/schedules/schedules-page').then(m => ({ default: m.SchedulesPage })))
-const ArtifactsPage = lazy(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
-const SessionShareViewPage = lazy(() => import('@/features/chat/session-share-view').then((module) => ({ default: module.SessionShareViewPage })))
+const LoginPage = lazyWithRetry(() => import('@/features/auth/login-page').then((module) => ({ default: module.LoginPage })))
+const ChangePasswordPage = lazyWithRetry(() => import('@/features/auth/change-password-page').then((module) => ({ default: module.ChangePasswordPage })))
+const DashboardPage = lazyWithRetry(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.DashboardPage })))
+const LearningSessionsPage = lazyWithRetry(() => import('@/features/dashboard/dashboard-page').then((module) => ({ default: module.LearningSessionsPage })))
+const LearningPlanPage = lazyWithRetry(() => import('@/features/dashboard/learning-workspace-pages').then((module) => ({ default: module.LearningPlanPage })))
+const LearningReportPage = lazyWithRetry(() => import('@/features/dashboard/learning-workspace-pages').then((module) => ({ default: module.LearningReportPage })))
+const GoalConfirmPage = lazyWithRetry(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GoalConfirmPage })))
+const GraphReviewPage = lazyWithRetry(() => import('@/features/goals/goal-pages').then((module) => ({ default: module.GraphReviewPage })))
+const CapabilityGraphPage = lazyWithRetry(() => import('@/features/graph/graph-pages').then((module) => ({ default: module.CapabilityGraphPage })))
+const GraphWorkspacePage = lazyWithRetry(() => import('@/features/graph/graph-pages').then((module) => ({ default: module.GraphWorkspacePage })))
+const JointStudyPage = lazyWithRetry(() => import('@/features/graph/graph-pages').then((module) => ({ default: module.JointStudyPage })))
+const ChatCanvasPage = lazyWithRetry(() => import('@/features/chat/chat-pages').then((module) => ({ default: module.ChatCanvasPage })))
+const VersionsPage = lazyWithRetry(() => import('@/features/chat/chat-pages').then((module) => ({ default: module.VersionsPage })))
+const EvidenceReviewPage = lazyWithRetry(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.EvidenceReviewPage })))
+const ExerciseAnswerPage = lazyWithRetry(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.ExerciseAnswerPage })))
+const NodeLearningPage = lazyWithRetry(() => import('@/features/learning/retired-learning-redirect').then((module) => ({ default: module.NodeLearningPage })))
+const PracticeCenterPage = lazyWithRetry(() => import('@/features/practice/practice-center-page').then((module) => ({ default: module.PracticeCenterPage })))
+const PracticeSessionPage = lazyWithRetry(() => import('@/features/practice/practice-session-page').then((module) => ({ default: module.PracticeSessionPage })))
+const PracticeReportPage = lazyWithRetry(() => import('@/features/practice/practice-report-page').then((module) => ({ default: module.PracticeReportPage })))
+const RoadmapPage = lazyWithRetry(() => import('@/features/learning/learning-pages').then((module) => ({ default: module.RoadmapPage })))
+const SourcesPage = lazyWithRetry(() => import('@/features/resources/resource-pages').then((module) => ({ default: module.SourcesPage })))
+const DocumentLearningPage = lazyWithRetry(() => import('@/features/resources/document-learning-page').then((module) => ({ default: module.DocumentLearningPage })))
+const MemoryPage = lazyWithRetry(() => import('@/features/memory/memory-page').then((module) => ({ default: module.MemoryPage })))
+const PersonalizationPage = lazyWithRetry(() => import('@/features/settings/personalization-page').then((module) => ({ default: module.PersonalizationPage })))
+const ModelSettingsPage = lazyWithRetry(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.ModelSettingsPage })))
+const VoiceSettingsPage = lazyWithRetry(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.VoiceSettingsPage })))
+const ToolsSettingsPage = lazyWithRetry(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.ToolsSettingsPage })))
+const WorkspaceSettingsPage = lazyWithRetry(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.WorkspaceSettingsPage })))
+const DataSettingsPage = lazyWithRetry(() => import('@/features/settings/settings-center-pages').then(m => ({ default: m.DataSettingsPage })))
+const MemorySettingsPage = lazyWithRetry(() => import('@/features/settings/memory-settings-page').then(m => ({ default: m.MemorySettingsPage })))
+const ArchivedSessionsPage = lazyWithRetry(() => import('@/features/settings/archived-sessions-page').then(m => ({ default: m.ArchivedSessionsPage })))
+const ConversationSettingsPage = lazyWithRetry(() => import('@/features/settings/conversation-settings-page').then(m => ({ default: m.ConversationSettingsPage })))
+const AccountSettingsPage = lazyWithRetry(() => import('@/features/settings/account-settings-page').then(m => ({ default: m.AccountSettingsPage })))
+const AboutPage = lazyWithRetry(() => import('@/features/settings/settings-center-pages').then((module) => ({ default: module.AboutSettingsPage })))
+const SchedulesPage = lazyWithRetry(() => import('@/features/schedules/schedules-page').then(m => ({ default: m.SchedulesPage })))
+const ArtifactsPage = lazyWithRetry(() => import('@/features/artifacts/artifacts-page').then((module) => ({ default: module.ArtifactsPage })))
+const SessionShareViewPage = lazyWithRetry(() => import('@/features/chat/session-share-view').then((module) => ({ default: module.SessionShareViewPage })))
 
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 1,
+      networkMode: 'offlineFirst',
       // Keep regular workspace pages (dashboard/graphs/sources/settings) cached
       // for 5 minutes across route switches so returning to a page does not
       // flash a loading state. Per-session message history sets its own shorter
@@ -67,6 +70,7 @@ const queryClient = new QueryClient({
       staleTime: 30_000,
       gcTime: 5 * 60_000,
       refetchOnWindowFocus: false,
+      refetchOnReconnect: true,
     },
     mutations: { retry: 0 },
   },
@@ -74,6 +78,7 @@ const queryClient = new QueryClient({
 hydratePersistedQueryCache(queryClient)
 startPersistedQueryCache(queryClient)
 registerAuthQueryClient(queryClient)
+offlineOutbox.bindQueryClient(queryClient)
 
 function RootRedirect() {
   const auth = useAuth()

@@ -247,10 +247,29 @@ export const useAppStore = create<AppState>((set, get) => ({
   async loadSessions() {
     const state = get()
     if (!state.token || !state.workspaceId) return
+    const cacheKey = `lg.sessionsCache:${state.workspaceId}`
+    if (state.sessions.length === 0) {
+      try {
+        const raw = await storageGet(cacheKey)
+        if (raw) {
+          const cached = JSON.parse(raw) as Session[]
+          if (Array.isArray(cached) && cached.length > 0) {
+            set({ sessions: cached })
+          }
+        }
+      } catch {
+        // Ignore malformed offline cache.
+      }
+    }
     set({ sessionsLoading: true, sessionsError: null })
     try {
       const sessions = await api.listSessions()
       set({ sessions, sessionsLoading: false })
+      try {
+        await storageSet(cacheKey, JSON.stringify(sessions.slice(0, 80)))
+      } catch {
+        // Storage full must not break session listing.
+      }
       const active = state.activeSessionId
       if (active) {
         const found = sessions.find((s) => s.id === active)

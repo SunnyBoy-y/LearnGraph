@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import asyncio
+import gzip
+import zlib
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.datastructures import MutableHeaders
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.router import api_router
@@ -188,9 +190,26 @@ async def lifespan(app: FastAPI):
     from app.services.scheduled_tasks import scheduled_task_worker
     schedules_stop = asyncio.Event()
     schedules_task = asyncio.create_task(scheduled_task_worker(schedules_stop, settings)) if settings.scheduled_tasks_enabled else None
+    from app.services.im_feishu_manager import feishu_listener_manager
+    from app.services.im_wechat_manager import wechat_listener_manager
+    feishu_stop: asyncio.Event | None = None
+    feishu_task: asyncio.Task[None] | None = None
+    wechat_stop: asyncio.Event | None = None
+    wechat_task: asyncio.Task[None] | None = None
+    if settings.durable_queue_enabled:
+        feishu_stop = asyncio.Event()
+        feishu_task = asyncio.create_task(feishu_listener_manager.supervise(feishu_stop), name="feishu-listeners")
+        wechat_stop = asyncio.Event()
+        wechat_task = asyncio.create_task(wechat_listener_manager.supervise(wechat_stop), name="wechat-listeners")
     try:
         yield
     finally:
+        if wechat_stop is not None and wechat_task is not None:
+            wechat_stop.set()
+            await wechat_task
+        if feishu_stop is not None and feishu_task is not None:
+            feishu_stop.set()
+            await feishu_task
         schedules_stop.set()
         if schedules_task is not None:
             await schedules_task
@@ -242,6 +261,154 @@ async def lifespan(app: FastAPI):
         if voice_reaper_stop is not None and voice_reaper_task is not None:
             voice_reaper_stop.set()
             await voice_reaper_task
+
+
+_GZIP_COMPRESSIBLE_EXACT = frozenset({
+    "application/json",
+    "application/javascript",
+    "application/x-javascript",
+    "application/xml",
+    "application/xhtml+xml",
+    "image/svg+xml",
+})
+
+
+def _accepts_gzip(headers: Headers) -> bool:
+    raw = headers.get("accept-encoding", "")
+    if not raw:
+        return False
+    for part in raw.split(","):
+        token, *params = [item.strip().lower() for item in part.split(";")]
+        if token != "gzip":
+            continue
+        for param in params:
+            if param.startswith("q="):
+                try:
+                    if float(param[2:]) <= 0.0:
+                        return False
+                except ValueError:
+                    pass
+        return True
+    return False
+
+
+def _is_gzip_compressible(content_type: str) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if not media_type or media_type == "text/event-stream":
+        return False
+    if media_type.startswith("text/"):
+        return True
+    return media_type in _GZIP_COMPRESSIBLE_EXACT or media_type.endswith("+json") or media_type.endswith("+xml")
+
+
+def _append_vary_accept_encoding(headers: MutableHeaders) -> None:
+    existing = headers.get("vary", "")
+    parts = [part.strip() for part in existing.split(",") if part.strip()]
+    if not any(part.lower() == "accept-encoding" or part == "*" for part in parts):
+        parts.append("Accept-Encoding")
+        headers["Vary"] = ", ".join(parts)
+
+
+class SafeGZipMiddleware:
+    """Compress JSON/text/SVG responses over GZip without ever buffering SSE."""
+
+    def __init__(self, app: ASGIApp, minimum_size: int = 1024, compresslevel: int = 5) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if not _accepts_gzip(Headers(scope=scope)):
+            await self.app(scope, receive, send)
+            return
+
+        start_message: Message | None = None
+        eligible = False
+        compressor: zlib._Compress | None = None
+
+        async def send_compressed(message: Message) -> None:
+            nonlocal start_message, eligible, compressor
+            msg_type = message["type"]
+            if msg_type == "http.response.start":
+                status_code = int(message.get("status", 200))
+                headers = MutableHeaders(scope=message)
+                content_type = headers.get("content-type", "")
+                cache_control = headers.get("cache-control", "").lower()
+                content_length_raw = headers.get("content-length")
+                too_small = False
+                if content_length_raw is not None:
+                    try:
+                        too_small = int(content_length_raw) < self.minimum_size
+                    except ValueError:
+                        too_small = False
+
+                if (
+                    status_code < 200
+                    or status_code in {204, 205, 206, 304}
+                    or "content-encoding" in headers
+                    or "content-range" in headers
+                    or "no-transform" in cache_control
+                    or not _is_gzip_compressible(content_type)
+                    or too_small
+                ):
+                    eligible = False
+                    await send(message)
+                    return
+
+                eligible = True
+                start_message = message
+                return
+
+            if msg_type == "http.response.body" and eligible:
+                body = message.get("body", b"")
+                more_body = bool(message.get("more_body", False))
+
+                if start_message is not None:
+                    headers = MutableHeaders(scope=start_message)
+                    if not more_body:
+                        if len(body) < self.minimum_size:
+                            _append_vary_accept_encoding(headers)
+                            await send(start_message)
+                            start_message = None
+                            eligible = False
+                            await send(message)
+                            return
+                        compressed = gzip.compress(body, compresslevel=self.compresslevel)
+                        headers["Content-Encoding"] = "gzip"
+                        headers["Content-Length"] = str(len(compressed))
+                        _append_vary_accept_encoding(headers)
+                        await send(start_message)
+                        start_message = None
+                        await send({"type": "http.response.body", "body": compressed, "more_body": False})
+                        return
+
+                    # Streaming compressible body (e.g. FileResponse for JS/CSS bundles).
+                    compressor = zlib.compressobj(
+                        self.compresslevel, zlib.DEFLATED, 16 + zlib.MAX_WBITS
+                    )
+                    headers["Content-Encoding"] = "gzip"
+                    if "content-length" in headers:
+                        del headers["content-length"]
+                    _append_vary_accept_encoding(headers)
+                    await send(start_message)
+                    start_message = None
+                    chunk = compressor.compress(body) if body else b""
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                    return
+
+                assert compressor is not None
+                chunk = compressor.compress(body) if body else b""
+                if not more_body:
+                    chunk += compressor.flush()
+                await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+                return
+
+            await send(message)
+
+        await self.app(scope, receive, send_compressed)
 
 
 class SecurityHeadersMiddleware:
@@ -319,6 +486,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SafeGZipMiddleware, minimum_size=1024, compresslevel=5)
 app.add_middleware(SecurityHeadersMiddleware)
 install_error_handlers(app)
 app.include_router(api_router)

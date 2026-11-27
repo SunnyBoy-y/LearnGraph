@@ -161,4 +161,61 @@ describe("duplex WSS audio transport", () => {
     capture.port.onmessage({ data: { audio: new Float32Array(960), capturedAt: 0 } });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+  it("steps down Opus bitrate and sheds silent frames under soft congestion instead of dropping immediately", async () => {
+    const configuredBitrates: number[] = [];
+    let outputCb: ((chunk: { byteLength: number; timestamp: number; copyTo: (d: Uint8Array) => void }) => void) | null = null;
+    vi.stubGlobal("AudioEncoder", class {
+      static isConfigSupported = vi.fn().mockResolvedValue({ supported: true });
+      state = "configured";
+      encodeQueueSize = 0;
+      constructor(init: { output: typeof outputCb }) { outputCb = init.output; }
+      configure(cfg: { bitrate?: number }) { if (cfg.bitrate) configuredBitrates.push(cfg.bitrate); }
+      encode() { outputCb?.({ byteLength: 40, timestamp: 0, copyTo: (d) => d.fill(1) }); }
+      close() { this.state = "closed"; }
+    });
+    vi.stubGlobal("AudioDecoder", class {
+      static isConfigSupported = vi.fn().mockResolvedValue({ supported: true });
+      state = "configured";
+      decodeQueueSize = 0;
+      configure() {}
+      decode() {}
+      close() { this.state = "closed"; }
+    });
+    vi.stubGlobal("AudioData", class { close() {} });
+    vi.stubGlobal("EncodedAudioChunk", class {});
+
+    const audio = audioContext();
+    const controller = new AbortController();
+    const onClose = vi.fn();
+    const transport = new VoiceSocketTransport(audio.context, {
+      url: "/api/v1/voice/sessions/test/api/audio",
+      token: "t", workspaceId: "ws", reconnecting: false,
+      signal: controller.signal, onMessage: vi.fn(), onClose,
+    });
+    const p = transport.connect();
+    await flush();
+    const socket = Socket.instances[0];
+    socket.onopen?.();
+    socket.message({ type: "voice.ready", codec: "opus", version: 1 });
+    await p;
+
+    let capture!: { port: { onmessage: (event: { data: { audio: Float32Array; capturedAt: number } }) => void } };
+    vi.stubGlobal("AudioWorkletNode", class {
+      port = { onmessage: null, close: vi.fn() };
+      connect = vi.fn(); disconnect = vi.fn();
+      constructor() { capture = this as unknown as typeof capture; }
+    });
+    await transport.startCapture({} as MediaStream);
+    expect(configuredBitrates).toEqual([32_000]);
+
+    // Advance past cooldown and simulate soft congestion (> 1024 bytes buffered) while muted.
+    await vi.advanceTimersByTimeAsync(3_500);
+    socket.bufferedAmount = 1_500;
+    transport.setMuted(true);
+    capture.port.onmessage({ data: { audio: new Float32Array(960), capturedAt: 0 } });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(configuredBitrates).toEqual([32_000, 16_000]);
+    expect(transport.stats.droppedFrames).toBeGreaterThanOrEqual(1);
+    transport.close();
+  });
 });

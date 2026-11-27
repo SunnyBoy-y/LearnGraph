@@ -1,7 +1,11 @@
 /** Duplex media transport. Business events remain the existing RTVI protocol. */
+import { networkQualityStore } from "@/lib/network-quality";
 import captureWorkletUrl from "./voice-wss-worklet.js?worker&url";
 type Codec = "opus" | "pcm";
 type AudioConfig = { codec: string; sampleRate: number; numberOfChannels: number; bitrate?: number };
+const OPUS_BITRATE_STEPS = [32_000, 16_000, 10_000] as const;
+const BITRATE_STEP_COOLDOWN_MS = 3_000;
+const BITRATE_RECOVERY_COOLDOWN_MS = 6_000;
 interface EncodedAudio {
   byteLength: number;
   timestamp: number;
@@ -111,6 +115,8 @@ export class VoiceSocketTransport {
   private ready = false;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private lastPong = 0;
+  private lastPingAt = 0;
+  private rttMs: number | null = null;
   private pongs = 0;
   private sequence = 0;
   private generation = 0;
@@ -122,6 +128,11 @@ export class VoiceSocketTransport {
   private muted = false;
   private awaitingClear = false;
   private receivedFrames = 0;
+  private droppedFrames = 0;
+  private consecutiveCongestedFrames = 0;
+  private opusBitrateIndex = 0;
+  private lastBitrateChangeAt = 0;
+  private healthySinceAt = 0;
   private readonly context: AudioContext;
   private readonly options: VoiceSocketOptions;
 
@@ -137,12 +148,22 @@ export class VoiceSocketTransport {
   }
 
   get stats() {
-    return { codec: this.codec, sentFrames: this.sequence, receivedFrames: this.receivedFrames, bufferedBytes: this.socket?.bufferedAmount ?? 0, pongs: this.pongs };
+    return {
+      codec: this.codec,
+      bitrate: this.codec === "opus" ? OPUS_BITRATE_STEPS[this.opusBitrateIndex] : 256_000,
+      sentFrames: this.sequence,
+      receivedFrames: this.receivedFrames,
+      droppedFrames: this.droppedFrames,
+      bufferedBytes: this.socket?.bufferedAmount ?? 0,
+      pongs: this.pongs,
+      rttMs: this.rttMs,
+    };
   }
 
   async connect(): Promise<void> {
     this.codec = await selectVoiceSocketCodec();
     if (this.closed || this.options.signal.aborted) throw new DOMException("Aborted", "AbortError");
+    this.opusBitrateIndex = networkQualityStore.getSnapshot().tier === "good" ? 0 : 1;
     if (this.codec === "opus") this.createCodecs();
     const socket = new WebSocket(voiceSocketUrl(this.options.url));
     this.socket = socket;
@@ -180,11 +201,21 @@ export class VoiceSocketTransport {
             this.heartbeat = setInterval(() => {
               if (!this.isOpen) return;
               if (performance.now() - this.lastPong > 40_000) { this.fail(); return; }
+              this.lastPingAt = performance.now();
               socket.send('{"type":"voice.ping"}');
             }, 15_000);
             resolve();
           } else if (message.type === "voice.pong") {
-            this.lastPong = performance.now();
+            const now = performance.now();
+            this.lastPong = now;
+            if (this.lastPingAt > 0) {
+              this.rttMs = Math.max(0, Math.round(now - this.lastPingAt));
+              if (this.rttMs >= 450) {
+                this.stepDownBitrate(now);
+              } else if (this.rttMs <= 250) {
+                this.maybeRecoverBitrate(now);
+              }
+            }
             this.pongs++;
           } else if (message.type === "voice.clear") {
             this.generation = Number(message.generation);
@@ -226,8 +257,47 @@ export class VoiceSocketTransport {
       },
       error: () => this.fail(),
     });
-    this.encoder.configure({ ...opusConfig, bitrate: 32_000 });
+    this.encoder.configure({ ...opusConfig, bitrate: OPUS_BITRATE_STEPS[this.opusBitrateIndex] });
+    this.lastBitrateChangeAt = performance.now();
     this.resetDecoder();
+  }
+
+  private stepDownBitrate(now: number): void {
+    if (this.codec !== "opus" || !this.encoder || this.encoder.state === "closed") return;
+    if (this.opusBitrateIndex >= OPUS_BITRATE_STEPS.length - 1) return;
+    if (now - this.lastBitrateChangeAt < BITRATE_STEP_COOLDOWN_MS) return;
+    this.opusBitrateIndex += 1;
+    this.lastBitrateChangeAt = now;
+    this.healthySinceAt = 0;
+    try {
+      this.encoder.configure({ ...opusConfig, bitrate: OPUS_BITRATE_STEPS[this.opusBitrateIndex] });
+    } catch {
+      // Keep running with current encoder config if live reconfigure is unsupported.
+    }
+  }
+
+  private maybeRecoverBitrate(now: number): void {
+    if (this.codec !== "opus" || !this.encoder || this.encoder.state === "closed") return;
+    if (this.opusBitrateIndex <= 0) return;
+    if (networkQualityStore.getSnapshot().tier !== "good") return;
+    if ((this.socket?.bufferedAmount ?? 0) > 256) {
+      this.healthySinceAt = 0;
+      return;
+    }
+    if (this.healthySinceAt === 0) {
+      this.healthySinceAt = now;
+      return;
+    }
+    if (now - this.healthySinceAt < BITRATE_RECOVERY_COOLDOWN_MS) return;
+    if (now - this.lastBitrateChangeAt < BITRATE_RECOVERY_COOLDOWN_MS) return;
+    this.opusBitrateIndex -= 1;
+    this.lastBitrateChangeAt = now;
+    this.healthySinceAt = now;
+    try {
+      this.encoder.configure({ ...opusConfig, bitrate: OPUS_BITRATE_STEPS[this.opusBitrateIndex] });
+    } catch {
+      // Ignore reconfigure errors.
+    }
   }
 
   private resetDecoder(): void {
@@ -258,7 +328,12 @@ export class VoiceSocketTransport {
     this.capture = new AudioWorkletNode(this.context, "learngraph-voice-capture");
     this.capture.port.onmessage = (event: MessageEvent<{ audio: Float32Array; capturedAt: number }>) => {
       if (!this.isOpen) return;
-      if ((this.encoder?.encodeQueueSize ?? 0) > 4 || this.captureClock.length > 8) { this.fail(); return; }
+      if ((this.encoder?.encodeQueueSize ?? 0) > 16 || this.captureClock.length > 24) { this.fail(); return; }
+      if ((this.encoder?.encodeQueueSize ?? 0) > 4 || this.captureClock.length > 8) {
+        this.droppedFrames++;
+        this.stepDownBitrate(performance.now());
+        return;
+      }
       // Like a disabled WebRTC track, continue silence so server VAD/ASR can
       // finish the current turn when the microphone is muted mid-sentence.
       const input = this.muted ? new Float32Array(event.data.audio.length) : event.data.audio;
@@ -298,8 +373,39 @@ export class VoiceSocketTransport {
   private sendAudio(audio: Uint8Array, timestamp: number, silent: boolean): void {
     if (!this.isOpen || (this.muted && !silent)) return;
     const socket = this.socket!;
-    // Do not accumulate a delayed conversation in the TCP send queue.
-    if (socket.bufferedAmount > (this.codec === "opus" ? 2048 : 8192)) { this.fail(); return; }
+    const now = performance.now();
+    const buffered = socket.bufferedAmount;
+    const softLimit = this.codec === "opus" ? 1_024 : 3_072;
+    const hardLimit = 8_192;
+
+    if (buffered > hardLimit) {
+      if (this.codec === "pcm") {
+        // Uncompressed PCM cannot be stepped down; fail fast before stale audio builds up.
+        this.fail();
+        return;
+      }
+      this.stepDownBitrate(now);
+      this.droppedFrames++;
+      this.consecutiveCongestedFrames++;
+      if (this.consecutiveCongestedFrames >= 15) {
+        this.fail();
+      }
+      return;
+    }
+
+    if (buffered > softLimit) {
+      this.healthySinceAt = 0;
+      this.stepDownBitrate(now);
+      // Shed silent frames first to drain TCP backlog without dropping speech.
+      if (silent) {
+        this.droppedFrames++;
+        return;
+      }
+    } else {
+      this.consecutiveCongestedFrames = 0;
+      if (buffered === 0) this.maybeRecoverBitrate(now);
+    }
+
     socket.send(packVoiceAudio(this.codec, this.sequence++, timestamp, 0, audio));
   }
 

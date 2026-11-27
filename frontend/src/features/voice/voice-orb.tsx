@@ -715,7 +715,7 @@ export function VoiceOrb({
     };
     window.addEventListener("resize", onViewportChange);
     window.addEventListener("scroll", onViewportChange, { capture: true, passive: true });
-    const observer = reducedMotion && typeof ResizeObserver !== "undefined"
+    const observer = typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(onViewportChange) : null;
     if (observer) {
       observer.observe(canvas);
@@ -754,24 +754,38 @@ export function VoiceOrb({
       };
     }
 
-    let sinceSync = 0;
-    let frame = window.requestAnimationFrame(function tick(now: number) {
+    let frame = 0;
+    const tick = (now: number) => {
+      frame = 0;
+      if (document.hidden) return;
       const dt = engine.last ? Math.min(1 / 30, (now - engine.last) / 1000) : 0;
       engine.last = now;
-      // Re-measure now and then: the composer moves without a resize too, since it
-      // grows as the draft gets longer.
-      sinceSync += dt;
-      if (sinceSync > 0.5) {
-        sinceSync = 0;
-        sync();
-      }
       context.setTransform(engine.dpr, 0, 0, engine.dpr, 0, 0);
       stepOrbEngine(engine, dt, signalRef.current);
       drawOrb(context, engine, true);
       frame = window.requestAnimationFrame(tick);
-    });
+    };
+    const startLoop = () => {
+      if (frame || document.hidden) return;
+      engine.last = 0;
+      frame = window.requestAnimationFrame(tick);
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        if (frame) {
+          window.cancelAnimationFrame(frame);
+          frame = 0;
+        }
+      } else {
+        sync();
+        startLoop();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    startLoop();
     return () => {
-      window.cancelAnimationFrame(frame);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (frame) window.cancelAnimationFrame(frame);
       stopListening();
     };
   }, [reducedMotion]);

@@ -14,7 +14,22 @@ export interface SseParseOptions {
   signal?: AbortSignal
   dedupe?: boolean
   seenEventIds?: Set<string>
+  /** 无数据空闲超时（毫秒）；传 0 关闭。 */
+  idleTimeoutMs?: number
 }
+
+export class SseIdleTimeoutError extends Error {
+  readonly code = 'sse_idle_timeout'
+  readonly timeoutMs: number
+
+  constructor(timeoutMs: number) {
+    super(`流式连接超过 ${Math.round(timeoutMs / 1000)} 秒无数据响应`)
+    this.name = 'SseIdleTimeoutError'
+    this.timeoutMs = timeoutMs
+  }
+}
+
+const DEFAULT_SSE_IDLE_TIMEOUT_MS = 30_000
 
 const MAX_SEEN_EVENT_IDS = 4096
 
@@ -87,7 +102,7 @@ export async function* parseSseResponse<TData = unknown>(
 ): AsyncGenerator<SseEvent<TData>> {
   if (!response.body) throw new TypeError('The SSE response has no readable body')
 
-  const { signal, dedupe = true } = options
+  const { signal, dedupe = true, idleTimeoutMs = DEFAULT_SSE_IDLE_TIMEOUT_MS } = options
   const seenEventIds = options.seenEventIds ?? new Set<string>()
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -97,6 +112,30 @@ export async function* parseSseResponse<TData = unknown>(
     void reader.cancel(abortReason(signal as AbortSignal)).catch(() => undefined)
   }
   signal?.addEventListener('abort', cancelReader, { once: true })
+
+  const readChunkWithTimeout = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+    if (idleTimeoutMs <= 0) return reader.read()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    const timeoutError = new SseIdleTimeoutError(idleTimeoutMs)
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true
+        reject(timeoutError)
+        void reader.cancel(timeoutError).catch(() => undefined)
+      }, idleTimeoutMs)
+    })
+    try {
+      const result = await Promise.race([reader.read(), timeoutPromise])
+      if (timedOut) throw timeoutError
+      return result
+    } catch (error) {
+      if (timedOut) throw timeoutError
+      throw error
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
 
   const emitBlock = (block: string): SseEvent<TData> | null => {
     const parsed = parseBlock(block)
@@ -121,7 +160,7 @@ export async function* parseSseResponse<TData = unknown>(
   try {
     assertNotAborted(signal)
     while (true) {
-      const { done, value } = await reader.read()
+      const { done, value } = await readChunkWithTimeout()
       assertNotAborted(signal)
       buffer += decoder.decode(value, { stream: !done })
 

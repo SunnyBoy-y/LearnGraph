@@ -4,7 +4,8 @@
 
 import { create } from 'zustand'
 import * as api from './api/endpoints'
-import { createUuid } from './storage'
+import { ApiError } from './api/http'
+import { createUuid, storageGet, storageSet } from './storage'
 import { useAppStore, useToastStore } from './store'
 import type {
   AnswerStartedEvent,
@@ -16,6 +17,68 @@ import type {
 } from './types'
 
 export type LiveStatus = 'idle' | 'streaming' | 'done' | 'error' | 'cancelled'
+
+const MAX_STREAM_RECONNECTS = 5
+const STREAM_RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000] as const
+
+function messageCacheKey(sessionId: string): string {
+  const workspaceId = useAppStore.getState().workspaceId ?? 'default'
+  return `lg.msgCache:${workspaceId}:${sessionId}`
+}
+
+async function saveCachedMessages(sessionId: string, messages: Message[]): Promise<void> {
+  try {
+    await storageSet(messageCacheKey(sessionId), JSON.stringify(messages.slice(-50)))
+  } catch {
+    // Ignore cache write errors.
+  }
+}
+
+async function loadCachedMessages(sessionId: string): Promise<Message[] | null> {
+  try {
+    const raw = await storageGet(messageCacheKey(sessionId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed) ? (parsed as Message[]) : null
+  } catch {
+    return null
+  }
+}
+
+function isRetryableStreamError(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    return error.status === 0 || error.status === 502 || error.status === 503 || error.status === 504
+  }
+  return true
+}
+
+function waitForReconnectDelay(attemptIndex: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+  const base = STREAM_RECONNECT_DELAYS_MS[Math.min(attemptIndex, STREAM_RECONNECT_DELAYS_MS.length - 1)]
+  const delay = Math.round(base * (0.5 + Math.random() * 0.5))
+  return new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      if (typeof window !== 'undefined') window.removeEventListener('online', finish)
+      signal.removeEventListener('abort', onAbort)
+    }
+    const finish = () => {
+      cleanup()
+      resolve()
+    }
+    const onAbort = () => {
+      cleanup()
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (typeof window !== 'undefined' && navigator.onLine === false) {
+      window.addEventListener('online', finish, { once: true })
+      return
+    }
+    timer = setTimeout(finish, delay)
+  })
+}
 
 function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
@@ -246,9 +309,10 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     async open(sessionId) {
       get().controller?.abort()
+      const cached = await loadCachedMessages(sessionId)
       set({
         sessionId,
-        messages: [],
+        messages: cached ?? [],
         hasMoreBefore: false,
         messagesLoading: true,
         messagesError: null,
@@ -267,10 +331,16 @@ export const useChatStore = create<ChatState>((set, get) => {
           hasMoreBefore: page.has_more_before,
           messagesLoading: false,
         })
+        void saveCachedMessages(sessionId, page.items)
       } catch (error) {
         set({
           messagesLoading: false,
-          messagesError: error instanceof Error ? error.message : String(error),
+          messagesError:
+            cached && cached.length > 0
+              ? '当前网络异常，已展示本地缓存消息'
+              : error instanceof Error
+                ? error.message
+                : String(error),
         })
       }
     },
@@ -334,6 +404,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         finalAnswerStarted: null,
       }))
 
+      const seenEventIds = new Set<string>()
       const consume = async (
         generator: AsyncGenerator<{ event: string; id?: string; data: SessionMessageStreamData; rawData: string }>,
       ) => {
@@ -346,27 +417,53 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
 
       try {
-        const generator = api.streamMessage(
-          sessionId,
-          { content: text, generation_mode: 'text' },
-          {
-            signal: controller.signal,
-            headers: { 'Idempotency-Key': idempotencyKey },
-          },
-        )
-        const completed = await consume(generator)
+        let completed = false
+        let lastError: unknown = null
+        for (let attempt = 0; attempt <= MAX_STREAM_RECONNECTS; attempt += 1) {
+          const cursor = get().lastEventId
+          const headers: Record<string, string> = { 'Idempotency-Key': idempotencyKey }
+          if (cursor) headers['Last-Event-ID'] = cursor
+          try {
+            const generator = api.streamMessage(
+              sessionId,
+              { content: text, generation_mode: 'text' },
+              {
+                signal: controller.signal,
+                headers,
+                seenEventIds,
+              },
+            )
+            completed = await consume(generator)
+            lastError = null
+          } catch (error) {
+            if (isAbort(error) || controller.signal.aborted) throw error
+            if (!isRetryableStreamError(error)) throw error
+            lastError = error
+          }
+
+          if (completed) break
+          if (attempt === MAX_STREAM_RECONNECTS) break
+
+          set({
+            liveError: `连接中断，正在重连（${attempt + 1}/${MAX_STREAM_RECONNECTS}）…`,
+          })
+          await waitForReconnectDelay(attempt, controller.signal)
+          set({ liveError: null })
+        }
+
         if (!completed) {
-          // 流正常结束但未收到 message.completed：分离式流（网络被掐/服务端
-          // 继续生成）。保留 liveParts 并进入可「同步」的错误态。
           set((s) => ({
             liveStatus: s.liveStatus === 'streaming' ? 'error' : s.liveStatus,
             liveError:
               s.liveStatus === 'streaming'
-                ? '连接中断，生成已在电脑端继续'
+                ? lastError instanceof Error
+                  ? `${lastError.message}（生成已在电脑端继续）`
+                  : '连接中断，生成已在电脑端继续'
                 : s.liveError,
           }))
         } else {
-          set((s) => ({ liveStatus: s.liveStatus === 'streaming' ? 'done' : s.liveStatus }))
+          set((s) => ({ liveStatus: s.liveStatus === 'streaming' ? 'done' : s.liveStatus, liveError: null }))
+          void saveCachedMessages(sessionId, get().messages)
         }
         void maybeAutoTitle(sessionId, userMessage.id)
       } catch (error) {

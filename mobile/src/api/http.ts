@@ -18,6 +18,10 @@ export interface ApiRequestOptions {
   auth?: boolean
   /** 默认 true；登录/会话管理接口传 false */
   workspace?: boolean
+  /** 请求超时（毫秒），弱网时自动放大 1.8 倍；传 0 关闭 */
+  timeoutMs?: number
+  /** 禁用自动重试 */
+  noRetry?: boolean
 }
 
 export interface ApiStreamOptions extends ApiRequestOptions, SseParseOptions {}
@@ -122,6 +126,59 @@ interface RequestBody {
   kind: 'json' | 'raw'
 }
 
+const RETRYABLE_METHODS = new Set(['GET', 'HEAD'])
+const RETRYABLE_STATUSES = new Set([502, 503, 504])
+const MAX_RETRY_ATTEMPTS = 3
+const BASE_RETRY_DELAY_MS = 500
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const DEFAULT_SSE_CONNECT_TIMEOUT_MS = 45_000
+
+let mobileEwmaRttMs: number | null = null
+let mobileConsecutiveFailures = 0
+
+export function isMobileWeakNetwork(): boolean {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return true
+  return (mobileEwmaRttMs !== null && mobileEwmaRttMs >= 1_500) || mobileConsecutiveFailures >= 2
+}
+
+function recordMobileSample(ok: boolean, durationMs: number): void {
+  if (ok) {
+    mobileConsecutiveFailures = 0
+    const clamped = Math.min(Math.max(0, durationMs), 30_000)
+    mobileEwmaRttMs =
+      mobileEwmaRttMs === null ? clamped : Math.round(0.3 * clamped + 0.7 * mobileEwmaRttMs)
+  } else {
+    mobileConsecutiveFailures += 1
+  }
+}
+
+function computeJitteredBackoff(attemptIndex: number): number {
+  const cap = Math.min(8_000, BASE_RETRY_DELAY_MS * 2 ** Math.max(0, attemptIndex))
+  return Math.round(cap * (0.5 + Math.random() * 0.5))
+}
+
+function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  return signal?.aborted === true || (error instanceof DOMException && error.name === 'AbortError')
+}
+
 class ApiClient {
   private async fetchResponse(
     method: string,
@@ -152,30 +209,123 @@ class ApiClient {
       requestBody = body.value as BodyInit
     }
 
-    const response = await fetch(url, {
-      method,
-      headers,
-      body: requestBody,
-      signal: options.signal,
-    })
-    if (response.ok) return response
+    const isSseStream = headers.get('Accept')?.includes('text/event-stream') ?? false
+    const retryable =
+      !options.noRetry &&
+      !isSseStream &&
+      (RETRYABLE_METHODS.has(method) || headers.has('Idempotency-Key'))
+    const baseTimeout =
+      options.timeoutMs === undefined
+        ? isSseStream
+          ? DEFAULT_SSE_CONNECT_TIMEOUT_MS
+          : DEFAULT_REQUEST_TIMEOUT_MS
+        : options.timeoutMs
 
-    const responseBody = await readResponseBody(response)
-    const known = appError(responseBody)
-    if (response.status === 401 && options.auth !== false) {
-      apiContext.onUnauthorized()
+    let attempt = 0
+    for (;;) {
+      attempt += 1
+      const hasMoreAttempts = attempt <= MAX_RETRY_ATTEMPTS
+      const effectiveTimeoutMs =
+        baseTimeout > 0
+          ? isMobileWeakNetwork()
+            ? Math.round(baseTimeout * 1.8)
+            : baseTimeout
+          : 0
+      const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now()
+      let attemptController: AbortController | null = null
+      let timedOut = false
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+      let detachCallerAbort: (() => void) | undefined
+
+      if (effectiveTimeoutMs > 0) {
+        attemptController = new AbortController()
+        if (options.signal) {
+          if (options.signal.aborted) {
+            attemptController.abort(options.signal.reason)
+          } else {
+            const onCallerAbort = () => attemptController?.abort(options.signal?.reason)
+            options.signal.addEventListener('abort', onCallerAbort, { once: true })
+            detachCallerAbort = () => options.signal?.removeEventListener('abort', onCallerAbort)
+          }
+        }
+        timeoutTimer = setTimeout(() => {
+          timedOut = true
+          attemptController?.abort(new DOMException('Request timeout', 'TimeoutError'))
+        }, effectiveTimeoutMs)
+      }
+
+      const cleanup = () => {
+        if (timeoutTimer !== undefined) {
+          clearTimeout(timeoutTimer)
+          timeoutTimer = undefined
+        }
+        detachCallerAbort?.()
+        detachCallerAbort = undefined
+      }
+
+      try {
+        const response = await fetch(url, {
+          method,
+          headers,
+          body: requestBody,
+          signal: attemptController ? attemptController.signal : options.signal,
+        })
+        cleanup()
+        const durationMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt
+        if (response.ok) {
+          recordMobileSample(true, durationMs)
+          return response
+        }
+
+        if (RETRYABLE_STATUSES.has(response.status)) {
+          recordMobileSample(false, durationMs)
+          if (retryable && hasMoreAttempts) {
+            await delayWithAbort(computeJitteredBackoff(attempt - 1), options.signal)
+            continue
+          }
+        }
+
+        const responseBody = await readResponseBody(response)
+        const known = appError(responseBody)
+        if (response.status === 401 && options.auth !== false) {
+          apiContext.onUnauthorized()
+        }
+        throw new ApiError({
+          status: response.status,
+          code: known?.code ?? 'http_error',
+          message:
+            known?.message ??
+            (typeof responseBody === 'string' ? responseBody : response.statusText || `HTTP ${response.status}`),
+          details: known?.details ?? null,
+          method,
+          url,
+          responseBody,
+        })
+      } catch (error) {
+        cleanup()
+        const durationMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - startedAt
+        if (error instanceof ApiError) throw error
+        if (!timedOut && isAbortError(error, options.signal)) throw error
+        recordMobileSample(false, durationMs)
+        if (retryable && hasMoreAttempts) {
+          await delayWithAbort(computeJitteredBackoff(attempt - 1), options.signal)
+          continue
+        }
+        throw new ApiError({
+          status: 0,
+          code: timedOut ? 'request_timeout' : 'network_error',
+          message: timedOut
+            ? `请求超时（>${Math.round(effectiveTimeoutMs / 1000)}s），请检查网络连接`
+            : error instanceof Error
+              ? error.message
+              : '网络请求失败',
+          details: timedOut ? { timeout_ms: effectiveTimeoutMs } : null,
+          method,
+          url,
+          cause: error,
+        })
+      }
     }
-    throw new ApiError({
-      status: response.status,
-      code: known?.code ?? 'http_error',
-      message:
-        known?.message ??
-        (typeof responseBody === 'string' ? responseBody : response.statusText || `HTTP ${response.status}`),
-      details: known?.details ?? null,
-      method,
-      url,
-      responseBody,
-    })
   }
 
   private async request<TResponse>(
@@ -221,7 +371,13 @@ class ApiClient {
       { ...options, headers },
       { value: body, kind: 'json' },
     )
-    yield* parseSseResponse<TData>(response, options)
+    const idleTimeoutMs =
+      options.idleTimeoutMs === undefined
+        ? isMobileWeakNetwork()
+          ? 54_000
+          : 30_000
+        : options.idleTimeoutMs
+    yield* parseSseResponse<TData>(response, { ...options, idleTimeoutMs })
   }
 }
 

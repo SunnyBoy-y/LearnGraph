@@ -683,6 +683,17 @@ function clearTypedAcceptTimer(clientMessageId: string) {
 
 function scheduleReconnect() {
   if (reconnectTimer !== null || !snapshot.sessionId || snapshot.transport === "idle") return;
+  if (typeof window !== "undefined" && window.navigator.onLine === false) {
+    update({ transport: "reconnecting", state: "ready", error: "网络已断开，恢复后将自动重连语音…" });
+    const onOnline = () => {
+      window.removeEventListener("online", onOnline);
+      if (snapshot.sessionId && snapshot.transport === "reconnecting") {
+        void voiceSessionController.connect();
+      }
+    };
+    window.addEventListener("online", onOnline, { once: true });
+    return;
+  }
   reconnectAttempt += 1;
   if (reconnectAttempt > 5) {    update({ transport: "error", state: "error", error: "语音连接无法恢复，已降级为文字模式。请重试或退出语音模式。" });
     return;
