@@ -85,7 +85,7 @@ class MemoryCommandService:
                 sensitivity=record.sensitivity,
                 metadata={"legacy_revision": record.revision, "dual_write": True},
             ),
-            outbox_kinds=("markdown", "mem0", "embedding", "profile", "index"),
+            outbox_kinds=("markdown", "mem0", "index"),
         )
         record.head_event_id = result.event.event_id
         record.projection_version = result.event.stream_version
@@ -114,7 +114,7 @@ class MemoryCommandService:
                 idempotency_key=f"feedback:{memory_id}:{actor_id}:{uuid4()}",
                 actor_id=actor_id,
             ),
-            outbox_kinds=("profile", "index"),
+            outbox_kinds=("index",),
         )
         row = MemoryFeedback(
             workspace_id=scope.workspace_id,
@@ -169,7 +169,7 @@ class MemoryCommandService:
                 idempotency_key=f"retract:{memory_id}:{record.revision}:{uuid4()}",
                 actor_id=actor_id,
             ),
-            outbox_kinds=("markdown", "mem0", "embedding", "profile", "index"),
+            outbox_kinds=("markdown", "mem0", "index"),
         )
         record.lifecycle_status = "retracted"
         record.ledger_status = "retracted"
@@ -193,6 +193,7 @@ class MemoryCommandService:
         confirmation: str,
         reason: str,
         commit: bool = True,
+        invalidate_bulk_projections: bool = True,
     ) -> ForgetReport:
         record = self._require_record(scope, memory_id)
         if confirmation.strip() not in {record.title.strip(), "永久忘记", "FORGET"}:
@@ -219,7 +220,7 @@ class MemoryCommandService:
                 sensitivity="normal",
                 metadata={"content_excluded": True},
             ),
-            outbox_kinds=("markdown", "mem0", "embedding", "profile", "index"),
+            outbox_kinds=("markdown", "mem0", "index"),
         )
         # Destroy the just-written action payload key too; the envelope metadata
         # retains the non-sensitive audit action and target hash.
@@ -262,18 +263,19 @@ class MemoryCommandService:
                 (MemoryRelation.from_id == memory_id) | (MemoryRelation.to_id == memory_id),
             )
         ).rowcount or 0
-        packages = self.db.scalars(
-            select(MemoryContextPackage).where(
-                MemoryContextPackage.workspace_id == scope.workspace_id
-            )
-        ).all()
         invalidated_packages = 0
-        for package in packages:
-            if memory_id in package.selected_ids_json or memory_id in package.candidate_ids_json:
-                package.outcome_status = "invalidated_by_forget"
-                package.selected_ids_json = [item for item in package.selected_ids_json if item != memory_id]
-                package.candidate_ids_json = [item for item in package.candidate_ids_json if item != memory_id]
-                invalidated_packages += 1
+        if invalidate_bulk_projections:
+            packages = self.db.scalars(
+                select(MemoryContextPackage).where(
+                    MemoryContextPackage.workspace_id == scope.workspace_id
+                )
+            ).all()
+            for package in packages:
+                if memory_id in package.selected_ids_json or memory_id in package.candidate_ids_json:
+                    package.outcome_status = "invalidated_by_forget"
+                    package.selected_ids_json = [item for item in package.selected_ids_json if item != memory_id]
+                    package.candidate_ids_json = [item for item in package.candidate_ids_json if item != memory_id]
+                    invalidated_packages += 1
         from app.domain.models import MemoryJournalEntry, MemoryDeletionRecovery, MemoryProfileSnapshot, MemoryDraft
         now = utc_now()
         for journal in self.db.scalars(select(MemoryJournalEntry).where(
@@ -307,18 +309,19 @@ class MemoryCommandService:
             draft.source_refs = []
             draft.status = "REJECTED"
             draft.rejection_reason = "source_forgotten"
-        for snapshot in self.db.scalars(select(MemoryProfileSnapshot).where(
-            MemoryProfileSnapshot.workspace_id == scope.workspace_id
-        )):
-            refs = set(snapshot.source_atom_ids or []) | {i for ids in (snapshot.claim_atom_map or {}).values() for i in ids}
-            if memory_id in refs:
-                snapshot.markdown = ""
-                snapshot.structured_sections = []
-                snapshot.source_atom_ids = []
-                snapshot.claim_atom_map = {}
-                snapshot.source_fingerprint = ""
-                snapshot.status = "stale"
-                snapshot.stale_reason = "source_forgotten"
+        if invalidate_bulk_projections:
+            for snapshot in self.db.scalars(select(MemoryProfileSnapshot).where(
+                MemoryProfileSnapshot.workspace_id == scope.workspace_id
+            )):
+                refs = set(snapshot.source_atom_ids or []) | {i for ids in (snapshot.claim_atom_map or {}).values() for i in ids}
+                if memory_id in refs:
+                    snapshot.markdown = ""
+                    snapshot.structured_sections = []
+                    snapshot.source_atom_ids = []
+                    snapshot.claim_atom_map = {}
+                    snapshot.source_fingerprint = ""
+                    snapshot.status = "stale"
+                    snapshot.stale_reason = "source_forgotten"
         record.title = "[forgotten]"
         record.content_hash = ""
         record.relative_path = ""

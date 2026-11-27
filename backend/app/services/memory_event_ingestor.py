@@ -77,9 +77,9 @@ class MemoryEventIngestor:
     @staticmethod
     def _outbox_kinds(event_type: str) -> tuple[str, ...]:
         if event_type.startswith("memory."):
-            return ("markdown", "mem0", "embedding", "profile", "index")
+            return ("markdown", "mem0", "index")
         if event_type.startswith("artifact."):
-            return ("index", "embedding")
+            return ("index",)
         if event_type.startswith("episode."):
             return ("index",)
         return ()

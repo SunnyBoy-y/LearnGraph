@@ -10,12 +10,21 @@ from app.prompts.fragments import (
     BASE_STYLE_PROMPTS,
     CORE_INSTRUCTIONS,
     EMOJI_PROMPTS,
+    EMOJI_TEXT_ALLOWED_NOTE,
+    EMOJI_TEXT_DISABLED_NOTE,
     ENTHUSIASM_PROMPTS,
     HEADINGS_PROMPTS,
+    OUTPUT_ADAPTATION_PROSE_RULES,
     OUTPUT_ADAPTATION_RULES,
+    SCHEDULED_NON_INTERACTIVE_RULES,
+    STICKER_TOOL_ALLOWED_NOTE,
+    STICKER_TOOL_DISABLED_NOTE,
+    VERBOSITY_OVERRIDE_NOTE,
     VERBOSITY_PROMPTS,
     WARMTH_PROMPTS,
 )
+
+PromptChannel = Literal["chat", "voice", "scheduled"]
 
 BaseStyle = Literal[
     "default",
@@ -75,7 +84,18 @@ class ResponseStyleConfig(BaseModel):
         return value
 
 
+class PromptRuntimeState(BaseModel):
+    """Per-turn runtime state used to compile conflict-free prompt instructions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel: PromptChannel = "chat"
+    interactive: bool = True
+    sticker_enabled: bool = True
+
+
 DEFAULT_RESPONSE_STYLE = ResponseStyleConfig()
+DEFAULT_PROMPT_RUNTIME_STATE = PromptRuntimeState()
 
 
 def normalize_response_style(value: Any | None) -> ResponseStyleConfig:
@@ -86,10 +106,47 @@ def normalize_response_style(value: Any | None) -> ResponseStyleConfig:
     return ResponseStyleConfig.model_validate(value)
 
 
-def build_style_instructions(config: ResponseStyleConfig | None = None) -> str:
-    """Compile base style + characteristics into a single instructions block."""
+def build_expression_policy(
+    style: ResponseStyleConfig,
+    *,
+    sticker_enabled: bool = True,
+) -> str:
+    """Compile independent text-emoji and image-sticker policies."""
+
+    emoji_note = (
+        EMOJI_TEXT_DISABLED_NOTE if style.emoji == -2 else EMOJI_TEXT_ALLOWED_NOTE
+    )
+    sticker_note = (
+        STICKER_TOOL_ALLOWED_NOTE if sticker_enabled else STICKER_TOOL_DISABLED_NOTE
+    )
+    return f"{emoji_note}\n{sticker_note}"
+
+
+def build_style_instructions(
+    config: ResponseStyleConfig | None = None,
+    *,
+    state: PromptRuntimeState | None = None,
+) -> str:
+    """Compile base style + characteristics into a conflict-free instructions block."""
 
     style = config or DEFAULT_RESPONSE_STYLE
+    runtime = state or DEFAULT_PROMPT_RUNTIME_STATE
+
+    if runtime.channel == "voice":
+        # Voice has its own spoken-first system prompt; only carry compatible tone dimensions.
+        parts = [
+            "# 语音语气偏好",
+            WARMTH_PROMPTS[style.warmth].strip(),
+            ENTHUSIASM_PROMPTS[style.enthusiasm].strip(),
+        ]
+        return "\n\n".join(part for part in parts if part)
+
+    output_rules = (
+        OUTPUT_ADAPTATION_PROSE_RULES
+        if style.headings_and_lists <= -1
+        else OUTPUT_ADAPTATION_RULES
+    )
+
     parts = [
         CORE_INSTRUCTIONS.strip(),
         BASE_STYLE_PROMPTS[style.base_style].strip(),
@@ -99,6 +156,13 @@ def build_style_instructions(config: ResponseStyleConfig | None = None) -> str:
         HEADINGS_PROMPTS[style.headings_and_lists].strip(),
         EMOJI_PROMPTS[style.emoji].strip(),
         VERBOSITY_PROMPTS[style.verbosity].strip(),
-        OUTPUT_ADAPTATION_RULES.strip(),
+        VERBOSITY_OVERRIDE_NOTE.strip() if style.verbosity <= -1 else "",
+        output_rules.strip(),
     ]
+    if runtime.channel == "scheduled" or not runtime.interactive:
+        parts.append(SCHEDULED_NON_INTERACTIVE_RULES.strip())
+    if state is not None:
+        parts.append(
+            build_expression_policy(style, sticker_enabled=runtime.sticker_enabled)
+        )
     return "\n\n".join(part for part in parts if part)

@@ -1,10 +1,13 @@
-import { type FormEvent, type ReactNode, useEffect, useState } from 'react'
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { History, Info, MoreHorizontal, Pencil, RotateCcw, Trash2 } from 'lucide-react'
 import { toast } from '@/lib/notifications'
 
 import { getMemory, listMemoryRevisions, updateMemory } from '@/api'
+import { ClearableSearchInput } from '@/components/shared/clearable-search-input'
 import { EmptyState, ErrorState, LoadingState } from '@/components/shared/page-elements'
+import { Pagination } from '@/components/shared/pagination'
+import { applyRangeSelection, useEscapeKey } from '@/lib/list-selection'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -86,13 +89,39 @@ export function MemoryAllList({
   onUpdate: (id: string, payload: Parameters<typeof updateMemory>[1]) => Promise<void>
 }) {
   const [category, setCategory] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const [detailId, setDetailId] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [deleteTarget, setDeleteTarget] = useState<MemoryEntry[] | null>(null)
+  const anchorRef = useRef<string | null>(null)
+  const shiftRef = useRef(false)
   const options = memoryCategoryOptions(items)
-  const visible = category ? items.filter((item) => memoryCategoryLabel(item) === category) : items
+  const query = search.trim().toLocaleLowerCase()
+  const visible = useMemo(() => {
+    const byCategory = category ? items.filter((item) => memoryCategoryLabel(item) === category) : items
+    if (!query) return byCategory
+    return byCategory.filter((item) =>
+      `${item.title} ${item.content ?? ''} ${memoryCategoryLabel(item)}`
+        .toLocaleLowerCase()
+        .includes(query),
+    )
+  }, [category, items, query])
+  const totalPages = Math.max(1, Math.ceil(visible.length / pageSize))
+  const safePage = Math.min(page, totalPages)
+  const pagedVisible = useMemo(
+    () => visible.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [pageSize, safePage, visible],
+  )
+  const pagedVisibleIds = useMemo(() => pagedVisible.map((item) => item.id), [pagedVisible])
   const selected = items.filter((item) => selectedIds.has(item.id))
   const visibleSelected = visible.filter((item) => selectedIds.has(item.id)).length
+  const clearSelection = useCallback(() => {
+    setSelectedIds(new Set())
+    anchorRef.current = null
+  }, [])
+  useEscapeKey(selectedIds.size > 0, clearSelection)
 
   function selectVisible(checked: boolean) {
     setSelectedIds((previous) => {
@@ -103,6 +132,21 @@ export function MemoryAllList({
       }
       return next
     })
+  }
+
+  function toggleRowSelection(id: string, checked: boolean) {
+    const useShift = shiftRef.current
+    shiftRef.current = false
+    setSelectedIds((previous) => {
+      if (useShift && anchorRef.current) {
+        return applyRangeSelection(previous, pagedVisibleIds, anchorRef.current, id, checked)
+      }
+      const next = new Set(previous)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+    anchorRef.current = id
   }
 
   async function confirmDelete() {
@@ -122,7 +166,7 @@ export function MemoryAllList({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1.5">
           <Button
-            onClick={() => setCategory(null)}
+            onClick={() => { setCategory(null); setPage(1) }}
             size="sm"
             variant={category === null ? 'default' : 'outline'}
           >
@@ -132,7 +176,7 @@ export function MemoryAllList({
           {options.map((label) => (
             <Button
               key={label}
-              onClick={() => setCategory(label)}
+              onClick={() => { setCategory(label); setPage(1) }}
               size="sm"
               variant={category === label ? 'default' : 'outline'}
             >
@@ -144,6 +188,14 @@ export function MemoryAllList({
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <ClearableSearchInput
+            aria-label="搜索记忆"
+            containerClassName="w-56"
+            inputClassName="h-8 text-xs"
+            onChange={(value) => { setSearch(value); setPage(1) }}
+            placeholder="搜索标题或内容…"
+            value={search}
+          />
           {createAction}
           <Button disabled={busy || !items.length} onClick={() => setDeleteTarget(items)} size="sm" variant="outline">
             <Trash2 className="size-3.5" />清空全部
@@ -162,8 +214,15 @@ export function MemoryAllList({
             />
             全选当前分类
           </label>
-          <span aria-live="polite" className="text-xs text-muted-foreground">已选 {selected.length} 条</span>
-          {selected.length ? <Button disabled={busy} onClick={() => setSelectedIds(new Set())} size="sm" variant="ghost">取消选择</Button> : null}
+          <span aria-live="polite" className="text-xs text-muted-foreground">
+            已选 {selected.length} 条
+          </span>
+          {selected.length > visibleSelected ? (
+            <span className="text-xs text-muted-foreground">
+              （另有 {selected.length - visibleSelected} 条在其他分类或筛选）
+            </span>
+          ) : null}
+          {selected.length ? <Button disabled={busy} onClick={clearSelection} size="sm" variant="ghost">取消选择</Button> : null}
           <Button className="ml-auto" disabled={busy || !selected.length} onClick={() => setDeleteTarget(selected)} size="sm" variant="destructive">
             <Trash2 className="size-3.5" />{busy ? '处理中…' : '删除所选'}
           </Button>
@@ -180,18 +239,14 @@ export function MemoryAllList({
       ) : (
         <section className="surface overflow-hidden">
           <div className="divide-y">
-            {visible.map((item) => (
+            {pagedVisible.map((item) => (
               <MemoryListRow
                 busy={busy}
                 item={item}
                 key={item.id}
                 selected={selectedIds.has(item.id)}
-                onSelect={(checked) => setSelectedIds((previous) => {
-                  const next = new Set(previous)
-                  if (checked) next.add(item.id)
-                  else next.delete(item.id)
-                  return next
-                })}
+                onSelectShift={(shift) => { shiftRef.current = shift }}
+                onSelect={(checked) => toggleRowSelection(item.id, checked)}
                 onDelete={() => onDelete(item.id)}
                 onOpenDetail={() => setDetailId(item.id)}
                 onRestoreRevision={(revision) => onRestoreRevision(item, revision)}
@@ -202,9 +257,21 @@ export function MemoryAllList({
           </div>
           {!visible.length ? (
             <EmptyState
-              description="换一个分类，或在报告里让 AI 导师学习新的偏好。"
-              title="该分类下没有记忆"
+              description={query ? `没有匹配「${search.trim()}」的记忆，可清空搜索重试。` : '换一个分类，或在报告里让 AI 导师学习新的偏好。'}
+              title={query ? '没有匹配的记忆' : '该分类下没有记忆'}
             />
+          ) : null}
+          {visible.length > pageSize || pageSize !== 20 ? (
+            <div className="border-t px-4 py-3">
+              <Pagination
+                onPageChange={setPage}
+                onPageSizeChange={(size) => { setPageSize(size); setPage(1) }}
+                page={safePage}
+                pageSize={pageSize}
+                sizes={[20, 50, 100]}
+                total={visible.length}
+              />
+            </div>
           ) : null}
         </section>
       )}
@@ -242,6 +309,7 @@ function MemoryListRow({
   onDelete,
   selected,
   onSelect,
+  onSelectShift,
   onOpenDetail,
   onRestoreRevision,
   onUpdate,
@@ -252,6 +320,7 @@ function MemoryListRow({
   onDelete: () => void
   selected: boolean
   onSelect: (checked: boolean) => void
+  onSelectShift?: (shift: boolean) => void
   onOpenDetail: () => void
   onRestoreRevision: (revision: number) => void
   onUpdate: (payload: Parameters<typeof updateMemory>[1]) => Promise<void>
@@ -264,7 +333,14 @@ function MemoryListRow({
 
   return (
     <div className={`flex items-start gap-3 px-5 py-3.5 ${selected ? 'bg-primary/5' : ''}`}>
-      <Checkbox aria-label={`选择记忆：${item.title}`} checked={selected} className="mt-0.5" disabled={busy} onCheckedChange={(checked) => onSelect(checked === true)} />
+      <Checkbox
+        aria-label={`选择记忆：${item.title}`}
+        checked={selected}
+        className="mt-0.5"
+        disabled={busy}
+        onClickCapture={(event) => onSelectShift?.(event.shiftKey)}
+        onCheckedChange={(checked) => onSelect(checked === true)}
+      />
       <div className="min-w-0 flex-1">
         <p className="line-clamp-2 text-sm font-medium leading-5">{item.title}</p>
         {memoryOccurrenceHint(item) ? <p className="mt-1 text-xs text-muted-foreground">发生时间：{memoryOccurrenceHint(item)}</p> : null}

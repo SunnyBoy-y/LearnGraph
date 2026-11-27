@@ -358,8 +358,45 @@ def test_api_actual_path_response_and_route_order(env):
         result = client.post("/api/v1/sessions/opening-prompts", json={"count": 3})
         assert result.status_code == 200, result.text
         assert len(result.json()["prompts"]) == 3
-        assert set(result.json()["prompts"][0]) == {"id", "content"}
+        assert set(result.json()["prompts"][0]) == {"id", "content", "display_text"}
         assert client.post("/api/v1/sessions/opening-prompts", json={"count": 10}).status_code == 422
         assert client.post("/api/v1/sessions/opening-prompts", json={"memory": "injection"}).status_code == 422
     paths = [route.path for route in router.routes]
     assert paths.index("/sessions/opening-prompts") < paths.index("/sessions/{session_id}/suggested-prompts")
+
+
+def test_paired_display_text_and_full_prompt_separation(env, monkeypatch):
+    seed_project(env, title="数据结构与算法")
+    pairs = [
+        ("循环数组的下标为什么会回到 0？", "结合循环数组取模运算与边界回绕，用从末尾绕回下标 0 的具体例子讲清推导过程。"),
+        ("画图解释 HashMap 的哈希冲突", "用图示对比 HashMap 发生哈希冲突时，直接覆盖旧对象与链表/红黑树在查找路径上的差异。"),
+        ("HashMap 在什么情况下会从红黑树退化为链表？", "针对 HashMap 树化后节点减少的退化阈值，带我做一组删除操作推演，理清树化与退化的边界条件。"),
+        ("什么是负载因子，为什么默认是 0.75？", "解释 HashMap 负载因子 0.75 在空间利用率和冲突概率之间的权衡。"),
+        ("画图演示循环队列的判空和判满", "画出循环队列中队头与队尾指针移动过程，说明判空与判满的区别。"),
+        ("出几道 HashMap 扩容的易错题", "围绕 HashMap 扩容时容量翻倍和节点重哈希设计 3 道易错判断题并逐题讲解。"),
+        ("红黑树为什么比普通二叉搜索树更稳？", "从最坏时间复杂度和旋转平衡机制讲清红黑树相对普通二叉搜索树的优势。"),
+        ("用生活例子解释哈希表怎么查数据", "用一个贴近日常生活的类比说明哈希函数、桶定位和冲突处理流程。"),
+        ("带我复盘一遍链表转红黑树的条件", "梳理 HashMap 链表长度阈值和数组容量阈值，通过具体例子带我核对每个边界条件。"),
+    ]
+    captured: list[str] = []
+
+    def generate(_chat, prompt):
+        captured.append(prompt)
+        return "\n".join(
+            f"{i}. {'展示文案：' if i == 1 else ''}{display} {'｜｜' if i == 2 else '||'} {'完整提示词：' if i == 1 else ''}{full}"
+            for i, (display, full) in enumerate(pairs, 1)
+        )
+
+    monkeypatch.setattr(module.ChatService, "_generate_suggested_prompt_text", generate)
+    response = env.service.generate(OpeningPromptRequest(count=3))
+    assert len(response.prompts) == 3
+    assert len(response.pool) == 9
+    assert response.prompts[0].display_text == pairs[0][0]
+    assert response.prompts[0].content == pairs[0][1]
+    assert response.prompts[1].display_text == pairs[1][0]
+    assert response.prompts[1].content == pairs[1][1]
+    assert response.prompts[2].display_text == pairs[2][0]
+    assert response.prompts[2].content == pairs[2][1]
+    assert "15到30个汉字" in captured[0]
+    assert "简短提问 || 完整提示词" in captured[0]
+    assert "知识理解" in captured[0] and "可视化解释" in captured[0]

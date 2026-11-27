@@ -1,7 +1,9 @@
+import { useMemo } from 'react'
 import { FileClock, RotateCcw } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -10,6 +12,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { EmptyState } from '@/components/shared/page-elements'
+import { useListSelection } from '@/lib/list-selection'
 import type { MemoryEntry } from '@/types/memory'
 import { formatMemoryTime } from '../memory-display'
 
@@ -23,15 +26,46 @@ export function MemoryTrashDialog({
   open,
   onOpenChange,
   onRestore,
+  onRestoreMany,
 }: {
   busy: boolean
   items: MemoryEntry[]
   open: boolean
   onOpenChange: (open: boolean) => void
   onRestore: (id: string) => void
+  onRestoreMany?: (ids: string[]) => Promise<void> | void
 }) {
+  const recoverableIds = useMemo(
+    () => items.filter((item) => item.restore_available).map((item) => item.id),
+    [items],
+  )
+  const selection = useListSelection(recoverableIds, {
+    alwaysActive: true,
+    allowEscapeInsideDialog: true,
+  })
+  const selectedRecoverableIds = useMemo(
+    () => recoverableIds.filter((id) => selection.selectedIds.has(id)),
+    [recoverableIds, selection.selectedIds],
+  )
+
+  async function handleRestoreMany(ids: string[]) {
+    if (!ids.length || busy) return
+    if (onRestoreMany) {
+      await onRestoreMany(ids)
+    } else {
+      for (const id of ids) onRestore(id)
+    }
+    selection.removeIds(ids)
+  }
+
   return (
-    <Dialog onOpenChange={onOpenChange} open={open}>
+    <Dialog
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) selection.clear()
+        onOpenChange(nextOpen)
+      }}
+      open={open}
+    >
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>回收站</DialogTitle>
@@ -40,31 +74,95 @@ export function MemoryTrashDialog({
           </DialogDescription>
         </DialogHeader>
         {items.length ? (
-          <div className="divide-y border-y">
-            {items.map((item) => (
-              <div className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center" key={item.id}>
-                <FileClock className="size-4 shrink-0 text-amber-600" />
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="text-sm font-semibold">{item.title}</p>
-                    <Badge variant="secondary">{item.state === 'destroyed' ? '已销毁' : '已删除'}</Badge>
-                  </div>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {item.restore_available
-                      ? `可恢复到 ${formatMemoryTime(item.recoverable_until)}`
-                      : `正文已于 ${formatMemoryTime(item.content_destroyed_at)} 销毁`}
-                  </p>
+          <div className="space-y-3">
+            {recoverableIds.length > 0 ? (
+              <div
+                aria-label="回收站批量操作"
+                className="flex flex-wrap items-center gap-2 rounded-xl border bg-muted/20 px-3 py-2 text-xs"
+                role="region"
+              >
+                <label className="flex items-center gap-2 text-sm">
+                  <Checkbox
+                    aria-label="全选可恢复记忆"
+                    checked={selection.visibleCheckboxState}
+                    disabled={busy}
+                    onCheckedChange={(checked) => selection.toggleVisible(checked === true)}
+                  />
+                  全选可恢复 ({recoverableIds.length})
+                </label>
+                {selectedRecoverableIds.length > 0 ? (
+                  <span className="tabular-nums text-muted-foreground">
+                    已选 {selectedRecoverableIds.length} 条
+                  </span>
+                ) : null}
+                <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                  <Button
+                    disabled={busy || !selectedRecoverableIds.length}
+                    onClick={() => void handleRestoreMany(selectedRecoverableIds)}
+                    size="xs"
+                    type="button"
+                    variant="outline"
+                  >
+                    <RotateCcw className="size-3.5" />
+                    恢复所选{selectedRecoverableIds.length ? ` (${selectedRecoverableIds.length})` : ''}
+                  </Button>
+                  <Button
+                    disabled={busy}
+                    onClick={() => void handleRestoreMany(recoverableIds)}
+                    size="xs"
+                    type="button"
+                    variant="secondary"
+                  >
+                    <RotateCcw className="size-3.5" />
+                    全部恢复
+                  </Button>
+                  {selectedRecoverableIds.length > 0 ? (
+                    <Button disabled={busy} onClick={selection.clear} size="xs" type="button" variant="ghost">
+                      取消选择
+                    </Button>
+                  ) : null}
                 </div>
-                <Button
-                  disabled={!item.restore_available || busy}
-                  onClick={() => onRestore(item.id)}
-                  size="sm"
-                  variant="outline"
-                >
-                  <RotateCcw className="size-4" />恢复
-                </Button>
               </div>
-            ))}
+            ) : null}
+            <div className="divide-y border-y">
+              {items.map((item) => {
+                const selected = item.restore_available && selection.selectedIds.has(item.id)
+                return (
+                  <div
+                    className={`flex flex-col gap-3 py-4 sm:flex-row sm:items-center ${selected ? 'bg-primary/5 px-2' : ''}`}
+                    key={item.id}
+                  >
+                    {recoverableIds.length > 0 ? (
+                      <Checkbox
+                        aria-label={`选择恢复记忆：${item.title}`}
+                        disabled={busy || !item.restore_available}
+                        {...selection.checkboxProps(item.id)}
+                      />
+                    ) : null}
+                    <FileClock className="size-4 shrink-0 text-amber-600" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-semibold">{item.title}</p>
+                        <Badge variant="secondary">{item.state === 'destroyed' ? '已销毁' : '已删除'}</Badge>
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {item.restore_available
+                          ? `可恢复到 ${formatMemoryTime(item.recoverable_until)}`
+                          : `正文已于 ${formatMemoryTime(item.content_destroyed_at)} 销毁`}
+                      </p>
+                    </div>
+                    <Button
+                      disabled={!item.restore_available || busy}
+                      onClick={() => onRestore(item.id)}
+                      size="sm"
+                      variant="outline"
+                    >
+                      <RotateCcw className="size-4" />恢复
+                    </Button>
+                  </div>
+                )
+              })}
+            </div>
           </div>
         ) : (
           <EmptyState

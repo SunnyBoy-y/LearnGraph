@@ -79,6 +79,7 @@ import type {
 import type { Goal } from '@/types/goals'
 import type { GraphNode, GraphSummary } from '@/types/graphs'
 import type { Session } from '@/types/sessions'
+import { memoryCategoryLabel } from './memory-display'
 import { MemoryAllList } from './components/memory-all-list'
 import { MemoryDiagnosticsSheet } from './components/memory-diagnostics-sheet'
 import { MemoryPendingConfirmationPanel } from './components/memory-pending-confirmation-panel'
@@ -95,10 +96,10 @@ import {
 import { usePendingMemorySummary } from './use-pending-memory-summary'
 
 const zoneDefinitions: Array<{ zone: MemoryZone; title: string }> = [
-  { zone: 'hot', title: '热摘要' },
+  { zone: 'hot', title: '常用摘要' },
   { zone: 'recent', title: '近期事件' },
   { zone: 'topics', title: '主题记忆' },
-  { zone: 'archive', title: '冷区归档' },
+  { zone: 'archive', title: '归档备查' },
 ]
 
 type MemoryTab = 'report' | 'all' | 'pending'
@@ -271,6 +272,20 @@ export function MemoryPage() {
       await refreshMemory()
     },
     onError: (error) => toast.error(error.message),
+  })
+  const restoreMany = useMutation({
+    mutationFn: async (ids: string[]) => {
+      const results = await Promise.allSettled(ids.map((id) => restoreDeletedMemory(id)))
+      const restored = results.filter((result) => result.status === 'fulfilled').length
+      return { restored, failed: ids.length - restored }
+    },
+    onSuccess: async ({ restored, failed }) => {
+      await refreshMemory()
+      if (failed === 0) toast.success(`已恢复 ${restored} 条记忆`)
+      else if (restored > 0) toast.warning(`已恢复 ${restored} 条记忆，${failed} 条失败`)
+      else toast.error('批量恢复记忆失败')
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : '批量恢复记忆失败'),
   })
   const restoreRevision = useMutation({
     mutationFn: ({ id, revision, expectedRevision }: { id: string; revision: number; expectedRevision: number }) =>
@@ -519,7 +534,7 @@ export function MemoryPage() {
   }
 
   return (
-    <PageFrame className={tab === 'report' ? 'pb-2' : undefined}>
+    <PageFrame className={tab === 'report' ? 'lg:pt-14 pb-2' : 'lg:pt-14'}>
       {/* 统一容器：页面标题、Tabs、报告、底部输入框共用同一个宽度基准。 */}
       <div className="mx-auto flex w-full max-w-[1040px] flex-col gap-5">
         <PageIntro
@@ -739,10 +754,11 @@ export function MemoryPage() {
         open={settingsOpen}
       />
       <MemoryTrashDialog
-        busy={restore.isPending}
+        busy={restore.isPending || restoreMany.isPending}
         items={deletedMemories}
         onOpenChange={setTrashOpen}
         onRestore={(id) => restore.mutate(id)}
+        onRestoreMany={(ids) => restoreMany.mutateAsync(ids).then(() => undefined)}
         open={trashOpen}
       />
       <MemoryDiagnosticsSheet
@@ -789,11 +805,11 @@ function ScopeFields({
   return (
     <div className="grid gap-4 sm:grid-cols-2">
       <div className="space-y-2">
-        <Label>作用范围</Label>
+        <Label htmlFor="memory-topic-scope">关联到</Label>
         <Select onValueChange={(value) => onScopeTypeChange(value as MemoryScopeType)} value={scopeType}>
-          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectTrigger id="memory-topic-scope"><SelectValue /></SelectTrigger>
           <SelectContent>
-            <SelectItem value="workspace">整个工作区</SelectItem>
+            <SelectItem value="workspace">工作区通用</SelectItem>
             <SelectItem value="goal">某个学习目标</SelectItem>
             <SelectItem value="node">某个知识节点</SelectItem>
             <SelectItem value="session">某次对话</SelectItem>
@@ -865,7 +881,7 @@ function CreateMemoryDialog({
   const [nodeId, setNodeId] = useState('')
   const [recordKind, setRecordKind] = useState('semantic_memory')
   const [timeExpression, setTimeExpression] = useState('')
-  const [timezoneName, setTimezoneName] = useState('Asia/Shanghai')
+  const timezoneName = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 
   async function submit(event: FormEvent) {
     event.preventDefault()
@@ -929,40 +945,37 @@ function CreateMemoryDialog({
                 <Label htmlFor="memory-time-expression">发生时间（可选）</Label>
                 <Input id="memory-time-expression" maxLength={120} value={timeExpression} onChange={(event) => setTimeExpression(event.target.value)} placeholder="昨天、上周、2026年10月18日" />
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="memory-create-timezone">时间表达的时区</Label>
-                <Input id="memory-create-timezone" maxLength={80} required value={timezoneName} onChange={(event) => setTimezoneName(event.target.value)} />
-              </div>
             </div>
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="memory-namespace">在哪些对话中可用</Label>
+              <Select onValueChange={(value) => setNamespace(value as MemoryNamespace)} value={namespace}>
+                <SelectTrigger id="memory-namespace"><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="workspace">工作区内的对话</SelectItem><SelectItem value="session">仅指定对话</SelectItem></SelectContent>
+              </Select>
+            </div>
+            <details className="space-y-3 rounded-lg border p-3">
+              <summary className="cursor-pointer text-sm">高级分类</summary>
               <div className="space-y-2">
-                <Label htmlFor="memory-zone">读取优先级</Label>
+                <Label htmlFor="memory-zone">归入哪类记忆</Label>
                 <Select onValueChange={(value) => setZone(value as MemoryZone)} value={zone}>
                   <SelectTrigger id="memory-zone"><SelectValue /></SelectTrigger>
                   <SelectContent>{zoneDefinitions.map((item) => <SelectItem key={item.zone} value={item.zone}>{item.title}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="memory-namespace">可见范围</Label>
-                <Select onValueChange={(value) => setNamespace(value as MemoryNamespace)} value={namespace}>
-                  <SelectTrigger id="memory-namespace"><SelectValue /></SelectTrigger>
-                  <SelectContent><SelectItem value="workspace">整个工作区</SelectItem><SelectItem value="session">仅当前对话</SelectItem></SelectContent>
-                </Select>
-              </div>
-            </div>
-            <div className="space-y-2">
-              <Label>记忆类型</Label>
+              <Label htmlFor="memory-record-kind">内容类型</Label>
               <Select onValueChange={(value) => setRecordKind(value ?? 'semantic_memory')} value={recordKind}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectTrigger id="memory-record-kind"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {(types.length ? types : [{ memory_type: 'semantic_memory', description: '稳定事实' }]).map((item) => (
                     <SelectItem key={item.memory_type} value={item.memory_type}>
-                      {item.memory_type}
+                      {item.memory_type === "semantic_memory" ? "长期有效的信息" : memoryCategoryLabel({ record_kind: item.memory_type })}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+              </div>
+            </details>
             <ScopeFields
               goalId={goalId}
               goals={goals}

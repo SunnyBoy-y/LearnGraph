@@ -7,6 +7,7 @@ export interface OpeningPromptsRequest {
   project_id?: string | null
   count?: number
   exhausted_pool_id?: string
+  mode?: 'goal'
 }
 
 export interface OpeningPromptsResponse {

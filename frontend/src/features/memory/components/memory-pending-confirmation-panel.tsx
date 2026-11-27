@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, Pencil, Trash2, XCircle } from 'lucide-react'
 import { toast } from '@/lib/notifications'
+import { applyRangeSelection, useEscapeKey } from '@/lib/list-selection'
 
 import {
   batchRecordMemoryFeedback,
@@ -126,6 +127,7 @@ function DraftCard({
   selected,
   selectionDisabled = false,
   onSelect,
+  onSelectShift,
   onResolved,
 }: {
   draft: MemoryDraft
@@ -133,6 +135,7 @@ function DraftCard({
   selected: boolean
   selectionDisabled?: boolean
   onSelect: (checked: boolean) => void
+  onSelectShift?: (shift: boolean) => void
   onResolved?: (id: string) => void
 }) {
   const queryClient = useQueryClient()
@@ -180,6 +183,7 @@ function DraftCard({
           checked={selected}
           className="mt-1"
           disabled={cardBusy}
+          onClickCapture={(event) => onSelectShift?.(event.shiftKey)}
           onCheckedChange={(checked) => onSelect(checked === true)}
         />
         <div className="min-w-0 flex-1">
@@ -245,6 +249,7 @@ function PendingMemoryCard({
   selected,
   selectionDisabled = false,
   onSelect,
+  onSelectShift,
   onResolved,
   onCorrect,
 }: {
@@ -253,6 +258,7 @@ function PendingMemoryCard({
   selected: boolean
   selectionDisabled?: boolean
   onSelect: (checked: boolean) => void
+  onSelectShift?: (shift: boolean) => void
   onResolved?: (id: string) => void
   onCorrect: (text: string) => void
 }) {
@@ -337,6 +343,7 @@ function PendingMemoryCard({
           checked={selected}
           className="mt-1"
           disabled={cardBusy}
+          onClickCapture={(event) => onSelectShift?.(event.shiftKey)}
           onCheckedChange={(checked) => onSelect(checked === true)}
         />
         <div className="min-w-0 flex-1">
@@ -505,6 +512,13 @@ export function MemoryPendingConfirmationPanel({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [batchRejectOpen, setBatchRejectOpen] = useState(false)
   const [batchRejectionReason, setBatchRejectionReason] = useState('')
+  const anchorRef = useRef<string | null>(null)
+  const shiftRef = useRef(false)
+  const clearSelection = useCallback(() => {
+    setSelectedIds(new Set())
+    anchorRef.current = null
+  }, [])
+  useEscapeKey(selectedIds.size > 0, clearSelection)
   const { counts, total } = usePendingMemorySummary()
   const active = useQuery({
     queryKey: ['memory-pending'],
@@ -540,12 +554,18 @@ export function MemoryPendingConfirmationPanel({
   }
 
   function toggleItem(id: string, checked: boolean) {
+    const useShift = shiftRef.current
+    shiftRef.current = false
     setSelectedIds((previous) => {
+      if (useShift && anchorRef.current) {
+        return applyRangeSelection(previous, visibleIds, anchorRef.current, id, checked)
+      }
       const next = new Set(previous)
       if (checked) next.add(id)
       else next.delete(id)
       return next
     })
+    anchorRef.current = id
   }
 
   function removeFromSelection(id: string) {
@@ -695,6 +715,7 @@ export function MemoryPendingConfirmationPanel({
                 draft={draft}
                 key={draft.id}
                 onResolved={removeFromSelection}
+                onSelectShift={(shift) => { shiftRef.current = shift }}
                 onSelect={(checked) => toggleItem(draft.id, checked)}
                 selected={selectedIds.has(draft.id)}
                 selectionDisabled={batchBusy}
@@ -708,6 +729,7 @@ export function MemoryPendingConfirmationPanel({
                 key={item.id}
                 onCorrect={(text) => onRequestCorrection?.(text)}
                 onResolved={removeFromSelection}
+                onSelectShift={(shift) => { shiftRef.current = shift }}
                 onSelect={(checked) => toggleItem(item.id, checked)}
                 selected={selectedIds.has(item.id)}
                 selectionDisabled={batchBusy}

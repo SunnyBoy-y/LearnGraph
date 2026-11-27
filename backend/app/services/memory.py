@@ -1024,9 +1024,30 @@ class MemoryService:
         ).all()
         for recovery in expired_recoveries:
             self.db.delete(recovery)
-        if destroyed or removed_journal or expired_recoveries:
+        draft_cutoff = current - timedelta(days=30)
+        stale_drafts = self.db.scalars(
+            self.drafts.query().where(
+                MemoryDraft.status == "PENDING",
+                MemoryDraft.created_by == "memory_extraction",
+            )
+        ).all()
+        expired_drafts_closed = 0
+        for draft in stale_drafts:
+            created_at = getattr(draft, "created_at", None)
+            if created_at is None or _as_utc(created_at) > draft_cutoff:
+                continue
+            draft.status = "REJECTED"
+            draft.reviewed_by = "system:memory-retention"
+            draft.reviewed_at = current
+            draft.rejection_reason = "expired_unreviewed"
+            expired_drafts_closed += 1
+        if destroyed or removed_journal or expired_recoveries or expired_drafts_closed:
             self.db.commit()
-        return {"content_keys_destroyed": destroyed, "journal_entries_removed": removed_journal}
+        return {
+            "content_keys_destroyed": destroyed,
+            "journal_entries_removed": removed_journal,
+            "expired_drafts_closed": expired_drafts_closed,
+        }
 
     def list(
         self,
@@ -1831,7 +1852,7 @@ class MemoryService:
                 payload={"memory_id": memory_id},
                 idempotency_key=f"delete-event-view:{memory_id}", actor_id=self.actor_id,
             ),
-            outbox_kinds=("markdown", "mem0", "embedding", "profile", "index"),
+            outbox_kinds=("markdown", "mem0", "index"),
         )
         MemoryProjector(self.db).apply(result.event, {"memory_id": memory_id})
         self.db.execute(delete(MemoryEmbedding).where(

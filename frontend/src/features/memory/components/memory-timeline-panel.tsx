@@ -8,6 +8,48 @@ import { Label } from '@/components/ui/label'
 import { workspaceQueryKey } from '@/lib/query-keys'
 import { memoryOccurrenceHint } from '../memory-display'
 
+const COMMON_TIMEZONES = [
+  'Asia/Shanghai',
+  'UTC',
+  'Asia/Tokyo',
+  'Asia/Singapore',
+  'America/New_York',
+  'America/Los_Angeles',
+  'Europe/London',
+] as const
+
+function offsetForTimezone(timezone: string, referenceDate: Date): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      timeZoneName: 'longOffset',
+    }).formatToParts(referenceDate)
+    const tzPart = parts.find((part) => part.type === 'timeZoneName')?.value ?? ''
+    if (tzPart === 'GMT' || tzPart === 'UTC') return 'Z'
+    const match = tzPart.match(/GMT([+-]\d{2}:\d{2})/)
+    if (match) return match[1]
+  } catch {
+    // Fallback to browser local offset when custom timezone string is unrecognized.
+  }
+  const minutes = -referenceDate.getTimezoneOffset()
+  const sign = minutes >= 0 ? '+' : '-'
+  const abs = Math.abs(minutes)
+  return `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`
+}
+
+function localInputToIso(localValue: string, timezone: string): string {
+  if (!localValue) return ''
+  const normalized = localValue.length === 16 ? `${localValue}:00` : localValue
+  const date = new Date(normalized)
+  const offset = offsetForTimezone(timezone, Number.isNaN(date.getTime()) ? new Date() : date)
+  return `${normalized}${offset}`
+}
+
+function isoToLocalInput(iso: string): string {
+  const match = iso.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/)
+  return match ? match[1] : ''
+}
+
 export function MemoryTimelinePanel({ workspaceId }: { workspaceId: string }) {
   const [expression, setExpression] = useState('')
   const [timezone, setTimezone] = useState('Asia/Shanghai')
@@ -28,7 +70,7 @@ export function MemoryTimelinePanel({ workspaceId }: { workspaceId: string }) {
     setValidationError('')
     const bounds = [startAt, endAt].filter(Boolean)
     if (bounds.some((value) => !/(Z|[+-]\d{2}:\d{2})$/i.test(value) || Number.isNaN(Date.parse(value)))) {
-      setValidationError('请使用带时区的 ISO 时间，例如 2026-10-18T00:00:00+08:00。')
+      setValidationError('请使用带时区的 ISO 时间，例如 2026-10-18T00:00:00+08:00，或使用日期选择器选取。')
       return
     }
     if (startAt && endAt && Date.parse(startAt) >= Date.parse(endAt)) {
@@ -65,18 +107,57 @@ export function MemoryTimelinePanel({ workspaceId }: { workspaceId: string }) {
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="memory-timezone">时区</Label>
-          <Input id="memory-timezone" value={timezone} onChange={(event) => setTimezone(event.target.value)} className="w-40" maxLength={80} required />
+          <Input id="memory-timezone" list="memory-common-timezones" value={timezone} onChange={(event) => setTimezone(event.target.value)} className="w-44" maxLength={80} required />
+          <datalist id="memory-common-timezones">
+            {COMMON_TIMEZONES.map((tz) => <option key={tz} value={tz} />)}
+          </datalist>
         </div>
         <Button disabled={(!expression.trim() && !startAt && !endAt) || timeline.isFetching} type="submit">查询时间线</Button>
         {filter ? <Button type="button" variant="ghost" onClick={() => { setFilter(null); setValidationError('') }}>清除查询</Button> : null}
       </div>
       <details>
         <summary className="cursor-pointer text-xs text-muted-foreground">精确时间范围（可选）</summary>
-        <div className="mt-2 grid gap-2 sm:grid-cols-2">
-          <div className="space-y-1.5"><Label htmlFor="memory-time-start">开始时间（含）</Label><Input id="memory-time-start" value={startAt} onChange={(event) => setStartAt(event.target.value)} placeholder="2026-10-18T00:00:00+08:00" /></div>
-          <div className="space-y-1.5"><Label htmlFor="memory-time-end">结束时间（不含）</Label><Input id="memory-time-end" value={endAt} onChange={(event) => setEndAt(event.target.value)} placeholder="2026-10-19T00:00:00+08:00" /></div>
+        <div className="mt-2 grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label htmlFor="memory-time-start">开始时间（含）</Label>
+            <div className="flex flex-wrap gap-1.5">
+              <Input
+                aria-label="选择开始日期时间"
+                className="w-44 shrink-0 text-xs"
+                onChange={(event) => setStartAt(localInputToIso(event.target.value, timezone))}
+                type="datetime-local"
+                value={isoToLocalInput(startAt)}
+              />
+              <Input
+                className="min-w-44 flex-1 font-mono text-xs"
+                id="memory-time-start"
+                onChange={(event) => setStartAt(event.target.value)}
+                placeholder="2026-10-18T00:00:00+08:00"
+                value={startAt}
+              />
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="memory-time-end">结束时间（不含）</Label>
+            <div className="flex flex-wrap gap-1.5">
+              <Input
+                aria-label="选择结束日期时间"
+                className="w-44 shrink-0 text-xs"
+                onChange={(event) => setEndAt(localInputToIso(event.target.value, timezone))}
+                type="datetime-local"
+                value={isoToLocalInput(endAt)}
+              />
+              <Input
+                className="min-w-44 flex-1 font-mono text-xs"
+                id="memory-time-end"
+                onChange={(event) => setEndAt(event.target.value)}
+                placeholder="2026-10-19T00:00:00+08:00"
+                value={endAt}
+              />
+            </div>
+          </div>
         </div>
-        <p className="mt-2 text-xs text-muted-foreground">带时区的精确边界优先于时间表达；不填写的边界由时间表达确定。</p>
+        <p className="mt-2 text-xs text-muted-foreground">选择日期时间后会自动补齐当前时区偏移；也可直接粘贴带时区的 ISO 时间。</p>
       </details>
     </form>
     <p className="text-xs text-muted-foreground">按事件发生时间筛选，不是记忆的最后更新时间；区间结束时刻不包含在内。</p>

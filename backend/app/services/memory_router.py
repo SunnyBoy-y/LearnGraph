@@ -6,7 +6,9 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
-from sqlalchemy.orm import Session
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.domain.memory_event_models import (
     MemoryRetrievalTrace,
@@ -233,6 +235,58 @@ class MemoryRouter:
         trace_id = self._persist_trace(scope, query, routes, signals, retrieval, latency_ms)
         return MemoryRouteResult(routes, retrieval, tuple(signals), trace_id, window=window)
 
+    def _isolated_trace_engine(self) -> Engine | None:
+        if self.db is None:
+            return None
+        try:
+            bind = self.db.get_bind()
+        except Exception:
+            return None
+        if not isinstance(bind, Engine):
+            return None
+        if isinstance(getattr(bind, "pool", None), StaticPool):
+            return None
+        if bind.dialect.name == "sqlite":
+            database_name = getattr(bind.url, "database", None)
+            if not database_name or database_name == ":memory:":
+                return None
+            from app.core.database import session_holds_write_gate
+
+            if session_holds_write_gate(self.db):
+                return None
+        return bind
+
+    def _build_trace(
+        self,
+        target_db: Session,
+        scope: MemoryScopeContext,
+        query: str,
+        routes: tuple[MemoryRoute, ...],
+        signals: list[IntentSignal],
+        retrieval: RetrievalResult,
+        latency_ms: int,
+    ) -> MemoryRetrievalTrace:
+        return MemoryRetrievalTrace(
+            tenant_id=scope.tenant_id,
+            workspace_id=scope.workspace_id,
+            subject_user_id=scope.principal_user_id,
+            agent_id=scope.agent_id,
+            query_hash=hashlib.sha256(query.encode("utf-8")).hexdigest(),
+            routes_json=list(routes),
+            signals_json=[
+                {"intent": s.intent, "confidence": s.confidence, "marker": s.marker}
+                for s in signals
+            ],
+            candidate_count=len(retrieval.candidates),
+            selected_count=len(retrieval.candidates),
+            excluded_counts_json=retrieval.excluded,
+            degraded_modes_json=list(retrieval.degraded_modes),
+            fts_capability=probe_memory_search_fts_capability(target_db),
+            strategy="hybrid_memory_v2",
+            status="completed",
+            latency_ms=latency_ms,
+        )
+
     def _persist_trace(
         self,
         scope: MemoryScopeContext,
@@ -247,36 +301,29 @@ class MemoryRouter:
         if self.db is None:
             return None
         try:
-            # A savepoint, not a bare flush.  This row is telemetry, and its own
-            # failure must stay its own: the previous fallback called
-            # ``rollback()`` on the *caller's* session, so the moment traces were
-            # actually turned on (they were not: see below) a failed trace write
-            # could have discarded a request's pending work.  ``begin_nested()``
-            # confines the rollback to this row.
-            #
-            # Note for whoever wires this up next: until ``MemoryRouter`` is built
-            # with a ``db`` the whole method is a no-op, which is why the chat and
-            # voice read paths had no traces at all.
+            # Prefer a short-lived isolated session that commits immediately so
+            # read/context-building paths never leave an uncommitted write (and
+            # thus the SQLite single-writer gate) held across subsequent LLM calls.
+            isolated_engine = self._isolated_trace_engine()
+            if isolated_engine is not None:
+                with sessionmaker(
+                    bind=isolated_engine,
+                    autoflush=False,
+                    expire_on_commit=False,
+                )() as trace_db:
+                    trace = self._build_trace(
+                        trace_db, scope, query, routes, signals, retrieval, latency_ms
+                    )
+                    trace_db.add(trace)
+                    trace_db.commit()
+                    return trace.id
+
+            # Fallback for shared single-connection in-memory test pools or
+            # callers already inside a SQLite write transaction: keep the trace
+            # inside a savepoint so a telemetry failure cannot roll back caller work.
             with self.db.begin_nested():
-                trace = MemoryRetrievalTrace(
-                    tenant_id=scope.tenant_id,
-                    workspace_id=scope.workspace_id,
-                    subject_user_id=scope.principal_user_id,
-                    agent_id=scope.agent_id,
-                    query_hash=hashlib.sha256(query.encode("utf-8")).hexdigest(),
-                    routes_json=list(routes),
-                    signals_json=[
-                        {"intent": s.intent, "confidence": s.confidence, "marker": s.marker}
-                        for s in signals
-                    ],
-                    candidate_count=len(retrieval.candidates),
-                    selected_count=len(retrieval.candidates),
-                    excluded_counts_json=retrieval.excluded,
-                    degraded_modes_json=list(retrieval.degraded_modes),
-                    fts_capability=probe_memory_search_fts_capability(self.db),
-                    strategy="hybrid_memory_v2",
-                    status="completed",
-                    latency_ms=latency_ms,
+                trace = self._build_trace(
+                    self.db, scope, query, routes, signals, retrieval, latency_ms
                 )
                 self.db.add(trace)
                 self.db.flush()

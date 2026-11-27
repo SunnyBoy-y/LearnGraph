@@ -190,10 +190,14 @@ class ContextBuilder:
                 task_view = None
                 continue
             _try_section(name, serialized, raw)
-        prompt_block = "\n\n".join(
-            [header]
-            + [f"<HOST_DATA_BLOCK kind={name}>\n{serialized}\n</HOST_DATA_BLOCK>" for name, serialized, _ in selected_sections]
-        )
+        if selected_sections:
+            prompt_block = "\n\n".join(
+                [header]
+                + [f"<HOST_DATA_BLOCK kind={name}>\n{serialized}\n</HOST_DATA_BLOCK>" for name, serialized, _ in selected_sections]
+            )
+        else:
+            prompt_block = ""
+            used = 0
         selected_payload = {
             "scope": {
                 "tenant_id": scope.tenant_id,

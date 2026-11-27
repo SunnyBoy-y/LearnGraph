@@ -87,6 +87,53 @@ _ALLOWED_OPERATIONS = {
 }
 
 
+_PROFILE_FAILURE_BASE_BACKOFF_SECONDS = 300
+_PROFILE_FAILURE_MAX_BACKOFF_SECONDS = 21_600
+_PROFILE_PERMANENT_FAILURE_BACKOFF_SECONDS = 86_400
+_PERMANENT_HTTP_STATUS_RE = re.compile(r"\bHTTP\s+(?:401|403|404)\b", re.I)
+
+
+def _is_permanent_profile_error(error: Exception | None, reason: str) -> bool:
+    if error is not None:
+        from app.providers.remote.openai import ProviderHTTPError
+
+        if isinstance(error, ProviderHTTPError) and error.status_code in {401, 403, 404}:
+            return True
+        cause = getattr(error, "__cause__", None)
+        if isinstance(cause, ProviderHTTPError) and cause.status_code in {401, 403, 404}:
+            return True
+        if isinstance(error, AppError) and error.code in {
+            "memory_profile_model_unconfigured",
+            "memory_profile_input_budget_exceeded",
+        }:
+            return True
+    return bool(_PERMANENT_HTTP_STATUS_RE.search(reason or ""))
+
+
+def _parse_refresh_failure_meta(stale_reason: str) -> tuple[int, bool, datetime | None]:
+    raw = str(stale_reason or "")
+    if not raw.startswith("refresh_failed|"):
+        return 0, False, None
+    parts = raw.split("|")
+    failed_at = _parse_iso(parts[-1]) if len(parts) >= 3 else None
+    # New format: refresh_failed|<attempts>|<permanent|transient>|<reason>|<iso>
+    if len(parts) >= 5 and parts[1].isdigit() and parts[2] in {"permanent", "transient"}:
+        return max(1, int(parts[1])), parts[2] == "permanent", failed_at
+    # Legacy format: refresh_failed|<reason>|<iso>
+    reason = parts[1] if len(parts) >= 2 else ""
+    return 1, _is_permanent_profile_error(None, reason), failed_at
+
+
+def _profile_failure_cooldown(attempts: int, permanent: bool) -> timedelta:
+    if permanent:
+        return timedelta(seconds=_PROFILE_PERMANENT_FAILURE_BACKOFF_SECONDS)
+    seconds = min(
+        _PROFILE_FAILURE_MAX_BACKOFF_SECONDS,
+        _PROFILE_FAILURE_BASE_BACKOFF_SECONDS * (2 ** min(max(0, attempts - 1), 6)),
+    )
+    return timedelta(seconds=seconds)
+
+
 def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
@@ -971,7 +1018,7 @@ class MemoryProfileService:
         the reason visible on the report page instead of a bare 502.
         """
 
-        reason = str(getattr(error, "message", "") or error).strip() or "unknown"
+        reason = str(getattr(error, "message", "") or error).strip().replace("|", "/") or "unknown"
         snapshot = self.db.scalar(
             select(MemoryProfileSnapshot)
             .where(
@@ -981,13 +1028,18 @@ class MemoryProfileService:
             .order_by(MemoryProfileSnapshot.version.desc())
             .limit(1)
         )
+        prev_attempts = 0
         if snapshot is None:
             snapshot = MemoryProfileSnapshot(workspace_id=self.workspace_id, owner_subject_id=self.actor_id,
                 version=1, status="failed", source_fingerprint="")
             self.db.add(snapshot)
+        else:
+            prev_attempts, _, _ = _parse_refresh_failure_meta(str(snapshot.stale_reason or ""))
+        attempts = prev_attempts + 1
+        kind = "permanent" if _is_permanent_profile_error(error, reason) else "transient"
         snapshot.status = "failed"
         snapshot.stale_reason = (
-            f"refresh_failed|{reason[:120]}|{utc_now().isoformat()}"
+            f"refresh_failed|{attempts}|{kind}|{reason[:100]}|{utc_now().isoformat()}"
         )[:240]
         self.db.commit()
 
@@ -1003,8 +1055,9 @@ class MemoryProfileService:
             MemoryProfileSnapshot.owner_subject_id == self.actor_id,
         ).order_by(MemoryProfileSnapshot.version.desc()).limit(1))
         if not force and latest is not None and str(latest.stale_reason or "").startswith("refresh_failed|"):
-            failed_at = _parse_iso(str(latest.stale_reason).rsplit("|", 1)[-1])
-            if failed_at is not None and utc_now() - failed_at < timedelta(seconds=60):
+            attempts, permanent, failed_at = _parse_refresh_failure_meta(str(latest.stale_reason))
+            cooldown = _profile_failure_cooldown(attempts, permanent)
+            if failed_at is not None and utc_now() - failed_at < cooldown:
                 return self._profile_view(latest)
         try:
             return self._refresh_profile(
@@ -1068,12 +1121,11 @@ class MemoryProfileService:
                 atom_refs[str(value)] for value in values or [] if str(value) in atom_refs
             ))
 
-        report_time = utc_now().isoformat()
+        report_time = utc_now().strftime("%Y-%m-%d")
         prompt = (
             "你是 LearnGraph 的长期记忆摘要整理器。仅依据 ATOMS JSON 写一篇完整的"
             "中文学习报告。使用第二人称“你”。报告是高层综合，选取最有价值的学习主题，"
             "不要逐条复述记忆，不要罗列全部兴趣、旧任务、临时指令或个人身份细节。\n"
-            f"当前时间：{report_time}。\n"
             "必须遵守：\n"
             "1. 每个段落只能陈述所引用 atom_ids 能直接支持的事实，绝不推断或发明。\n"
             "2. 合并重复事实；当前计划和稳定偏好分开；不要把一次事件写成习惯。\n"
@@ -1090,8 +1142,9 @@ class MemoryProfileService:
             "6. 全文目标 800-1200 中文字符，硬上限约 2000；按完整段落取舍。"
             "最多 7 个维度，每个维度只写 1 个综合段落（不超过 240 字），"
             "每段引用 1-8 条最直接的证据。概览不超过 240 字，引用不超过 12 条。\n"
-            "7. atom_ids 必须逐字来自输入中的 A1、A2 等短编号。\n\n"
+            "7. atom_ids 必须逐字来自输入中的 A1、A2 等短编号。\n"
             "8. 引用编号只放在 overview_atom_ids / atom_ids 字段，正文不得出现编号。\n\n"
+            f"当前时间：{report_time}。\n\n"
             f"ATOMS JSON:\n{json.dumps(prompt_atoms, ensure_ascii=False)}"
         )
         try:
@@ -1183,7 +1236,7 @@ class MemoryProfileService:
         verification_prompt = (
             "你是记忆摘要事实校验器。逐条判断 CLAIMS 是否由其 atom_ids "
             "对应的 ATOMS 支持。摘要本身是高层综合，因此：\n"
-            f"当前时间：{report_time}；已过去的目标日期不得写成当前或未来安排，"
+            "已过去的目标日期不得写成当前或未来安排，"
             "也不得自行判断完成与否。\n"
             "必须判为**有效**：\n"
             "1. 把多个原子合并、并列、归类、去重，或按维度归纳成一条陈述；\n"
@@ -1194,6 +1247,7 @@ class MemoryProfileService:
             "2. 把一次事件写成习惯，或把「尚未确定」写成「已经确定」；\n"
             "3. 时态不一致，或放大/缩小原子表达的确定性、范围与适用条件。\n"
             "只返回可保留的 valid_claim_ids 和违规原因。\n\n"
+            f"当前时间：{report_time}。\n\n"
             f"ATOMS:\n{json.dumps(verification_atoms, ensure_ascii=False)}\n\n"
             f"CLAIMS:\n{json.dumps(claims, ensure_ascii=False)}"
         )

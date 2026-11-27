@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useMemo, useRef, useState } from 'react'
+import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import { useReducedMotionPreference } from '@/lib/motion-preferences'
 import { cn } from '@/lib/utils'
@@ -176,34 +176,55 @@ export function MemoryReportComposer({
   const localTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [expanded, setExpanded] = useState(false)
 
-  useEffect(() => {
+  const syncHeight = useCallback(() => {
     const el = localTextareaRef.current
     if (!el) return
     el.style.width = '100%'
-    const syncHeight = () => {
-      const styles = window.getComputedStyle(el)
-      const maxHeight = Number.parseFloat(styles.getPropertyValue('--composer-textarea-max')) || 210
-      const minHeight = Number.parseFloat(styles.getPropertyValue('--composer-textarea-min')) || 52
-      el.style.height = '0px'
-      const contentHeight = el.scrollHeight
-      const next = Math.min(maxHeight, Math.max(minHeight, contentHeight))
-      el.style.height = `${next}px`
-      el.style.overflowY = contentHeight > maxHeight + 1 ? 'auto' : 'hidden'
-      setExpanded(contentHeight > minHeight + 1)
-    }
+    const styles = window.getComputedStyle(el)
+    const maxHeight = Number.parseFloat(styles.getPropertyValue('--composer-textarea-max')) || 210
+    const minHeight = Number.parseFloat(styles.getPropertyValue('--composer-textarea-min')) || 52
+    el.style.height = '0px'
+    const contentHeight = el.scrollHeight
+    const next = Math.min(maxHeight, Math.max(minHeight, contentHeight))
+    el.style.height = `${next}px`
+    el.style.overflowY = contentHeight > maxHeight + 1 ? 'auto' : 'hidden'
+    setExpanded(contentHeight > minHeight + 1)
+  }, [])
+
+  useEffect(() => {
     syncHeight()
-    window.addEventListener('resize', syncHeight)
+  }, [draft, syncHeight])
+
+  useEffect(() => {
+    const el = localTextareaRef.current
+    if (!el) return
+    let frame = 0
+    const scheduleSync = () => {
+      if (frame) return
+      frame = window.requestAnimationFrame(() => {
+        frame = 0
+        syncHeight()
+      })
+    }
+    window.addEventListener('resize', scheduleSync)
     const group = el.closest("[data-slot='input-group']")
+    let lastWidth = group ? group.getBoundingClientRect().width : -1
     let observer: ResizeObserver | undefined
     if (group && typeof ResizeObserver !== 'undefined') {
-      observer = new ResizeObserver(syncHeight)
+      observer = new ResizeObserver(([entry]) => {
+        const nextWidth = entry?.contentRect.width ?? group.getBoundingClientRect().width
+        if (Math.abs(nextWidth - lastWidth) <= 0.5) return
+        lastWidth = nextWidth
+        scheduleSync()
+      })
       observer.observe(group)
     }
     return () => {
-      window.removeEventListener('resize', syncHeight)
+      window.removeEventListener('resize', scheduleSync)
       observer?.disconnect()
+      if (frame) window.cancelAnimationFrame(frame)
     }
-  }, [draft])
+  }, [syncHeight])
 
   return (
     <div className="w-full">
