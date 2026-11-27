@@ -4060,16 +4060,54 @@ class UsageService:
                model_id: str | None = None, feature: str | None = None,
                start_at: datetime | None = None, end_at: datetime | None = None,
                archived: str = "exclude", offset: int = 0, limit: int = 500,
-               unknown_currency: bool = False) -> list[UsageEvent]:
+               unknown_currency: bool = False, unpriced_only: bool = False) -> list[UsageEvent]:
         statement = self._filtered_query(currency=None if unknown_currency else currency,
             provider_id=provider_id, model_id=model_id, feature=feature, start_at=start_at, end_at=end_at)
         statement = statement.where(UsageEvent.record_stage == "settled")
+        if unpriced_only and not unknown_currency:
+            statement = statement.where(UsageEvent.cost_amount.is_(None), UsageEvent.cost_status != "non_billable")
         if archived == "exclude":
             statement = statement.where(UsageEvent.archived_at.is_(None))
         elif archived == "only":
             statement = statement.where(UsageEvent.archived_at.is_not(None))
         return list(self.db.scalars(statement.order_by(UsageEvent.created_at.desc(), UsageEvent.id)
             .offset(max(0, offset)).limit(min(max(1, limit), 2000))).all())
+
+    def resolve_provider_names(self, provider_ids: set[str]) -> dict[str, str]:
+        targets = {pid for pid in provider_ids if pid and pid != "*"}
+        if not targets:
+            return {}
+        names: dict[str, str] = {}
+        if "local_mock" in targets:
+            names["local_mock"] = "本地模拟服务"
+        remaining = targets - set(names)
+        if remaining:
+            for provider_id, display_name in self.db.execute(
+                select(ProviderConfig.id, ProviderConfig.display_name).where(
+                    ProviderConfig.workspace_id == self.workspace_id,
+                    ProviderConfig.id.in_(remaining),
+                )
+            ):
+                if display_name:
+                    names[provider_id] = display_name
+        missing = targets - set(names)
+        if missing:
+            for audit in self.db.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.workspace_id == self.workspace_id,
+                    AuditEvent.resource_type == "provider",
+                    AuditEvent.resource_id.in_(missing),
+                    AuditEvent.action == "provider.delete",
+                )
+                .order_by(AuditEvent.created_at.desc())
+            ).all():
+                if audit.resource_id in names:
+                    continue
+                display_name = (audit.details or {}).get("display_name")
+                if isinstance(display_name, str) and display_name.strip():
+                    names[audit.resource_id] = display_name.strip()
+        return names
 
     def summary(self, *, currency: str = "USD", provider_id: str | None = None,
                 model_id: str | None = None, feature: str | None = None,
@@ -4093,11 +4131,13 @@ class UsageService:
             breakdown[dimension] = [dict(label=label, cost_amount=sum_amounts(event.cost_amount for event in members),
                 attempts=len(members), total_tokens=sum(event.total_tokens for event in members),
                 unknown_events=sum(event.cost_amount is None for event in members)) for label, members in sorted(groups.items())]
+        provider_names = self.resolve_provider_names({event.provider_id for event in records if event.provider_id})
         return UsageSummary(workspace_id=self.workspace_id, currency=currency, **tokens, attempts=len(events),
             cost_amount=sum_amounts(event.cost_amount for event in events),
             reserved_amount=sum_amounts(event.reserved_amount for event in records),
             unpriced_events=sum(event.cost_amount is None for event in events), unknown_currency_events=unknown,
-            remote_usage_recorded=any(event.cost_status != "non_billable" for event in events), breakdown=breakdown)
+            remote_usage_recorded=any(event.cost_status != "non_billable" for event in events), breakdown=breakdown,
+            provider_names=provider_names)
 
     def clear_events(self, *, actor_id: str, currency: str, provider_id: str | None = None,
                      model_id: str | None = None, feature: str | None = None,

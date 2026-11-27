@@ -79,17 +79,24 @@ def usage_events(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=500, ge=1, le=2000),
     unknown_currency: bool = False,
+    unpriced_only: bool = False,
 ) -> list[UsageEventView]:
+    service = UsageService(db, context.workspace_id)
+    items = service.events(
+        currency=currency, archived=archived, offset=offset, limit=limit,
+        unknown_currency=unknown_currency, unpriced_only=unpriced_only,
+        provider_id=provider_id,
+        model_id=model_id,
+        feature=feature,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    names = service.resolve_provider_names({item.provider_id for item in items if item.provider_id})
     return [
-        UsageEventView.model_validate(item)
-        for item in UsageService(db, context.workspace_id).events(
-            currency=currency, archived=archived, offset=offset, limit=limit, unknown_currency=unknown_currency,
-            provider_id=provider_id,
-            model_id=model_id,
-            feature=feature,
-            start_at=start_at,
-            end_at=end_at,
+        UsageEventView.model_validate(item).model_copy(
+            update={"provider_display_name": names.get(item.provider_id)}
         )
+        for item in items
     ]
 
 

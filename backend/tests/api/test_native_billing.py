@@ -382,3 +382,51 @@ def test_chat_api_uses_native_cny_price_with_zero_usd_limit(client, register_use
     with SessionLocal() as db:
         events = db.scalars(select(UsageEvent).where(UsageEvent.workspace_id == workspace, UsageEvent.feature == "chat")).all()
         assert len(events) == 1 and events[0].currency == "CNY" and events[0].cost_amount == "0.0000006"
+
+
+def test_usage_resolves_deleted_provider_names_and_unpriced_filter(client, register_user, auth_headers):
+    from app.core.config import get_settings
+    from app.services.management import ProviderService
+
+    token, workspace, provider_id = setup_native(register_user, "USD")
+    headers = auth_headers(token, workspace)
+    with SessionLocal() as db:
+        billing = BillingService(db, workspace, "test")
+        priced = quote(billing, provider_id)
+        billing.record_usage(priced, input_tokens=1000, output_tokens=0, attempt=1)
+        unpriced = quote(billing, provider_id)
+        billing.record_usage(unpriced, input_tokens=0, output_tokens=0, attempt=1, usage_reported=False)
+        orphan_id = str(uuid4())
+        db.add(UsageEvent(
+            workspace_id=workspace,
+            provider_id=orphan_id,
+            model_id="orphan-model",
+            feature="chat_fast_preface",
+            currency="USD",
+            cost_amount=None,
+            amount_source="unknown",
+            cost_status="unpriced",
+            record_stage="settled",
+        ))
+        db.commit()
+        ProviderService(db, workspace, "test", get_settings()).delete(provider_id)
+
+    summary = client.get("/api/v1/usage/summary?currency=USD", headers=headers)
+    assert summary.status_code == 200, summary.text
+    summary_json = summary.json()
+    assert summary_json["provider_names"][provider_id] == "native-test"
+    assert orphan_id not in summary_json["provider_names"]
+
+    all_events = client.get("/api/v1/usage/events?currency=USD", headers=headers)
+    assert all_events.status_code == 200
+    rows = all_events.json()
+    assert len(rows) == 3
+    by_provider = {row["provider_id"]: row["provider_display_name"] for row in rows}
+    assert by_provider[provider_id] == "native-test"
+    assert by_provider[orphan_id] is None
+
+    unpriced_only = client.get("/api/v1/usage/events?currency=USD&unpriced_only=true", headers=headers)
+    assert unpriced_only.status_code == 200
+    unpriced_rows = unpriced_only.json()
+    assert len(unpriced_rows) == 2
+    assert all(row["cost_amount"] is None for row in unpriced_rows)

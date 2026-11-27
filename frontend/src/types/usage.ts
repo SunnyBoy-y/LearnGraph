@@ -10,9 +10,10 @@ export interface UsageSummary {
   cost_amount: Money; reserved_amount: Money; unpriced_events: number;
   unknown_currency_events: number; remote_usage_recorded: boolean;
   breakdown: Record<string, { label: string; cost_amount: Money; attempts: number; total_tokens: number; unknown_events: number }[]>;
+  provider_names?: Record<string, string>;
 }
 export interface UsageEvent {
-  id: string; workspace_id: string; provider_id: string; model_id: string; feature: string;
+  id: string; workspace_id: string; provider_id: string; provider_display_name?: string | null; model_id: string; feature: string;
   currency: BillingCurrency | null; cost_amount: Money | null; reserved_amount: Money | null;
   input_tokens: number; cached_input_tokens: number; cache_creation_input_tokens: number;
   output_tokens: number; reasoning_tokens: number; total_tokens: number; attempt: number;

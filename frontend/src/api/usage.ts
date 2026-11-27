@@ -10,6 +10,7 @@ export interface UsageScope { workspaceId: string; userId?: string; currency: Bi
 export interface UsageFilters {
   provider_id?: string; model_id?: string; feature?: string; start_at?: string; end_at?: string;
   archived?: "exclude" | "include" | "only"; offset?: number; limit?: number; unknown_currency?: boolean;
+  unpriced_only?: boolean;
 }
 function currentScope(): UsageScope {
   const session = authStore.getSession();
@@ -39,7 +40,7 @@ export async function listUsageEvents(scope = currentScope(), filters: UsageFilt
   return records;
 }
 export function clearUsageEvents(scope: UsageScope, filters: UsageFilters = {}): Promise<{ archived_count: number }> {
-  const { archived: _archived, offset: _offset, limit: _limit, unknown_currency: _unknown, ...criteria } = filters;
+  const { archived: _archived, offset: _offset, limit: _limit, unknown_currency: _unknown, unpriced_only: _unpriced, ...criteria } = filters;
   return apiClient.delete("/usage/events", options(scope, undefined, criteria));
 }
 export function listPriceCatalog(scope = currentScope(), signal?: AbortSignal): Promise<PriceCatalogItem[]> {

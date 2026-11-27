@@ -1105,12 +1105,14 @@ class UsageSummary(BaseModel):
     unknown_currency_events: int = 0
     remote_usage_recorded: bool
     breakdown: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    provider_names: dict[str, str] = Field(default_factory=dict)
 
 
 class UsageEventView(ORMModel):
     id: str
     workspace_id: str
     provider_id: str
+    provider_display_name: str | None = None
     model_id: str
     feature: str
     currency: Literal["USD", "CNY"] | None
