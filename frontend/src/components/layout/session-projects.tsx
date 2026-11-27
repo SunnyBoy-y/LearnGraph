@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type PointerEvent as ReactPointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { Archive, Folder, FolderOpen, ListChecks, LoaderCircle, MoreHorizontal, Pencil, Pin, Plus, Save, Share2, Trash2, X } from 'lucide-react'
 import { toast } from '@/lib/notifications'
 import { Button } from '@/components/ui/button'
@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuPortal, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { applyRangeSelection, useEscapeKey } from '@/lib/list-selection'
 import { withScrollLockBypass } from '@/lib/scroll-lock'
 import { isVoiceSessionActive } from '@/features/voice/voice-session-markers'
 import { getSessionActivity, getSessionActivitySnapshot, sortSidebarSessions, subscribeSessionActivity } from '@/lib/session-activity'
@@ -37,6 +38,9 @@ export function SessionProjects({
   onMoveSession,
   onRequestSessionBatchDeletion,
   onRequestMixedBatchDeletion,
+  onBatchArchive,
+  onBatchMoveSessions,
+  onBatchToggleSessionPin,
   onRequestSessionDeletion,
   onRenameSession,
   onToggleSessionPin,
@@ -73,6 +77,9 @@ export function SessionProjects({
     projects: SidebarProject[],
     sessions: SidebarSession[],
   ) => void;
+  onBatchArchive?: (projects: SidebarProject[], sessions: SidebarSession[]) => Promise<void> | void;
+  onBatchMoveSessions?: (sessions: SidebarSession[], projectId?: string) => Promise<void> | void;
+  onBatchToggleSessionPin?: (sessions: SidebarSession[], pinned: boolean) => Promise<void> | void;
   onRequestSessionDeletion: (session: SidebarSession) => void;
   onRenameSession: (session: SidebarSession, title: string) => Promise<boolean>;
   onToggleSessionPin: (session: SidebarSession) => void;
@@ -105,6 +112,9 @@ export function SessionProjects({
   const [selectedProjectIds, setSelectedProjectIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const [batchBusy, setBatchBusy] = useState(false);
+  const sessionAnchorRef = useRef<string | null>(null);
+  const sessionShiftRef = useRef(false);
   // 会话「更多」菜单受控态（长按/右键唤起，与 MoreHorizontal 触发共用）
   const [menuOpenFor, setMenuOpenFor] = useState<string | null>(null);
   const [projectMenuOpenFor, setProjectMenuOpenFor] = useState<string | null>(null);
@@ -264,17 +274,20 @@ export function SessionProjects({
     const open = allFoldersCollapsed;
     onToggleFolders(folderEntries, open);
   }
-  const visibleSessionIds = useMemo(
-    () =>
-      new Set([
-        ...visibleProjects.flatMap((project) =>
-          flattenSidebarSessions(project.sessions).map((session) => session.id),
-        ),
-        ...flattenSidebarSessions(visibleUngroupedSessions).map(
-          (session) => session.id,
-        ),
-      ]),
+  const orderedVisibleSessionIds = useMemo(
+    () => [
+      ...visibleProjects.flatMap((project) =>
+        flattenSidebarSessions(project.sessions).map((session) => session.id),
+      ),
+      ...flattenSidebarSessions(visibleUngroupedSessions).map(
+        (session) => session.id,
+      ),
+    ],
     [visibleProjects, visibleUngroupedSessions],
+  );
+  const visibleSessionIds = useMemo(
+    () => new Set(orderedVisibleSessionIds),
+    [orderedVisibleSessionIds],
   );
   const visibleProjectIds = useMemo(
     () => new Set(visibleProjects.map((project) => project.id)),
@@ -339,7 +352,10 @@ export function SessionProjects({
     setSelectedSessionIds(new Set());
     setSelectedProjectIds(new Set());
     selectedRecords.current.clear();
+    sessionAnchorRef.current = null;
   }
+
+  useEscapeKey(selectionMode, exitSelection);
 
   // Only loaded records are selectable here; no cross-page selection API exists.
   // At the session limit, the same control must still allow deselecting.
@@ -366,19 +382,43 @@ export function SessionProjects({
     setSelectedProjectIds(current => new Set([...current, ...visibleProjectIds]));
   }
 
-  function toggleSessionSelection(sessionId: string) {
+  function toggleSessionSelection(sessionId: string, shiftKey?: boolean) {
+    const useShift = shiftKey ?? sessionShiftRef.current;
+    sessionShiftRef.current = false;
     const parent = projects.find((project) =>
       flattenSidebarSessions(project.sessions).some(
         (session) => session.id === sessionId,
       ),
     );
     const coveredByProject = parent && selectedProjectIds.has(parent.id);
-    setSelectedSessionIds((current) => {
-      const next = new Set(current);
-      if (next.has(sessionId) || coveredByProject) next.delete(sessionId);
-      else if (next.size < MAX_SELECTED_SESSIONS) next.add(sessionId);
-      return next;
-    });
+    const currentlySelected = selectedSessionIds.has(sessionId) || Boolean(coveredByProject);
+    const nextChecked = !currentlySelected;
+    if (useShift && sessionAnchorRef.current) {
+      setSelectedSessionIds((current) => {
+        const range = applyRangeSelection(
+          current,
+          orderedVisibleSessionIds,
+          sessionAnchorRef.current,
+          sessionId,
+          nextChecked,
+        );
+        if (range.size <= MAX_SELECTED_SESSIONS) return range;
+        const clamped = new Set(current);
+        for (const id of range) {
+          if (clamped.size >= MAX_SELECTED_SESSIONS) break;
+          clamped.add(id);
+        }
+        return clamped;
+      });
+    } else {
+      setSelectedSessionIds((current) => {
+        const next = new Set(current);
+        if (currentlySelected) next.delete(sessionId);
+        else if (next.size < MAX_SELECTED_SESSIONS) next.add(sessionId);
+        return next;
+      });
+    }
+    sessionAnchorRef.current = sessionId;
     // Deselect a project folder if any of its sessions is unchecked.
     if (coveredByProject) {
       setSelectedProjectIds((current) => {
@@ -415,6 +455,54 @@ export function SessionProjects({
       }
       return next;
     });
+  }
+
+  const selectedSessionsForActions = useMemo(() => {
+    const map = new Map<string, SidebarSession>();
+    for (const session of selectedStandaloneSessions) map.set(session.id, session);
+    for (const project of selectedProjects) {
+      for (const session of flattenSidebarSessions(project.sessions)) {
+        map.set(session.id, session);
+      }
+    }
+    return [...map.values()];
+  }, [selectedProjects, selectedStandaloneSessions]);
+
+  const anySelectedSessionUnpinned = selectedSessionsForActions.some(
+    (session) => !session.pinned,
+  );
+
+  async function runBatchArchive() {
+    if (!onBatchArchive || !selectedCount || batchBusy) return;
+    setBatchBusy(true);
+    try {
+      await onBatchArchive(selectedProjects, selectedStandaloneSessions);
+      exitSelection();
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function runBatchMove(projectId?: string) {
+    if (!onBatchMoveSessions || !selectedSessionsForActions.length || batchBusy) return;
+    setBatchBusy(true);
+    try {
+      await onBatchMoveSessions(selectedSessionsForActions, projectId);
+      exitSelection();
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function runBatchPin() {
+    if (!onBatchToggleSessionPin || !selectedSessionsForActions.length || batchBusy) return;
+    setBatchBusy(true);
+    try {
+      await onBatchToggleSessionPin(selectedSessionsForActions, anySelectedSessionUnpinned);
+      exitSelection();
+    } finally {
+      setBatchBusy(false);
+    }
   }
 
   function requestSelectedDeletion() {
@@ -528,6 +616,9 @@ export function SessionProjects({
             <Checkbox
               aria-label={`选择会话 ${displayTitle}`}
               checked={selectedSessionIds.has(session.id) || coveredBySelectedProjects.has(session.id)}
+              onClickCapture={(event: ReactMouseEvent) => {
+                sessionShiftRef.current = event.shiftKey;
+              }}
               onCheckedChange={() => toggleSessionSelection(session.id)}
             />
           ) : null}
@@ -573,13 +664,13 @@ export function SessionProjects({
           ) : (
             <button
               className="sidebar-project__session-title min-w-0 flex-1 truncate text-left"
-              onClick={() => {
+              onClick={(event) => {
                 if (longPressRef.current.fired) {
                   longPressRef.current.fired = false;
                   return;
                 }
                 if (selectionMode) {
-                  toggleSessionSelection(session.id);
+                  toggleSessionSelection(session.id, event.shiftKey);
                   return;
                 }
                 // Folder rows no longer show a collapse arrow: the whole row
@@ -850,7 +941,10 @@ export function SessionProjects({
       <div className="sidebar-section__heading">
         <button aria-expanded={open} aria-label={`${open ? "折叠" : "展开"}${label}分组`} className="sidebar-section__toggle" type="button" onClick={() => onToggleFolder("section", section, !open)}>{label}</button>
         <div className="sidebar-section__actions">
-          {isProjects ? <Tooltip><TooltipTrigger asChild><Button aria-label="新建项目" onClick={() => { onToggleFolder("section", "projects", true); setCreatingProject(value => !value); }} size="icon-xs" variant="ghost"><Plus className="size-3.5" /></Button></TooltipTrigger><TooltipContent side="right">新建项目</TooltipContent></Tooltip> : <Tooltip><TooltipTrigger asChild><Button aria-label="新建最近对话" className="sidebar-section__create" disabled={creatingConversation} onClick={() => { onToggleFolder("section", "recent", true); void onCreateConversation(null); }} size="icon-xs" variant="ghost"><Plus className="size-3.5" /></Button></TooltipTrigger><TooltipContent side="right">新建对话</TooltipContent></Tooltip>}
+          {isProjects ? <Tooltip><TooltipTrigger asChild><Button aria-label="新建项目" onClick={() => { onToggleFolder("section", "projects", true); setCreatingProject(value => !value); }} size="icon-xs" variant="ghost"><Plus className="size-3.5" /></Button></TooltipTrigger><TooltipContent side="right">新建项目</TooltipContent></Tooltip> : <>
+            <Tooltip><TooltipTrigger asChild><Button aria-label={selectionMode ? "退出多选" : "多选会话"} aria-pressed={selectionMode} className="sidebar-section__select" onClick={() => selectionMode ? exitSelection() : beginSelection()} size="icon-xs" variant={selectionMode ? "secondary" : "ghost"}><ListChecks className="size-3.5" /></Button></TooltipTrigger><TooltipContent side="right">{selectionMode ? "退出多选 (Esc)" : "多选管理"}</TooltipContent></Tooltip>
+            <Tooltip><TooltipTrigger asChild><Button aria-label="新建最近对话" className="sidebar-section__create" disabled={creatingConversation} onClick={() => { onToggleFolder("section", "recent", true); void onCreateConversation(null); }} size="icon-xs" variant="ghost"><Plus className="size-3.5" /></Button></TooltipTrigger><TooltipContent side="right">新建对话</TooltipContent></Tooltip>
+          </>}
           <DropdownMenu>
             <DropdownMenuTrigger asChild><Button aria-label={isProjects ? "管理项目分组" : "管理最近会话"} className="sidebar-section__more" size="icon-xs" variant="ghost"><MoreHorizontal className="size-3.5" /></Button></DropdownMenuTrigger>
             <DropdownMenuContent align="end" side="right" className="w-44">
@@ -880,47 +974,113 @@ export function SessionProjects({
           }} />
       </div>
       {selectionMode ? (
-        <div className="sidebar-sessions__batch-bar">
-          <div>
-            <strong>{selectedCount}</strong>
-            <span> 个已选</span>
-            {selectedProjects.length ? (
-              <span className="sidebar-sessions__batch-detail">
-                {" "}
-                {selectedProjects.length} 项目
-                {selectedStandaloneSessions.length
-                  ? ` ${selectedStandaloneSessions.length} 会话`
-                  : ""}
-              </span>
-            ) : null}
+        <div className="sidebar-sessions__batch-bar flex-wrap gap-y-1.5">
+          <div className="flex w-full items-center justify-between gap-1">
+            <div>
+              <strong>{selectedCount}</strong>
+              <span> 个已选</span>
+              {selectedProjects.length ? (
+                <span className="sidebar-sessions__batch-detail">
+                  {" "}
+                  {selectedProjects.length} 项目
+                  {selectedStandaloneSessions.length
+                    ? ` ${selectedStandaloneSessions.length} 会话`
+                    : ""}
+                </span>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-0.5">
+              <Button
+                disabled={batchBusy}
+                onClick={toggleAllLoadedSelection}
+                size="xs"
+                title={`最多选择 ${MAX_SELECTED_SESSIONS} 个会话`}
+                variant="ghost"
+              >
+                {allLoadedSelected ? "取消全选" : "全选已加载"}
+              </Button>
+              <Button
+                aria-label="退出批量管理"
+                disabled={batchBusy}
+                onClick={exitSelection}
+                size="icon-xs"
+                title="退出批量管理 (Esc)"
+                variant="ghost"
+              >
+                <X className="size-3" />
+              </Button>
+            </div>
           </div>
-          <Button
-            onClick={toggleAllLoadedSelection}
-            size="xs"
-            title={`最多选择 ${MAX_SELECTED_SESSIONS} 个会话`}
-            variant="ghost"
-          >
-            {allLoadedSelected ? "取消全选" : "全选已加载"}
-          </Button>
-          <div className="flex items-center gap-1">
+          <div className="flex w-full flex-wrap items-center gap-1">
+            {onBatchToggleSessionPin ? (
+              <Button
+                aria-label={anySelectedSessionUnpinned ? "批量置顶" : "批量取消置顶"}
+                disabled={batchBusy || !selectedSessionsForActions.length}
+                onClick={() => void runBatchPin()}
+                size="xs"
+                title={anySelectedSessionUnpinned ? "批量置顶选中会话" : "批量取消置顶选中会话"}
+                variant="outline"
+              >
+                <Pin className="size-3" />
+                {anySelectedSessionUnpinned ? "置顶" : "取消置顶"}
+              </Button>
+            ) : null}
+            {onBatchMoveSessions ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    aria-label="批量移动到项目"
+                    disabled={batchBusy || !selectedSessionsForActions.length}
+                    size="xs"
+                    variant="outline"
+                  >
+                    <Folder className="size-3" />
+                    移动
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="max-h-60 w-48 overflow-y-auto" side="top">
+                  <DropdownMenuItem onSelect={() => void runBatchMove(undefined)}>
+                    <Folder className="size-3.5" />
+                    移出项目
+                  </DropdownMenuItem>
+                  {projects.filter((entry) => entry.status !== "archived").length ? <DropdownMenuSeparator /> : null}
+                  {projects
+                    .filter((entry) => entry.status !== "archived")
+                    .map((target) => (
+                      <DropdownMenuItem
+                        key={target.id}
+                        onSelect={() => void runBatchMove(target.id)}
+                        title={target.title}
+                      >
+                        <Folder className="size-3.5" />
+                        <span className="min-w-0 truncate">{target.title}</span>
+                      </DropdownMenuItem>
+                    ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : null}
+            {onBatchArchive ? (
+              <Button
+                aria-label="批量归档"
+                disabled={batchBusy || !selectedCount}
+                onClick={() => void runBatchArchive()}
+                size="xs"
+                variant="outline"
+              >
+                <Archive className="size-3" />
+                归档
+              </Button>
+            ) : null}
             <Button
               aria-label="批量删除"
-              disabled={!selectedCount}
+              className="ml-auto"
+              disabled={batchBusy || !selectedCount}
               onClick={requestSelectedDeletion}
               size="xs"
               variant="destructive"
             >
               <Trash2 className="size-3" />
               删除
-            </Button>
-            <Button
-              aria-label="退出批量管理"
-              onClick={exitSelection}
-              size="icon-xs"
-              title="退出批量管理"
-              variant="ghost"
-            >
-              <X className="size-3" />
             </Button>
           </div>
         </div>

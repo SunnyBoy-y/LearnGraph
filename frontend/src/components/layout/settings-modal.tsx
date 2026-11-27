@@ -214,7 +214,7 @@ export function SettingsModal({
         <section className="flex min-h-0 min-w-0 flex-col">
           <header
             className={cn(
-              "settings-modal__topbar flex shrink-0 items-center gap-2 border-b bg-background/90 px-3 backdrop-blur-xl",
+              "settings-modal__topbar flex shrink-0 items-center gap-2 border-b bg-background/98 px-3",
               // Mobile: polished app-bar with notch-safe spacing and a large touch target.
               "min-h-[4.5rem] py-2 pt-[max(0.5rem,env(safe-area-inset-top))] sm:h-12 sm:min-h-0 sm:px-7 sm:py-0 sm:pt-0",
             )}
@@ -245,7 +245,7 @@ export function SettingsModal({
                   align="start"
                   sideOffset={8}
                   collisionPadding={12}
-                  className="settings-mobile-menu max-h-[min(68dvh,34rem)] w-[calc(100vw-1.5rem)] min-w-0 overflow-y-auto !rounded-[1.25rem] border bg-popover/98 !p-2 !shadow-2xl ring-1 ring-foreground/5 backdrop-blur-xl"
+                  className="settings-mobile-menu max-h-[min(68dvh,34rem)] w-[calc(100vw-1.5rem)] min-w-0 overflow-y-auto !rounded-[1.25rem] border bg-popover/98 !p-2 !shadow-2xl ring-1 ring-foreground/5"
                 >
                   <DropdownMenuLabel className="px-2.5 pb-2 pt-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/70">
                     设置分类
@@ -299,7 +299,7 @@ export function SettingsModal({
             <button
               type="button"
               onClick={() => handleOpenChange(false)}
-              className="grid size-11 shrink-0 place-items-center rounded-2xl border border-border/70 bg-background/80 text-muted-foreground shadow-sm transition-all hover:bg-muted hover:text-foreground active:scale-95 sm:size-8 sm:rounded-lg sm:border-0 sm:bg-transparent sm:shadow-none"
+              className="grid size-11 shrink-0 place-items-center rounded-2xl border border-border/70 bg-background/80 text-muted-foreground shadow-sm transition-[color,background-color,border-color,opacity,transform] hover:bg-muted hover:text-foreground active:scale-95 sm:size-8 sm:rounded-lg sm:border-0 sm:bg-transparent sm:shadow-none"
               aria-label="关闭设置"
             >
               <X className="size-5 sm:size-4" />

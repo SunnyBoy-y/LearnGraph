@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { apiClient } from '@/api/client'
 import { authStore } from '@/api/auth-store'
@@ -61,7 +61,6 @@ describe('model parameter drafts', () => {
   it('guards dismissal and retains edits when the server snapshot refreshes', async () => {
     const register = vi.fn()
     const close = vi.fn()
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     const result = renderWithProviders(<SettingsDirtyContext.Provider value={register}><TooltipProvider>
       <ModelOverrideDialog provider={provider} modelId="model-a" globalOverrideOn={false} onSaved={() => {}} onClose={close}/>
     </TooltipProvider></SettingsDirtyContext.Provider>)
@@ -73,11 +72,16 @@ describe('model parameter drafts', () => {
       provider_id: provider.id, model_id: 'model-a', capabilities: { max_output_tokens: 3000 },
     })
     expect(input).toHaveValue(2000)
-    fireEvent.click(screen.getByRole('button', { name: 'Close', exact: true }))
-    expect(confirm).toHaveBeenCalledOnce()
+    const closeButton = () => screen.getByRole('button', { name: 'Close', exact: true })
+    fireEvent.click(closeButton())
+    const confirmation = () => screen.getByRole('alertdialog', { name: '放弃修改？' })
+    expect(confirmation()).toBeVisible()
     expect(close).not.toHaveBeenCalled()
-    confirm.mockReturnValue(true)
-    fireEvent.click(screen.getByRole('button', { name: 'Close', exact: true }))
+    fireEvent.click(within(confirmation()).getByRole('button', { name: '取消' }))
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+    expect(input).toHaveValue(2000)
+    fireEvent.click(closeButton())
+    fireEvent.click(within(confirmation()).getByRole('button', { name: '放弃修改' }))
     expect(close).toHaveBeenCalledOnce()
   })
 })

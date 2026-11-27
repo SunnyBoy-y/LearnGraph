@@ -1,11 +1,15 @@
+import { useActionConfirmation } from "@/components/shared/use-action-confirmation";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
 import "./provider-settings-layout.css";
 import { useAuth } from "@/features/auth/auth-context-value";
 import { useSettingsDirty } from "@/lib/settings-dirty";
+import { useListSelection } from "@/lib/list-selection";
 import { currentWorkspaceQueryKey, workspaceQueryKey } from "@/lib/query-keys";
 import {
   Children,
   isValidElement,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type Dispatch,
@@ -25,12 +29,11 @@ import {
   Search,
   Settings2,
   SlidersHorizontal,
+  SquareCheck,
   Trash2,
   WalletCards,
 } from "lucide-react";
 import { toast } from '@/lib/notifications';
-import { AnimatePresence, motion } from "motion/react";
-import { useReducedMotionPreference } from "@/lib/motion-preferences";
 
 import deepseekMark from "@/assets/deepseek.svg";
 import deepseekBrandMark from "@/assets/brands/si-deepseek.svg";
@@ -133,7 +136,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import {
   isAnthropicProvider,
   isOfficialDeepSeekProvider,
@@ -474,7 +477,7 @@ function HostBridgeHint({ status }: { status?: HostBridgeStatus }) {
   if (status.host_access_mode === "direct") {
     if (status.host_gateway_reachable === true) return null;
     return (
-      <div className="mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+      <div className="mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
         <p className="font-medium">可信桌面直连已启用，但宿主机网关不可达</p>
         <p className="mt-1 whitespace-pre-line text-xs leading-relaxed">
           {status.guidance}
@@ -491,8 +494,8 @@ function HostBridgeHint({ status }: { status?: HostBridgeStatus }) {
     <div
       className={
         ready
-          ? "mx-5 mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800"
-          : "mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"
+          ? "mx-5 mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-200"
+          : "mx-5 mt-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
       }
     >
       <p className="font-medium">{title}</p>
@@ -516,7 +519,6 @@ export function ProvidersPage() {
   return <ProvidersPageForm key={workspaceId}/>;
 }
 function ProvidersPageForm() {
-  const reducedMotion = useReducedMotionPreference();
   const queryClient = useQueryClient();
   const providerWorkspaceId = String(currentWorkspaceQueryKey()[1]);
   const [roleFilter, setRoleFilter] = useState<ProviderRole>("model");
@@ -782,13 +784,88 @@ function ProvidersPageForm() {
   });
   const remove = useMutation({
     mutationFn: deleteProvider,
-    onSuccess: () => {
+    onSuccess: (_data, deletedId) => {
       setDeleteTarget(null);
+      providerSelection.removeIds([deletedId]);
+      setExpandedProviderIds((current) => {
+        if (!current.has(deletedId)) return current;
+        const next = new Set(current);
+        next.delete(deletedId);
+        return next;
+      });
       toast.success("Provider 实例已删除");
       void queryClient.invalidateQueries({ predicate: query => query.queryKey[0] === "providers" || (query.queryKey[0] === "workspace" && query.queryKey[1] === providerWorkspaceId && query.queryKey[2] === "providers") });
     },
     onError: (error) => toast.error(error.message),
   });
+  const { confirm: confirmProviderBatch, dialog: providerConfirmDialog } = useActionConfirmation();
+  const [batchProviderBusy, setBatchProviderBusy] = useState(false);
+  const [expandedProviderIds, setExpandedProviderIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const toggleProviderExpanded = (providerId: string) => {
+    setExpandedProviderIds((current) => {
+      const next = new Set(current);
+      if (next.has(providerId)) next.delete(providerId);
+      else next.add(providerId);
+      return next;
+    });
+  };
+  const catalogByType = useMemo(
+    () => new Map((providerCatalog.data ?? []).map((item) => [item.provider_type, item])),
+    [providerCatalog.data],
+  );
+  const filteredProviders = useMemo(
+    () =>
+      (providers.data ?? []).filter((provider) => {
+        const search = providerSearch.trim().toLowerCase();
+        if (
+          search &&
+          !`${provider.display_name} ${provider.base_url ?? ""} ${provider.provider_type}`
+            .toLowerCase()
+            .includes(search)
+        ) {
+          return false;
+        }
+        const providerRole = catalogByType.get(provider.provider_type)?.role;
+        if (providerRole !== roleFilter) return false;
+        if (roleFilter === "image_search" && imageModeFilter !== "all") {
+          const modes =
+            catalogByType.get(provider.provider_type)?.image_search_modes ?? [];
+          if (imageModeFilter === "both") {
+            if (!(modes.includes("text") && modes.includes("image"))) return false;
+          } else if (!modes.includes(imageModeFilter)) {
+            return false;
+          }
+        }
+        return true;
+      }),
+    [catalogByType, imageModeFilter, providerSearch, providers.data, roleFilter],
+  );
+  const providerSelection = useListSelection(
+    useMemo(() => filteredProviders.map((provider) => provider.id), [filteredProviders]),
+    { alwaysActive: true },
+  );
+  const providerSelectionPrune = providerSelection.prune;
+  useEffect(() => {
+    if (!providers.data) return;
+    const validIds = new Set(providers.data.map((provider) => provider.id));
+    providerSelectionPrune(validIds);
+    setExpandedProviderIds((current) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of current) {
+        if (validIds.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : current;
+    });
+  }, [providerSelectionPrune, providers.data]);
+  const selectedProviders = useMemo(
+    () => (providers.data ?? []).filter((provider) => providerSelection.selectedIds.has(provider.id)),
+    [providerSelection.selectedIds, providers.data],
+  );
+
   if (providers.isPending)
     return (
       <PageFrame>
@@ -801,9 +878,6 @@ function ProvidersPageForm() {
         <ErrorState message={providers.error.message} />
       </PageFrame>
     );
-  const catalogByType = new Map(
-    (providerCatalog.data ?? []).map((item) => [item.provider_type, item]),
-  );
   // Prefer catalog roles so tabs stay stable even when a role has no instances yet.
   const catalogRoles = [
     ...new Set(
@@ -835,22 +909,52 @@ function ProvidersPageForm() {
       (ROLE_ORDER.indexOf(a) === -1 ? 99 : ROLE_ORDER.indexOf(a)) -
       (ROLE_ORDER.indexOf(b) === -1 ? 99 : ROLE_ORDER.indexOf(b)),
   );
-  const filteredProviders = providers.data.filter((provider) => {
-    const search = providerSearch.trim().toLowerCase();
-    if (search && !`${provider.display_name} ${provider.base_url ?? ''} ${provider.provider_type}`.toLowerCase().includes(search)) return false;
-    const providerRole = catalogByType.get(provider.provider_type)?.role;
-    if (providerRole !== roleFilter) return false;
-    if (roleFilter === "image_search" && imageModeFilter !== "all") {
-      const modes =
-        catalogByType.get(provider.provider_type)?.image_search_modes ?? [];
-      if (imageModeFilter === "both") {
-        if (!(modes.includes("text") && modes.includes("image"))) return false;
-      } else if (!modes.includes(imageModeFilter)) {
-        return false;
+
+  async function runProviderBatch(
+    mode: "enable" | "disable" | "delete",
+    targets: Provider[],
+  ) {
+    if (!targets.length || batchProviderBusy) return;
+    setBatchProviderBusy(true);
+    try {
+      const results = await Promise.allSettled(
+        targets.map((provider) =>
+          mode === "delete"
+            ? deleteProvider(provider.id)
+            : updateProvider(provider.id, { enabled: mode === "enable" }),
+        ),
+      );
+      const okIds: string[] = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") okIds.push(targets[index].id);
+      });
+      if (mode === "delete") {
+        providerSelection.removeIds(okIds);
+        setExpandedProviderIds((current) => {
+          let changed = false;
+          const next = new Set(current);
+          for (const id of okIds) {
+            if (next.delete(id)) changed = true;
+          }
+          return changed ? next : current;
+        });
       }
+      void queryClient.invalidateQueries({
+        predicate: (query) =>
+          query.queryKey[0] === "providers" ||
+          (query.queryKey[0] === "workspace" &&
+            query.queryKey[1] === providerWorkspaceId &&
+            query.queryKey[2] === "providers"),
+      });
+      const label = mode === "enable" ? "启用" : mode === "disable" ? "停用" : "删除";
+      const failed = targets.length - okIds.length;
+      if (failed === 0) toast.success(`已${label} ${okIds.length} 个供应商`);
+      else if (okIds.length > 0) toast.warning(`已${label} ${okIds.length} 个供应商，${failed} 个失败`);
+      else toast.error(`批量${label}失败`);
+    } finally {
+      setBatchProviderBusy(false);
     }
-    return true;
-  });
+  }
   return (
     <PageFrame>
       <div className="flex justify-end">
@@ -892,7 +996,13 @@ function ProvidersPageForm() {
       <Surface className="overflow-hidden">
         <div className="provider-list-heading border-b p-5">
           <SectionHeading title="已配置连接" />
-          <Input aria-label="搜索供应商" className="mt-3" placeholder="搜索名称、地址或协议…" value={providerSearch} onChange={(event) => setProviderSearch(event.target.value)} />
+          <ClearableSearchInput
+            aria-label="搜索供应商"
+            containerClassName="w-full min-[721px]:w-64 lg:w-72"
+            onChange={setProviderSearch}
+            placeholder="搜索名称、地址或协议…"
+            value={providerSearch}
+          />
         </div>
         <div className="border-b px-5 py-3">
           <div
@@ -904,7 +1014,12 @@ function ProvidersPageForm() {
               <button
                 aria-selected={roleFilter === role}
                 key={role}
-                onClick={() => setRoleFilter(role)}
+                onClick={() => {
+                  if (roleFilter !== role) {
+                    setRoleFilter(role);
+                    providerSelection.clear();
+                  }
+                }}
                 role="tab"
                 type="button"
               >
@@ -937,20 +1052,120 @@ function ProvidersPageForm() {
             </div>
           </div>
         ) : null}
-        <div className="provider-settings-container overflow-x-auto">
-          <table className="provider-settings-table w-full table-fixed text-left text-sm [&_td]:break-words [&_td]:px-3 [&_th]:px-3">
-            <thead className="bg-muted/35 text-xs text-muted-foreground">
-              <tr>
-                <th className="px-5 py-3">实例</th>
-                <th className="px-5 py-3">协议</th>
-                <th className="px-5 py-3">状态</th>
-                <th className="px-5 py-3">密钥</th>
-                <th className="px-5 py-3">默认模型</th>
-                <th className="px-5 py-3 text-right">操作</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              <AnimatePresence initial={false}>
+        <div
+          aria-label="连接列表工具栏"
+          className="flex h-11 items-center justify-between gap-2 border-b bg-muted/15 px-5 text-xs"
+          role="region"
+        >
+          <div className="flex min-w-0 items-center gap-3">
+            <label className="flex cursor-pointer items-center gap-2.5 select-none">
+              <Checkbox
+                aria-label="全选当前列表"
+                checked={providerSelection.visibleCheckboxState}
+                disabled={batchProviderBusy || filteredProviders.length === 0}
+                onCheckedChange={(checked) =>
+                  providerSelection.toggleVisible(checked === true)
+                }
+              />
+              {providerSelection.selectedCount === 0 ? (
+                <span className="whitespace-nowrap text-muted-foreground">
+                  全选
+                </span>
+              ) : null}
+            </label>
+            {providerSelection.selectedCount > 0 ? (
+              <>
+                <span
+                  aria-live="polite"
+                  className="font-medium tabular-nums whitespace-nowrap text-foreground"
+                >
+                  已选 {providerSelection.selectedCount} 项
+                </span>
+                {providerSelection.otherSelectedCount > 0 ? (
+                  <span className="hidden truncate text-muted-foreground sm:inline">
+                    （另有 {providerSelection.otherSelectedCount} 项不在当前筛选）
+                  </span>
+                ) : null}
+                <Button
+                  className="h-6 px-1.5 text-xs font-normal text-muted-foreground hover:text-foreground"
+                  disabled={batchProviderBusy}
+                  onClick={providerSelection.clear}
+                  size="xs"
+                  type="button"
+                  variant="ghost"
+                >
+                  取消选择
+                </Button>
+              </>
+            ) : null}
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {providerSelection.selectedCount === 0 ? (
+              <span className="tabular-nums whitespace-nowrap text-muted-foreground">
+                共 {filteredProviders.length} 个连接
+              </span>
+            ) : (
+              <>
+                <Button
+                  disabled={
+                    batchProviderBusy ||
+                    !selectedProviders.some((provider) => !provider.enabled)
+                  }
+                  onClick={() =>
+                    void runProviderBatch(
+                      "enable",
+                      selectedProviders.filter((provider) => !provider.enabled),
+                    )
+                  }
+                  size="xs"
+                  type="button"
+                  variant="ghost"
+                >
+                  启用
+                </Button>
+                <Button
+                  disabled={
+                    batchProviderBusy ||
+                    !selectedProviders.some((provider) => provider.enabled)
+                  }
+                  onClick={() =>
+                    void runProviderBatch(
+                      "disable",
+                      selectedProviders.filter((provider) => provider.enabled),
+                    )
+                  }
+                  size="xs"
+                  type="button"
+                  variant="ghost"
+                >
+                  停用
+                </Button>
+                <Button
+                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  disabled={batchProviderBusy || selectedProviders.length === 0}
+                  onClick={() =>
+                    confirmProviderBatch({
+                      title: `删除选中的 ${selectedProviders.length} 个供应商实例？`,
+                      description:
+                        "将删除所选实例的配置及其加密 Secret，历史用量记录保留。",
+                      label: `删除 ${selectedProviders.length} 项`,
+                      destructive: true,
+                      run: () => void runProviderBatch("delete", selectedProviders),
+                    })
+                  }
+                  size="xs"
+                  type="button"
+                  variant="ghost"
+                >
+                  <Trash2 className="size-3.5" />
+                  删除
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="provider-settings-container">
+          <div className="divide-y" role="list">
               {filteredProviders.map((provider) => {
                 const providerSpec = catalogByType.get(provider.provider_type);
                 // Identity display (brand mark / "DeepSeek" badge) belongs to
@@ -1044,155 +1259,221 @@ function ProvidersPageForm() {
                 const customHeaderCount = Object.keys(
                   providerExtraHeaders(provider),
                 ).length;
+                const isSelected = providerSelection.selectedIds.has(provider.id);
+                const isExpanded = expandedProviderIds.has(provider.id);
+                const detailsPanelId = `provider-details-${provider.id}`;
+                const protocolDescription = isOfficialOpenAi
+                  ? providerSpec?.label ?? provider.provider_type
+                  : isDeepSeek
+                    ? "OpenAI-compatible Chat"
+                    : isAnthropic
+                      ? "Anthropic Messages"
+                      : providerSpec?.label ?? provider.provider_type;
                 return (
-                  <motion.tr
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -4 }}
-                    initial={reducedMotion ? false : { opacity: 0, y: 4 }}
+                  <div
+                    className={`provider-settings-list-row px-5 py-4 transition-colors ${
+                      isSelected
+                        ? "bg-muted/50 hover:bg-muted/65 dark:bg-muted/40 dark:hover:bg-muted/55"
+                        : "hover:bg-muted/25"
+                    }`}
+                    data-selected={isSelected ? "true" : undefined}
                     key={provider.id}
-                    layout={!reducedMotion}
-                    transition={{ duration: reducedMotion ? 0 : 0.16 }}
-                  ><td colSpan={6} className="px-5 py-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><div className="flex items-center gap-2">
-                        <span className="grid size-8 place-items-center rounded-lg bg-white p-1 shadow-sm ring-1 ring-black/5">
-                          {providerQuickBrand(provider) ? (
-                            <img
-                              alt=""
-                              aria-hidden="true"
-                              className="size-5 object-contain"
-                              src={providerQuickBrand(provider)!.iconUrl}
-                            />
-                          ) : providerSpec?.brand_id === "openai" ||
-                            providerSpec?.brand_id === "openai_compatible" ? (
-                            <img
-                              alt=""
-                              aria-hidden="true"
-                              className="size-4"
-                              src={openAiMark}
-                            />
-                          ) : providerSpec &&
-                            (brandIcon(providerSpec.brand_id) ??
-                              providerSpec.brand_icon_url) ? (
-                            <img
-                              alt=""
-                              aria-hidden="true"
-                              className="size-4"
-                              onError={(event) => {
-                                event.currentTarget.style.display = "none";
-                              }}
-                              src={
-                                brandIcon(providerSpec.brand_id) ??
-                                providerSpec.brand_icon_url ??
-                                undefined
-                              }
-                            />
-                          ) : isOfficialOpenAi ? (
-                            <img
-                              alt=""
-                              aria-hidden="true"
-                              className="size-4"
-                              src={openAiMark}
-                            />
-                          ) : isDeepSeek ? (
-                            <img
-                              alt=""
-                              aria-hidden="true"
-                              className="size-4"
-                              src={deepseekMark}
-                            />
-                          ) : (
-                            <Bot className="size-4" />
-                          )}
-                        </span>
-                        <div>
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <p className="font-medium">{provider.display_name}</p>
-                            {providerSpec?.role === "image_search" ? (
-                              <ImageSearchBadges spec={providerSpec} />
-                            ) : null}
-                            {isOfficialOpenAi ? (
-                              <span className="rounded-md border border-foreground/15 bg-foreground/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-foreground">
-                                OpenAI 官方
-                              </span>
+                    role="listitem"
+                  >
+                    <div className="flex items-start gap-3.5 sm:items-center">
+                      <div
+                        className="relative z-10 flex h-8 shrink-0 items-center"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <Checkbox
+                          aria-label={`选择供应商 ${provider.display_name}`}
+                          disabled={batchProviderBusy}
+                          {...providerSelection.checkboxProps(provider.id)}
+                        />
+                      </div>
+                      <div className="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-x-3 gap-y-2">
+                        <button
+                          aria-controls={detailsPanelId}
+                          aria-expanded={isExpanded}
+                          aria-label={`${provider.display_name} ${protocolDescription}`}
+                          className="flex min-w-[min(100%,14rem)] flex-1 cursor-pointer items-center gap-3 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          onClick={() => toggleProviderExpanded(provider.id)}
+                          type="button"
+                        >
+                          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-white p-1 shadow-sm ring-1 ring-black/5">
+                            {providerQuickBrand(provider) ? (
+                              <img
+                                alt=""
+                                aria-hidden="true"
+                                className="size-5 object-contain"
+                                src={providerQuickBrand(provider)!.iconUrl}
+                              />
+                            ) : providerSpec?.brand_id === "openai" ||
+                              providerSpec?.brand_id === "openai_compatible" ? (
+                              <img
+                                alt=""
+                                aria-hidden="true"
+                                className="size-4"
+                                src={openAiMark}
+                              />
+                            ) : providerSpec &&
+                              (brandIcon(providerSpec.brand_id) ??
+                                providerSpec.brand_icon_url) ? (
+                              <img
+                                alt=""
+                                aria-hidden="true"
+                                className="size-4"
+                                onError={(event) => {
+                                  event.currentTarget.style.display = "none";
+                                }}
+                                src={
+                                  brandIcon(providerSpec.brand_id) ??
+                                  providerSpec.brand_icon_url ??
+                                  undefined
+                                }
+                              />
+                            ) : isOfficialOpenAi ? (
+                              <img
+                                alt=""
+                                aria-hidden="true"
+                                className="size-4"
+                                src={openAiMark}
+                              />
                             ) : isDeepSeek ? (
-                              <span className="rounded-md border border-[#4d6bfe]/30 bg-[#4d6bfe]/10 px-1.5 py-0.5 text-[10px] font-medium text-[#4d6bfe]">
-                                DeepSeek
+                              <img
+                                alt=""
+                                aria-hidden="true"
+                                className="size-4"
+                                src={deepseekMark}
+                              />
+                            ) : (
+                              <Bot className="size-4" />
+                            )}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-medium text-foreground">
+                                {provider.display_name}
                               </span>
-                            ) : isAnthropic ? (
-                              <span className="rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-                                Anthropic
-                              </span>
+                              {providerSpec?.role === "image_search" ? (
+                                <ImageSearchBadges spec={providerSpec} />
+                              ) : null}
+                              {isOfficialOpenAi ? (
+                                <span className="rounded-md border border-foreground/15 bg-foreground/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-foreground">
+                                  OpenAI 官方
+                                </span>
+                              ) : isDeepSeek ? (
+                                <span className="rounded-md border border-[#4d6bfe]/30 bg-[#4d6bfe]/10 px-1.5 py-0.5 text-[10px] font-medium text-[#4d6bfe]">
+                                  DeepSeek
+                                </span>
+                              ) : isAnthropic ? (
+                                <span className="rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
+                                  Anthropic
+                                </span>
+                              ) : null}
+                            </span>
+                            <span className="mt-0.5 block text-xs text-muted-foreground">
+                              {protocolDescription}
+                              {customHeaderCount > 0
+                                ? ` · ${customHeaderCount} 个自定义请求头`
+                                : ""}
+                            </span>
+                          </span>
+                        </button>
+                        <div className="ml-auto flex shrink-0 items-center gap-2 sm:gap-2.5">
+                          <div className="flex flex-col items-end gap-1 sm:items-start">
+                            <StatePill
+                              status={provider.enabled ? "enabled" : "disabled"}
+                            />
+                            {customBalanceLast ? (
+                              <p
+                                className={`text-[10px] ${
+                                  customBalanceLast.is_valid === false
+                                    ? "text-destructive"
+                                    : "text-muted-foreground"
+                                }`}
+                                title="自定义余额查询的缓存结果"
+                              >
+                                {formatBalanceQuerySummary(customBalanceLast)} ·{" "}
+                                {relativeTimeLabel(customBalanceLast.queried_at)}
+                              </p>
                             ) : null}
                           </div>
-                        </div>
-                      </div></div><div className="shrink-0"><div className="flex flex-col items-start gap-1">
-                        <StatePill
-                          status={provider.enabled ? "enabled" : "disabled"}
-                        />
-                        {customBalanceLast ? (
-                          <p
-                            className={`text-[10px] ${
-                              customBalanceLast.is_valid === false
-                                ? "text-destructive"
-                                : "text-muted-foreground"
-                            }`}
-                            title="自定义余额查询的缓存结果"
+                          <Button
+                            disabled={
+                              update.isPending ||
+                              (hasConfigurableDefaultModel &&
+                                !provider.enabled &&
+                                !(isTranscriptionProvider
+                                  ? modelValue.trim() || realtimeModelValue.trim()
+                                  : modelValue.trim()))
+                            }
+                            onClick={() =>
+                              update.mutate({
+                                id: provider.id,
+                                enabled: !provider.enabled,
+                                default_model:
+                                  isModelProvider ||
+                                  isEmbeddingProvider
+                                    ? modelValue.trim() || undefined
+                                    : undefined,
+                                default_image_generation_model_id:
+                                  isImageGenerationProvider
+                                    ? modelValue.trim() || undefined
+                                    : undefined,
+                                default_transcription_model_id:
+                                  isTranscriptionProvider && modelValue.trim()
+                                    ? modelValue.trim()
+                                    : undefined,
+                                default_realtime_transcription_model_id:
+                                  isTranscriptionProvider && realtimeModelValue.trim()
+                                    ? realtimeModelValue.trim()
+                                    : undefined,
+                                default_vision_model_id: isVisionProvider
+                                  ? modelValue.trim() || undefined
+                                  : undefined,
+                              })
+                            }
+                            size="xs"
+                            type="button"
+                            variant={provider.enabled ? "ghost" : "default"}
                           >
-                            {formatBalanceQuerySummary(customBalanceLast)} ·{" "}
-                            {relativeTimeLabel(customBalanceLast.queried_at)}
+                            {provider.enabled ? "停用" : "启用"}
+                          </Button>
+                          <button
+                            aria-controls={detailsPanelId}
+                            aria-expanded={isExpanded}
+                            aria-label={
+                              isExpanded
+                                ? `收起 ${provider.display_name} 连接详情`
+                                : `展开 ${provider.display_name} 连接详情`
+                            }
+                            className="inline-flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            onClick={() => toggleProviderExpanded(provider.id)}
+                            type="button"
+                          >
+                            <ChevronRight
+                              aria-hidden="true"
+                              className={`size-4 transition-transform duration-150 ${
+                                isExpanded ? "rotate-90" : ""
+                              }`}
+                            />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                    {isExpanded ? (
+                      <div
+                        className="mt-4 space-y-4 border-t pt-4"
+                        id={detailsPanelId}
+                      >
+                        <div>
+                          <p className="mb-1 text-xs text-muted-foreground">
+                            API Key
                           </p>
-                        ) : null}
-                      </div></div><Button
-                          disabled={
-                            update.isPending ||
-                            (hasConfigurableDefaultModel &&
-                              !provider.enabled &&
-                              !(isTranscriptionProvider
-                                ? modelValue.trim() || realtimeModelValue.trim()
-                                : modelValue.trim()))
-                          }
-                          onClick={() =>
-                            update.mutate({
-                              id: provider.id,
-                              enabled: !provider.enabled,
-                              default_model:
-                                isModelProvider ||
-                                isEmbeddingProvider
-                                  ? modelValue.trim() || undefined
-                                  : undefined,
-                              default_image_generation_model_id:
-                                isImageGenerationProvider
-                                  ? modelValue.trim() || undefined
-                                  : undefined,
-                              default_transcription_model_id:
-                                isTranscriptionProvider && modelValue.trim()
-                                  ? modelValue.trim()
-                                  : undefined,
-                              default_realtime_transcription_model_id:
-                                isTranscriptionProvider && realtimeModelValue.trim()
-                                  ? realtimeModelValue.trim()
-                                  : undefined,
-                              default_vision_model_id: isVisionProvider
-                                ? modelValue.trim() || undefined
-                                : undefined,
-                            })
-                          }
-                          size="xs"
-                          variant={provider.enabled ? "ghost" : "default"}
-                        >
-                          {provider.enabled ? "停用" : "启用"}
-                        </Button></div><details className="mt-3"><summary className="flex cursor-pointer items-center justify-between gap-3 text-xs text-muted-foreground"><span><p>
-                        {isOfficialOpenAi
-                          ? providerSpec?.label ?? provider.provider_type
-                          : isDeepSeek
-                          ? "OpenAI-compatible Chat"
-                          : isAnthropic
-                            ? "Anthropic Messages"
-                          : providerSpec?.label ?? provider.provider_type}
-                      </p>{customHeaderCount > 0 ? (
-                        <p className="mt-1 text-[10px] text-muted-foreground">
-                          {customHeaderCount} 个自定义请求头
-                        </p>
-                      ) : null}</span><span className="shrink-0">连接详情与高级操作</span></summary><div className="mt-4 space-y-4 border-t pt-4"><div><p className="mb-1 text-xs text-muted-foreground">API Key</p><p>{provider.api_key_masked ?? "未保存"}</p></div><div>{isTranscriptionProvider ? (
+                          <p>{provider.api_key_masked ?? "未保存"}</p>
+                        </div>
+                        <div>{isTranscriptionProvider ? (
                         <>
                           <div className="grid min-w-64 gap-3">
                           <div className="grid gap-1">
@@ -1385,7 +1666,7 @@ function ProvidersPageForm() {
                             ? `${providerRoleLabel(providerSpec.role)}服务不设置默认模型`
                             : "不适用"}
                         </p>
-                      )}</div><div><div className="flex flex-wrap justify-end gap-2">
+                      )}</div><div><div className="flex flex-wrap justify-start gap-2">
                         <div className="flex items-center gap-1.5 rounded-lg border px-2 py-1">
                           <span className="text-[10px] text-muted-foreground">优先级</span>
                           <Input
@@ -1549,22 +1830,19 @@ function ProvidersPageForm() {
                           <Trash2 className="size-3" />
                           删除
                         </Button>
-                      </div></div></div></details></td></motion.tr>
+                      </div></div></div>
+                    ) : null}
+                  </div>
                 );
               })}
               {filteredProviders.length === 0 ? (
-                <tr>
-                  <td
-                    className="px-5 py-10 text-center text-sm text-muted-foreground"
-                    colSpan={6}
-                  >
-                    {`当前「${providerRoleLabel(roleFilter)}」分类下还没有实例。`}
-                  </td>
-                </tr>
+                <div className="px-5 py-10 text-center text-sm text-muted-foreground">
+                  {providerSearch.trim()
+                    ? `没有匹配「${providerSearch.trim()}」的连接。`
+                    : `当前「${providerRoleLabel(roleFilter)}」分类下还没有实例。`}
+                </div>
               ) : null}
-              </AnimatePresence>
-            </tbody>
-          </table>
+          </div>
         </div>
       </Surface>
       <Dialog
@@ -2047,6 +2325,7 @@ function ProvidersPageForm() {
           provider={capabilityTarget.provider}
         />
       ) : null}
+      {providerConfirmDialog}
     </PageFrame>
   );
 }
@@ -3796,6 +4075,7 @@ export function ModelCapabilitiesDialog({
   onStatesSaved: (result: ProviderModelStatesView) => void;
   provider: Provider;
 }) {
+  const { confirm, dialog } = useActionConfirmation();
   const queryClient = useQueryClient();
   const providerWorkspaceId = String(currentWorkspaceQueryKey()[1]);
   const protocolCatalog = useQuery({
@@ -3815,6 +4095,7 @@ export function ModelCapabilitiesDialog({
   const [headers, setHeaders] = useState(() => stringifyExtraHeaders(providerExtraHeaders(provider)));
   const [secret, setSecret] = useState("");
   const [modelSearch, setModelSearch] = useState("");
+  const [batchDeletingModels, setBatchDeletingModels] = useState(false);
   // The dialog can grow the list by pinning models manually, so it keeps its
   // own copy instead of reading the discovery-derived prop directly.
   const [modelsList, setModelsList] = useState(() => {
@@ -4057,12 +4338,70 @@ export function ModelCapabilitiesDialog({
     (model) => modelStates[model.id] === true,
   ).length;
   const newModelCount = orderedModels.filter((model) => model.is_new).length;
+  const modelSelection = useListSelection(
+    useMemo(() => visibleModels.map((model) => model.id), [visibleModels]),
+    { allowEscapeInsideDialog: true },
+  );
+  const selectedModelIds = useMemo(
+    () => orderedModels.map((model) => model.id).filter((id) => modelSelection.selectedIds.has(id)),
+    [modelSelection.selectedIds, orderedModels],
+  );
+  async function deleteSelectedModels(ids: string[]) {
+    if (!ids.length || batchDeletingModels) return;
+    setBatchDeletingModels(true);
+    try {
+      const results = await Promise.allSettled(
+        ids.map((id) => deleteProviderModel(provider.id, id)),
+      );
+      const removedIds: string[] = [];
+      let nextDefault = defaultModelId;
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          removedIds.push(result.value.model_id);
+          nextDefault = result.value.default_model ?? nextDefault;
+        }
+      }
+      if (removedIds.length) {
+        const drop = new Set(removedIds);
+        setModelsList((current) => ({
+          ...current,
+          models: current.models.filter((model) => !drop.has(model.id)),
+        }));
+        setModelStates((current) => {
+          const next = { ...current };
+          for (const id of removedIds) delete next[id];
+          return next;
+        });
+        if (drop.has(defaultModelId)) setDefaultModelId(nextDefault === defaultModelId ? "" : nextDefault);
+        modelSelection.removeIds(removedIds);
+        void queryClient.invalidateQueries({
+          predicate: (query) =>
+            query.queryKey[0] === "providers" ||
+            (query.queryKey[0] === "workspace" &&
+              query.queryKey[1] === providerWorkspaceId &&
+              query.queryKey[2] === "providers"),
+        });
+      }
+      const failed = ids.length - removedIds.length;
+      if (failed === 0) toast.success(`已删除 ${removedIds.length} 个模型`);
+      else if (removedIds.length > 0) toast.warning(`已删除 ${removedIds.length} 个模型，${failed} 个失败`);
+      else toast.error("批量删除模型失败");
+    } finally {
+      setBatchDeletingModels(false);
+    }
+  }
   const balanceConfig = providerBalanceQueryConfig(provider);
   const balanceLast = balanceConfig?.enabled
     ? providerBalanceQueryLastResult(provider)
     : null;
+  const requestClose = () => {
+    if (!(!saveModelStates.isPending && !updateConnection.isPending)) return;
+    if (draftDirty) confirm({ title: "放弃修改？", description: "供应商配置尚未保存。", label: "放弃修改", destructive: true, run: onClose });
+    else onClose();
+  };
   return (
-    <Dialog onOpenChange={(open) => { if (!open && !saveModelStates.isPending && !updateConnection.isPending && (!draftDirty || window.confirm("供应商配置尚未保存，确定放弃修改？"))) onClose(); }} open>
+    <>
+    <Dialog onOpenChange={(open) => { if (!open) requestClose(); }} open>
       <DialogContent className="h-[min(88dvh,860px)] overflow-hidden p-0 sm:max-w-3xl">
         {/* min-w-0：DialogContent 是 grid 容器，子项默认 min-width:auto，会被内容的
             min-content 撑到超过弹窗宽度；窄屏下即表现为「配置溢出窗口」——右侧内容
@@ -4074,7 +4413,7 @@ export function ModelCapabilitiesDialog({
           <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-5">
             <div className="space-y-5 py-5">
               <section className="space-y-3 rounded-xl border p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">模型开关在底部保存；新增与手动添加的模型默认未启用，请按需勾选后保存。</p></div><div className="flex gap-2"><Button disabled={targetModels.length === 0 || allTargetSelected} onClick={() => { for (const model of targetModels) touchedModelIds.current.add(model.id); setModelStates((current) => ({ ...current, ...Object.fromEntries(targetModels.map((model) => [model.id, true])) })); }} size="xs" type="button" variant="outline">全选</Button><Button disabled={targetModels.length === 0 || !anyTargetSelected} onClick={() => { for (const model of targetModels) touchedModelIds.current.add(model.id); setModelStates((current) => ({ ...current, ...Object.fromEntries(targetModels.map((model) => [model.id, false])) })); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
+                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">模型列表</p><p className="mt-1 text-xs text-muted-foreground">模型开关在底部保存；新增与手动添加的模型默认未启用，请按需勾选后保存。</p></div><div className="flex flex-wrap gap-2">{orderedModels.length > 0 ? <Button aria-pressed={modelSelection.multiSelect} disabled={batchDeletingModels} onClick={modelSelection.toggleMultiSelect} size="xs" type="button" variant={modelSelection.multiSelect ? "secondary" : "outline"}><SquareCheck className="size-3" />{modelSelection.multiSelect ? "退出多选" : "多选"}</Button> : null}<Button disabled={targetModels.length === 0 || allTargetSelected} onClick={() => { for (const model of targetModels) touchedModelIds.current.add(model.id); setModelStates((current) => ({ ...current, ...Object.fromEntries(targetModels.map((model) => [model.id, true])) })); }} size="xs" type="button" variant="outline">全选</Button><Button disabled={targetModels.length === 0 || !anyTargetSelected} onClick={() => { for (const model of targetModels) touchedModelIds.current.add(model.id); setModelStates((current) => ({ ...current, ...Object.fromEntries(targetModels.map((model) => [model.id, false])) })); }} size="xs" type="button" variant="outline">全部停用</Button></div></div>
                 <div className="flex items-center gap-2">
                   <Textarea
                     aria-label="批量添加模型"
@@ -4111,7 +4450,46 @@ export function ModelCapabilitiesDialog({
                   <span className="text-xs text-muted-foreground">打开面板不会自动请求供应商</span>
                 </div>
                 {latestModels.isError ? <p role="alert" className="text-xs text-destructive">模型刷新失败：{latestModels.error.message}；保留现有列表。</p> : null}
-                <Input aria-label="搜索模型" onChange={(event) => setModelSearch(event.target.value)} placeholder="模糊搜索模型名称…" value={modelSearch} />
+                <ClearableSearchInput aria-label="搜索模型" onChange={setModelSearch} placeholder="模糊搜索模型名称…" value={modelSearch} />
+                {modelSelection.multiSelect && visibleModels.length > 0 ? (
+                  <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/25 px-3 py-1.5 text-xs">
+                    <label className="flex items-center gap-2">
+                      <Checkbox
+                        aria-label="全选当前可见模型"
+                        checked={modelSelection.visibleCheckboxState}
+                        disabled={batchDeletingModels}
+                        onCheckedChange={(checked) => modelSelection.toggleVisible(checked === true)}
+                      />
+                      全选当前可见
+                    </label>
+                    <span className="tabular-nums text-muted-foreground">已选 {modelSelection.selectedCount} 个</span>
+                    <div className="ml-auto flex items-center gap-1.5">
+                      <Button
+                        disabled={batchDeletingModels || !selectedModelIds.length}
+                        onClick={() =>
+                          confirm({
+                            title: `移除选中的 ${selectedModelIds.length} 个模型？`,
+                            description: "将从该供应商配置中移除所选模型（若包含当前默认模型，需要重新设置默认模型）。",
+                            label: `移除 ${selectedModelIds.length} 个`,
+                            destructive: true,
+                            run: () => void deleteSelectedModels(selectedModelIds),
+                          })
+                        }
+                        size="xs"
+                        type="button"
+                        variant="destructive"
+                      >
+                        <Trash2 className="size-3" />
+                        批量删除
+                      </Button>
+                      {modelSelection.selectedCount > 0 ? (
+                        <Button disabled={batchDeletingModels} onClick={modelSelection.clear} size="xs" type="button" variant="ghost">
+                          取消选择
+                        </Button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
                 {orderedModels.length > 0 ? (
                   <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
                     <span>已启用 {enabledModelCount} / {orderedModels.length} 个模型</span>
@@ -4135,9 +4513,16 @@ export function ModelCapabilitiesDialog({
                     ) : null}
                     {visibleModels.map((model) => (
                     <div
-                      className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 text-xs"
+                      className={`flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 text-xs ${modelSelection.multiSelect && modelSelection.selectedIds.has(model.id) ? "bg-primary/5" : ""}`}
                       key={model.id}
                     >
+                      {modelSelection.multiSelect ? (
+                        <Checkbox
+                          aria-label={`选择模型 ${model.id}`}
+                          disabled={batchDeletingModels}
+                          {...modelSelection.checkboxProps(model.id)}
+                        />
+                      ) : null}
                       {/* 窄屏：模型名独占一行（省略号截断），操作按钮整体换到下一行；
                           宽屏（sm+）：回到 flex-1 的单行布局。 */}
                       <div className="flex w-full min-w-0 items-center gap-1.5 sm:w-auto sm:flex-1">
@@ -4186,8 +4571,16 @@ export function ModelCapabilitiesDialog({
                       )}
                       <Button onClick={() => setEditModelId(model.id)} size="xs" type="button" variant="ghost"><Pencil className="size-3" />编辑</Button>
                       <Button
-                        disabled={removeModel.isPending}
-                        onClick={() => removeModel.mutate(model.id)}
+                        disabled={removeModel.isPending || batchDeletingModels}
+                        onClick={() =>
+                          confirm({
+                            title: `移除模型「${model.id}」？`,
+                            description: "将从此供应商的模型列表移除，可通过刷新模型列表或手动添加重新恢复。",
+                            label: "移除",
+                            destructive: true,
+                            run: () => removeModel.mutate(model.id),
+                          })
+                        }
                         size="xs"
                         title="从此供应商的模型列表移除"
                         type="button"
@@ -4330,6 +4723,8 @@ export function ModelCapabilitiesDialog({
         />
       ) : null}
     </Dialog>
+    {dialog}
+    </>
   );
 }
 
@@ -4878,6 +5273,7 @@ export function ModelOverrideDialog({
   onSaved: (snapshot: ProviderModelCapabilityView) => void;
   provider: Provider;
 }) {
+  const { confirm, dialog } = useActionConfirmation();
   const [edited, setEdited] = useState(false);
   const [validationMessage, setValidationMessage] = useState("");
   useSettingsDirty(`model-parameters-${provider.id}-${modelId}`, edited);
@@ -4979,8 +5375,14 @@ export function ModelOverrideDialog({
     save.mutate();
   }
 
+  const requestClose = () => {
+    if (save.isPending) return;
+    if (edited) confirm({ title: "放弃修改？", description: "模型参数尚未保存。", label: "放弃修改", destructive: true, run: onClose });
+    else onClose();
+  };
   return (
-    <Dialog onOpenChange={(open) => { if (!open && !save.isPending && (!edited || window.confirm("模型参数尚未保存，确定放弃修改？"))) onClose(); }} open>
+    <>
+    <Dialog onOpenChange={(open) => { if (!open) requestClose(); }} open>
       <DialogContent className="h-[min(84dvh,780px)] overflow-hidden p-0 sm:max-w-2xl">
         {/* 与「供应商配置」同因：两层 min-w-0 防止窄屏下内容被撑出弹窗后裁掉。 */}
         <form inert={save.isPending} className="flex min-h-0 min-w-0 flex-1 flex-col" onSubmit={submit}>
@@ -5058,6 +5460,8 @@ export function ModelOverrideDialog({
         </form>
       </DialogContent>
     </Dialog>
+    {dialog}
+    </>
   );
 }
 
@@ -5142,9 +5546,9 @@ function AsrTestedModesBadge({
               }
               className={`rounded-full border px-2 py-0.5 font-mono text-[10px] transition-colors ${
                 isTested
-                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600"
+                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
                   : isUntested
-                    ? "border-amber-500/40 bg-amber-500/10 text-amber-600"
+                    ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400"
                     : "border-border text-muted-foreground hover:bg-accent"
               }`}
               onClick={() => cycle(mode)}

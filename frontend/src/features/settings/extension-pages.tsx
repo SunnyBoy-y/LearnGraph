@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useActionConfirmation } from "@/components/shared/use-action-confirmation";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Network,
@@ -6,13 +8,15 @@ import {
   Pencil,
   Puzzle,
   RefreshCcw,
-  Search,
   ShieldCheck,
+  SquareCheck,
   TerminalSquare,
   Trash2,
 } from "lucide-react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { toast } from '@/lib/notifications';
+import { Checkbox } from "@/components/ui/checkbox";
+import { useListSelection } from "@/lib/list-selection";
 
 import {
   authorizeMcpServer,
@@ -1105,6 +1109,8 @@ function ToolsWorkspace({
   });
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
   const [skillSearch, setSkillSearch] = useState("");
+  const [mcpSearch, setMcpSearch] = useState("");
+  const [batchExtBusy, setBatchExtBusy] = useState(false);
   const [viewingBuiltinTool, setViewingBuiltinTool] = useState<BuiltinNativeTool | null>(
     null,
   );
@@ -1143,6 +1149,7 @@ function ToolsWorkspace({
     },
     onError: (error) => toast.error(error.message),
   });
+  const { confirm, dialog } = useActionConfirmation();
   const updateCheckMutation = useMutation({
     mutationFn: checkSkillUpdate,
     onSuccess: (result) => {
@@ -1156,13 +1163,12 @@ function ToolsWorkspace({
         );
         return;
       }
-      if (
-        window.confirm(
-          `发现上游更新：${result.current_commit.slice(0, 12)} → ${result.latest_commit.slice(0, 12)}。\n升级会替换包内容并需要重新授权，继续？`,
-        )
-      ) {
-        upgradeSkillMutation.mutate(result.skill_id);
-      }
+      confirm({
+        title: "升级技能包？",
+        description: `发现上游更新：${result.current_commit.slice(0, 12)} → ${result.latest_commit.slice(0, 12)}。升级会替换包内容，需要重新授权。`,
+        label: "升级",
+        run: () => upgradeSkillMutation.mutate(result.skill_id),
+      });
     },
     onError: (error) => toast.error(error.message),
   });
@@ -1276,6 +1282,118 @@ function ToolsWorkspace({
     },
     onError: (error) => toast.error(error.message),
   });
+  const filteredServers = useMemo(() => {
+    const list = servers.data ?? [];
+    const q = mcpSearch.trim().toLocaleLowerCase();
+    if (!q) return list;
+    return list.filter((server) =>
+      `${server.display_name} ${server.endpoint_url ?? ""} ${server.discovered_tools.join(" ")}`
+        .toLocaleLowerCase()
+        .includes(q),
+    );
+  }, [mcpSearch, servers.data]);
+  const mcpSelection = useListSelection(
+    useMemo(() => filteredServers.map((server) => server.id), [filteredServers]),
+  );
+  const selectedServers = useMemo(
+    () => (servers.data ?? []).filter((server) => mcpSelection.selectedIds.has(server.id)),
+    [mcpSelection.selectedIds, servers.data],
+  );
+
+  const skillKeyword = skillSearch.trim().toLowerCase();
+  const filteredOfficialSkills = useMemo(
+    () =>
+      (skills.data ?? []).filter(
+        (skill) =>
+          skill.is_official &&
+          (!skillKeyword ||
+            `${skill.name} ${skill.skill_key} ${skill.source}`.toLowerCase().includes(skillKeyword)),
+      ),
+    [skillKeyword, skills.data],
+  );
+  const filteredUserSkills = useMemo(
+    () =>
+      (skills.data ?? []).filter(
+        (skill) =>
+          !skill.is_official &&
+          (!skillKeyword ||
+            `${skill.name} ${skill.skill_key} ${skill.source}`.toLowerCase().includes(skillKeyword)),
+      ),
+    [skillKeyword, skills.data],
+  );
+  const skillSelection = useListSelection(
+    useMemo(() => filteredUserSkills.map((skill) => skill.id), [filteredUserSkills]),
+  );
+  const selectedUserSkills = useMemo(
+    () =>
+      (skills.data ?? []).filter(
+        (skill) => !skill.is_official && skillSelection.selectedIds.has(skill.id),
+      ),
+    [skillSelection.selectedIds, skills.data],
+  );
+
+  async function runMcpBatch(mode: "enable" | "disable" | "refresh" | "delete", targets: typeof selectedServers) {
+    if (!targets.length || batchExtBusy) return;
+    setBatchExtBusy(true);
+    try {
+      const results = await Promise.allSettled(
+        targets.map((server) => {
+          if (mode === "enable") return authorizeMcpServer(server.id, "always", server.required_permissions);
+          if (mode === "disable") return revokeMcpServer(server.id);
+          if (mode === "refresh") return refreshMcpServer(server.id);
+          return deleteMcpServer(server.id);
+        }),
+      );
+      const okIds: string[] = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") okIds.push(targets[index].id);
+      });
+      if (mode === "delete") mcpSelection.removeIds(okIds);
+      refresh();
+      const label = mode === "enable" ? "启用" : mode === "disable" ? "停用" : mode === "refresh" ? "探测" : "删除";
+      const failed = targets.length - okIds.length;
+      if (failed === 0) toast.success(`已${label} ${okIds.length} 个 MCP 服务`);
+      else if (okIds.length > 0) toast.warning(`已${label} ${okIds.length} 个 MCP 服务，${failed} 个失败`);
+      else toast.error(`批量${label}失败`);
+    } finally {
+      setBatchExtBusy(false);
+    }
+  }
+
+  async function runSkillBatch(mode: "enable" | "disable" | "checkUpdate", targets: Skill[]) {
+    if (!targets.length || batchExtBusy) return;
+    setBatchExtBusy(true);
+    try {
+      if (mode === "checkUpdate") {
+        const results = await Promise.allSettled(targets.map((skill) => checkSkillUpdate(skill.id)));
+        const okCount = results.filter((result) => result.status === "fulfilled").length;
+        const updatable = results.filter(
+          (result) =>
+            result.status === "fulfilled" &&
+            result.value.supported &&
+            result.value.update_available,
+        ).length;
+        toast.info(`已检查 ${okCount} 个 Skill，发现 ${updatable} 个可更新`);
+        return;
+      }
+      const results = await Promise.allSettled(
+        targets.map((skill) =>
+          mode === "enable"
+            ? authorizeSkill(skill.id, "always", skill.required_permissions)
+            : authorizeSkill(skill.id, "deny", []),
+        ),
+      );
+      const okCount = results.filter((result) => result.status === "fulfilled").length;
+      refresh();
+      const label = mode === "enable" ? "启用" : "禁用";
+      if (okCount === targets.length) toast.success(`已${label} ${okCount} 个 Skill`);
+      else if (okCount > 0) toast.warning(`已${label} ${okCount} 个 Skill，${targets.length - okCount} 个失败`);
+      else toast.error(`批量${label}失败`);
+    } finally {
+      setBatchExtBusy(false);
+    }
+  }
+
   const queries = [servers, skills, ...(showMcp ? [builtinTools] : [])];
   if (queries.some((query) => query.isPending))
     return embedded ? (
@@ -1430,7 +1548,7 @@ function ToolsWorkspace({
                         ))}
                       </div>
                     ) : null}
-                    <p className="mt-2 text-[11px] text-muted-foreground/70 opacity-0 transition-opacity group-hover:opacity-100">
+                    <p className="mt-2 text-[11px] text-muted-foreground/70 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100">
                       点击查看协议内容 →
                     </p>
                   </div>
@@ -1444,16 +1562,122 @@ function ToolsWorkspace({
       </Surface>
       <Surface className="overflow-hidden">
         <div className="border-b p-5">
-          <SectionHeading
-            description={`${servers.data?.length ?? 0} 个用户配置`}
-            title="用户配置的 MCP"
-          />
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <SectionHeading
+              description={`${servers.data?.length ?? 0} 个用户配置`}
+              title="用户配置的 MCP"
+            />
+            {(servers.data?.length ?? 0) > 0 ? (
+              <Button
+                aria-pressed={mcpSelection.multiSelect}
+                disabled={batchExtBusy}
+                onClick={mcpSelection.toggleMultiSelect}
+                size="sm"
+                type="button"
+                variant={mcpSelection.multiSelect ? "secondary" : "outline"}
+              >
+                <SquareCheck className="size-4" />
+                {mcpSelection.multiSelect ? "退出多选" : "多选"}
+              </Button>
+            ) : null}
+          </div>
+          {(servers.data?.length ?? 0) > 0 ? (
+            <ClearableSearchInput
+              aria-label="搜索用户 MCP 服务"
+              containerClassName="mt-3"
+              onChange={setMcpSearch}
+              placeholder="搜索 MCP 名称、地址或已探测工具…"
+              value={mcpSearch}
+            />
+          ) : null}
+          {mcpSelection.multiSelect && filteredServers.length > 0 ? (
+            <div
+              aria-label="MCP 批量操作"
+              className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border bg-muted/25 px-3 py-2 text-xs"
+              role="region"
+            >
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  aria-label="全选当前 MCP"
+                  checked={mcpSelection.visibleCheckboxState}
+                  disabled={batchExtBusy}
+                  onCheckedChange={(checked) => mcpSelection.toggleVisible(checked === true)}
+                />
+                全选当前列表
+              </label>
+              <span className="tabular-nums text-muted-foreground">
+                已选 {mcpSelection.selectedCount} 个
+              </span>
+              <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                <Button
+                  disabled={batchExtBusy || !selectedServers.some((s) => !s.enabled)}
+                  onClick={() => void runMcpBatch("enable", selectedServers.filter((s) => !s.enabled))}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  批量启用
+                </Button>
+                <Button
+                  disabled={batchExtBusy || !selectedServers.some((s) => s.enabled)}
+                  onClick={() => void runMcpBatch("disable", selectedServers.filter((s) => s.enabled))}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  批量停用
+                </Button>
+                <Button
+                  disabled={batchExtBusy || !selectedServers.length}
+                  onClick={() => void runMcpBatch("refresh", selectedServers)}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  <RefreshCcw className="size-3" />
+                  批量探测
+                </Button>
+                <Button
+                  disabled={batchExtBusy || !selectedServers.length}
+                  onClick={() =>
+                    confirm({
+                      title: `删除选中的 ${selectedServers.length} 个 MCP 服务？`,
+                      description: "将同时移除其凭据、能力快照与授权记录。",
+                      label: `删除 ${selectedServers.length} 项`,
+                      destructive: true,
+                      run: () => void runMcpBatch("delete", selectedServers),
+                    })
+                  }
+                  size="xs"
+                  type="button"
+                  variant="destructive"
+                >
+                  <Trash2 className="size-3" />
+                  批量删除
+                </Button>
+                {mcpSelection.selectedCount > 0 ? (
+                  <Button disabled={batchExtBusy} onClick={mcpSelection.clear} size="xs" type="button" variant="ghost">
+                    取消选择
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
         </div>
         {servers.data?.length ? (
+          filteredServers.length ? (
           <div className="divide-y">
-            {servers.data.map((server) => (
-              <div className="space-y-3 p-5" key={server.id}>
+            {filteredServers.map((server) => (
+              <div className={`space-y-3 p-5 ${mcpSelection.multiSelect && mcpSelection.selectedIds.has(server.id) ? "bg-primary/5" : ""}`} key={server.id}>
                 <div className="flex flex-wrap items-start gap-3">
+                  {mcpSelection.multiSelect ? (
+                    <Checkbox
+                      aria-label={`选择 MCP ${server.display_name}`}
+                      className="mt-1"
+                      disabled={batchExtBusy}
+                      {...mcpSelection.checkboxProps(server.id)}
+                    />
+                  ) : null}
                   <Network className="mt-1 size-4 text-primary" />
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
@@ -1547,13 +1771,7 @@ function ToolsWorkspace({
                       className="text-destructive hover:text-destructive"
                       disabled={deleteMcpMutation.isPending}
                       onClick={() => {
-                        if (
-                          window.confirm(
-                            `删除 MCP Server「${server.display_name}」？将同时移除其凭据、能力快照与授权记录。`,
-                          )
-                        ) {
-                          deleteMcpMutation.mutate(server.id);
-                        }
+                        confirm({ title: `删除「${server.display_name}」？`, description: "将同时移除其凭据、能力快照与授权记录。", label: "删除", destructive: true, run: () => deleteMcpMutation.mutate(server.id) });
                       }}
                       size="xs"
                       variant="ghost"
@@ -1566,6 +1784,11 @@ function ToolsWorkspace({
               </div>
             ))}
           </div>
+          ) : (
+            <p className="py-12 text-center text-sm text-muted-foreground">
+              没有匹配「{mcpSearch.trim()}」的 MCP 服务。
+            </p>
+          )
         ) : (
           <p className="py-12 text-center text-sm text-muted-foreground">
             尚未配置用户 MCP 服务
@@ -1577,41 +1800,111 @@ function ToolsWorkspace({
       {showSkills ? (
       <Surface className="overflow-hidden">
         <div className="border-b p-5">
-          <SectionHeading
-            description={`${skills.data?.length ?? 0} 个已安装 · 授权后可用`}
-            title="已安装 Skills"
-          />
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <SectionHeading
+              description={`${skills.data?.length ?? 0} 个已安装 · 授权后可用`}
+              title="已安装 Skills"
+            />
+            {filteredUserSkills.length > 0 ? (
+              <Button
+                aria-pressed={skillSelection.multiSelect}
+                disabled={batchExtBusy}
+                onClick={skillSelection.toggleMultiSelect}
+                size="sm"
+                type="button"
+                variant={skillSelection.multiSelect ? "secondary" : "outline"}
+              >
+                <SquareCheck className="size-4" />
+                {skillSelection.multiSelect ? "退出多选" : "多选"}
+              </Button>
+            ) : null}
+          </div>
           {(skills.data?.length ?? 0) > 0 ? (
-            <div className="relative mt-3">
-              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                className="pl-9"
-                onChange={(event) => setSkillSearch(event.currentTarget.value)}
-                placeholder="搜索名称、skill key、来源…"
-                value={skillSearch}
-              />
+            <ClearableSearchInput
+              aria-label="搜索已安装 Skills"
+              containerClassName="mt-3"
+              onChange={setSkillSearch}
+              placeholder="搜索名称、skill key、来源…"
+              value={skillSearch}
+            />
+          ) : null}
+          {skillSelection.multiSelect && filteredUserSkills.length > 0 ? (
+            <div
+              aria-label="用户 Skills 批量操作"
+              className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border bg-muted/25 px-3 py-2 text-xs"
+              role="region"
+            >
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  aria-label="全选当前用户 Skills"
+                  checked={skillSelection.visibleCheckboxState}
+                  disabled={batchExtBusy}
+                  onCheckedChange={(checked) => skillSelection.toggleVisible(checked === true)}
+                />
+                全选用户 Skills ({filteredUserSkills.length})
+              </label>
+              <span className="tabular-nums text-muted-foreground">
+                已选 {skillSelection.selectedCount} 个
+              </span>
+              <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                <Button
+                  disabled={batchExtBusy || !selectedUserSkills.some((s) => s.status !== "enabled")}
+                  onClick={() => void runSkillBatch("enable", selectedUserSkills.filter((s) => s.status !== "enabled"))}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  批量启用
+                </Button>
+                <Button
+                  disabled={batchExtBusy || !selectedUserSkills.some((s) => s.status === "enabled")}
+                  onClick={() => void runSkillBatch("disable", selectedUserSkills.filter((s) => s.status === "enabled"))}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  批量禁用
+                </Button>
+                <Button
+                  disabled={batchExtBusy || !selectedUserSkills.some((s) => s.origin_type === "github_import")}
+                  onClick={() =>
+                    void runSkillBatch(
+                      "checkUpdate",
+                      selectedUserSkills.filter((s) => s.origin_type === "github_import"),
+                    )
+                  }
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  <RefreshCcw className="size-3" />
+                  检查更新
+                </Button>
+                {skillSelection.selectedCount > 0 ? (
+                  <Button disabled={batchExtBusy} onClick={skillSelection.clear} size="xs" type="button" variant="ghost">
+                    取消选择
+                  </Button>
+                ) : null}
+              </div>
             </div>
           ) : null}
         </div>
         {skills.data?.length ? (
           (() => {
-            const keyword = skillSearch.trim().toLowerCase();
-            const matchesSearch = (skill: Skill) =>
-              !keyword ||
-              `${skill.name} ${skill.skill_key} ${skill.source}`
-                .toLowerCase()
-                .includes(keyword);
-            const officialSkills = skills.data.filter(
-              (skill) => skill.is_official && matchesSearch(skill),
-            );
-            const userSkills = skills.data.filter(
-              (skill) => !skill.is_official && matchesSearch(skill),
-            );
+            const officialSkills = filteredOfficialSkills;
+            const userSkills = filteredUserSkills;
             const renderSkillRow = (skill: Skill) => (
               <div
-                className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center"
+                className={`flex flex-col gap-3 p-4 sm:flex-row sm:items-center ${!skill.is_official && skillSelection.multiSelect && skillSelection.selectedIds.has(skill.id) ? "bg-primary/5" : ""}`}
                 key={skill.id}
               >
+                {!skill.is_official && skillSelection.multiSelect ? (
+                  <Checkbox
+                    aria-label={`选择 Skill ${skill.name}`}
+                    disabled={batchExtBusy}
+                    {...skillSelection.checkboxProps(skill.id)}
+                  />
+                ) : null}
                 <TerminalSquare className="size-4 shrink-0 text-primary" />
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
@@ -1793,6 +2086,7 @@ function ToolsWorkspace({
             );
           })()
         : null}
+      {dialog}
       <BuiltinToolDetailDialog
         onOpenChange={(open) => {
           if (!open) setViewingBuiltinTool(null);

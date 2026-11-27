@@ -1,16 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ArrowRight, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, Database, Download, Eye, HardDrive, Play, RefreshCcw, RotateCcw, Search, Settings2, ShieldAlert, Trash2, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { AlertTriangle, ArrowRight, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, Database, Download, Eye, HardDrive, Play, RefreshCcw, RotateCcw, Settings2, ShieldAlert, Trash2, X } from "lucide-react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { toast } from '@/lib/notifications';
 import { commitMigration, deleteAuditEvent, deleteAuditEvents, getMigration, listAuditEvents, listMigrationAdapters, listMigrations, preflightMigration, rollbackMigration, startMigration } from "@/api";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
 import { ErrorState, LoadingState, PageFrame, PageIntro, SectionHeading, StatePill, Surface, } from "@/components/shared/page-elements";
+import { applyRangeSelection, useEscapeKey } from "@/lib/list-selection";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger, } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, } from "@/components/ui/select";
 import { DatabaseConfigurationSheet } from "@/features/settings/database-configuration-sheet";
@@ -1059,6 +1060,13 @@ export function AuditPage() {
   const [page, setPage] = useState(1);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const eventAnchorRef = useRef<string | null>(null);
+  const eventShiftRef = useRef(false);
+  const clearAuditSelection = useCallback(() => {
+    setSelectedIds(new Set());
+    eventAnchorRef.current = null;
+  }, []);
+  useEscapeKey(selectedIds.size > 0, clearAuditSelection);
   const [deleteTarget, setDeleteTarget] = useState<
     { kind: "one"; event: AuditEvent } | { kind: "many"; ids: string[] } | null
   >(null);
@@ -1178,13 +1186,27 @@ export function AuditPage() {
     setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
+  const pageEventIds = pagedGroups.flatMap((group) =>
+    group.events.map((event) => event.id),
+  );
+  const pageSelectedCount = pageEventIds.filter((id) => selectedIds.has(id)).length;
+  const otherPageSelectedCount = Math.max(0, selectedIds.size - pageSelectedCount);
+  const pageAllSelected = pageEventIds.length > 0 && pageSelectedCount === pageEventIds.length;
+
   function toggleEventSelected(eventId: string, checked: boolean) {
+    const useShift = eventShiftRef.current;
+    const anchorId = eventAnchorRef.current;
+    eventShiftRef.current = false;
     setSelectedIds((prev) => {
+      if (useShift && anchorId) {
+        return applyRangeSelection(prev, pageEventIds, anchorId, eventId, checked);
+      }
       const next = new Set(prev);
       if (checked) next.add(eventId);
       else next.delete(eventId);
       return next;
     });
+    eventAnchorRef.current = eventId;
   }
 
   function toggleGroupSelected(group: AuditSessionGroup, checked: boolean) {
@@ -1197,12 +1219,6 @@ export function AuditPage() {
       return next;
     });
   }
-
-  const pageEventIds = pagedGroups.flatMap((group) =>
-    group.events.map((event) => event.id),
-  );
-  const pageSelectedCount = pageEventIds.filter((id) => selectedIds.has(id)).length;
-  const pageAllSelected = pageEventIds.length > 0 && pageSelectedCount === pageEventIds.length;
 
   function togglePageSelected() {
     setSelectedIds((prev) => {
@@ -1234,17 +1250,28 @@ export function AuditPage() {
               {pageAllSelected ? "取消全选本页" : "全选本页"}
             </Button>
             {selectedIds.size > 0 ? (
-              <Button
-                disabled={deleting}
-                onClick={() =>
-                  setDeleteTarget({ kind: "many", ids: [...selectedIds] })
-                }
-                size="sm"
-                variant="destructive"
-              >
-                <Trash2 className="size-4" />
-                删除所选 ({selectedIds.size})
-              </Button>
+              <>
+                <Button
+                  disabled={deleting}
+                  onClick={() =>
+                    setDeleteTarget({ kind: "many", ids: [...selectedIds] })
+                  }
+                  size="sm"
+                  variant="destructive"
+                >
+                  <Trash2 className="size-4" />
+                  删除所选 ({selectedIds.size}
+                  {otherPageSelectedCount > 0 ? ` · 含其他页 ${otherPageSelectedCount}` : ""})
+                </Button>
+                <Button
+                  disabled={deleting}
+                  onClick={clearAuditSelection}
+                  size="sm"
+                  variant="ghost"
+                >
+                  清空选择
+                </Button>
+              </>
             ) : null}
             <Button
               disabled={!auditEvents.length}
@@ -1268,18 +1295,22 @@ export function AuditPage() {
             description={`${sessionGroups.length} 个会话组 · ${auditEvents.length} 条事件`}
             title="审计日志"
           />
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              className="w-56 pl-9"
-              onChange={(event) => {
-                setAction(event.target.value);
-                setPage(1);
-              }}
-              placeholder="按 action 精确过滤"
-              value={action}
-            />
-          </div>
+          <ClearableSearchInput
+            aria-label="按 action 过滤审计日志"
+            containerClassName="w-60"
+            list="audit-action-suggestions"
+            onChange={(value) => {
+              setAction(value);
+              setPage(1);
+            }}
+            placeholder="按 action 精确过滤"
+            value={action}
+          />
+          <datalist id="audit-action-suggestions">
+            {knownActions.map((item) => (
+              <option key={item} value={item} />
+            ))}
+          </datalist>
         </div>
 
         <ScrollArea className="h-[min(62vh,720px)]">
@@ -1391,6 +1422,9 @@ export function AuditPage() {
                                     <Checkbox
                                       aria-label={`选择 ${event.action}`}
                                       checked={selectedIds.has(event.id)}
+                                      onClickCapture={(e) => {
+                                        eventShiftRef.current = e.shiftKey;
+                                      }}
                                       onCheckedChange={(value) =>
                                         toggleEventSelected(
                                           event.id,

@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Circle, Database, LoaderCircle, RefreshCcw, ShieldCheck } from 'lucide-react'
 import { toast } from '@/lib/notifications'
+import { adaptivePollInterval } from '@/lib/network-quality'
 import { activatePrimaryDatabaseMigration, cancelPrimaryDatabaseMigration, getPrimaryDatabaseMigration, preflightPrimaryDatabaseMigration, resumePrimaryDatabaseMigration, startPrimaryDatabaseMigration } from '@/api/migrations'
 import { SectionHeading, Surface } from '@/components/shared/page-elements'
 import { Button } from '@/components/ui/button'
@@ -61,7 +62,7 @@ export function PrimaryDatabaseMigrationPanel() {
   const [configurationOpen, setConfigurationOpen] = useState(false)
   useEffect(() => { setPassword(''); setPasswordError(''); setAcknowledged(false); setConfigurationOpen(false) }, [userId, isSystemAdmin])
   const status = useQuery({ queryKey: key, queryFn: getPrimaryDatabaseMigration, enabled: isSystemAdmin,
-    refetchInterval: query => query.state.data?.active_database === 'postgresql' ? false : 1500 })
+    refetchInterval: query => adaptivePollInterval(query.state.data?.active_database === 'postgresql' ? false : 1500) })
   const accept = (value: PrimaryDatabaseMigration) => { queryClient.setQueryData(key, value); void queryClient.invalidateQueries({ queryKey: key }) }
   const preflight = useMutation({ mutationFn: preflightPrimaryDatabaseMigration, onError: error => toast.error(error.message) })
   const start = useMutation({ mutationFn: (currentPassword: string) => startPrimaryDatabaseMigration({ confirm: true, current_password: currentPassword, managed, auto_activate: autoActivate }),

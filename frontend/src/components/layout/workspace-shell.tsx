@@ -1,8 +1,11 @@
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
 import "./graph-rail.css";
 import { scheduleSessionRefresh } from "@/lib/session-refresh";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -58,7 +61,6 @@ import {
 import { toast } from '@/lib/notifications';
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { useModalDrawerFocus } from "./use-modal-drawer-focus";
@@ -67,7 +69,7 @@ import { useSessionNavigator } from "./use-session-navigator";
 import { SessionProjects } from "./session-projects";
 const WorkspaceSearchDialog = lazy(() => import("./workspace-search-dialog").then(module => ({ default: module.WorkspaceSearchDialog })));
 import { toSidebarSession, nestSidebarSessions, flattenSidebarSessions, type SidebarSession, type SidebarProject } from "./session-sidebar-model";
-import { useSessionDetail, updateSessionCaches, summaryOf } from "@/lib/session-queries";
+import { useSessionDetail, updateSessionCaches, removeSessionsFromCaches, summaryOf } from "@/lib/session-queries";
 import { getSessionCounts, getSessionAncestors, listSessionPage, getSession } from "@/api/session-browser";
 import { createGraphOpenCoordinator, graphVisit, rememberGraphVisit, pickGraphConversation } from "@/lib/graph-folder-navigation";
 import { claimLearningNodeNavigation } from "@/lib/learning-node-binding";
@@ -538,6 +540,7 @@ function SidebarNav({
   const draftSessionId = useRef<string | null>(getDraftSessionId());
   const creatingConversationRef = useRef(false);
   const deleteRequestId = useRef(0);
+  const deleteImpactAbortRef = useRef<AbortController | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SidebarDeleteTarget>();
   const [deleteImpact, setDeleteImpact] = useState<DeleteImpact>();
   const [deleteImpactError, setDeleteImpactError] = useState<string>();
@@ -1170,6 +1173,8 @@ function SidebarNav({
 
   function closeDeleteDialog() {
     deleteRequestId.current += 1;
+    deleteImpactAbortRef.current?.abort();
+    deleteImpactAbortRef.current = null;
     setDeleteTarget(undefined);
     setDeleteImpact(undefined);
     setDeleteImpactError(undefined);
@@ -1179,6 +1184,9 @@ function SidebarNav({
   async function requestDeletion(target: SidebarDeleteTarget) {
     const requestId = deleteRequestId.current + 1;
     deleteRequestId.current = requestId;
+    deleteImpactAbortRef.current?.abort();
+    const abortController = new AbortController();
+    deleteImpactAbortRef.current = abortController;
     setDeleteTarget(target);
     setDeleteImpact(undefined);
     setDeleteImpactError(undefined);
@@ -1186,11 +1194,14 @@ function SidebarNav({
     try {
       if (target.kind === "mixed_batch") {
         const projectImpacts = await Promise.all(
-          target.projects.map((project) => getProjectDeleteImpact(project.id)),
+          target.projects.map((project) =>
+            getProjectDeleteImpact(project.id, { signal: abortController.signal }),
+          ),
         );
         const sessionImpact = target.sessions.length
           ? await getSessionBatchDeleteImpact(
               target.sessions.map((session) => session.id),
+              { signal: abortController.signal },
             )
           : undefined;
         const impact = mergeDeleteImpacts(
@@ -1221,20 +1232,30 @@ function SidebarNav({
       }
       const impact =
         target.kind === "session"
-          ? await getSessionDeleteImpact(target.session.id)
+          ? await getSessionDeleteImpact(target.session.id, {
+              signal: abortController.signal,
+            })
           : target.kind === "session_batch"
             ? await getSessionBatchDeleteImpact(
                 target.sessions.map((session) => session.id),
+                { signal: abortController.signal },
               )
-            : await getProjectDeleteImpact(target.project.id);
+            : await getProjectDeleteImpact(target.project.id, {
+                signal: abortController.signal,
+              });
       if (deleteRequestId.current === requestId) setDeleteImpact(impact);
     } catch (error) {
-      if (deleteRequestId.current === requestId)
+      if (deleteRequestId.current === requestId && !abortController.signal.aborted)
         setDeleteImpactError(
           error instanceof Error ? error.message : "无法检查删除影响",
         );
     } finally {
-      if (deleteRequestId.current === requestId) setDeleteImpactLoading(false);
+      if (deleteRequestId.current === requestId) {
+        if (deleteImpactAbortRef.current === abortController) {
+          deleteImpactAbortRef.current = null;
+        }
+        setDeleteImpactLoading(false);
+      }
     }
   }
 
@@ -1396,19 +1417,17 @@ function SidebarNav({
         onNavigate?.();
       }
 
+      removeSessionsFromCaches(queryClient, workspaceId, removedSessionIds);
+      if (removedProjectIds.size) {
+        queryClient.setQueryData<Array<{ id: string }>>(
+          workspaceQueryKey(workspaceId, "projects"),
+          (previous) => previous?.filter((item) => !removedProjectIds.has(item.id)),
+        );
+      }
+
       window.dispatchEvent(new CustomEvent('learngraph:sessions-deleted', {
         detail: { workspaceId, sessionIds: [...removedSessionIds], projectIds: [...removedProjectIds] },
       }));
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") }),
-        scheduleSessionRefresh(queryClient, workspaceId),
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memory") }),
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memories") }),
-        queryClient.invalidateQueries({ queryKey: ["memory-pending"] }),
-        queryClient.invalidateQueries({ queryKey: ["memory-drafts"] }),
-        queryClient.invalidateQueries({ queryKey: ["memory-episodes"] }),
-        queryClient.invalidateQueries({ queryKey: ["memory-context-manifests"] }),
-      ]);
       toast.success(
         deleteTarget.kind === "session"
           ? `已删除会话「${deleteTarget.session.title}」`
@@ -1419,6 +1438,18 @@ function SidebarNav({
               : `已删除项目「${deleteTarget.project.title}」及相关影响`,
       );
       closeDeleteDialog();
+      // Reconcile server caches asynchronously after closing the modal so a
+      // slow background refresh never keeps the delete dialog locked.
+      void Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") }),
+        scheduleSessionRefresh(queryClient, workspaceId),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memory") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "memories") }),
+        queryClient.invalidateQueries({ queryKey: ["memory-pending"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-drafts"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-episodes"] }),
+        queryClient.invalidateQueries({ queryKey: ["memory-context-manifests"] }),
+      ]);
     } catch (error) {
       setDeleteImpactError(
         error instanceof Error ? error.message : "删除失败，请稍后重试",
@@ -1428,15 +1459,24 @@ function SidebarNav({
     }
   }
 
-  async function renameProject(project: SidebarProject) {
-    const title = window.prompt("输入新的项目名称：", project.title)?.trim();
+  const [projectRename, setProjectRename] = useState<{ project: SidebarProject; title: string } | null>(null);
+  const [renamingProject, setRenamingProject] = useState(false);
+
+  async function renameProject() {
+    if (!projectRename || renamingProject) return;
+    const { project } = projectRename;
+    const title = projectRename.title.trim();
     if (!title || title === project.title) return;
+    setRenamingProject(true);
     try {
       await updateProjectRecord(project.id, { title });
       await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
       toast.success("项目名称已更新");
+      setProjectRename(null);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "项目改名失败");
+    } finally {
+      setRenamingProject(false);
     }
   }
 
@@ -1535,6 +1575,70 @@ function SidebarNav({
       );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "项目状态更新失败");
+    }
+  }
+
+  async function batchArchiveSelection(targetProjects: SidebarProject[], targetSessions: SidebarSession[]) {
+    const projectResults = await Promise.allSettled(
+      targetProjects.map((project) =>
+        project.status === "archived" ? restoreProject(project.id) : archiveProject(project.id),
+      ),
+    );
+    const sessionResults = await Promise.allSettled(
+      targetSessions.map(async (session) => {
+        const updated =
+          session.status === "archived"
+            ? await restoreSession(session.id)
+            : await archiveSession(session.id);
+        patchSidebarSession(session.id, { status: updated.status });
+        updateSessionCaches(queryClient, workspaceId, updated);
+        return updated;
+      }),
+    );
+    const total = projectResults.length + sessionResults.length;
+    const failed = [...projectResults, ...sessionResults].filter((r) => r.status === "rejected").length;
+    if (targetProjects.length) {
+      await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "projects") });
+    }
+    await scheduleSessionRefresh(queryClient, workspaceId);
+    if (failed === 0) toast.success(`已归档 ${total} 项`);
+    else if (failed < total) toast.warning(`已处理 ${total - failed} 项，${failed} 项失败`);
+    else toast.error("批量归档失败");
+  }
+
+  async function batchMoveSessions(targetSessions: SidebarSession[], projectId?: string) {
+    const results = await Promise.allSettled(
+      targetSessions.map((session) => assignSessionProject(session.id, projectId ?? null)),
+    );
+    const failed = results.filter((r) => r.status === "rejected").length;
+    await scheduleSessionRefresh(queryClient, workspaceId);
+    if (failed === 0) {
+      toast.success(projectId ? `已移动 ${targetSessions.length} 个会话` : `已移出 ${targetSessions.length} 个会话`);
+    } else if (failed < targetSessions.length) {
+      toast.warning(`已移动 ${targetSessions.length - failed} 个会话，${failed} 个失败`);
+    } else {
+      toast.error("批量移动会话失败");
+    }
+  }
+
+  async function batchToggleSessionPin(targetSessions: SidebarSession[], pinned: boolean) {
+    const candidates = targetSessions.filter((session) => Boolean(session.pinned) !== pinned);
+    const targets = candidates.length ? candidates : targetSessions;
+    const results = await Promise.allSettled(
+      targets.map(async (session) => {
+        const updated = await updateSession(session.id, { pinned });
+        patchSidebarSession(session.id, { pinned: updated.pinned });
+        updateSessionCaches(queryClient, workspaceId, updated);
+        return updated;
+      }),
+    );
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed === 0) {
+      toast.success(pinned ? `已置顶 ${targets.length} 个会话` : `已取消置顶 ${targets.length} 个会话`);
+    } else if (failed < targets.length) {
+      toast.warning(`已更新 ${targets.length - failed} 个会话，${failed} 个失败`);
+    } else {
+      toast.error("批量更新置顶状态失败");
     }
   }
 
@@ -1762,7 +1866,7 @@ function SidebarNav({
           onRequestProjectDeletion={(project) =>
             void requestDeletion({ kind: "project", project })
           }
-          onRenameProject={renameProject}
+          onRenameProject={async (project) => setProjectRename({ project, title: project.title })}
           onToggleProjectArchive={toggleProjectArchive}
           onMoveSession={moveSession}
           onRequestSessionDeletion={(session) =>
@@ -1783,6 +1887,9 @@ function SidebarNav({
               projectImpacts: [],
             })
           }
+          onBatchArchive={batchArchiveSelection}
+          onBatchMoveSessions={batchMoveSessions}
+          onBatchToggleSessionPin={batchToggleSessionPin}
           onSelectSession={(sessionId, project) => {
             markSessionViewed(sessionId);
             setActiveSessionId(sessionId);
@@ -1797,6 +1904,19 @@ function SidebarNav({
         />
       </div>
 
+      <Dialog open={projectRename !== null} onOpenChange={(open) => { if (!open && !renamingProject) setProjectRename(null); }}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>重命名项目</DialogTitle><DialogDescription>输入新的项目名称。</DialogDescription></DialogHeader>
+          <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); void renameProject(); }}>
+            <Label htmlFor="sidebar-project-new-name">项目名称</Label>
+            <Input id="sidebar-project-new-name" value={projectRename?.title ?? ""} onChange={(event) => { const title = event.currentTarget.value; setProjectRename((current) => current ? { ...current, title } : null); }} disabled={renamingProject} required />
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={renamingProject} onClick={() => setProjectRename(null)}>取消</Button>
+              <Button type="submit" disabled={renamingProject || !projectRename?.title.trim() || projectRename.title.trim() === projectRename.project.title}>{renamingProject ? "保存中…" : "保存"}</Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
       <DeleteImpactDialog
         confirmLabel={
           deleteTarget?.kind === "project"
@@ -1901,7 +2021,7 @@ function UserMenu({
             )}
           >
             {avatarUrl ? <AvatarImage alt={`${username}的头像`} src={avatarUrl} /> : null}
-            <AvatarFallback className="sidebar-user-avatar text-xs font-semibold" style={defaultAvatar.style}>
+            <AvatarFallback className="sidebar-user-avatar text-xs font-semibold" data-avatar-tone={defaultAvatar.tone}>
               {defaultAvatar.initial}
             </AvatarFallback>
           </Avatar>
@@ -2356,10 +2476,26 @@ export function ContextRail({
   const isGoalClarify = pathname.includes("/goals/new/clarify");
   const isGraph = pathname.includes("/graphs/");
   const isChat = pathname.includes("/chat/");
-  const isGoalMode = isChat && new URLSearchParams(search).get("mode") === "goal";
-  const sessionId =
-    new URLSearchParams(search).get("sidebarSession") ??
-    pathname.match(/\/chat\/([^/]+)/)?.[1];
+  const params = new URLSearchParams(search);
+  const chatRouteSessionId = pathname.match(/\/chat\/([^/]+)/)?.[1];
+  const sessionId = params.get("sidebarSession") ?? chatRouteSessionId;
+  const goalPreviewScope = isChat
+    ? `${workspaceId}:${chatRouteSessionId}${chatRouteSessionId === "new" ? `:${params.get("project") ?? "root"}` : ""}`
+    : undefined;
+  const [goalPreview, setGoalPreview] = useState<(GoalGraphPreview & { scopeKey: string }) | null>(null);
+  useLayoutEffect(() => {
+    setGoalPreview(null);
+    if (!goalPreviewScope) return;
+    const updatePreview = (event: Event) => {
+      const detail = (event as CustomEvent<Partial<GoalGraphPreview> & { scopeKey: string }>).detail;
+      if (detail?.scopeKey !== goalPreviewScope) return;
+      setGoalPreview({ ...initialGoalGraphPreview, ...detail });
+    };
+    window.addEventListener("learngraph:goal-graph-preview", updatePreview);
+    return () => window.removeEventListener("learngraph:goal-graph-preview", updatePreview);
+  }, [goalPreviewScope]);
+  const activeGoalPreview = goalPreview && goalPreview.scopeKey === goalPreviewScope &&
+    (goalPreview.phase !== "draft" || goalPreview.graphNodes.length) ? goalPreview : null;
   const railSession = useSessionDetail(workspaceId, sessionId);
   const activeSession = railSession.data;
   const creationParentSessionId = activeSession?.parent_session_id ?? sessionId;
@@ -2380,18 +2516,18 @@ export function ContextRail({
           ]
         : [
             [
-              "Projects",
+              "学习项目",
               `${railProjects.data?.filter((item) => item.status !== "archived").length ?? 0} 个活跃项目`,
             ],
             [
-              "Sessions",
+              "会话",
               `${railCounts.data?.active ?? "—"} 个活跃会话`,
             ],
             [
-              "Memory",
+              "学习记忆",
               `${railCounts.data?.memory_enabled ?? "—"} 个会话已启用`,
             ],
-            ["Scope", sessionId ? "当前会话" : "当前工作区"],
+            ["当前范围", sessionId ? "当前会话" : "当前工作区"],
           ],
     [isSettings, railProjects.data, railCounts.data, sessionId],
   );
@@ -2495,8 +2631,8 @@ export function ContextRail({
       // Collapsed rail stays mounted for CSS slide; inert keeps it out of tab order.
       inert={collapsed || undefined}
     >
-      {contentMounted && ((isGoalClarify || isGoalMode) && !selectionExplanation ? (
-        <GoalGraphPreviewRail />
+      {contentMounted && ((isGoalClarify || activeGoalPreview) && !selectionExplanation ? (
+        <GoalGraphPreviewRail preview={activeGoalPreview ?? initialGoalGraphPreview} />
       ) : isGraph ? (
         <GraphWorkspaceRail />
       ) : isChat ? (
@@ -2521,7 +2657,7 @@ export function ContextRail({
             </p>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               {isSettings
-                ? "配置变更只在任务边界生效。"
+                ? "当前设置适用于此工作区。"
                 : "回答仅注入明确选择的资源。"}
             </p>
           </div>
@@ -2541,8 +2677,7 @@ export function ContextRail({
               能力边界
             </p>
             <p className="mt-2 text-xs leading-5 text-muted-foreground">
-              每次模型、搜索与研究结果都保留 Provider
-              能力标记；本地演示结果不会伪装成远程调用。
+              可以在回答中查看模型与搜索结果的来源。
             </p>
           </div>
         </div>
@@ -3501,35 +3636,7 @@ const initialGoalGraphPreview: GoalGraphPreview = {
   graphEdges: [],
 };
 
-function GoalGraphPreviewRail() {
-  const [preview, setPreview] = useState<GoalGraphPreview>(
-    initialGoalGraphPreview,
-  );
-  useEffect(() => {
-    const updatePreview = (event: Event) => {
-      const detail = (event as CustomEvent<Partial<GoalGraphPreview>>).detail;
-      if (!detail) return;
-      setPreview((current) => ({
-        ...current,
-        ...detail,
-        answers: Array.isArray(detail.answers)
-          ? detail.answers
-          : current.answers,
-        graphNodes: Array.isArray(detail.graphNodes)
-          ? detail.graphNodes
-          : current.graphNodes,
-        graphEdges: Array.isArray(detail.graphEdges)
-          ? detail.graphEdges
-          : current.graphEdges,
-      }));
-    };
-    window.addEventListener("learngraph:goal-graph-preview", updatePreview);
-    return () =>
-      window.removeEventListener(
-        "learngraph:goal-graph-preview",
-        updatePreview,
-      );
-  }, []);
+function GoalGraphPreviewRail({ preview }: { preview: GoalGraphPreview }) {
 
   const graph = useMemo(() => {
     return {
@@ -3562,24 +3669,17 @@ function GoalGraphPreviewRail() {
         : preview.phase === "approved"
           ? "目标图谱已发布"
       : preview.phase === "clarifying"
-        ? `${preview.answers.length}/${preview.questionCount || 1} 项已确认`
-        : preview.composerText || preview.submittedPrompt
-          ? "学习意向已同步"
-          : "输入目标后开始生长";
+        ? preview.questionCount
+          ? `${preview.answers.length}/${preview.questionCount} 项已确认`
+          : "正在澄清学习目标"
+        : undefined;
   return (
     <div className="chat-graph-rail goal-graph-rail">
       <div className="goal-graph-rail__header">
         <div>
           <p>目标图谱预览</p>
-          <span>{phaseLabel}</span>
+          {phaseLabel ? <span role="status">{phaseLabel}</span> : null}
         </div>
-        <Badge className="font-normal" variant="secondary">
-          {preview.phase === "approved"
-            ? "已发布"
-            : preview.phase === "reviewing"
-              ? "待审核"
-            : "待生成"}
-        </Badge>
       </div>
       {graph.nodes.length ? (
         <Suspense fallback={<div className="grid min-h-48 place-items-center text-xs text-muted-foreground" role="status">正在加载目标图谱…</div>}><KnowledgeGraph
@@ -3594,24 +3694,7 @@ function GoalGraphPreviewRail() {
           showZoomControls
           title="当前目标图谱"
         /></Suspense>
-      ) : (
-        <div className="goal-graph-rail__empty">
-          <Network aria-hidden="true" className="size-5" />
-          <div>
-            <strong>
-              {preview.title ||
-                preview.submittedPrompt ||
-                preview.composerText ||
-                "尚未描述学习目标"}
-            </strong>
-            <span>
-              {preview.title || preview.submittedPrompt || preview.composerText
-                ? "候选图谱会在 Goal 确认后出现。"
-                : "输入目标后开始澄清；这里不会预填虚构节点。"}
-            </span>
-          </div>
-        </div>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -3755,11 +3838,11 @@ function ShellOutletFallback() {
 
 const ShellOutlet = memo(function ShellOutlet() {
   return (
-    <Suspense fallback={<ShellOutletFallback />}>
-      <RouteMotion>
+    <RouteMotion>
+      <Suspense fallback={<ShellOutletFallback />}>
         <Outlet />
-      </RouteMotion>
-    </Suspense>
+      </Suspense>
+    </RouteMotion>
   );
 });
 
@@ -3916,10 +3999,21 @@ export function WorkspaceShell() {
     setRailCollapsed(true);
     window.localStorage.setItem("lg-rail-collapsed", "true");
   }, []);
+  const shellRef = useRef<HTMLDivElement>(null);
+  const resizerRef = useRef<HTMLDivElement>(null);
+  const previewRailWidth = useCallback((nextWidth: number) => {
+    shellRef.current?.style.setProperty("--rail-width", `${nextWidth}px`);
+    const separator = resizerRef.current;
+    if (separator) {
+      const rounded = Math.round(nextWidth);
+      separator.setAttribute("aria-valuenow", String(rounded));
+      separator.setAttribute("aria-valuetext", `${rounded} 像素`);
+    }
+  }, []);
   const railResize = useWorkspaceRailResize({
     width: railWidth, sidebarWidth: collapsed ? 50 : 268,
     disabled: railCollapsed && !selectionExplanationOpen,
-    setWidth: setRailWidth, collapse: collapseRailFromResize,
+    setWidth: setRailWidth, onPreviewWidth: previewRailWidth, collapse: collapseRailFromResize,
   });
   const shellStyle = {
     "--sidebar-width": collapsed ? "50px" : "268px",
@@ -3986,6 +4080,7 @@ export function WorkspaceShell() {
       )}
       data-rail-state={railAvailable ? (railCollapsedEffective ? "collapsed" : "expanded") : "unavailable"}
       data-sidebar-state={collapsed ? "collapsed" : "expanded"}
+      ref={shellRef}
       style={shellStyle}
     >
       <aside
@@ -4018,7 +4113,7 @@ export function WorkspaceShell() {
         ) : (
           <>
             {isDocumentReader ? (
-              <header className="sticky top-0 z-30 flex min-h-14 items-center gap-2 border-b bg-background/92 px-3 backdrop-blur-xl lg:hidden">
+              <header className="sticky top-0 z-30 flex min-h-14 items-center gap-2 border-b bg-background/98 px-3 lg:hidden">
                 <MobileNavTrigger onOpen={openNavDrawer} />
                 <span className="text-sm font-semibold">LearnGraph</span>
               </header>
@@ -4051,6 +4146,7 @@ export function WorkspaceShell() {
             className="workspace-resizer"
             onPointerDown={railResize.begin}
             onKeyDown={railResize.onKeyDown}
+            ref={resizerRef}
             tabIndex={railCollapsedEffective ? -1 : 0}
             aria-valuemin={railResize.minimum}
             aria-valuemax={railResize.maximum}

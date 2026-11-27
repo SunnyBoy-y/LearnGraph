@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDownToLine, History, RefreshCw } from 'lucide-react'
 import { toast } from '@/lib/notifications'
+import { adaptivePollInterval } from '@/lib/network-quality'
 import { getCurrentUser } from '@/api/control'
 import { checkUpdates, getAppVersion, getUpdateStatus, isUpdateRunning, setUpdatePolicy, startUpdate, type UpdateJob } from '@/api/updates'
 import { ApiError } from '@/api/client'
@@ -32,7 +33,7 @@ export function UpdatesPage() {
     // Keep polling through the short connection gap, including when a mutation
     // response was lost or this page was reloaded during deployment.
     refetchInterval: query => query.state.error instanceof ApiError && query.state.error.status === 404
-      ? false : query.state.data?.jobs?.some(isUpdateRunning) || query.state.error ? 3000 : 30000,
+      ? false : adaptivePollInterval(query.state.data?.jobs?.some(isUpdateRunning) || query.state.error ? 3000 : 30000, { pauseWhenHidden: false }),
     refetchIntervalInBackground: true,
     retry: false,
   })

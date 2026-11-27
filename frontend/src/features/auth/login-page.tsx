@@ -152,11 +152,6 @@ export function LoginPage() {
           </span>
           <strong>LearnGraph</strong>
         </div>
-        {!isNativeApp() ? (
-          <div className="mb-4 flex justify-center border-b pb-4">
-            <ConnectQrCode size={140} />
-          </div>
-        ) : null}
         {registerMode ? (
           <form onSubmit={submitRegister}>
             <div className="eyebrow">
@@ -329,6 +324,12 @@ export function LoginPage() {
             <p className="login-footnote">本地优先 · API {apiClient.baseUrl}</p>
           </form>
         )}
+        {!isNativeApp() && !registerMode ? (
+          <details className="mt-4 border-t pt-3">
+            <summary className="cursor-pointer text-sm text-muted-foreground">连接手机 App</summary>
+            <div className="mt-3"><ConnectQrCode size={140} /></div>
+          </details>
+        ) : null}
       </section>
     </main>
   );

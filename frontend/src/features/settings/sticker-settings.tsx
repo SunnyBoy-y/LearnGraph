@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronLeft, ChevronRight, Eye, ImagePlus, Layers, Pencil, Plus, RefreshCw, Search, Trash2 } from 'lucide-react';
 import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import { toast } from '@/lib/notifications';
+import { adaptivePollInterval } from '@/lib/network-quality';
 import { listProviders } from '@/api';
 import { configureStickers, deleteSticker, getStickerStatus, importStickerPack, rebuildStickerIndex, reorderStickerPacks, searchStickers, setStickerPackEnabled, updateSticker, type Sticker } from '@/api/stickers';
 import { useAuth } from '@/features/auth/auth-context-value';
@@ -42,7 +43,7 @@ export function StickerSettingsPanel() {
   const [editing, setEditing] = useState<Sticker | null>(null);
   const [analyzing, setAnalyzing] = useState<Sticker | null>(null);
   const input = useRef<HTMLInputElement>(null);
-  const status = useQuery({ queryKey: [...prefix, 'status'], queryFn: getStickerStatus, refetchInterval: 4000 });
+  const status = useQuery({ queryKey: [...prefix, 'status'], queryFn: getStickerStatus, refetchInterval: () => adaptivePollInterval(4000) });
   const result = useQuery({ queryKey: [...prefix, 'search', query, packFilter, page], queryFn: () => searchStickers(query, false, { packId: packFilter === 'all' ? undefined : packFilter, offset: page * 24 }), staleTime: 5000 });
   const providers = useQuery({ queryKey: ['providers', auth.workspaceId], queryFn: () => listProviders() });
   const refresh = () => client.invalidateQueries({ queryKey: ['stickers', auth.workspaceId] });
@@ -64,7 +65,7 @@ export function StickerSettingsPanel() {
   const renderStickerCard = (sticker: Sticker) => {
     const isBuiltin = data?.packs.find(pack => pack.id === sticker.pack_id)?.builtin ?? true;
     return (
-      <div className="group relative flex min-w-0 flex-col rounded-xl border border-border/70 bg-card/60 transition-all hover:border-border hover:bg-muted/35" key={sticker.id}>
+      <div className="group relative flex min-w-0 flex-col rounded-xl border border-border/70 bg-card/60 transition-colors hover:border-border hover:bg-muted/35" key={sticker.id}>
         <button
           className="flex min-w-0 flex-1 flex-col items-center rounded-xl px-2.5 py-2.5 text-center focus-visible:outline-2 focus-visible:outline-ring"
           onClick={() => { if (sticker.needs_description) setAnalyzing(sticker); else setEditing(sticker); }}

@@ -62,7 +62,7 @@ export function ProfileEditor() {
       <div className="flex flex-wrap items-center gap-4">
         <Avatar className="size-20">
           {auth.avatarUrl ? <AvatarImage alt={`${auth.username}的头像`} src={auth.avatarUrl} /> : null}
-          <AvatarFallback className="sidebar-user-avatar text-2xl font-medium" style={defaultAvatar.style}>
+          <AvatarFallback className="sidebar-user-avatar text-2xl font-medium" data-avatar-tone={defaultAvatar.tone}>
             {defaultAvatar.initial}
           </AvatarFallback>
         </Avatar>

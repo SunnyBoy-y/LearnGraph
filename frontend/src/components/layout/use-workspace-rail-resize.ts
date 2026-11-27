@@ -3,9 +3,10 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type Poin
 export function useWorkspaceRailResize(options: {
   width: number; sidebarWidth: number; disabled: boolean
   setWidth: (width: number) => void
+  onPreviewWidth?: (width: number) => void
   collapse: () => void
 }) {
-  const { width, sidebarWidth, disabled, setWidth, collapse } = options
+  const { width, sidebarWidth, disabled, setWidth, onPreviewWidth, collapse } = options
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
   const minimum = 280
   const maximum = Math.max(minimum, viewportWidth - sidebarWidth - 360)
@@ -23,10 +24,16 @@ export function useWorkspaceRailResize(options: {
     const before = width
     const pointerId = event.pointerId
     let rawWidth = width
+    let clampedWidth = Math.min(maximum, Math.max(minimum, width))
+    let previewFrame = 0
     const previousUserSelect = document.body.style.userSelect
     document.body.style.userSelect = 'none'
     document.body.classList.add('is-resizing')
     const cleanup = () => {
+      if (previewFrame) {
+        window.cancelAnimationFrame(previewFrame)
+        previewFrame = 0
+      }
       document.body.style.userSelect = previousUserSelect
       document.body.classList.remove('is-resizing')
       window.removeEventListener('pointermove', move)
@@ -39,14 +46,31 @@ export function useWorkspaceRailResize(options: {
     const move = (native: globalThis.PointerEvent) => {
       if (native.pointerId !== pointerId) return
       rawWidth = window.innerWidth - native.clientX
-      setWidth(Math.min(maximum, Math.max(minimum, rawWidth)))
+      clampedWidth = Math.min(maximum, Math.max(minimum, rawWidth))
+      if (onPreviewWidth) {
+        if (!previewFrame) {
+          previewFrame = window.requestAnimationFrame(() => {
+            previewFrame = 0
+            onPreviewWidth(clampedWidth)
+          })
+        }
+      } else {
+        setWidth(clampedWidth)
+      }
     }
     const end = (native: globalThis.PointerEvent) => {
       if (native.pointerId !== pointerId) return
       cleanup()
-      if (rawWidth < minimum * 0.65) { setWidth(before); collapse() }
+      if (rawWidth < minimum * 0.65) {
+        onPreviewWidth?.(before)
+        setWidth(before)
+        collapse()
+        return
+      }
+      onPreviewWidth?.(clampedWidth)
+      setWidth(clampedWidth)
     }
-    const cancel = () => { cleanup(); setWidth(before) }
+    const cancel = () => { cleanup(); onPreviewWidth?.(before); setWidth(before) }
     const key = (native: globalThis.KeyboardEvent) => {
       if (native.key === 'Escape') { native.preventDefault(); native.stopImmediatePropagation(); cancel() }
     }
@@ -56,7 +80,7 @@ export function useWorkspaceRailResize(options: {
     window.addEventListener('pointercancel', cancel)
     window.addEventListener('keydown', key)
     window.addEventListener('blur', cancel)
-  }, [disabled, width, maximum, setWidth, collapse])
+  }, [disabled, width, maximum, setWidth, onPreviewWidth, collapse])
   const onKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
     if (disabled) return
     let next = width

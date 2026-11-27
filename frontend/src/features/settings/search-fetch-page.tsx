@@ -1,8 +1,8 @@
 import { useSettingsDirty } from '@/lib/settings-dirty';
 import { AdvancedSettings, SettingsSection } from './settings-primitives';
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CircleAlert, Plus, RefreshCcw } from "lucide-react";
+import { CircleAlert, Plus, RefreshCcw, SquareCheck } from "lucide-react";
 import { Link, useParams } from "react-router-dom";
 import { toast } from '@/lib/notifications';
 
@@ -19,6 +19,7 @@ import {
   updateWebFetchSettings,
 } from "@/api/fetch-authorizations";
 import { listSandboxNetAudit } from "@/api/sandbox-net";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
 import {
   SandboxEgressSwitch,
   UnifiedAllowlistEditor,
@@ -33,8 +34,11 @@ import {
   StatePill,
   Surface,
 } from "@/components/shared/page-elements";
+import { Pagination } from "@/components/shared/pagination";
+import { useActionConfirmation } from "@/components/shared/use-action-confirmation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -45,6 +49,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { useListSelection } from "@/lib/list-selection";
 import { workspaceResourcePrefix } from "@/lib/query-keys";
 import type { WebFetchChannel } from "@/types/fetch-authorization";
 import type {
@@ -222,8 +227,13 @@ function EgressApprovalQueue() {
   const queryClient = useQueryClient();
   const { workspaceId = "" } = useParams();
   const [statusFilter, setStatusFilter] = useState("");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [hostname, setHostname] = useState("");
   const [purpose, setPurpose] = useState("");
+  const [batchBusy, setBatchBusy] = useState(false);
+  const { confirm, dialog } = useActionConfirmation();
   useSettingsDirty("egress-request", Boolean(hostname.trim() || purpose.trim()));
   const queryPrefix = workspaceResourcePrefix(workspaceId, "egress-approvals");
   const approvals = useQuery({
@@ -273,6 +283,57 @@ function EgressApprovalQueue() {
     create.mutate();
   }
   const items = approvals.data?.items ?? [];
+  const filteredItems = useMemo(() => {
+    const source = approvals.data?.items ?? [];
+    const q = search.trim().toLocaleLowerCase();
+    if (!q) return source;
+    return source.filter((item) =>
+      `${item.hostname} ${item.capability} ${item.requested_by}`
+        .toLocaleLowerCase()
+        .includes(q),
+    );
+  }, [approvals.data?.items, search]);
+  const totalPages = Math.max(1, Math.ceil(filteredItems.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const pagedItems = filteredItems.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pendingPageIds = useMemo(
+    () => pagedItems.filter((item) => item.status === "pending").map((item) => item.id),
+    [pagedItems],
+  );
+  const selection = useListSelection(pendingPageIds);
+  const selectedPending = useMemo(
+    () => (approvals.data?.items ?? []).filter((item) => item.status === "pending" && selection.selectedIds.has(item.id)),
+    [approvals.data?.items, selection.selectedIds],
+  );
+
+  async function runBatchDecision(decision: EgressAuthorizationDecision) {
+    if (!selectedPending.length || batchBusy) return;
+    setBatchBusy(true);
+    try {
+      const results = await Promise.allSettled(
+        selectedPending.map((item) => decideEgressApproval(item.id, decision)),
+      );
+      const okIds: string[] = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") okIds.push(selectedPending[index].id);
+      });
+      selection.removeIds(okIds);
+      await invalidate();
+      const label =
+        decision === "allow_once"
+          ? "允许一次"
+          : decision === "allow_always"
+            ? "总是允许"
+            : "拒绝";
+      const failed = selectedPending.length - okIds.length;
+      if (failed === 0) toast.success(`已${label} ${okIds.length} 条出站请求`);
+      else if (okIds.length > 0) toast.warning(`已${label} ${okIds.length} 条，${failed} 条失败`);
+      else toast.error(`批量${label}失败`);
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <Surface className="p-4">
@@ -295,12 +356,15 @@ function EgressApprovalQueue() {
       <Surface className="p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <SectionHeading title="审批队列" />
-          <div className="flex flex-wrap gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             {STATUS_FILTERS.map((option) => (
               <Button
                 key={option.value}
                 className={statusFilter === option.value ? "bg-muted" : ""}
-                onClick={() => setStatusFilter(option.value)}
+                onClick={() => {
+                  setStatusFilter(option.value);
+                  setPage(1);
+                }}
                 size="sm"
                 type="button"
                 variant="ghost"
@@ -308,43 +372,156 @@ function EgressApprovalQueue() {
                 {option.label}
               </Button>
             ))}
+            {items.some((item) => item.status === "pending") ? (
+              <Button
+                aria-pressed={selection.multiSelect}
+                disabled={batchBusy}
+                onClick={selection.toggleMultiSelect}
+                size="sm"
+                type="button"
+                variant={selection.multiSelect ? "secondary" : "outline"}
+              >
+                <SquareCheck className="size-4" />
+                {selection.multiSelect ? "退出多选" : "多选"}
+              </Button>
+            ) : null}
           </div>
         </div>
+        {items.length > 0 ? (
+          <ClearableSearchInput
+            aria-label="搜索审批队列"
+            containerClassName="mt-3 max-w-sm"
+            inputClassName="h-8 text-xs"
+            onChange={(next) => {
+              setSearch(next);
+              setPage(1);
+            }}
+            placeholder="搜索主机名、能力或请求者…"
+            value={search}
+          />
+        ) : null}
+        {selection.multiSelect && pendingPageIds.length > 0 ? (
+          <div
+            aria-label="审批队列批量操作"
+            className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border bg-muted/25 px-3 py-2 text-xs"
+            role="region"
+          >
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                aria-label="全选本页待审批"
+                checked={selection.visibleCheckboxState}
+                disabled={batchBusy}
+                onCheckedChange={(checked) => selection.toggleVisible(checked === true)}
+              />
+              全选本页待审批
+            </label>
+            <span className="tabular-nums text-muted-foreground">
+              已选 {selection.selectedCount} 条
+            </span>
+            <div className="ml-auto flex flex-wrap items-center gap-1.5">
+              <Button
+                disabled={batchBusy || !selectedPending.length}
+                onClick={() => void runBatchDecision("allow_once")}
+                size="xs"
+                type="button"
+                variant="outline"
+              >
+                允许一次
+              </Button>
+              <Button
+                disabled={batchBusy || !selectedPending.length}
+                onClick={() =>
+                  confirm({
+                    title: `总是允许选中的 ${selectedPending.length} 个主机？`,
+                    description: "对应主机将加入总是允许列表，后续同域名出站将不再拦截。",
+                    label: `总是允许 ${selectedPending.length} 项`,
+                    run: () => void runBatchDecision("allow_always"),
+                  })
+                }
+                size="xs"
+                type="button"
+                variant="outline"
+              >
+                总是允许
+              </Button>
+              <Button
+                disabled={batchBusy || !selectedPending.length}
+                onClick={() =>
+                  confirm({
+                    title: `拒绝选中的 ${selectedPending.length} 条审批请求？`,
+                    description: "请求方此次出站访问将被拦截。",
+                    label: `拒绝 ${selectedPending.length} 项`,
+                    destructive: true,
+                    run: () => void runBatchDecision("deny"),
+                  })
+                }
+                size="xs"
+                type="button"
+                variant="destructive"
+              >
+                批量拒绝
+              </Button>
+            </div>
+          </div>
+        ) : null}
         {approvals.isPending ? (
           <LoadingState label="正在读取审批请求…" />
         ) : approvals.isError ? (
           <ErrorState message={approvals.error.message} onRetry={() => void approvals.refetch()} />
-        ) : items.length === 0 ? (
+        ) : filteredItems.length === 0 ? (
           <EmptyState
-            description={statusFilter ? "该状态下暂无审批请求" : "暂无审批请求。白名单内的主机会自动放行，不会出现在这里"}
+            description={search.trim() ? "没有匹配的审批请求" : statusFilter ? "该状态下暂无审批请求" : "暂无审批请求。白名单内的主机会自动放行，不会出现在这里"}
             title="没有审批请求"
           />
         ) : (
-          <ul className="mt-3 divide-y">
-            {items.map((request) => (
-              <li key={request.id} className="flex flex-col gap-2 py-3 first:pt-1 last:pb-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <code className="text-sm font-semibold">{request.hostname}</code>
-                  <StatePill status={request.status} />
-                  {request.allow_always && <Badge variant="outline">总是允许</Badge>}
-                  {request.decided_by === "system:allowlist" && <Badge variant="outline">白名单自动放行</Badge>}
-                </div>
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                  <span>能力：{request.capability}</span>
-                  <span>请求者：{request.requested_by}</span>
-                  <span>创建：{formatTime(request.created_at)}</span>
-                  <span>过期：{formatTime(request.expires_at)}</span>
-                </div>
-                <DecisionButtons busy={decide.isPending} onDecide={(decision) => decide.mutate({ id: request.id, decision })} request={request} />
-              </li>
-            ))}
-          </ul>
+          <>
+            <ul className="mt-3 divide-y">
+              {pagedItems.map((request) => (
+                <li key={request.id} className={`flex flex-col gap-2 py-3 first:pt-1 last:pb-1 ${selection.multiSelect && selection.selectedIds.has(request.id) ? "rounded-md bg-primary/5 px-2" : ""}`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selection.multiSelect && request.status === "pending" ? (
+                      <Checkbox
+                        aria-label={`选择出站请求 ${request.hostname}`}
+                        disabled={batchBusy}
+                        {...selection.checkboxProps(request.id)}
+                      />
+                    ) : null}
+                    <code className="text-sm font-semibold">{request.hostname}</code>
+                    <StatePill status={request.status} />
+                    {request.allow_always && <Badge variant="outline">总是允许</Badge>}
+                    {request.decided_by === "system:allowlist" && <Badge variant="outline">白名单自动放行</Badge>}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                    <span>能力：{request.capability}</span>
+                    <span>请求者：{request.requested_by}</span>
+                    <span>创建：{formatTime(request.created_at)}</span>
+                    <span>过期：{formatTime(request.expires_at)}</span>
+                  </div>
+                  <DecisionButtons busy={decide.isPending || batchBusy} onDecide={(decision) => decide.mutate({ id: request.id, decision })} request={request} />
+                </li>
+              ))}
+            </ul>
+            {filteredItems.length > pageSize ? (
+              <div className="mt-4 border-t pt-3">
+                <Pagination
+                  onPageChange={setPage}
+                  onPageSizeChange={(size) => {
+                    setPageSize(size);
+                    setPage(1);
+                  }}
+                  page={safePage}
+                  pageSize={pageSize}
+                  total={filteredItems.length}
+                />
+              </div>
+            ) : null}
+          </>
         )}
       </Surface>
       {approvals.data && approvals.data.total > (approvals.data?.items.length ?? 0) && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <CircleAlert className="size-3.5" />
-          仅显示前 {approvals.data.items.length} 条（共 {approvals.data.total} 条）
+          仅拉取最近 {approvals.data.items.length} 条（服务端共 {approvals.data.total} 条）
         </div>
       )}
       <div className="flex justify-end">
@@ -353,6 +530,7 @@ function EgressApprovalQueue() {
           刷新
         </Button>
       </div>
+      {dialog}
     </div>
   );
 }
@@ -453,6 +631,9 @@ function decisionLabel(decision: string | null): string | null {
 function FetchApprovalHistory() {
   const { workspaceId = "" } = useParams();
   const [statusFilter, setStatusFilter] = useState("");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const queryPrefix = workspaceResourcePrefix(workspaceId, "fetch-authorizations");
   const history = useQuery({
     queryKey: [...queryPrefix, "history", statusFilter],
@@ -460,6 +641,19 @@ function FetchApprovalHistory() {
     enabled: Boolean(workspaceId),
   });
   const items = history.data?.items ?? [];
+  const filteredItems = useMemo(() => {
+    const source = history.data?.items ?? [];
+    const q = search.trim().toLocaleLowerCase();
+    if (!q) return source;
+    return source.filter((item) =>
+      `${item.hostname} ${item.requested_url ?? ""} ${item.requested_by}`
+        .toLocaleLowerCase()
+        .includes(q),
+    );
+  }, [history.data?.items, search]);
+  const totalPages = Math.max(1, Math.ceil(filteredItems.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const pagedItems = filteredItems.slice((safePage - 1) * pageSize, safePage * pageSize);
   return (
     <Surface className="p-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -472,7 +666,10 @@ function FetchApprovalHistory() {
             <Button
               key={option.value}
               className={statusFilter === option.value ? "bg-muted" : ""}
-              onClick={() => setStatusFilter(option.value)}
+              onClick={() => {
+                setStatusFilter(option.value);
+                setPage(1);
+              }}
               size="sm"
               type="button"
               variant="ghost"
@@ -482,54 +679,85 @@ function FetchApprovalHistory() {
           ))}
         </div>
       </div>
+      {items.length > 0 ? (
+        <ClearableSearchInput
+          aria-label="搜索抓取审批记录"
+          containerClassName="mt-3 max-w-sm"
+          inputClassName="h-8 text-xs"
+          onChange={(next) => {
+            setSearch(next);
+            setPage(1);
+          }}
+          placeholder="搜索域名、URL 或请求者…"
+          value={search}
+        />
+      ) : null}
       {history.isPending ? (
         <LoadingState label="正在读取审批记录…" />
       ) : history.isError ? (
         <ErrorState message={history.error.message} onRetry={() => void history.refetch()} />
-      ) : items.length === 0 ? (
+      ) : filteredItems.length === 0 ? (
         <EmptyState
           description={
-            statusFilter
-              ? "该状态下暂无审批记录"
-              : "暂无审批记录。聊天内抓取需要授权时会生成记录并持久化保存"
+            search.trim()
+              ? "没有匹配的抓取审批记录"
+              : statusFilter
+                ? "该状态下暂无审批记录"
+                : "暂无审批记录。聊天内抓取需要授权时会生成记录并持久化保存"
           }
           title="没有审批记录"
         />
       ) : (
-        <ul className="mt-3 divide-y">
-          {items.map((request) => {
-            const decision = decisionLabel(request.decision);
-            return (
-              <li key={request.id} className="flex flex-col gap-2 py-3 first:pt-1 last:pb-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <code className="text-sm font-semibold">{request.hostname}</code>
-                  <StatePill
-                    label={FETCH_STATUS_LABELS[request.status] ?? request.status}
-                    status={request.status}
-                  />
-                  {request.decision === "allow_always" && (
-                    <Badge variant="outline">已入个人白名单</Badge>
+        <>
+          <ul className="mt-3 divide-y">
+            {pagedItems.map((request) => {
+              const decision = decisionLabel(request.decision);
+              return (
+                <li key={request.id} className="flex flex-col gap-2 py-3 first:pt-1 last:pb-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <code className="text-sm font-semibold">{request.hostname}</code>
+                    <StatePill
+                      label={FETCH_STATUS_LABELS[request.status] ?? request.status}
+                      status={request.status}
+                    />
+                    {request.decision === "allow_always" && (
+                      <Badge variant="outline">已入个人白名单</Badge>
+                    )}
+                  </div>
+                  {request.requested_url && request.requested_url !== request.hostname && (
+                    <p className="min-w-0 truncate text-xs text-muted-foreground">
+                      {request.requested_url}
+                    </p>
                   )}
-                </div>
-                {request.requested_url && request.requested_url !== request.hostname && (
-                  <p className="min-w-0 truncate text-xs text-muted-foreground">
-                    {request.requested_url}
-                  </p>
-                )}
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                  <span>请求者：{request.requested_by}</span>
-                  <span>创建：{formatTime(request.created_at)}</span>
-                  <span>
-                    决定：
-                    {request.decided_at
-                      ? `${decision ?? request.decision ?? "—"} · ${formatTime(request.decided_at)}`
-                      : "—"}
-                  </span>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                    <span>请求者：{request.requested_by}</span>
+                    <span>创建：{formatTime(request.created_at)}</span>
+                    <span>
+                      决定：
+                      {request.decided_at
+                        ? `${decision ?? request.decision ?? "—"} · ${formatTime(request.decided_at)}`
+                        : "—"}
+                    </span>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+          {filteredItems.length > pageSize ? (
+            <div className="mt-4 border-t pt-3">
+              <Pagination
+                onPageChange={setPage}
+                onPageSizeChange={(size) => {
+                  setPageSize(size);
+                  setPage(1);
+                }}
+                page={safePage}
+                pageSize={pageSize}
+                total={filteredItems.length}
+              />
+            </div>
+          ) : null}
+        </>
       )}
       {history.data && history.data.total > items.length && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">

@@ -4,6 +4,7 @@ import { ArrowDownToLine, Check, ExternalLink, RefreshCw } from 'lucide-react'
 import { toast } from '@/lib/notifications'
 import { ApiError } from '@/api/client'
 import { checkUpdates, getAppVersion, getUpdateStatus, isUpdateRunning, startUpdate } from '@/api/updates'
+import { adaptivePollInterval } from '@/lib/network-quality'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { AlertDialog, AlertDialogContent, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogCancel, AlertDialogAction } from '@/components/ui/alert-dialog'
 import './sidebar-version.css'
@@ -18,7 +19,7 @@ export function SidebarVersion({ isSystemAdmin }: { isSystemAdmin: boolean }) {
     queryKey: ['deployment-updates'], queryFn: getUpdateStatus,
     enabled: isSystemAdmin && docker, staleTime: 30_000, retry: false,
     refetchInterval: query => query.state.error instanceof ApiError && query.state.error.status === 404
-      ? false : query.state.data?.jobs?.some(isUpdateRunning) ? 3000 : 30_000,
+      ? false : adaptivePollInterval(query.state.data?.jobs?.some(isUpdateRunning) ? 3000 : 30_000),
   })
   const data = isSystemAdmin && docker ? status.data : undefined
   const active = data?.jobs?.find(isUpdateRunning)

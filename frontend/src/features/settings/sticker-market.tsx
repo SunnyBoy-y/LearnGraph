@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDownToLine, Check, ChevronRight, PackagePlus, Search, Sparkles, Minus } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { toast } from '@/lib/notifications';
+import { adaptivePollInterval } from '@/lib/network-quality';
 import { analyzeStickerPack, configureStickerPipeline, getStickerMarket, getStickerPipeline, installMarketPack, removeMarketPack, marketStickerBlob, type StickerMarketPack } from '@/api/stickers';
 import { useAuth } from '@/features/auth/auth-context-value';
 import { Button } from '@/components/ui/button';
@@ -31,7 +32,7 @@ export function StickerMarketPanel({ onOpenLibrary }: { onOpenLibrary: (id: stri
   const [category, setCategory] = useState('全部');
   const [source, setSource] = useState('all');
   const [detail, setDetail] = useState<StickerMarketPack | null>(null);
-  const market = useQuery({ queryKey: ['stickers', auth.workspaceId, auth.userId, 'market', query], queryFn: () => getStickerMarket(query), refetchInterval: 8000 });
+  const market = useQuery({ queryKey: ['stickers', auth.workspaceId, auth.userId, 'market', query], queryFn: () => getStickerMarket(query), refetchInterval: () => adaptivePollInterval(8000) });
   const install = useMutation({ mutationFn: installMarketPack, onSuccess: async data => { await client.invalidateQueries({ queryKey: ['stickers', auth.workspaceId] }); toast.success(data.imported ? `已添加 ${data.imported} 张表情，语义卡与关键词已就绪` : '已添加到表情库'); }, onError: (error: Error) => toast.error(error.message) });
   const remove = useMutation({ mutationFn: removeMarketPack, onSuccess: async () => { await client.invalidateQueries({ queryKey: ['stickers', auth.workspaceId] }); toast.success('已从你的表情库移除，可随时重新添加'); }, onError: (error: Error) => toast.error(error.message) });
   const download = useMutation({ mutationFn: (pack: StickerMarketPack) => saveStickerArchive(pack.id, pack.name, true), onSuccess: () => toast.success('表情包已交给浏览器保存，含完整语义清单与许可证'), onError: (error: Error) => toast.error(error.message) });
@@ -55,7 +56,7 @@ export function StickerPipelinePanel() {
   const auth = useAuth();
   const client = useQueryClient();
   const [consent, setConsent] = useState(false);
-  const pipeline = useQuery({ queryKey: ['stickers', auth.workspaceId, auth.userId, 'pipeline'], queryFn: getStickerPipeline, refetchInterval: 4000 });
+  const pipeline = useQuery({ queryKey: ['stickers', auth.workspaceId, auth.userId, 'pipeline'], queryFn: getStickerPipeline, refetchInterval: () => adaptivePollInterval(4000) });
   const completed = pipeline.data?.completed;
   const queued = pipeline.data?.queued;
   const failed = pipeline.data?.failed;

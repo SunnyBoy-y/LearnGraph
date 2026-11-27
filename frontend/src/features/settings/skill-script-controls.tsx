@@ -4,6 +4,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiClient } from "@/api/client";
 import { listSkillFiles } from "@/api/extensions";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { adaptivePollInterval } from "@/lib/network-quality";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -28,7 +29,7 @@ export function SkillScriptControls({ skill, workspaceId }: { skill:Skill; works
   const invocationId=start.data?.invocation_id;
   const status=useQuery({queryKey:workspaceQueryKey(workspaceId,"skills",skill.id,"sandbox-runs",invocationId ?? "none"),
     queryFn:()=>apiClient.get<Invocation>(`/skills/${encodeURIComponent(skill.id)}/sandbox-runs/${encodeURIComponent(invocationId!)}`),enabled:Boolean(invocationId),
-    refetchInterval:query=>query.state.data?.status === "running" || !query.state.data ? 1000 : false});
+    refetchInterval:query=>adaptivePollInterval(query.state.data?.status === "running" || !query.state.data ? 1000 : false)});
   const cancel=useMutation({mutationFn:()=>apiClient.post<Invocation>(`/skills/${encodeURIComponent(skill.id)}/sandbox-runs/${encodeURIComponent(invocationId!)}/cancel`),onSuccess:()=>void status.refetch(),onError:(e:Error)=>setError(e.message)});
   if (!skill.has_scripts) return null;
   const current=status.data?.status ?? start.data?.status;

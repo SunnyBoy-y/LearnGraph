@@ -1,3 +1,4 @@
+import { useActionConfirmation } from "@/components/shared/use-action-confirmation";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -55,6 +56,7 @@ function splitFrontmatter(markdown: string): {
 
 /** Lightweight MVP editor for agent_skill_package file trees (D-081). */
 export function SkillPackageEditor({ skill }: { skill: Skill }) {
+  const { confirm, dialog } = useActionConfirmation();
   const queryClient = useQueryClient();
   const [selectedPath, setSelectedPath] = useState("SKILL.md");
   const [draft, setDraft] = useState("");
@@ -212,6 +214,7 @@ export function SkillPackageEditor({ skill }: { skill: Skill }) {
 
   return (
     <Surface className="overflow-hidden">
+      {dialog}
       <div className="border-b p-4">
         <SectionHeading
           description={`content_hash ${(tree.data?.content_hash ?? skill.content_hash ?? "—").slice(0, 12)} · 轻量编辑器（非 Monaco）`}
@@ -384,10 +387,10 @@ export function SkillPackageEditor({ skill }: { skill: Skill }) {
                 }`}
                 key={path}
                 onClick={() => {
-                  if (dirty && !window.confirm("有未保存修改，切换文件？"))
-                    return;
-                  setSelectedPath(path);
-                  setDirty(false);
+                  if (path === selectedPath) return;
+                  const switchFile = () => { setSelectedPath(path); setDirty(false); };
+                  if (dirty) confirm({ title: "切换文件？", description: "当前文件的修改尚未保存。", label: "放弃修改并切换", run: switchFile });
+                  else switchFile();
                 }}
                 type="button"
               >
@@ -480,7 +483,7 @@ export function SkillPackageEditor({ skill }: { skill: Skill }) {
                 !selectedPath
               }
               onClick={() => {
-                if (window.confirm(`删除 ${selectedPath}？`)) remove.mutate();
+                confirm({ title: `删除 ${selectedPath}？`, description: "此文件将从技能包中移除。", label: "删除", destructive: true, run: () => remove.mutate() });
               }}
               size="xs"
               variant="ghost"

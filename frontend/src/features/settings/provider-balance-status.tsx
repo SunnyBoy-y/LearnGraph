@@ -1,5 +1,6 @@
 import { useAuth } from "@/features/auth/auth-context-value";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { adaptivePollInterval } from "@/lib/network-quality";
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from '@/lib/notifications';
 import { getBalanceStatus, rediscoverBalance } from '@/api/provider-automation';
@@ -19,7 +20,7 @@ export function ProviderBalanceStatus({ providerId }: { providerId: string }) {
   const key = workspaceQueryKey(workspaceId, "provider-balance-status", providerId, userId);
   const status = useQuery({
     queryKey: key, queryFn: ({ signal }) => getBalanceStatus(providerId, { signal, headers: { "X-Workspace-ID": workspaceId } }), retry: false,
-    refetchInterval: (query) => ['pending', 'running'].includes(query.state.data?.state ?? '') ? 5000 : 60000,
+    refetchInterval: (query) => adaptivePollInterval(['pending', 'running'].includes(query.state.data?.state ?? '') ? 5000 : 60000),
     refetchOnWindowFocus: false,
   });
   const discover = useMutation({

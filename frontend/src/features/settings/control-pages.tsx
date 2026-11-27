@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Boxes,
@@ -10,8 +10,14 @@ import {
   Play,
   RefreshCcw,
   ServerCog,
+  SquareCheck,
 } from "lucide-react";
 import { toast } from '@/lib/notifications';
+import { adaptivePollInterval } from '@/lib/network-quality';
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
+import { useActionConfirmation } from "@/components/shared/use-action-confirmation";
+import { Checkbox } from "@/components/ui/checkbox";
+import { useListSelection } from "@/lib/list-selection";
 
 import {
   Tooltip,
@@ -216,16 +222,85 @@ export function AccessManagementPage({ section = "collaboration" }: { section?: 
     },
     onError: (error) => toast.error(error.message),
   });
+  const [userSearch, setUserSearch] = useState("");
+  const [batchControlBusy, setBatchControlBusy] = useState(false);
+  const { confirm: confirmControl, dialog: controlConfirmDialog } = useActionConfirmation();
+  const isSystemAdmin = Boolean(currentUser.data?.is_system_admin);
+  const activeSessions = useMemo(
+    () => (authSessions.data ?? []).filter((session) => !session.revoked_at),
+    [authSessions.data],
+  );
+  const revocableSessionIds = useMemo(
+    () => activeSessions.filter((s) => !s.current).map((s) => s.id),
+    [activeSessions],
+  );
+  const sessionSelection = useListSelection(revocableSessionIds);
+  const filteredUsers = useMemo(() => {
+    const list = users.data ?? [];
+    const q = userSearch.trim().toLocaleLowerCase();
+    if (!q) return list;
+    return list.filter((user) =>
+      `${user.display_name} ${user.username} ${user.email ?? ""}`
+        .toLocaleLowerCase()
+        .includes(q),
+    );
+  }, [userSearch, users.data]);
+  const manageableUserIds = useMemo(
+    () =>
+      filteredUsers
+        .filter((user) => user.id !== currentUser.data?.id)
+        .map((user) => user.id),
+    [currentUser.data?.id, filteredUsers],
+  );
+  const userSelection = useListSelection(manageableUserIds);
+
+  async function runBatchUserStatus(status: "active" | "disabled", ids: string[]) {
+    if (!ids.length || batchControlBusy) return;
+    setBatchControlBusy(true);
+    try {
+      const results = await Promise.allSettled(
+        ids.map((userId) => updateManagedUserStatus(userId, status)),
+      );
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      void queryClient.invalidateQueries({ queryKey: ["managed-users"] });
+      const label = status === "active" ? "启用" : "停用";
+      if (ok === ids.length) toast.success(`已${label} ${ok} 个用户`);
+      else if (ok > 0) toast.warning(`已${label} ${ok} 个用户，${ids.length - ok} 个失败`);
+      else toast.error(`批量${label}失败`);
+    } finally {
+      setBatchControlBusy(false);
+    }
+  }
+
+  async function runBatchRevokeSessions(ids: string[]) {
+    if (!ids.length || batchControlBusy) return;
+    setBatchControlBusy(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => revokeAuthSession(id)));
+      const okIds: string[] = [];
+      results.forEach((result, idx) => {
+        if (result.status === "fulfilled") okIds.push(ids[idx]);
+      });
+      sessionSelection.removeIds(okIds);
+      void queryClient.invalidateQueries({ queryKey: ["auth-sessions"] });
+      const failed = ids.length - okIds.length;
+      if (failed === 0) toast.success(`已下线 ${okIds.length} 个登录会话`);
+      else if (okIds.length > 0) toast.warning(`已下线 ${okIds.length} 个会话，${failed} 个失败`);
+      else toast.error("批量下线会话失败");
+    } finally {
+      setBatchControlBusy(false);
+    }
+  }
+
   if (currentUser.isPending || (section === "security" && authSessions.isPending)) {
     return <PageFrame><LoadingState /></PageFrame>;
   }
   if (currentUser.isError || (section === "security" && authSessions.isError)) {
     return <PageFrame><ErrorState message={(currentUser.error ?? authSessions.error)?.message ?? "身份信息读取失败"} /></PageFrame>;
   }
-  const isSystemAdmin = currentUser.data.is_system_admin;
-  const activeSessions = (authSessions.data ?? []).filter((session) => !session.revoked_at);
   return (
     <PageFrame className={section === "security" ? "!p-0 !gap-0" : undefined}>
+      {controlConfirmDialog}
       {section === "collaboration" ? <PageIntro
         eyebrow="Identity and access"
         title="成员与访问"
@@ -388,19 +463,95 @@ export function AccessManagementPage({ section = "collaboration" }: { section?: 
 
       {isSystemAdmin ? (
         <Surface className="p-5">
-          <SectionHeading
-            action={
-              <details>
-                <summary className="cursor-pointer text-sm font-medium text-primary">创建用户</summary>
-                <UserForm busy={createUser.isPending} onSubmit={(payload) => createUser.mutate(payload)} />
-              </details>
-            }
-            description="管理系统用户账号，可启用/停用并授予系统管理员身份。"
-            title="用户目录"
-          />
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <SectionHeading
+              action={
+                <div className="flex flex-wrap items-center gap-3">
+                  {manageableUserIds.length > 0 ? (
+                    <Button
+                      aria-pressed={userSelection.multiSelect}
+                      disabled={batchControlBusy}
+                      onClick={userSelection.toggleMultiSelect}
+                      size="xs"
+                      type="button"
+                      variant={userSelection.multiSelect ? "secondary" : "outline"}
+                    >
+                      <SquareCheck className="size-3.5" />
+                      {userSelection.multiSelect ? "退出多选" : "多选"}
+                    </Button>
+                  ) : null}
+                  <details>
+                    <summary className="cursor-pointer text-sm font-medium text-primary">创建用户</summary>
+                    <UserForm busy={createUser.isPending} onSubmit={(payload) => createUser.mutate(payload)} />
+                  </details>
+                </div>
+              }
+              description="管理系统用户账号，可启用/停用并授予系统管理员身份。"
+              title="用户目录"
+            />
+          </div>
+          {(users.data?.length ?? 0) > 0 ? (
+            <ClearableSearchInput
+              aria-label="搜索用户"
+              containerClassName="mt-3 max-w-sm"
+              inputClassName="h-8 text-xs"
+              onChange={setUserSearch}
+              placeholder="搜索用户名、显示名称或邮箱…"
+              value={userSearch}
+            />
+          ) : null}
+          {userSelection.multiSelect && manageableUserIds.length > 0 ? (
+            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border bg-muted/25 px-3 py-2 text-xs">
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  aria-label="全选可管理用户"
+                  checked={userSelection.visibleCheckboxState}
+                  disabled={batchControlBusy}
+                  onCheckedChange={(checked) => userSelection.toggleVisible(checked === true)}
+                />
+                全选当前列表
+              </label>
+              <span className="tabular-nums text-muted-foreground">已选 {userSelection.selectedCount} 位</span>
+              <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                <Button
+                  disabled={batchControlBusy || !userSelection.selectedCount}
+                  onClick={() => void runBatchUserStatus("active", [...userSelection.selectedIds])}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  批量启用
+                </Button>
+                <Button
+                  disabled={batchControlBusy || !userSelection.selectedCount}
+                  onClick={() =>
+                    confirmControl({
+                      title: `停用选中的 ${userSelection.selectedCount} 位用户？`,
+                      description: "停用后这些用户将无法继续登录工作区，后续可重新启用。",
+                      label: `停用 ${userSelection.selectedCount} 位`,
+                      destructive: true,
+                      run: () => void runBatchUserStatus("disabled", [...userSelection.selectedIds]),
+                    })
+                  }
+                  size="xs"
+                  type="button"
+                  variant="destructive"
+                >
+                  批量停用
+                </Button>
+              </div>
+            </div>
+          ) : null}
           <div className="mt-4 divide-y overflow-hidden rounded-xl border">
-            {users.data?.map((user) => (
-              <div className="flex flex-col gap-3 bg-card/30 p-4 sm:flex-row sm:items-center" key={user.id}>
+            {filteredUsers.map((user) => (
+              <div className={`flex flex-col gap-3 bg-card/30 p-4 sm:flex-row sm:items-center ${userSelection.multiSelect && userSelection.selectedIds.has(user.id) ? "bg-primary/5" : ""}`} key={user.id}>
+                {userSelection.multiSelect && user.id !== currentUser.data.id ? (
+                  <Checkbox
+                    aria-label={`选择用户 ${user.display_name}`}
+                    disabled={batchControlBusy}
+                    {...userSelection.checkboxProps(user.id)}
+                  />
+                ) : null}
                 <div className="min-w-0 flex-1">
                   <p className="font-medium">{user.display_name}</p>
                   <p className="text-xs text-muted-foreground">
@@ -411,13 +562,20 @@ export function AccessManagementPage({ section = "collaboration" }: { section?: 
                 <StatePill status={user.status} />
                 <Badge variant="outline">{user.is_system_admin ? "系统管理员" : "普通用户"}</Badge>
                 <Button
-                  disabled={changeUserStatus.isPending || user.id === currentUser.data.id}
-                  onClick={() =>
-                    changeUserStatus.mutate({
-                      userId: user.id,
-                      status: user.status === "active" ? "disabled" : "active",
-                    })
-                  }
+                  disabled={changeUserStatus.isPending || batchControlBusy || user.id === currentUser.data.id}
+                  onClick={() => {
+                    if (user.status === "active") {
+                      confirmControl({
+                        title: `停用用户「${user.display_name}」？`,
+                        description: "停用后该用户无法登录或继续使用当前会话。",
+                        label: "确认停用",
+                        destructive: true,
+                        run: () => changeUserStatus.mutate({ userId: user.id, status: "disabled" }),
+                      });
+                    } else {
+                      changeUserStatus.mutate({ userId: user.id, status: "active" });
+                    }
+                  }}
                   size="xs"
                   variant="outline"
                 >
@@ -426,8 +584,10 @@ export function AccessManagementPage({ section = "collaboration" }: { section?: 
               </div>
             ))}
             {users.isError ? <QueryFailure message={users.error.message} /> : null}
-            {users.isSuccess && !users.data?.length ? (
-              <p className="p-5 text-sm text-muted-foreground">暂无用户记录。</p>
+            {users.isSuccess && !filteredUsers.length ? (
+              <p className="p-5 text-sm text-muted-foreground">
+                {userSearch.trim() ? "没有匹配的用户记录。" : "暂无用户记录。"}
+              </p>
             ) : null}
           </div>
         </Surface>
@@ -441,15 +601,81 @@ export function AccessManagementPage({ section = "collaboration" }: { section?: 
       {section === "security" ? <div className="grid gap-5">
         <Surface className="p-5">
           <SectionHeading
-            description="可单独下线其他登录设备；当前会话通过退出登录处理。已下线的会话不再显示。"
+            action={
+              revocableSessionIds.length > 0 ? (
+                <Button
+                  aria-pressed={sessionSelection.multiSelect}
+                  disabled={batchControlBusy}
+                  onClick={sessionSelection.toggleMultiSelect}
+                  size="xs"
+                  type="button"
+                  variant={sessionSelection.multiSelect ? "secondary" : "outline"}
+                >
+                  <SquareCheck className="size-3.5" />
+                  {sessionSelection.multiSelect ? "退出多选" : "多选"}
+                </Button>
+              ) : null
+            }
+            description="可单独或批量下线其他登录设备；当前会话通过退出登录处理。已下线的会话不再显示。"
             title="会话安全"
           />
+          {sessionSelection.multiSelect && revocableSessionIds.length > 0 ? (
+            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border bg-muted/25 px-3 py-2 text-xs">
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  aria-label="全选其他登录会话"
+                  checked={sessionSelection.visibleCheckboxState}
+                  disabled={batchControlBusy}
+                  onCheckedChange={(checked) => sessionSelection.toggleVisible(checked === true)}
+                />
+                全选其他设备
+              </label>
+              <span className="tabular-nums text-muted-foreground">已选 {sessionSelection.selectedCount} 个</span>
+              <div className="ml-auto flex items-center gap-1.5">
+                <Button
+                  disabled={batchControlBusy || !sessionSelection.selectedCount}
+                  onClick={() =>
+                    confirmControl({
+                      title: `下线选中的 ${sessionSelection.selectedCount} 个登录会话？`,
+                      description: "对应设备将立即退出登录并需要重新验证。",
+                      label: `下线 ${sessionSelection.selectedCount} 个`,
+                      destructive: true,
+                      run: () => void runBatchRevokeSessions([...sessionSelection.selectedIds]),
+                    })
+                  }
+                  size="xs"
+                  type="button"
+                  variant="destructive"
+                >
+                  批量下线
+                </Button>
+              </div>
+            </div>
+          ) : null}
           <div className="mt-4 grid gap-3 xl:grid-cols-2">
             {activeSessions.map((session) => (
               <AuthSessionRow
+                checkbox={
+                  sessionSelection.multiSelect && !session.current ? (
+                    <Checkbox
+                      aria-label={`选择会话 ${session.id}`}
+                      disabled={batchControlBusy}
+                      {...sessionSelection.checkboxProps(session.id)}
+                    />
+                  ) : null
+                }
                 key={session.id}
-                onRevoke={() => revokeSession.mutate(session.id)}
-                revoking={revokeSession.isPending}
+                onRevoke={() =>
+                  confirmControl({
+                    title: "下线该登录设备？",
+                    description: `将撤销会话 ${session.id.slice(0, 12)}…，对应设备需要重新登录。`,
+                    label: "确认下线",
+                    destructive: true,
+                    run: () => revokeSession.mutate(session.id),
+                  })
+                }
+                revoking={revokeSession.isPending || batchControlBusy}
+                selected={sessionSelection.multiSelect && sessionSelection.selectedIds.has(session.id)}
                 session={session}
               />
             ))}
@@ -467,10 +693,14 @@ export function AccessManagementPage({ section = "collaboration" }: { section?: 
 }
 
 function AuthSessionRow({
+  checkbox,
+  selected = false,
   session,
   onRevoke,
   revoking,
 }: {
+  checkbox?: React.ReactNode;
+  selected?: boolean;
   session: {
     id: string;
     current: boolean;
@@ -518,7 +748,7 @@ function AuthSessionRow({
 
   return (
     <div
-      className="flex flex-col gap-3 rounded-xl border bg-card/30 p-3 sm:flex-row sm:items-center"
+      className={`flex flex-col gap-3 rounded-xl border bg-card/30 p-3 sm:flex-row sm:items-center ${selected ? "ring-1 ring-ring bg-primary/5" : ""}`}
       onPointerCancel={clearLongPress}
       onPointerDown={startLongPress}
       onPointerLeave={clearLongPress}
@@ -527,6 +757,7 @@ function AuthSessionRow({
         if (isTouch) event.preventDefault();
       }}
     >
+      {checkbox}
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
           <Tooltip>
@@ -683,7 +914,7 @@ export function SandboxAdministration() {
     queryFn: getSandboxBootstrapStatus,
     refetchInterval: (query) => {
       const job = query.state.data?.active_job;
-      return job && job.status === "running" ? 1500 : 15000;
+      return adaptivePollInterval(job && job.status === "running" ? 1500 : 15000);
     },
   });
   const profiles = useQuery({
@@ -692,7 +923,7 @@ export function SandboxAdministration() {
     // Poll so runtime-environment changes (e.g. the runner image being
     // deleted from Docker while running) flip the 可用/不可用 state without a
     // manual refresh.
-    refetchInterval: 15000,
+    refetchInterval: () => adaptivePollInterval(15000),
   });
   const currentUser = useQuery({ queryKey: ["auth-me"], queryFn: getCurrentUser });
   const isAdmin = Boolean(currentUser.data?.is_system_admin);
@@ -793,5 +1024,5 @@ export function SandboxAdministration() {
         : "初始化沙箱";
   const initializeDisabled = initBootstrap.isPending || Boolean(activeJob) || !bootstrapStatus?.can_initialize || (!isAdmin && memberGateRestricted);
   const visibleSandboxSessions = (sandboxSessions.data ?? []).filter((session) => session.cleanup_status !== "cleaned" && session.status !== "deleted");
-  return <div className="space-y-5"><Surface className="p-5"><SectionHeading description="多文件教学子应用（subapp）预览的独立 Origin。必须与主 API Origin 不同：本地开发由 scripts/dev.mjs 自动启动 preview 进程并按 http://127.0.0.1:<端口> 推导；真实域名部署请配置 nginx/Caddy 反代后在此填入 https://preview.example.com 形式。留空时多文件 bundle 预览不可用（fail-closed）。" title="子应用预览域名" />{previewConfig.isError ? <QueryFailure message={previewConfig.error.message} /> : null}{previewConfig.data ? <div className="mt-4 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatePill status={previewConfig.data.origin ? "approved" : "failed"} label={previewConfig.data.origin ? "已配置" : "未配置"} /><span className="font-mono text-xs text-muted-foreground">{previewConfig.data.origin ?? "—"}</span><Badge variant="outline">{previewConfig.data.source === "persisted" ? "设置页持久化" : previewConfig.data.source === "env" ? "环境变量" : previewConfig.data.source === "auto" ? "本地端口推导" : "未配置"}</Badge></div><KeyValueGrid items={[{ label: "来源", value: previewConfig.data.source }, { label: "持久化", value: previewConfig.data.persisted ? "是" : "否" }, { label: "上次修改", value: previewConfig.data.updated_at ? formatDate(previewConfig.data.updated_at) : "—" }, { label: "修改者", value: previewConfig.data.updated_by ?? "—" }]} />{isAdmin ? <form className="flex flex-wrap items-end gap-2" onSubmit={(event) => { event.preventDefault(); if (previewOriginInput.trim()) savePreviewConfig.mutate(previewOriginInput.trim()); }}><div className="min-w-0 flex-1"><Label htmlFor="subapp-preview-origin">预览 Origin</Label><Input id="subapp-preview-origin" className="mt-1 font-mono" disabled={savePreviewConfig.isPending} onChange={(event) => setPreviewOriginInput(event.target.value)} placeholder="https://preview.example.com" value={previewOriginInput} /></div><Button disabled={savePreviewConfig.isPending || !previewOriginInput.trim()} size="sm" type="submit"><PackageCheck className="size-4" />保存</Button></form> : <p className="text-xs text-muted-foreground">仅部署管理员可修改预览域名。</p>}</div> : previewConfig.isLoading ? <LoadingState label="正在读取子应用预览配置…" /> : null}</Surface><Surface className="p-5"><SectionHeading description="在任意已安装 Docker 的设备上点击初始化即可构建统一 Runner 镜像（Python + Node + Chromium/Playwright + ffmpeg + 中文字体 + Vue/React 构建工具链）。" title="沙箱一键初始化" />{bootstrap.isError ? <QueryFailure message={bootstrap.error.message} /> : null}{bootstrapStatus ? <div className="mt-4 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatePill status={bootstrapStatus.image_ready ? "approved" : activeJob ? "pending" : "failed"} label={bootstrapStatus.image_ready ? "已就绪" : activeJob ? "初始化中" : "未就绪"} /><p className="text-sm text-muted-foreground">{bootstrapStatus.message}</p></div>{activeJob ? <SandboxBuildProgress job={activeJob} /> : <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-all" style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} /></div>}<KeyValueGrid items={[{ label: "Docker", value: bootstrapStatus.docker_reachable ? "可达" : "不可达" }, { label: "镜像 digest", value: <span className="font-mono text-[10px]">{bootstrapStatus.image_digest ?? "—"}</span> }, { label: "配置来源", value: bootstrapStatus.image_source ?? "—" }, { label: "镜像来源", value: sourceLabel }, { label: "阶段", value: bootstrapStatus.phase }, { label: "成员初始化权限", value: memberAllowed ? "允许普通成员" : "仅管理员" }]} /><ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">{bootstrapStatus.remediation_steps.map((step) => <li key={step}>{step}</li>)}</ul>{activeJob?.log_tail?.length ? <pre className="max-h-40 overflow-auto rounded-lg bg-muted p-3 text-[10px]">{activeJob.log_tail.join("\n")}</pre> : null}{memberGateRestricted && !isAdmin ? <p className="text-xs text-amber-800 dark:text-amber-200">当前工作区已限制沙箱初始化权限，请联系管理员开启「允许普通成员初始化沙箱」。</p> : null}<div className="flex flex-wrap gap-2"><Button disabled={initializeDisabled} onClick={() => initBootstrap.mutate()} size="sm"><Play className="size-4" />{initLabel}</Button><Button onClick={() => { void bootstrap.refetch(); void profiles.refetch(); void bootstrapSource.refetch(); }} size="sm" variant="outline"><RefreshCcw className="size-4" />刷新状态</Button></div>{bootstrapStatus.last_failed_job && !activeJob ? <div className="space-y-2"><p className="text-xs text-amber-800 dark:text-amber-200">上次失败：{bootstrapStatus.last_failed_job.error_code} · {bootstrapStatus.last_failed_job.error_message}</p>{bootstrapStatus.last_failed_job.log_tail.length ? <details className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-xs dark:border-amber-900 dark:bg-amber-950/20"><summary className="cursor-pointer font-medium text-amber-900 dark:text-amber-100">查看失败日志（最后 {bootstrapStatus.last_failed_job.log_tail.length} 行）</summary><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[11px] leading-5 text-foreground">{bootstrapStatus.last_failed_job.log_tail.join("\n")}</pre></details> : null}</div> : null}</div> : bootstrap.isLoading ? <LoadingState label="正在读取沙箱初始化状态…" /> : null}{isAdmin ? <div className="mt-5 space-y-3 rounded-xl border p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><p className="font-medium">允许普通成员初始化沙箱</p><p className="mt-1 text-xs text-muted-foreground">默认允许：任意工作区成员都可以在本机 Docker 上构建沙箱镜像。关闭后只有管理员（部署管理员或工作区管理者）能触发初始化。</p></div><Switch checked={memberAllowed} disabled={saveBootstrapPolicy.isPending || bootstrapPolicy.isLoading} onCheckedChange={(checked) => saveBootstrapPolicy.mutate(checked)} /></div>{bootstrapPolicy.data?.persisted && bootstrapPolicy.data.updated_at ? <p className="text-[10px] text-muted-foreground">上次调整：{formatDate(bootstrapPolicy.data.updated_at)}{bootstrapPolicy.data.updated_by ? ` · ${bootstrapPolicy.data.updated_by}` : ""}</p> : <p className="text-[10px] text-muted-foreground">尚未手动调整，当前为部署默认（允许普通成员）。</p>}</div> : null}{isAdmin ? <div className="mt-5 space-y-3 rounded-xl border p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><p className="font-medium">沙箱镜像来源（部署级）</p><p className="mt-1 text-xs text-muted-foreground">选择「初始化沙箱」时是拉取预构建镜像还是本地构建。保存后全工作区成员的初始化都按此策略执行；未配置时保持原有行为（环境变量优先，否则本地构建）。</p></div><StatePill status={sourceEffective === "prebuilt" ? "approved" : sourceEffective === "build" ? "failed" : "pending"} label={sourceLabel} /></div><RadioGroup className="mt-3" disabled={updateBootstrapSource.isPending || bootstrapSource.isLoading} onValueChange={(value) => setSourceMode(value as "auto" | "prebuilt" | "build")} value={sourceMode}><div className="flex items-start gap-2"><RadioGroupItem id="source-auto" value="auto" /><Label className="font-normal" htmlFor="source-auto"><span className="font-medium">自动（推荐）</span> — 已配置预构建镜像时拉取，否则本地构建</Label></div><div className="flex items-start gap-2"><RadioGroupItem id="source-prebuilt" value="prebuilt" /><Label className="font-normal" htmlFor="source-prebuilt"><span className="font-medium">预构建镜像</span> — 总是从镜像仓库拉取，不在本机构建（有网即可用）</Label></div><div className="flex items-start gap-2"><RadioGroupItem id="source-build" value="build" /><Label className="font-normal" htmlFor="source-build"><span className="font-medium">本地构建</span> — 总是现场 docker build，忽略预构建镜像</Label></div></RadioGroup>{sourceMode !== "build" ? <div className="space-y-1.5"><Label htmlFor="sandbox-prebuilt-image">预构建镜像地址</Label><Input className="mt-1 font-mono text-xs" disabled={updateBootstrapSource.isPending || bootstrapSource.isLoading} id="sandbox-prebuilt-image" onChange={(event) => setSourceImageInput(event.target.value)} placeholder="crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.3" value={sourceImageInput} /><p className="text-[10px] text-muted-foreground">留空时回退到环境变量 LEARNGRAPH_SANDBOX_PREBUILT_IMAGE（若已设置）。建议使用公开仓库，无需登录即可拉取。</p></div> : null}{bootstrapSource.data?.env_prebuilt_image ? <p className="text-[10px] text-amber-800 dark:text-amber-200">环境变量 LEARNGRAPH_SANDBOX_PREBUILT_IMAGE 已配置，优先级高于设置页地址：{bootstrapSource.data.env_prebuilt_image}</p> : null}<div className="flex flex-wrap items-center gap-2"><Button disabled={updateBootstrapSource.isPending || bootstrapSource.isLoading || (sourceMode === "prebuilt" && !sourceImageInput.trim() && !bootstrapSource.data?.env_prebuilt_image)} onClick={() => updateBootstrapSource.mutate({ mode: sourceMode, prebuilt_image: sourceMode === "build" ? null : sourceImageInput.trim() || null })} size="sm"><PackageCheck className="size-4" />保存镜像来源</Button><p className="text-[10px] text-muted-foreground">保存即生效，下次「初始化沙箱」按新策略执行。</p></div>{bootstrapSource.data?.persisted && bootstrapSource.data.updated_at ? <p className="text-[10px] text-muted-foreground">上次调整：{formatDate(bootstrapSource.data.updated_at)}{bootstrapSource.data.updated_by ? ` · ${bootstrapSource.data.updated_by}` : ""}</p> : <p className="text-[10px] text-muted-foreground">尚未手动调整，当前为部署默认（自动）。</p>}</div> : <div className="mt-5 space-y-3 rounded-xl border p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><p className="font-medium">沙箱镜像来源</p><p className="mt-1 text-xs text-muted-foreground">当前策略由部署管理员维护：{sourceLabel}{sourceEffective === "prebuilt" && bootstrapStatus?.prebuilt_image_ref ? ` · ${bootstrapStatus.prebuilt_image_ref}` : ""}</p></div><StatePill status={sourceEffective === "prebuilt" ? "approved" : sourceEffective === "build" ? "failed" : "pending"} label={sourceLabel} /></div></div>}</Surface><Surface className="p-5"><SectionHeading description="统一运行时的实时探测结果：所有会话共享同一个加固镜像（断网、只读、seccomp 白名单），浏览器 / ffmpeg / 前端工具链能力始终可用。" title="Sandbox Profile" />{profiles.isError ? <QueryFailure message={profiles.error.message} /> : null}<div className="mt-4 space-y-3">{profiles.data?.map((profile) => <div className="rounded-xl border p-4" key={profile.backend_id}><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="font-medium">统一沙箱运行时</p><p className="font-mono text-[10px] text-muted-foreground">{profile.backend_id}</p></div><StatePill status={profile.available ? "approved" : "failed"} label={profile.available ? "可用" : "不可用"} /></div><p className="mt-2 text-xs text-muted-foreground">{profile.platform} · 固定镜像 {profile.image_pinned ? "是" : "否"}</p>{profile.reason ? <p className="mt-2 text-xs text-amber-800 dark:text-amber-200">{profile.reason}</p> : <div className="mt-2 flex flex-wrap gap-1">{profile.capabilities.map((capability) => <Badge key={capability} variant="outline">{capability}</Badge>)}</div>}</div>)}</div></Surface><Surface className="p-5"><SectionHeading description={isAdmin ? "管理员视图：可清理本工作区全部用户的会话；已清理或已删除的 Session 不再显示。" : "只能清理自己的 Sandbox Session；已清理或已删除的 Session 不再显示。"} title="Sandbox Session 清理" />{sandboxSessions.isError ? <QueryFailure message={sandboxSessions.error.message} /> : null}<div className="mt-4 space-y-2">{visibleSandboxSessions.map((session) => <div className="flex flex-col gap-3 rounded-xl border p-3 sm:flex-row sm:items-center" key={session.id}><div className="min-w-0 flex-1"><p className="font-mono text-xs">{session.id}</p><p className="mt-1 text-xs text-muted-foreground">{isAdmin ? <span className="text-primary">所有者 {session.owner_user_id} · </span> : null}{session.backend_id} · 过期 {formatDate(session.expires_at)} · 清理 {session.cleanup_status}</p></div><StatePill status={session.status} /><Button disabled={cleanup.isPending} onClick={() => cleanup.mutate(session.id)} size="xs" variant="outline">清理</Button></div>)}{sandboxSessions.isSuccess && !visibleSandboxSessions.length ? <p className="py-5 text-sm text-muted-foreground">当前没有待清理的 Sandbox Session。</p> : null}</div></Surface></div>;
+  return <div className="space-y-5"><Surface className="p-5"><SectionHeading description="多文件教学子应用（subapp）预览的独立 Origin。必须与主 API Origin 不同：本地开发由 scripts/dev.mjs 自动启动 preview 进程并按 http://127.0.0.1:<端口> 推导；真实域名部署请配置 nginx/Caddy 反代后在此填入 https://preview.example.com 形式。留空时多文件 bundle 预览不可用（fail-closed）。" title="子应用预览域名" />{previewConfig.isError ? <QueryFailure message={previewConfig.error.message} /> : null}{previewConfig.data ? <div className="mt-4 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatePill status={previewConfig.data.origin ? "approved" : "failed"} label={previewConfig.data.origin ? "已配置" : "未配置"} /><span className="font-mono text-xs text-muted-foreground">{previewConfig.data.origin ?? "—"}</span><Badge variant="outline">{previewConfig.data.source === "persisted" ? "设置页持久化" : previewConfig.data.source === "env" ? "环境变量" : previewConfig.data.source === "auto" ? "本地端口推导" : "未配置"}</Badge></div><KeyValueGrid items={[{ label: "来源", value: previewConfig.data.source }, { label: "持久化", value: previewConfig.data.persisted ? "是" : "否" }, { label: "上次修改", value: previewConfig.data.updated_at ? formatDate(previewConfig.data.updated_at) : "—" }, { label: "修改者", value: previewConfig.data.updated_by ?? "—" }]} />{isAdmin ? <form className="flex flex-wrap items-end gap-2" onSubmit={(event) => { event.preventDefault(); if (previewOriginInput.trim()) savePreviewConfig.mutate(previewOriginInput.trim()); }}><div className="min-w-0 flex-1"><Label htmlFor="subapp-preview-origin">预览 Origin</Label><Input id="subapp-preview-origin" className="mt-1 font-mono" disabled={savePreviewConfig.isPending} onChange={(event) => setPreviewOriginInput(event.target.value)} placeholder="https://preview.example.com" value={previewOriginInput} /></div><Button disabled={savePreviewConfig.isPending || !previewOriginInput.trim()} size="sm" type="submit"><PackageCheck className="size-4" />保存</Button></form> : <p className="text-xs text-muted-foreground">仅部署管理员可修改预览域名。</p>}</div> : previewConfig.isLoading ? <LoadingState label="正在读取子应用预览配置…" /> : null}</Surface><Surface className="p-5"><SectionHeading description="在任意已安装 Docker 的设备上点击初始化即可构建统一 Runner 镜像（Python + Node + Chromium/Playwright + ffmpeg + 中文字体 + Vue/React 构建工具链）。" title="沙箱一键初始化" />{bootstrap.isError ? <QueryFailure message={bootstrap.error.message} /> : null}{bootstrapStatus ? <div className="mt-4 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatePill status={bootstrapStatus.image_ready ? "approved" : activeJob ? "pending" : "failed"} label={bootstrapStatus.image_ready ? "已就绪" : activeJob ? "初始化中" : "未就绪"} /><p className="text-sm text-muted-foreground">{bootstrapStatus.message}</p></div>{activeJob ? <SandboxBuildProgress job={activeJob} /> : <div className="h-2 overflow-hidden rounded-full bg-muted"><div className="h-full w-full origin-left rounded-full bg-primary transition-transform" style={{ transform: `scaleX(${Math.max(0, Math.min(100, progress)) / 100})` }} /></div>}<KeyValueGrid items={[{ label: "Docker", value: bootstrapStatus.docker_reachable ? "可达" : "不可达" }, { label: "镜像 digest", value: <span className="font-mono text-[10px]">{bootstrapStatus.image_digest ?? "—"}</span> }, { label: "配置来源", value: bootstrapStatus.image_source ?? "—" }, { label: "镜像来源", value: sourceLabel }, { label: "阶段", value: bootstrapStatus.phase }, { label: "成员初始化权限", value: memberAllowed ? "允许普通成员" : "仅管理员" }]} /><ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">{bootstrapStatus.remediation_steps.map((step) => <li key={step}>{step}</li>)}</ul>{activeJob?.log_tail?.length ? <pre className="max-h-40 overflow-auto rounded-lg bg-muted p-3 text-[10px]">{activeJob.log_tail.join("\n")}</pre> : null}{memberGateRestricted && !isAdmin ? <p className="text-xs text-amber-800 dark:text-amber-200">当前工作区已限制沙箱初始化权限，请联系管理员开启「允许普通成员初始化沙箱」。</p> : null}<div className="flex flex-wrap gap-2"><Button disabled={initializeDisabled} onClick={() => initBootstrap.mutate()} size="sm"><Play className="size-4" />{initLabel}</Button><Button onClick={() => { void bootstrap.refetch(); void profiles.refetch(); void bootstrapSource.refetch(); }} size="sm" variant="outline"><RefreshCcw className="size-4" />刷新状态</Button></div>{bootstrapStatus.last_failed_job && !activeJob ? <div className="space-y-2"><p className="text-xs text-amber-800 dark:text-amber-200">上次失败：{bootstrapStatus.last_failed_job.error_code} · {bootstrapStatus.last_failed_job.error_message}</p>{bootstrapStatus.last_failed_job.log_tail.length ? <details className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-xs dark:border-amber-900 dark:bg-amber-950/20"><summary className="cursor-pointer font-medium text-amber-900 dark:text-amber-100">查看失败日志（最后 {bootstrapStatus.last_failed_job.log_tail.length} 行）</summary><pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[11px] leading-5 text-foreground">{bootstrapStatus.last_failed_job.log_tail.join("\n")}</pre></details> : null}</div> : null}</div> : bootstrap.isLoading ? <LoadingState label="正在读取沙箱初始化状态…" /> : null}{isAdmin ? <div className="mt-5 space-y-3 rounded-xl border p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><p className="font-medium">允许普通成员初始化沙箱</p><p className="mt-1 text-xs text-muted-foreground">默认允许：任意工作区成员都可以在本机 Docker 上构建沙箱镜像。关闭后只有管理员（部署管理员或工作区管理者）能触发初始化。</p></div><Switch checked={memberAllowed} disabled={saveBootstrapPolicy.isPending || bootstrapPolicy.isLoading} onCheckedChange={(checked) => saveBootstrapPolicy.mutate(checked)} /></div>{bootstrapPolicy.data?.persisted && bootstrapPolicy.data.updated_at ? <p className="text-[10px] text-muted-foreground">上次调整：{formatDate(bootstrapPolicy.data.updated_at)}{bootstrapPolicy.data.updated_by ? ` · ${bootstrapPolicy.data.updated_by}` : ""}</p> : <p className="text-[10px] text-muted-foreground">尚未手动调整，当前为部署默认（允许普通成员）。</p>}</div> : null}{isAdmin ? <div className="mt-5 space-y-3 rounded-xl border p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><p className="font-medium">沙箱镜像来源（部署级）</p><p className="mt-1 text-xs text-muted-foreground">选择「初始化沙箱」时是拉取预构建镜像还是本地构建。保存后全工作区成员的初始化都按此策略执行；未配置时保持原有行为（环境变量优先，否则本地构建）。</p></div><StatePill status={sourceEffective === "prebuilt" ? "approved" : sourceEffective === "build" ? "failed" : "pending"} label={sourceLabel} /></div><RadioGroup className="mt-3" disabled={updateBootstrapSource.isPending || bootstrapSource.isLoading} onValueChange={(value) => setSourceMode(value as "auto" | "prebuilt" | "build")} value={sourceMode}><div className="flex items-start gap-2"><RadioGroupItem id="source-auto" value="auto" /><Label className="font-normal" htmlFor="source-auto"><span className="font-medium">自动（推荐）</span> — 已配置预构建镜像时拉取，否则本地构建</Label></div><div className="flex items-start gap-2"><RadioGroupItem id="source-prebuilt" value="prebuilt" /><Label className="font-normal" htmlFor="source-prebuilt"><span className="font-medium">预构建镜像</span> — 总是从镜像仓库拉取，不在本机构建（有网即可用）</Label></div><div className="flex items-start gap-2"><RadioGroupItem id="source-build" value="build" /><Label className="font-normal" htmlFor="source-build"><span className="font-medium">本地构建</span> — 总是现场 docker build，忽略预构建镜像</Label></div></RadioGroup>{sourceMode !== "build" ? <div className="space-y-1.5"><Label htmlFor="sandbox-prebuilt-image">预构建镜像地址</Label><Input className="mt-1 font-mono text-xs" disabled={updateBootstrapSource.isPending || bootstrapSource.isLoading} id="sandbox-prebuilt-image" onChange={(event) => setSourceImageInput(event.target.value)} placeholder="crpi-a89c780kegywb9dg.cn-hangzhou.personal.cr.aliyuncs.com/learngraph/learngraph:v0.3" value={sourceImageInput} /><p className="text-[10px] text-muted-foreground">留空时回退到环境变量 LEARNGRAPH_SANDBOX_PREBUILT_IMAGE（若已设置）。建议使用公开仓库，无需登录即可拉取。</p></div> : null}{bootstrapSource.data?.env_prebuilt_image ? <p className="text-[10px] text-amber-800 dark:text-amber-200">环境变量 LEARNGRAPH_SANDBOX_PREBUILT_IMAGE 已配置，优先级高于设置页地址：{bootstrapSource.data.env_prebuilt_image}</p> : null}<div className="flex flex-wrap items-center gap-2"><Button disabled={updateBootstrapSource.isPending || bootstrapSource.isLoading || (sourceMode === "prebuilt" && !sourceImageInput.trim() && !bootstrapSource.data?.env_prebuilt_image)} onClick={() => updateBootstrapSource.mutate({ mode: sourceMode, prebuilt_image: sourceMode === "build" ? null : sourceImageInput.trim() || null })} size="sm"><PackageCheck className="size-4" />保存镜像来源</Button><p className="text-[10px] text-muted-foreground">保存即生效，下次「初始化沙箱」按新策略执行。</p></div>{bootstrapSource.data?.persisted && bootstrapSource.data.updated_at ? <p className="text-[10px] text-muted-foreground">上次调整：{formatDate(bootstrapSource.data.updated_at)}{bootstrapSource.data.updated_by ? ` · ${bootstrapSource.data.updated_by}` : ""}</p> : <p className="text-[10px] text-muted-foreground">尚未手动调整，当前为部署默认（自动）。</p>}</div> : <div className="mt-5 space-y-3 rounded-xl border p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0 flex-1"><p className="font-medium">沙箱镜像来源</p><p className="mt-1 text-xs text-muted-foreground">当前策略由部署管理员维护：{sourceLabel}{sourceEffective === "prebuilt" && bootstrapStatus?.prebuilt_image_ref ? ` · ${bootstrapStatus.prebuilt_image_ref}` : ""}</p></div><StatePill status={sourceEffective === "prebuilt" ? "approved" : sourceEffective === "build" ? "failed" : "pending"} label={sourceLabel} /></div></div>}</Surface><Surface className="p-5"><SectionHeading description="统一运行时的实时探测结果：所有会话共享同一个加固镜像（断网、只读、seccomp 白名单），浏览器 / ffmpeg / 前端工具链能力始终可用。" title="Sandbox Profile" />{profiles.isError ? <QueryFailure message={profiles.error.message} /> : null}<div className="mt-4 space-y-3">{profiles.data?.map((profile) => <div className="rounded-xl border p-4" key={profile.backend_id}><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="font-medium">统一沙箱运行时</p><p className="font-mono text-[10px] text-muted-foreground">{profile.backend_id}</p></div><StatePill status={profile.available ? "approved" : "failed"} label={profile.available ? "可用" : "不可用"} /></div><p className="mt-2 text-xs text-muted-foreground">{profile.platform} · 固定镜像 {profile.image_pinned ? "是" : "否"}</p>{profile.reason ? <p className="mt-2 text-xs text-amber-800 dark:text-amber-200">{profile.reason}</p> : <div className="mt-2 flex flex-wrap gap-1">{profile.capabilities.map((capability) => <Badge key={capability} variant="outline">{capability}</Badge>)}</div>}</div>)}</div></Surface><Surface className="p-5"><SectionHeading description={isAdmin ? "管理员视图：可清理本工作区全部用户的会话；已清理或已删除的 Session 不再显示。" : "只能清理自己的 Sandbox Session；已清理或已删除的 Session 不再显示。"} title="Sandbox Session 清理" />{sandboxSessions.isError ? <QueryFailure message={sandboxSessions.error.message} /> : null}<div className="mt-4 space-y-2">{visibleSandboxSessions.map((session) => <div className="flex flex-col gap-3 rounded-xl border p-3 sm:flex-row sm:items-center" key={session.id}><div className="min-w-0 flex-1"><p className="font-mono text-xs">{session.id}</p><p className="mt-1 text-xs text-muted-foreground">{isAdmin ? <span className="text-primary">所有者 {session.owner_user_id} · </span> : null}{session.backend_id} · 过期 {formatDate(session.expires_at)} · 清理 {session.cleanup_status}</p></div><StatePill status={session.status} /><Button disabled={cleanup.isPending} onClick={() => cleanup.mutate(session.id)} size="xs" variant="outline">清理</Button></div>)}{sandboxSessions.isSuccess && !visibleSandboxSessions.length ? <p className="py-5 text-sm text-muted-foreground">当前没有待清理的 Sandbox Session。</p> : null}</div></Surface></div>;
 }
