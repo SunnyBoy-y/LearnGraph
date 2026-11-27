@@ -248,6 +248,66 @@ SUBAPP_CLIENT = r"""// LearnGraph bidirectional subapp client SDK (opaque-origin
 
 SUBAPP_CLIENT_SCRIPT_TAG = '<script src="/api/v1/subapps/subapp-client.js"></script>'
 
+# --------------------------------------------------------------------------- //
+# Preview pause-control shim (opaque-origin iframe)
+# --------------------------------------------------------------------------- //
+# Keeps multi-file bundles responsive to host `preview.control` pause/resume
+# messages so tab switches and preview-wall pauses freeze timers/RAF/audio in
+# place instead of hitting the host's 350ms blank-and-reload fallback.
+# Keep in sync with `PREVIEW_CONTROL_SHIM` in
+# `frontend/src/lib/sandboxed-html-preview.ts`.
+PREVIEW_CONTROL_SHIM = r"""(function(){
+'use strict';
+var paused=false, nextId=1, timers=new Map(), frames=new Map(), contexts=new Set(), animations=[], playing=new Set();
+var nativeTimeout=window.setTimeout.bind(window), nativeClear=window.clearTimeout.bind(window);
+var nativeFrame=window.requestAnimationFrame.bind(window), nativeCancel=window.cancelAnimationFrame.bind(window);
+function invoke(callback,args){if(typeof callback==='function')callback.apply(window,args);else (0,eval)(String(callback));}
+function scheduleTimer(id,entry){entry.due=performance.now()+entry.remaining;entry.native=nativeTimeout(function(){if(paused)return;entry.remaining=entry.delay;if(!entry.repeat)timers.delete(id);invoke(entry.callback,entry.args);if(entry.repeat&&timers.has(id)&&!paused)scheduleTimer(id,entry);},entry.remaining);}
+function addTimer(callback,delay,repeat,args){var id=nextId++,entry={callback:callback,args:args,delay:Math.max(0,Number(delay)||0),remaining:Math.max(0,Number(delay)||0),repeat:repeat,native:null,due:0};timers.set(id,entry);if(!paused)scheduleTimer(id,entry);return id;}
+window.setTimeout=function(callback,delay){return addTimer(callback,delay,false,Array.prototype.slice.call(arguments,2));};
+window.setInterval=function(callback,delay){return addTimer(callback,delay,true,Array.prototype.slice.call(arguments,2));};
+window.clearTimeout=window.clearInterval=function(id){var entry=timers.get(id);if(entry){nativeClear(entry.native);timers.delete(id);}else nativeClear(id);};
+function scheduleFrame(id,callback){var nativeId=nativeFrame(function(time){if(paused)return;frames.delete(id);callback(time);});frames.set(id,{callback:callback,native:nativeId});}
+window.requestAnimationFrame=function(callback){var id=nextId++;frames.set(id,{callback:callback,native:null});if(!paused)scheduleFrame(id,callback);return id;};
+window.cancelAnimationFrame=function(id){var entry=frames.get(id);if(entry){nativeCancel(entry.native);frames.delete(id);}};
+['AudioContext','webkitAudioContext'].forEach(function(name){var Original=window[name];if(!Original)return;window[name]=new Proxy(Original,{construct:function(target,args){var context=Reflect.construct(target,args);contexts.add(context);if(paused)void context.suspend().catch(function(){});return context;}});});
+function holdMedia(){document.querySelectorAll('audio,video').forEach(function(media){if(!media.paused&&!media.ended){playing.add(media);media.pause();}});}
+document.addEventListener('play',function(event){if(paused&&event.target&&event.target.pause){playing.add(event.target);event.target.pause();}},true);
+function setPaused(next){
+  if(paused===next)return;paused=next;
+  if(next){
+    timers.forEach(function(entry){nativeClear(entry.native);entry.remaining=Math.max(0,entry.due-performance.now());});
+    frames.forEach(function(entry){nativeCancel(entry.native);});
+    holdMedia();contexts.forEach(function(context){if(context.state==='running'){context.__lgResume=true;void context.suspend().catch(function(){});}});
+    animations=document.getAnimations?document.getAnimations().filter(function(animation){return animation.playState==='running';}):[];animations.forEach(function(animation){animation.pause();});
+  }else{
+    timers.forEach(function(entry,id){scheduleTimer(id,entry);});frames.forEach(function(entry,id){scheduleFrame(id,entry.callback);});
+    playing.forEach(function(media){void media.play().catch(function(){});});playing.clear();
+    contexts.forEach(function(context){if(context.__lgResume){context.__lgResume=false;void context.resume().catch(function(){});}});
+    animations.forEach(function(animation){try{animation.play();}catch(e){}});animations=[];
+  }
+  document.documentElement.dataset.lgPaused=next?'true':'false';
+  window.dispatchEvent(new CustomEvent('learngraph:preview-control',{detail:{action:next?'pause':'resume'}}));
+}
+window.addEventListener('message',function(event){var data=event.data;if(event.source!==parent||!data||data.lg!==1||data.kind!=='preview.control')return;if(data.action==='pause'||data.action==='resume'){setPaused(data.action==='pause');parent.postMessage({lg:1,kind:'preview.control.ack',action:data.action,requestId:data.requestId},'*');}});
+})();
+"""
+
+PREVIEW_CONTROL_SHIM_SCRIPT_TAG = '<script src="/api/v1/subapps/preview-control-shim.js"></script>'
+
+
+@router.get("/preview-control-shim.js", include_in_schema=False)
+def serve_preview_control_shim() -> Response:
+    """Same-origin preview pause-control shim for preview-origin iframes."""
+    return Response(
+        content=PREVIEW_CONTROL_SHIM,
+        media_type="text/javascript",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
 
 @router.get("/subapp-client.js", include_in_schema=False)
 def serve_subapp_client() -> Response:
@@ -287,7 +347,7 @@ def _inject_runtime_shim(html: bytes, *, subapp_mode: bool = False) -> bytes:
     except UnicodeDecodeError:
         text = html.decode("utf-8", errors="replace")
     marker = "</head>"
-    tags = RUNTIME_SHIM_SCRIPT_TAG
+    tags = PREVIEW_CONTROL_SHIM_SCRIPT_TAG + RUNTIME_SHIM_SCRIPT_TAG
     if subapp_mode:
         tags += SUBAPP_CLIENT_SCRIPT_TAG
     if marker in text:

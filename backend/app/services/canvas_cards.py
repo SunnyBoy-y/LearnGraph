@@ -31,6 +31,7 @@ CHANNEL_A_TYPES = frozenset(
     }
 )
 MAX_MAGIC_CARD_PREVIEW_CHARS = 100_000
+HEIGHT_MODES = frozenset({"auto", "aspect-ratio", "fixed", "bounded"})
 
 DEFAULT_RENDER_CONTRACT: dict[str, Any] = {
     "slot": "inline",
@@ -38,6 +39,8 @@ DEFAULT_RENDER_CONTRACT: dict[str, Any] = {
     "min_width": 320,
     "max_width": 760,
     "max_height": 720,
+    "height_modes": ["auto", "aspect-ratio", "fixed", "bounded"],
+    "default_height_mode": "auto",
     "device_pixel_ratio": 1,
     "theme": "light",
     "locale": "zh-CN",
@@ -428,7 +431,11 @@ def build_magic_card_part(
     card_id: str | None = None,
     version: int = 1,
     preferred_height: int | None = None,
+    max_height: int | None = None,
+    height_mode: str | None = None,
+    aspect_ratio: str | None = None,
     preview_html: str | None = None,
+    display_mode: str | None = None,
     artifact_url: str | None = None,
     origin_verified: bool = False,
     scope: dict[str, Any] | None = None,
@@ -456,7 +463,31 @@ def build_magic_card_part(
             {"max_chars": MAX_MAGIC_CARD_PREVIEW_CHARS},
         )
 
+    normalized_height_mode = (
+        height_mode.strip().lower()
+        if isinstance(height_mode, str) and height_mode.strip().lower() in HEIGHT_MODES
+        else "auto"
+    )
+    normalized_aspect_ratio = (
+        aspect_ratio.strip()[:32]
+        if isinstance(aspect_ratio, str) and aspect_ratio.strip()
+        else None
+    )
+    resolved_max_height = (
+        max(160, min(1600, int(max_height)))
+        if isinstance(max_height, int)
+        else 720
+    )
+
     inline_ready = bool(cleaned_preview)
+    viewport: dict[str, Any] = {
+        "mode": "inline",
+        "height_mode": normalized_height_mode,
+        "preferred_height": preferred_height or 360,
+        "max_height": resolved_max_height,
+    }
+    if normalized_aspect_ratio:
+        viewport["aspect_ratio"] = normalized_aspect_ratio
     data: dict[str, Any] = {
         "card_instance_id": instance_id,
         "card_id": card_key,
@@ -466,16 +497,19 @@ def build_magic_card_part(
         "fallback_text": (fallback_text or cleaned_title)[:500],
         "status": "ready",
         "origin_verified": runtime_ready,
-        "viewport": {
-            "mode": "inline",
-            "preferred_height": preferred_height or 360,
-            "max_height": 720,
-        },
+        "height_mode": normalized_height_mode,
+        "viewport": viewport,
         "scope": scope or {},
         "reason": None,
     }
     if preferred_height is not None:
         data["preferred_height"] = max(120, min(900, int(preferred_height)))
+    if isinstance(max_height, int):
+        data["max_height"] = resolved_max_height
+    if normalized_aspect_ratio:
+        data["aspect_ratio"] = normalized_aspect_ratio
+    if isinstance(display_mode, str) and display_mode.strip().lower() in {"inline", "artifact"}:
+        data["display_mode"] = display_mode.strip().lower()
     if inline_ready:
         # Dynamic preview HTML runs in an opaque-origin iframe. The host replaces
         # its CSP and blocks network, frames, forms, and host-DOM access.

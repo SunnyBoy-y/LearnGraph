@@ -159,11 +159,11 @@ export function SandboxBuildProgress({
       >
         <div
           className={cn(
-            "h-full rounded-full transition-[width] duration-700 ease-out",
+            "h-full w-full origin-left rounded-full transition-transform duration-700 ease-out",
             isAmber ? "bg-amber-600 dark:bg-amber-400" : "bg-primary",
             running && "sandbox-progress-stripes",
           )}
-          style={{ width: `${percent}%` }}
+          style={{ transform: `scaleX(${Math.max(0, Math.min(100, percent)) / 100})` }}
         />
       </div>
     </div>

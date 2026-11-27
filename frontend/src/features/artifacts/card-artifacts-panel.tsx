@@ -12,6 +12,9 @@ import {
   Link2,
   List as ListIcon,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
+  Scan,
   MessageSquare,
   MoreHorizontal,
   Pencil,
@@ -26,7 +29,11 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { Pagination } from "@/components/shared/pagination";
+import { Checkbox } from "@/components/ui/checkbox";
+import { applyRangeSelection, useEscapeKey } from "@/lib/list-selection";
+import { artifactDownload, downloadArtifacts, downloadBlob, processArtifactBatch, useGalleryScroll } from "./gallery-actions";
 import { toast } from "@/lib/notifications";
 
 import {
@@ -129,15 +136,46 @@ function PrimaryActionIcon({ kind }: { kind: ArtifactGalleryKind }) {
   return <Play className="size-3.5" />;
 }
 
+function cardListParams(status: string, sort: string) {
+  return { status: status === "all" ? undefined : status, exclude_card_type: DECLARATIVE_COMPONENT_CARD_TYPE, sort, order: "desc", limit: 0 };
+}
+
+export function useGalleryCards(workspaceId: string, status = "all", sort = "updated_at") {
+  const params = cardListParams(status, sort);
+  return useQuery({ queryKey: cardQueryKey(workspaceId, params), queryFn: () => listArtifactCards(params) });
+}
+
 export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
-  const [searchQuery, setSearchQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<string>("all");
-  const [typeFilter, setTypeFilter] = useState<string>("all");
-  const [sortOrder, setSortOrder] = useState<string>("updated_at");
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [params, setParams] = useSearchParams();
+  const updateBrowse = (updates: Record<string, string>, replace = true) => {
+    setParams((current) => {
+      const next = new URLSearchParams(current);
+      for (const [key, value] of Object.entries(updates)) {
+        if (value) next.set(key, value);
+        else next.delete(key);
+      }
+      return next;
+    }, { replace, preventScrollReset: true });
+  };
+  const searchQuery = params.get("q") ?? "";
+  const statusFilter = params.get("status") ?? "all";
+  const typeFilter = params.get("type") ?? "all";
+  const sortOrder = params.get("sort") === "created_at" ? "created_at" : "updated_at";
+  const viewMode = params.get("view") === "list" ? "list" : "grid";
+  const setSearchQuery = (q: string) => updateBrowse({ q, page: "" });
+  const setTypeFilter = (type: string) => updateBrowse({ type, page: "" });
+  const setStatusFilter = (status: string) => updateBrowse({ status, page: "" });
+  const setSortOrder = (sort: string) => updateBrowse({ sort, page: "" });
+  const setViewMode = (view: string) => updateBrowse({ view });
+  const requestedPage = Number(params.get("page"));
+  const pageSize = [12, 24, 48].includes(Number(params.get("size"))) ? Number(params.get("size")) : 12;
+  const [selecting, setSelecting] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchDelete, setBatchDelete] = useState<ArtifactCard[] | null>(null);
 
   // Snapshot-refined kinds reported by loaded previews (allows refining e.g. static SVG vs HTML)
   const [resolvedKinds, setResolvedKinds] = useState<Record<string, ArtifactGalleryKind>>({});
@@ -156,29 +194,13 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   const [renameTarget, setRenameTarget] = useState<ArtifactCard | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ArtifactCard | null>(null);
 
-  const [visibleCount, setVisibleCount] = useState(24);
-  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const galleryTop = useRef<HTMLDivElement>(null);
 
   const handleKindResolved = useCallback((cardId: string, kind: ArtifactGalleryKind) => {
     setResolvedKinds((prev) => (prev[cardId] === kind ? prev : { ...prev, [cardId]: kind }));
   }, []);
 
-  const params = useMemo(
-    () => ({
-      status: statusFilter === "all" ? undefined : statusFilter,
-      // 组件卡不算页面：服务端排除，避免它挤占 limit 把页面卡挤出结果集。
-      exclude_card_type: DECLARATIVE_COMPONENT_CARD_TYPE,
-      sort: sortOrder,
-      order: "desc",
-      limit: 200,
-    }),
-    [statusFilter, sortOrder],
-  );
-
-  const cards = useQuery({
-    queryKey: cardQueryKey(workspaceId, params),
-    queryFn: () => listArtifactCards(params),
-  });
+  const cards = useGalleryCards(workspaceId, statusFilter, sortOrder);
 
   const invalidateCards = () =>
     queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "cards") });
@@ -243,23 +265,79 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
     });
   }, [cards.data, effectiveKindFor, searchQuery, typeFilter]);
 
-  // Progressive reveal: render cards in batches and grow on scroll
-  useEffect(() => {
-    const total = filteredCards.length;
-    if (visibleCount >= total) return;
-    const sentinel = sentinelRef.current;
-    if (!sentinel || typeof IntersectionObserver === "undefined") return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          setVisibleCount((count) => Math.min(count + 24, total));
-        }
-      },
-      { rootMargin: "320px" },
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [filteredCards.length, visibleCount]);
+  const page = Math.min(Math.max(1, Number.isSafeInteger(requestedPage) ? requestedPage : 1), Math.max(1, Math.ceil(filteredCards.length / pageSize)));
+  const pageCards = filteredCards.slice((page - 1) * pageSize, page * pageSize);
+  const pageCardIds = useMemo(() => pageCards.map((card) => card.card_id), [pageCards]);
+  const cardAnchorRef = useRef<string | null>(null);
+  const cardShiftRef = useRef(false);
+  const exitSelecting = useCallback(() => {
+    setSelecting(false);
+    setSelectedIds(new Set());
+    cardAnchorRef.current = null;
+  }, []);
+  useEscapeKey(selecting, exitSelecting);
+  // Select from the unfiltered index so sorting, paging and filtering cannot silently change the operation scope.
+  const allCards = useGalleryCards(workspaceId);
+  const selected = (allCards.data ?? []).filter((card) => selectedIds.has(card.card_id));
+  const selectedPublishable = selected.filter((card) => card.latest_version === 0 || card.draft_dirty);
+  const onPageCount = pageCards.filter((card) => selectedIds.has(card.card_id)).length;
+  const toggleCards = (items: ArtifactCard[], checked: boolean) => setSelectedIds((current) => {
+    const next = new Set(current);
+    for (const item of items) {
+      if (checked) next.add(item.card_id);
+      else next.delete(item.card_id);
+    }
+    return next;
+  });
+  const toggleCard = (card: ArtifactCard, shiftKey?: boolean) => {
+    if (batchBusy) return;
+    const useShift = shiftKey ?? cardShiftRef.current;
+    cardShiftRef.current = false;
+    const nextChecked = !selectedIds.has(card.card_id);
+    if (useShift && cardAnchorRef.current) {
+      setSelectedIds((current) =>
+        applyRangeSelection(current, pageCardIds, cardAnchorRef.current, card.card_id, nextChecked),
+      );
+    } else {
+      toggleCards([card], nextChecked);
+    }
+    cardAnchorRef.current = card.card_id;
+  };
+  const changePage = (next: number) => {
+    if (next === page) return;
+    updateBrowse({ page: String(next) }, false);
+    galleryTop.current?.scrollIntoView?.({ block: "start" });
+  };
+  useGalleryScroll(cards.isSuccess, workspaceId, galleryTop);
+
+  const runBatch = async (mode: "download" | "delete" | "publish", items: ArtifactCard[]) => {
+    setBatchBusy(true);
+    try {
+      if (mode === "download") {
+        const { count, skipped } = await downloadArtifacts(items);
+        if (skipped) toast.error(`${count} 项已导出，${skipped} 项下载失败或没有可导出的 HTML / SVG`);
+        else toast.success(`已导出 ${count} 项`);
+      } else if (mode === "publish") {
+        const result = await processArtifactBatch(items, (item) => publishArtifactCardVersion(item.card_id, {}));
+        const published = items.filter((_, index) => result[index].status === "fulfilled");
+        await invalidateCards();
+        if (published.length !== items.length) toast.error(`已发布 ${published.length} 项，${items.length - published.length} 项发布失败`);
+        else toast.success(`已发布 ${published.length} 项`);
+      } else {
+        const result = await processArtifactBatch(items, (item) => deleteArtifactCard(item.card_id));
+        const deleted = items.filter((_, index) => result[index].status === "fulfilled");
+        toggleCards(deleted, false);
+        setBatchDelete(null);
+        await invalidateCards();
+        if (deleted.length !== items.length) toast.error(`已删除 ${deleted.length} 项，${items.length - deleted.length} 项删除失败`);
+        else toast.success(`已删除 ${deleted.length} 项`);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "批量操作失败");
+    } finally {
+      setBatchBusy(false);
+    }
+  };
 
   const openRuntimeOrViewer = useCallback(
     (card: ArtifactCard, resolvedKind?: ArtifactGalleryKind) => {
@@ -317,10 +395,9 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
   );
 
   return (
-    <div className="grid gap-4">
-      {/* Gallery toolbar: Search + Type + Status + Sort + View switcher */}
-      <div className="flex flex-wrap items-center gap-2.5">
-        <div className="relative min-w-[200px] flex-1 sm:max-w-xs">
+    <div className="grid min-w-0 gap-4" ref={galleryTop}>
+      <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+        <div className="relative min-w-0 flex-[1_1_12rem]">
           <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             aria-label="搜索产物"
@@ -375,7 +452,13 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
           </SelectContent>
         </Select>
 
-        <div className="ml-auto flex items-center gap-1.5">
+        <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          <Button aria-pressed={selecting} disabled={batchBusy} onClick={() => {
+            setSelecting(!selecting);
+            if (selecting) setSelectedIds(new Set());
+          }} size="sm" type="button" variant={selecting ? "secondary" : "outline"}>
+            {selecting ? "退出多选" : "多选"}
+          </Button>
           <div
             aria-label="视图切换"
             className="inline-flex h-9 items-center rounded-md border bg-background p-0.5"
@@ -420,8 +503,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
         </div>
       </div>
 
-      {/* Count summary */}
-      {!cards.isPending && !cards.isError ? (
+      {hasActiveFilter && cards.isSuccess ? (
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           <span>
             {hasActiveFilter
@@ -431,11 +513,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
           {hasActiveFilter ? (
             <button
               className="text-xs text-foreground/80 underline-offset-2 hover:underline"
-              onClick={() => {
-                setSearchQuery("");
-                setTypeFilter("all");
-                setStatusFilter("all");
-              }}
+              onClick={() => updateBrowse({ q: "", type: "", status: "", page: "" })}
               type="button"
             >
               重置筛选
@@ -444,9 +522,25 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
         </div>
       ) : null}
 
-      <div>
+      {selecting && (
+        <div aria-label="批量管理" className="sticky top-2 z-10 flex min-w-0 flex-wrap items-center gap-2 rounded-xl border bg-background p-2 shadow-xs" role="group">
+          <label className="flex items-center gap-2 px-2 text-sm">
+            <Checkbox checked={onPageCount > 0 && (onPageCount === pageCards.length || "indeterminate")} disabled={batchBusy || !pageCards.length} onCheckedChange={(checked) => toggleCards(pageCards, checked === true)} />
+            全选本页
+          </label>
+          <span aria-live="polite" className="text-xs text-muted-foreground">已选择 {selected.length} 项 · 本页 {onPageCount} 项</span>
+          <div className="ml-auto flex flex-wrap items-center gap-1.5">
+            <Button disabled={batchBusy || !selectedPublishable.length} onClick={() => void runBatch("publish", selectedPublishable)} size="sm" variant="outline"><Rocket />批量发布{selectedPublishable.length ? ` (${selectedPublishable.length})` : ""}</Button>
+            <Button disabled={batchBusy || !selected.length} onClick={() => void runBatch("download", selected)} size="sm" variant="outline"><Download />批量下载</Button>
+            <Button disabled={batchBusy || !selected.length} onClick={() => setBatchDelete(selected)} size="sm" variant="outline"><Trash2 />批量删除</Button>
+            <Button disabled={batchBusy || !selected.length} onClick={() => setSelectedIds(new Set())} size="sm" variant="ghost">清空选择</Button>
+          </div>
+        </div>
+      )}
+
+      <div className="min-w-0">
         {cards.isPending ? (
-          <div className="artifact-card-grid">
+          <div className="artifact-gallery-grid">
             <Skeleton className="h-[270px] w-full rounded-[12px]" />
             <Skeleton className="h-[270px] w-full rounded-[12px]" />
             <Skeleton className="h-[270px] w-full rounded-[12px]" />
@@ -461,7 +555,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
             <LayoutGrid className="size-6 text-muted-foreground" />
             <p className="text-sm font-medium">还没有产物</p>
             <p className="text-xs text-muted-foreground">
-              在会话中让智能体生成 Magic Card、SVG 图示或学习页面后，会自动收录到这里。
+              在会话中生成互动练习、图示或学习页面后，会自动收录到这里。
             </p>
           </div>
         ) : filteredCards.length === 0 ? (
@@ -473,8 +567,8 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
             </p>
           </div>
         ) : viewMode === "grid" ? (
-          <div className="artifact-card-grid">
-            {filteredCards.slice(0, visibleCount).map((card) => {
+          <div className="artifact-gallery-grid">
+            {pageCards.map((card) => {
               const kind = effectiveKindFor(card);
               const kindMeta = artifactKindMeta(kind);
               const source = formatArtifactSource(card);
@@ -483,69 +577,46 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
               return (
                 <ArtifactCardShell
                   card={card}
-                  footer={
+                  compact
+                  selection={selecting ? { checked: selectedIds.has(card.card_id), disabled: batchBusy, toggle: (shiftKey?: boolean) => toggleCard(card, shiftKey) } : undefined}
+                  footer={selecting ? null : (
                     <>
                       <Button
-                        className="h-7 gap-1.5 px-2 text-xs font-medium text-foreground/85 hover:text-foreground"
+                        className="rounded-xl"
                         onClick={() => openRuntimeOrViewer(card, kind)}
                         size="sm"
                         type="button"
-                        variant="ghost"
                       >
                         <PrimaryActionIcon kind={kind} />
                         {kindMeta.actionLabel}
                       </Button>
                       <Button
                         aria-label={`分享 ${card.title}`}
-                        className="ml-auto h-7 gap-1.5 px-2 text-xs text-muted-foreground hover:text-foreground"
+                        className="ml-auto text-muted-foreground hover:text-foreground"
                         onClick={() => setShareTarget(card)}
-                        size="sm"
+                        size="icon-sm"
                         title="分享与发布"
                         type="button"
                         variant="ghost"
                       >
-                        <Share2 className="size-3.5" />
-                        分享
+                        <Share2 className="size-4" />
                       </Button>
+                      {renderMoreMenu(card)}
                     </>
-                  }
-                  headerAction={renderMoreMenu(card)}
+                  )}
                   key={card.id}
+                  updated={<time className="shrink-0" dateTime={card.updated_at} title={`更新于 ${formatDate(card.updated_at)}`}>{updatedText}</time>}
                   onActivate={(_id, resolved) => openRuntimeOrViewer(card, resolved ?? kind)}
                   onResolvedKind={handleKindResolved}
-                  subtitle={
-                    <>
-                      <span className="truncate" title={source}>
-                        {source}
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span className="shrink-0" title={`更新于 ${formatDate(card.updated_at)}`}>
-                        {updatedText}
-                      </span>
-                      {card.status === "published" && card.latest_version > 0 ? (
-                        <span className="ml-auto shrink-0 rounded bg-muted px-1.5 py-0.2 text-[10px] font-medium text-muted-foreground">
-                          v{card.latest_version}
-                          {card.draft_dirty ? "*" : ""}
-                        </span>
-                      ) : null}
-                    </>
-                  }
+                  subtitle={<span className="truncate" title={source}>{source}</span>}
                   workspaceId={workspaceId}
                 />
               );
             })}
-            {visibleCount < filteredCards.length ? (
-              <div
-                ref={sentinelRef}
-                className="flex items-center justify-center rounded-xl border border-dashed py-6 text-xs text-muted-foreground"
-              >
-                继续滚动加载更多…
-              </div>
-            ) : null}
           </div>
         ) : (
-          <div className="flex flex-col gap-2.5">
-            {filteredCards.slice(0, visibleCount).map((card) => {
+          <div className="grid gap-3">
+            {pageCards.map((card) => {
               const kind = effectiveKindFor(card);
               const kindMeta = artifactKindMeta(kind);
               const source = formatArtifactSource(card);
@@ -554,31 +625,23 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
               return (
                 <article
                   aria-label={card.title}
-                  className="group flex flex-col gap-3 rounded-[12px] border border-[#e5e5e5] bg-background p-2.5 transition-all duration-200 hover:border-[#c8c8cc] hover:shadow-sm sm:flex-row sm:items-center dark:border-border dark:hover:border-border/90"
+                  className="artifact-gallery-row relative grid min-w-0 items-center gap-3 rounded-xl border bg-card p-3"
+                  data-selected={selecting && selectedIds.has(card.card_id)}
                   key={card.id}
+                  onClick={selecting ? (event) => { if (!(event.target as Element).closest('button')) toggleCard(card, event.shiftKey); } : undefined}
                 >
-                  <div
-                    className="w-full shrink-0 cursor-pointer sm:w-44"
-                    onClick={() => openRuntimeOrViewer(card, kind)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        openRuntimeOrViewer(card, kind);
-                      }
-                    }}
-                  >
+                  {selecting && <Checkbox aria-label={`选择 ${card.title}`} checked={selectedIds.has(card.card_id)} className="absolute left-5 top-5 z-10 size-5 bg-background" disabled={batchBusy} onClickCapture={(event) => { cardShiftRef.current = event.shiftKey; }} onCheckedChange={() => toggleCard(card)} />}
+                  <div className="relative min-w-0">
                     <CardInlinePreview
                       card={card}
-                      kind={kind}
                       onKindResolved={(resolved) => handleKindResolved(card.card_id, resolved)}
                       workspaceId={workspaceId}
                     />
+                    {!selecting && <button aria-label={`${kindMeta.actionLabel} ${card.title}`} className="absolute inset-0 cursor-pointer rounded-xl focus-visible:ring-2 focus-visible:ring-ring" onClick={() => openRuntimeOrViewer(card, kind)} type="button" />}
                   </div>
-                  <div className="min-w-0 flex-1 space-y-1 px-1">
+                  <div className="min-w-0 space-y-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="truncate text-[15px] font-semibold text-foreground">
+                      <h3 className="min-w-0 line-clamp-2 break-words text-base font-semibold text-foreground" title={card.title}>
                         {card.title}
                       </h3>
                       <StatusBadge card={card} />
@@ -592,7 +655,7 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                       {kindMeta.filterLabel} · {source} · {updatedText}
                     </p>
                   </div>
-                  <div className="flex shrink-0 items-center gap-1.5 px-1">
+                  {!selecting && <div className="artifact-gallery-row-actions flex min-w-0 flex-wrap items-center gap-1.5">
                     <Button
                       onClick={() => openRuntimeOrViewer(card, kind)}
                       size="sm"
@@ -610,16 +673,40 @@ export function CardArtifactsPanel({ workspaceId }: { workspaceId: string }) {
                       variant="ghost"
                     >
                       <Share2 className="size-3.5" />
-                      分享
+                      <span className="artifact-gallery-share-label">分享</span>
                     </Button>
                     {renderMoreMenu(card)}
-                  </div>
+                  </div>}
                 </article>
               );
             })}
           </div>
         )}
       </div>
+
+      {cards.isSuccess && filteredCards.length > 0 && (
+        <Pagination page={page} pageSize={pageSize} total={filteredCards.length} onPageChange={changePage} onPageSizeChange={(size) => {
+          updateBrowse({ size: String(size), page: "" }, false);
+          galleryTop.current?.scrollIntoView?.({ block: "start" });
+        }} />
+      )}
+      <AlertDialog open={Boolean(batchDelete)} onOpenChange={(open) => { if (!open && !batchBusy) setBatchDelete(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除选中的 {batchDelete?.length ?? 0} 项产物？</AlertDialogTitle>
+            <AlertDialogDescription>
+              范围包括所有已选项，不限于本页。产物将从库中移除，原始会话不受影响；若其中有产物已分享，其分享链接在产物删除期间将无法访问。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={batchBusy}>取消</AlertDialogCancel>
+            <AlertDialogAction disabled={batchBusy} onClick={(event) => {
+              event.preventDefault();
+              if (batchDelete) void runBatch("delete", batchDelete);
+            }} variant="destructive">{batchBusy ? "正在删除…" : "确认批量删除"}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Tier 3: Runtime / Static Viewer Dialog */}
       <ArtifactRuntimeDialog
@@ -728,6 +815,23 @@ function ArtifactRuntimeDialog({
 }) {
   const [zoom, setZoom] = useState(1);
   const [showSource, setShowSource] = useState(false);
+  const [maximized, setMaximized] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const sync = () => setFullscreen(document.fullscreenElement === dialogRef.current && Boolean(dialogRef.current));
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+  const toggleFullscreen = async () => {
+    try {
+      if (document.fullscreenElement === dialogRef.current && dialogRef.current) await document.exitFullscreen();
+      else if (dialogRef.current?.requestFullscreen) await dialogRef.current.requestFullscreen();
+      else setMaximized(true);
+    } catch {
+      setMaximized(true);
+    }
+  };
 
   const preview = useQuery({
     queryKey: workspaceQueryKey(
@@ -745,6 +849,7 @@ function ArtifactRuntimeDialog({
   useEffect(() => {
     setZoom(1);
     setShowSource(false);
+    setMaximized(false);
   }, [target?.card_id]);
 
   const snapshot = preview.data?.preview_snapshot ?? {};
@@ -758,48 +863,9 @@ function ArtifactRuntimeDialog({
     [effectiveKind, previewHtml],
   );
 
-  const handleDownload = () => {
-    if (!target || !previewHtml) return;
-    const isSvg = effectiveKind === "svg" && Boolean(svgMarkup);
-    const content = isSvg && svgMarkup ? svgMarkup : previewHtml;
-    const mime = isSvg ? "image/svg+xml;charset=utf-8" : "text/html;charset=utf-8";
-    const safeName = target.title.replace(/[\\/:*?"<>|]+/g, "_").trim() || target.card_id;
-    const filename = isSvg ? `${safeName}.svg` : `${safeName}.html`;
-    const blobUrl = URL.createObjectURL(new Blob([content], { type: mime }));
-    const anchor = document.createElement("a");
-    anchor.href = blobUrl;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 2_000);
-  };
-
-  return (
-    <Dialog
-      onOpenChange={(next) => {
-        if (!next) onClose();
-      }}
-      open={Boolean(target)}
-    >
-      <DialogContent
-        className="flex h-[86vh] max-h-[880px] w-[94vw] max-w-5xl flex-col gap-3 overflow-hidden p-4 sm:p-5"
-        showCloseButton
-      >
-        <DialogHeader className="shrink-0 pr-8">
-          <div className="flex flex-wrap items-center gap-2">
-            <ArtifactKindBadge kind={effectiveKind} />
-            <DialogTitle className="truncate text-base font-semibold">
-              {target?.title ?? "产物运行"}
-            </DialogTitle>
-            <span className="text-xs text-muted-foreground">
-              {artifactKindMeta(effectiveKind).modeLabel}
-            </span>
-          </div>
-          <DialogDescription className="sr-only">
-            产物运行与完整预览窗口
-          </DialogDescription>
-          <div className="flex flex-wrap items-center gap-1.5 pt-1">
+  const download = target && artifactDownload(target, snapshot);
+  const runtimeFooter = (
+    <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-t px-3 py-2 sm:px-4">
             {effectiveKind === "svg" ? (
               <>
                 <Button
@@ -848,10 +914,9 @@ function ArtifactRuntimeDialog({
                 ) : null}
               </>
             ) : null}
-            {previewHtml ? (
-              <Button onClick={handleDownload} size="xs" type="button" variant="outline">
-                <Download className="size-3.5" />
-                {effectiveKind === "svg" ? "下载 SVG" : "下载 HTML"}
+            {download ? (
+              <Button onClick={() => downloadBlob(new Blob([download.content], { type: download.extension === "svg" ? "image/svg+xml;charset=utf-8" : "text/html;charset=utf-8" }), `${download.name}.${download.extension}`)} size="xs" type="button" variant="ghost">
+                <Download className="size-3.5" />下载 {download.extension.toUpperCase()}
               </Button>
             ) : null}
             {target ? (
@@ -874,17 +939,47 @@ function ArtifactRuntimeDialog({
                 variant="ghost"
               >
                 <MessageSquare className="size-3.5" />
-                会话
+                来源会话
               </Button>
             ) : null}
+    </div>
+  );
+
+  return (
+    <Dialog onOpenChange={(next) => { if (!next) onClose(); }} open={Boolean(target)}>
+      <DialogContent
+        className="artifact-runtime-dialog flex flex-col gap-0 p-0 sm:max-w-none"
+        data-maximized={maximized}
+        data-wide={Boolean(snapshot.bundle_id || snapshot.artifact_url || Number(snapshot.preferred_height) > 580)}
+        data-kind={effectiveKind}
+        ref={dialogRef}
+        showCloseButton={false}
+        onEscapeKeyDown={(event) => {
+          if (maximized || fullscreen) {
+            event.preventDefault();
+            if (fullscreen) void toggleFullscreen();
+            else setMaximized(false);
+          }
+        }}
+      >
+        <DialogHeader className="flex shrink-0 flex-row items-center justify-between gap-2 border-b px-3 py-2.5 text-left sm:px-4">
+          <div className="min-w-0">
+            <DialogTitle className="line-clamp-2 break-words text-base font-semibold">{target?.title ?? "产物运行"}</DialogTitle>
+            <ArtifactKindBadge kind={effectiveKind} />
+          </div>
+          <DialogDescription className="sr-only">产物运行与完整预览窗口</DialogDescription>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button aria-label={fullscreen ? "退出全屏" : "全屏运行"} title={fullscreen ? "退出全屏" : "全屏运行"} disabled={!fullscreen && !document.fullscreenEnabled} onClick={() => void toggleFullscreen()} size="icon-sm" variant="ghost"><Scan /></Button>
+            <Button aria-label={maximized ? "还原窗口" : "最大化"} title={maximized ? "还原窗口" : "最大化"} aria-pressed={maximized} disabled={fullscreen} onClick={() => setMaximized((value) => !value)} size="icon-sm" variant="ghost">{maximized ? <Minimize2 /> : <Maximize2 />}</Button>
+            <Button aria-label="关闭" onClick={onClose} size="icon-sm" variant="ghost"><X /></Button>
           </div>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-1 flex-col overflow-auto rounded-lg border bg-muted/20 p-3">
+        <div className="artifact-runtime-stage">
           {preview.isPending ? (
-            <Skeleton className="h-full min-h-[360px] w-full" />
+            <Skeleton className="h-48 w-full rounded-none" />
           ) : preview.isError ? (
-            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+            <div className="grid min-h-28 place-content-center justify-items-center gap-3 p-4 text-center">
               <p className="text-sm text-destructive">
                 {preview.error instanceof Error ? preview.error.message : "加载产物失败"}
               </p>
@@ -899,38 +994,38 @@ function ArtifactRuntimeDialog({
               interactive={false}
             />
           ) : effectiveKind === "svg" && showSource && svgMarkup ? (
-            <pre className="h-full overflow-auto rounded-md bg-background p-4 font-mono text-xs leading-relaxed text-foreground">
+            <pre className="m-0 bg-background p-4 font-mono text-xs leading-relaxed text-foreground">
               <code>{svgMarkup}</code>
             </pre>
           ) : effectiveKind === "svg" && pureSvgDataUrl ? (
-            <div className="flex h-full w-full items-center justify-center overflow-auto">
+            <div className="artifact-runtime-svg" style={{ width: `${Math.max(1, zoom) * 100}%` }}>
               <img
                 alt={target?.title ?? "SVG 预览"}
-                className="max-h-full max-w-full object-contain transition-transform duration-150"
+                className="mx-auto block h-auto object-contain"
                 src={pureSvgDataUrl}
-                style={{ transform: `scale(${zoom})`, transformOrigin: "center center" }}
+                style={{ maxWidth: `${Math.min(1, zoom) * 100}%`, maxHeight: `calc(var(--artifact-svg-height) * ${zoom})` }}
               />
             </div>
           ) : effectiveKind === "svg" && previewHtml ? (
-            <div className="flex h-full w-full items-center justify-center overflow-auto">
-              <iframe
-                className="h-full w-full rounded-md border-0 bg-white transition-transform duration-150"
-                referrerPolicy="no-referrer"
-                sandbox=""
-                srcDoc={sandboxedHtmlPreviewDocument(previewHtml, { scripts: false })}
-                style={{ transform: `scale(${zoom})`, transformOrigin: "top center" }}
-                title={target?.title ?? "SVG 预览"}
-              />
-            </div>
+            <iframe
+              className="artifact-runtime-static-frame"
+              referrerPolicy="no-referrer"
+              sandbox=""
+              srcDoc={sandboxedHtmlPreviewDocument(previewHtml, { scripts: false })}
+              style={{ width: `${zoom * 100}%` }}
+              title={target?.title ?? "SVG 预览"}
+            />
           ) : (
             <MagicCardHost
               data={snapshot}
-              fillContainer
+              fitArtifact
+              expandedArtifact={maximized || fullscreen}
               hideHeader
               key={`runtime-${target?.card_id}-${target?.updated_at}`}
             />
           )}
         </div>
+        {runtimeFooter}
       </DialogContent>
     </Dialog>
   );

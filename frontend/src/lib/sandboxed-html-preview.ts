@@ -1,3 +1,4 @@
+import { artifactAutoSizeStyle, artifactSizeShim } from "./artifact-frame-size";
 import { sandboxRuntimeShimInlineTag } from "./sandbox-runtime-shim";
 import { subappClientInlineTag } from "./subapp-client-shim";
 
@@ -18,6 +19,8 @@ export const SANDBOXED_HTML_PREVIEW_CSP = [
 
 const DEFAULT_PREVIEW_STYLE =
   "html,body{margin:0;min-height:100%;font-family:system-ui,sans-serif;color:#171717;background:#fff}*{box-sizing:border-box}";
+const DEFAULT_AUTO_SIZE_PREVIEW_STYLE =
+  "html,body{margin:0;height:auto;min-height:0;font-family:system-ui,sans-serif;color:#171717;background:#fff}*{box-sizing:border-box}";
 
 /** Inline control channel used by the host preview pause controller. */
 const PREVIEW_CONTROL_SHIM = `<script>(function(){
@@ -83,6 +86,8 @@ export interface SandboxedHtmlPreviewOptions {
   offline?: boolean
   /** Disable executable book content and omit host script shims. */
   scripts?: boolean
+  /** Report layout size to the artifact gallery, never to embedded covers. */
+  measureArtifact?: boolean
   /**
    * Inject the browser-sandbox runtime shim (`window.__lg` + `fetch` relay).
    * The shim talks to the host bridge over postMessage (`lg:1` protocol) so
@@ -190,12 +195,20 @@ export function sandboxedHtmlPreviewDocument(
 
   const scripts = options.scripts !== false;
   if (!scripts) doc.querySelectorAll("script").forEach((node) => node.remove());
+  const autoMeasure = scripts && Boolean(options.measureArtifact);
   const shimTag = scripts && options.runtimeShim ? sandboxRuntimeShimInlineTag() : "";
   const clientTag = scripts && options.subappClient ? subappClientInlineTag() : "";
   let policy = options.offline ? "default-src 'none'; img-src data: blob:; media-src data: blob:; font-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" : SANDBOXED_HTML_PREVIEW_CSP;
   if (!scripts) policy = policy.replace(/script-src[^;]*/u, "script-src 'none'");
-  const hostHead = parser.parseFromString(`<head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${DEFAULT_PREVIEW_STYLE}</style>${scripts ? PREVIEW_CONTROL_SHIM : ""}${shimTag}${clientTag}</head>`, "text/html").head;
+  const baseStyle = autoMeasure ? DEFAULT_AUTO_SIZE_PREVIEW_STYLE : DEFAULT_PREVIEW_STYLE;
+  const hostHead = parser.parseFromString(`<head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${baseStyle}</style>${scripts ? PREVIEW_CONTROL_SHIM : ""}${shimTag}${clientTag}${autoMeasure ? artifactSizeShim : ""}</head>`, "text/html").head;
   doc.head.prepend(...hostHead.childNodes);
+  if (autoMeasure) {
+    // Appended after author styles so inline auto-height can shrink even when
+    // generated HTML sets html/body { min-height: 100vh; height: 100% }.
+    const autoStyleHead = parser.parseFromString(`<head>${artifactAutoSizeStyle}</head>`, "text/html").head;
+    doc.head.append(...autoStyleHead.childNodes);
+  }
   // Keep the sanitized document's lang/dir/classes/body styles: throwing away
   // these attributes loses generated backgrounds and can make text invisible.
   return `<!doctype html>${doc.documentElement.outerHTML}`;

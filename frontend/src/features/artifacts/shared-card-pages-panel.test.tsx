@@ -13,10 +13,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   batchArtifactCardShareTokens,
   cardShareUrl,
-  deleteArtifactCardShareTokenRecord,
   listAllArtifactCardShares,
   revealArtifactCardShareToken,
-  revokeArtifactCardShareToken,
 } from "@/api/artifacts";
 import { renderWithProviders } from "@/test/render";
 import type {
@@ -30,6 +28,7 @@ vi.mock("@/api/artifacts", () => ({
   batchArtifactCardShareTokens: vi.fn(),
   cardShareUrl: (rawToken: string) => `/api/v1/card-share/${encodeURIComponent(rawToken)}`,
   deleteArtifactCardShareTokenRecord: vi.fn(),
+  getArtifactCardPreview: vi.fn(async () => ({ preview_snapshot: {} })),
   listAllArtifactCardShares: vi.fn(),
   revealArtifactCardShareToken: vi.fn(),
   revokeArtifactCardShareToken: vi.fn(),
@@ -38,8 +37,6 @@ vi.mock("@/api/artifacts", () => ({
 const listShares = vi.mocked(listAllArtifactCardShares);
 const batchShares = vi.mocked(batchArtifactCardShareTokens);
 const revealShare = vi.mocked(revealArtifactCardShareToken);
-const purgeShare = vi.mocked(deleteArtifactCardShareTokenRecord);
-const revokeShare = vi.mocked(revokeArtifactCardShareToken);
 
 function share(
   overrides: Partial<ArtifactCardShareManagement> & { id: string },
@@ -86,18 +83,8 @@ const ROWS = [
 
 const writeText = vi.fn<(text: string) => Promise<void>>();
 
-/** 计数行由多个文本节点拼成（共 <strong>3</strong> 条分享），按元素文本整体断言。 */
-function headerNode(): HTMLElement {
-  return screen.getByText(
-    (_content, element) =>
-      element?.tagName === "P" && (element.textContent ?? "").trim().startsWith("共 "),
-  );
-}
-
-/** 等首屏加载完成（列表渲染前计数行不存在，避免断言到占位状态）。 */
-async function waitForCount(expected: string): Promise<HTMLElement> {
-  await waitFor(() => expect(headerNode().textContent).toContain(expected));
-  return headerNode();
+async function startBatch(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: "多选" }));
 }
 
 /**
@@ -112,6 +99,7 @@ function stubClipboard(): void {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   listShares.mockResolvedValue(ROWS);
   writeText.mockResolvedValue(undefined);
 });
@@ -121,12 +109,15 @@ describe("SharedCardPagesPanel 批量操作", () => {
     const user = userEvent.setup();
     renderWithProviders(<SharedCardPagesPanel workspaceId="ws-1" />);
 
-    await waitForCount("共 3 条分享");
-    expect(screen.queryByRole("button", { name: "批量撤销分享" })).toBeNull();
+    await screen.findByRole("button", { name: "多选" });
+    expect(screen.queryByRole("checkbox", { name: "全选已分享页面" })).toBeNull();
+    await startBatch(user);
+    await user.click(screen.getByRole("button", { name: "分享详情" }));
 
-    await user.click(screen.getByRole("checkbox", { name: "选择 卡片 revoked 的分享" }));
+    await user.click(screen.getByRole("checkbox", { name: "选择分享链接 2" }));
 
-    expect((await waitForCount("已选 1 项")).textContent).toContain("共 3 条分享");
+    expect(screen.getByText("已选 1 项")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "全选 卡片 active 的分享链接" })).toBePartiallyChecked();
     // 已撤销的行不能再撤销，但可以删除记录，也可以复制链接。
     expect(screen.getByRole("button", { name: "批量撤销分享" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "批量删除记录" })).toBeEnabled();
@@ -137,10 +128,10 @@ describe("SharedCardPagesPanel 批量操作", () => {
     const user = userEvent.setup();
     renderWithProviders(<SharedCardPagesPanel workspaceId="ws-1" />);
 
-    await waitForCount("共 3 条分享");
+    await startBatch(user);
     await user.click(screen.getByRole("checkbox", { name: "全选已分享页面" }));
 
-    expect((await waitForCount("已选 3 项")).textContent).toContain("共 3 条分享");
+    expect(screen.getByText("已选 3 项")).toBeInTheDocument();
     // revoked 行已撤销 → 批量撤销仍可用（active/legacy 未撤销）；legacy 行无令牌但 revoked 行可复制。
     expect(screen.getByRole("button", { name: "批量撤销分享" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "批量删除记录" })).toBeEnabled();
@@ -155,7 +146,7 @@ describe("SharedCardPagesPanel 批量操作", () => {
     batchShares.mockResolvedValue(batchResult("purge", 1, 2));
     renderWithProviders(<SharedCardPagesPanel workspaceId="ws-1" />);
 
-    await waitForCount("共 3 条分享");
+    await startBatch(user);
     await user.click(screen.getByRole("checkbox", { name: "全选已分享页面" }));
     await user.click(screen.getByRole("button", { name: "批量删除记录" }));
 
@@ -171,7 +162,7 @@ describe("SharedCardPagesPanel 批量操作", () => {
     expect(batchShares).toHaveBeenCalledWith(["revoked"], "purge");
     // 选择集在批量操作后清空，避免残留幽灵选中项。
     await waitFor(() => expect(screen.queryByRole("button", { name: "批量删除记录" })).toBeNull());
-    expect(headerNode().textContent).not.toContain("已选");
+    expect(screen.getByText("已选 0 项")).toBeInTheDocument();
   });
 
   it("批量撤销只下发未撤销的链接", async () => {
@@ -179,7 +170,7 @@ describe("SharedCardPagesPanel 批量操作", () => {
     batchShares.mockResolvedValue(batchResult("revoke", 2, 1));
     renderWithProviders(<SharedCardPagesPanel workspaceId="ws-1" />);
 
-    await waitForCount("共 3 条分享");
+    await startBatch(user);
     await user.click(screen.getByRole("checkbox", { name: "全选已分享页面" }));
     await user.click(screen.getByRole("button", { name: "批量撤销分享" }));
 
@@ -197,7 +188,7 @@ describe("SharedCardPagesPanel 批量操作", () => {
     revealShare.mockImplementation(async (tokenId: string) => ({ token: `raw-${tokenId}` }));
     renderWithProviders(<SharedCardPagesPanel workspaceId="ws-1" />);
 
-    await waitForCount("共 3 条分享");
+    await startBatch(user);
     await user.click(screen.getByRole("checkbox", { name: "全选已分享页面" }));
     await user.click(screen.getByRole("button", { name: "批量复制链接" }));
 
@@ -211,24 +202,22 @@ describe("SharedCardPagesPanel 批量操作", () => {
     );
   });
 
-  it("有效链接的行内删除记录禁用，撤销后单个操作仍可用", async () => {
-    revokeShare.mockResolvedValue(ROWS[0]);
-    purgeShare.mockResolvedValue(ROWS[1]);
+  it("批量模式点击卡片选中整组，并在复制被拒绝时提供可选中的链接", async () => {
+    const user = userEvent.setup();
+    stubClipboard();
+    writeText.mockRejectedValueOnce(new Error("Clipboard denied"));
+    revealShare.mockImplementation(async (id) => ({ token: `raw-${id}` }));
     renderWithProviders(<SharedCardPagesPanel workspaceId="ws-1" />);
 
-    await waitForCount("共 3 条分享");
+    await startBatch(user);
+    await user.click(screen.getByRole("button", { name: "选择 卡片 active 的分享" }));
+    expect(screen.getByRole("checkbox", { name: "全选 卡片 active 的分享链接" })).toBeChecked();
+    expect(revealShare).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "批量复制链接" }));
 
-    const activeRow = screen.getByText("卡片 active").closest("div.flex.flex-col");
-    expect(
-      within(activeRow as HTMLElement).getByRole("button", { name: "删除记录" }),
-    ).toBeDisabled();
-    expect(
-      within(activeRow as HTMLElement).getByRole("button", { name: "撤销分享" }),
-    ).toBeEnabled();
-
-    const revokedRow = screen.getByText("卡片 revoked").closest("div.flex.flex-col");
-    expect(
-      within(revokedRow as HTMLElement).getByRole("button", { name: "删除记录" }),
-    ).toBeEnabled();
+    const dialog = await screen.findByRole("dialog", { name: "手动复制分享链接" });
+    expect(within(dialog).getByRole("textbox", { name: "分享链接" })).toHaveValue(
+      ["raw-active", "raw-revoked"].map(token => window.location.origin + cardShareUrl(token)).join("\n"),
+    );
   });
 });

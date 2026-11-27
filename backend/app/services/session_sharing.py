@@ -83,6 +83,52 @@ def _utc_datetime(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _sanitize_ui_snapshot(data: dict) -> dict | None:
+    """Keep a display-safe Stream UI snapshot without internal workspace refs."""
+    snapshot = dict(data)
+    preview = snapshot.get("preview")
+    if isinstance(preview, dict):
+        base = preview.get("base")
+        if isinstance(base, dict):
+            snapshot = dict(base)
+        else:
+            snapshot.pop("preview", None)
+    if snapshot.get("state") == "removed":
+        return None
+    snapshot.pop("preview", None)
+    props = snapshot.get("props")
+    if isinstance(props, dict):
+        cleaned_props = dict(props)
+        cleaned_props.pop("data_ref", None)
+        snapshot["props"] = cleaned_props
+    blocks = snapshot.get("blocks")
+    if isinstance(blocks, list):
+        cleaned_blocks: list[dict] = []
+        for raw_block in blocks:
+            if not isinstance(raw_block, dict):
+                continue
+            block = dict(raw_block)
+            media = block.get("media")
+            if isinstance(media, list):
+                safe_media: list[dict] = []
+                for item in media:
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url") or "")
+                    if url and not url.startswith(("https://", "http://")):
+                        continue
+                    safe_media.append(dict(item))
+                block["media"] = safe_media
+            visual = block.get("visual")
+            if isinstance(visual, dict) and isinstance(visual.get("props"), dict):
+                vprops = dict(visual["props"])
+                vprops.pop("data_ref", None)
+                block["visual"] = {**visual, "props": vprops}
+            cleaned_blocks.append(block)
+        snapshot["blocks"] = cleaned_blocks
+    return snapshot
+
+
 def _sanitize_parts(parts: list[dict]) -> list[dict]:
     """Project message parts onto a display-safe subset for the snapshot."""
     out: list[dict] = []
@@ -93,6 +139,24 @@ def _sanitize_parts(parts: list[dict]) -> list[dict]:
         kind = str(p.get("type") or "")
         if kind in _TEXT_KINDS:
             out.append(p)
+            continue
+        if kind == "ui":
+            raw_ui = p.get("data")
+            if isinstance(raw_ui, dict):
+                cleaned_ui = _sanitize_ui_snapshot(raw_ui)
+                if cleaned_ui is not None:
+                    out.append({**p, "data": cleaned_ui})
+            continue
+        if kind == "svg":
+            raw_svg = p.get("data")
+            if isinstance(raw_svg, dict) and raw_svg.get("state") != "removed":
+                safe_svg = {
+                    key: raw_svg[key]
+                    for key in ("block_id", "title", "view_box", "nodes", "svg", "state")
+                    if key in raw_svg
+                }
+                if safe_svg:
+                    out.append({**p, "content": "", "data": safe_svg})
             continue
         if kind == _SOURCE_KIND:
             raw = p.get("data") or {}

@@ -112,8 +112,8 @@ describe('Artifact Gallery CardArtifactsPanel', () => {
     const outerCard = viewport.closest('article') as HTMLElement
 
     expect(viewport).toHaveClass('aspect-video')
-    expect(viewport).toHaveClass('rounded-[8px]')
-    expect(outerCard).toHaveClass('rounded-[12px]', 'p-2')
+    expect(viewport).toHaveClass('rounded-[16px]')
+    expect(outerCard).toHaveClass('rounded-[24px]', 'p-3')
     expect(screen.queryByText('点击播放')).toBeNull()
 
     // Title + source below preview, primary action + share in footer
@@ -182,7 +182,7 @@ describe('Artifact Gallery CardArtifactsPanel', () => {
     expect(section).toBeTruthy()
   })
 
-  it('pauses animation cover by default and resumes while hovered', async () => {
+  it('keeps animation covers static and puts the type outside the preview', async () => {
     const card = cardFixture(3, { artifact_kind: 'animation', title: '波动传播动画' })
     listArtifactCards.mockResolvedValue([card])
     getArtifactCardPreview.mockResolvedValue(
@@ -204,23 +204,33 @@ describe('Artifact Gallery CardArtifactsPanel', () => {
       return f!
     })
 
-    fireEvent.load(iframe)
+    expect(iframe.getAttribute('sandbox')).toBe('')
+    expect(iframe.srcdoc).toContain('animation-play-state:paused')
+    expect(viewport.querySelector('[data-artifact-kind-badge]')).toBeNull()
+    expect(viewport.closest('article')?.querySelector('[data-artifact-kind-badge]')).toBeTruthy()
+  })
 
-    await waitFor(
-      () => expect(iframe.dataset.previewPaused).toBe('true'),
-      { timeout: 1500 },
-    )
-    expect(within(viewport).getByText('悬停播放')).toBeInTheDocument()
-
-    fireEvent.mouseEnter(viewport)
-    await waitFor(() => expect(iframe.dataset.previewPaused).toBe('false'))
-    expect(within(viewport).getByText('预览中')).toBeInTheDocument()
-
-    fireEvent.mouseLeave(viewport)
-    await waitFor(
-      () => expect(iframe.dataset.previewPaused).toBe('true'),
-      { timeout: 1500 },
-    )
+  it('preserves selection across pages and view modes', async () => {
+    const user = userEvent.setup()
+    const cards = Array.from({ length: 15 }, (_, i) => cardFixture(i + 1, { artifact_kind: 'html' }))
+    listArtifactCards.mockResolvedValue(cards)
+    getArtifactCardPreview.mockImplementation((id: string) => {
+      const card = cards.find((item) => item.card_id === id)!
+      return Promise.resolve(previewFixture(card, { preview_html: '<p>预览</p>' }))
+    })
+    renderWithProviders(<CardArtifactsPanel workspaceId="ws-1" />)
+    await screen.findByText('产物 1')
+    await user.click(screen.getByRole('button', { name: '多选' }))
+    await user.click(screen.getByRole('checkbox', { name: '选择 产物 1' }))
+    await user.click(screen.getByRole('button', { name: '下一页' }))
+    expect(screen.getByText('已选择 1 项 · 本页 0 项')).toBeInTheDocument()
+    await user.click(screen.getByRole('checkbox', { name: '选择 产物 13' }))
+    await user.click(screen.getByRole('button', { name: '列表视图' }))
+    expect(screen.getByRole('checkbox', { name: '选择 产物 13' })).toBeChecked()
+    expect(screen.getByText('已选择 2 项 · 本页 1 项')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '批量删除' }))
+    expect(screen.getByText(/范围包括所有已选项/)).toBeInTheDocument()
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('2 项')
   })
 
   it('filters cards by search query and resets filters', async () => {
@@ -249,6 +259,6 @@ describe('Artifact Gallery CardArtifactsPanel', () => {
 
     await user.click(screen.getByRole('button', { name: '重置筛选' }))
     expect(screen.getByText('矩阵乘法图解')).toBeInTheDocument()
-    expect(screen.getByText('全部产物 · 2')).toBeInTheDocument()
+    expect(screen.queryByText(/匹配产物/)).not.toBeInTheDocument()
   })
 })

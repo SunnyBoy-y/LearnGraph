@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import {
   Check,
   Copy,
+  Ellipsis,
   ExternalLink,
   FileText,
   Link2,
@@ -16,6 +17,7 @@ import {
   Upload,
 } from "lucide-react";
 import { toast } from '@/lib/notifications';
+import { applyRangeSelection, useEscapeKey } from "@/lib/list-selection";
 
 import {
   artifactShareUrl,
@@ -41,7 +43,6 @@ import { listFiles, uploadFile } from "@/api/files";
 import {
   PageFrame,
   SectionHeading,
-  Surface,
 } from "@/components/shared/page-elements";
 import {
   AlertDialog,
@@ -77,7 +78,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/features/auth/auth-context-value";
-import { CardArtifactsPanel } from "@/features/artifacts/card-artifacts-panel";
+import { CardArtifactsPanel, useGalleryCards } from "@/features/artifacts/card-artifacts-panel";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { DECLARATIVE_COMPONENT_CARD_TYPE } from "@/features/artifacts/card-types";
 import { ArtifactCardShell } from "@/features/artifacts/card-preview";
 import { workspaceQueryKey } from "@/lib/query-keys";
@@ -208,9 +210,12 @@ export function ArtifactsPage() {
     onError: (error: Error) => toast.error(error.message),
   });
 
+  const galleryCards = useGalleryCards(workspaceId);
+  const galleryShares = useGalleryShares(workspaceId);
+
   return (
-    <PageFrame className="max-w-[1360px]">
-      <header className="flex flex-col gap-3 border-b pb-4 sm:flex-row sm:items-center sm:justify-between">
+    <PageFrame className="min-w-0 max-w-[1760px] gap-4 sm:gap-5">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
           <h1
             className="break-words text-balance text-xl font-semibold tracking-tight sm:text-2xl"
@@ -234,14 +239,14 @@ export function ArtifactsPage() {
         </div>
       </header>
 
-      <Tabs defaultValue="cards">
+      <Tabs className="artifact-gallery-area" defaultValue="cards">
         <TabsList>
-          <TabsTrigger value="cards">我的产物</TabsTrigger>
+          <TabsTrigger value="cards">我的产物{galleryCards.data && <GalleryCount count={galleryCards.data.length} />}</TabsTrigger>
           {/* 「文件产物」入口已永久下线：不再提供 tab 触发器，页面内无法进入该视图。
               仅断入口——后端 /artifacts 系列接口、Artifact / ArtifactVersion 数据与
               已发出的分享链接原样保留；实现（含下方 value="files" 的 TabsContent）
               也一并保留，后续若需恢复只需把触发器加回此处。 */}
-          <TabsTrigger value="shared">已分享</TabsTrigger>
+          <TabsTrigger value="shared">已分享{galleryShares.data && <GalleryCount count={galleryShares.data.length} />}</TabsTrigger>
         </TabsList>
 
         <TabsContent className="mt-3" value="cards">
@@ -410,7 +415,7 @@ function cardShareStatus(share: ArtifactCardShareManagement): {
   if (share.max_views && share.view_count >= share.max_views) {
     return { label: "次数已用完", usable: false };
   }
-  return { label: "有效", usable: true };
+  return { label: "分享中", usable: true };
 }
 
 /**
@@ -437,20 +442,42 @@ function sharedCardPreviewModel(share: ArtifactCardShareManagement): ArtifactCar
   };
 }
 
+function GalleryCount({ count }: { count: number }) {
+  return <span className="rounded-full bg-muted px-1.5 text-xs tabular-nums text-muted-foreground">{count}</span>;
+}
+
+function useGalleryShares(workspaceId: string) {
+  return useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens", "all"),
+    queryFn: () => listAllArtifactCardShares({ exclude_card_type: DECLARATIVE_COMPONENT_CARD_TYPE }),
+  });
+}
+
 export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
   const queryClient = useQueryClient();
   const [deleteTarget, setDeleteTarget] = useState<ArtifactCardShareManagement | null>(null);
+  const [manualCopy, setManualCopy] = useState<{ text: string; skipped: number } | null>(null);
+  const [expandedCardId, setExpandedCardId] = useState<string | null>(null);
+  const [selecting, setSelecting] = useState(false);
   const [batchTarget, setBatchTarget] = useState<"revoke" | "purge" | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
-  const shares = useQuery({
-    queryKey: workspaceQueryKey(workspaceId, "cards", "share-tokens", "all"),
-    // 组件卡的分享记录同样不在本页显示：服务端按 card_type 排除，记录本身保留。
-    queryFn: () =>
-      listAllArtifactCardShares({ exclude_card_type: DECLARATIVE_COMPONENT_CARD_TYPE }),
-  });
+  const shares = useGalleryShares(workspaceId);
 
   // 选择集只保存 id：列表刷新后自动收敛，不留幽灵选中项。
   const rows = shares.data ?? [];
+  const groupedRows = useMemo(() => {
+    const source = shares.data ?? [];
+    const groups = new Map<string, ArtifactCardShareManagement[]>();
+    source.forEach((share) => groups.set(share.card_id, [...(groups.get(share.card_id) ?? []), share]));
+    return Array.from(groups, ([cardId, items]) => ({
+      cardId,
+      shares: items,
+      representative: items.find((item) => item.share_token_available && cardShareStatus(item).usable)
+        ?? items.find((item) => cardShareStatus(item).usable)
+        ?? items.find((item) => item.share_token_available)
+        ?? items[0],
+    }));
+  }, [shares.data]);
   const selectedShares = rows.filter((share) => selectedIds.has(share.id));
   const copyableShares = selectedShares.filter((share) => share.share_token_available);
   const revocableShares = selectedShares.filter((share) => !share.revoked_at);
@@ -476,13 +503,40 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
     }
   }, []);
 
-  const toggleSelected = (id: string, checked: boolean) =>
+  const shareAnchorRef = useRef<string | null>(null);
+  const shareShiftRef = useRef(false);
+  const orderedShareIds = useMemo(() => (shares.data ?? []).map((share) => share.id), [shares.data]);
+  const exitShareSelecting = useCallback(() => {
+    setSelecting(false);
+    setSelectedIds(new Set());
+    shareAnchorRef.current = null;
+  }, []);
+  useEscapeKey(selecting, exitShareSelecting);
+
+  const toggleGroup = (items: ArtifactCardShareManagement[], checked: boolean) =>
     setSelectedIds((current) => {
+      const next = new Set(current);
+      for (const item of items) {
+        if (checked) next.add(item.id);
+        else next.delete(item.id);
+      }
+      return next;
+    });
+
+  const toggleSelected = (id: string, checked: boolean, shiftKey?: boolean) => {
+    const useShift = shiftKey ?? shareShiftRef.current;
+    shareShiftRef.current = false;
+    setSelectedIds((current) => {
+      if (useShift && shareAnchorRef.current) {
+        return applyRangeSelection(current, orderedShareIds, shareAnchorRef.current, id, checked);
+      }
       const next = new Set(current);
       if (checked) next.add(id);
       else next.delete(id);
       return next;
     });
+    shareAnchorRef.current = id;
+  };
 
   const invalidateShares = () =>
     queryClient.invalidateQueries({
@@ -498,17 +552,23 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
     onError: (error: Error) => toast.error(error.message),
   });
 
+  async function copyShareText(text: string, skipped = 0) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setManualCopy({ text, skipped });
+      return;
+    }
+    const count = text.split("\n").length;
+    toast.success(`已复制 ${count} 条分享链接${skipped ? `，已跳过 ${skipped} 条无法复制的链接` : ""}`);
+  }
+
   const copyLink = useMutation({
     mutationFn: async (share: ArtifactCardShareManagement) => {
       const revealed = await revealArtifactCardShareToken(share.id);
       const shareUrl = window.location.origin + cardShareUrl(revealed.token);
-      try {
-        await navigator.clipboard.writeText(shareUrl);
-      } catch {
-        throw new Error(`浏览器拒绝了剪贴板写入，请手动复制：${shareUrl}`);
-      }
+      await copyShareText(shareUrl);
     },
-    onSuccess: () => toast.success("分享链接已复制"),
     onError: (error: Error) => toast.error(error.message),
   });
 
@@ -522,17 +582,8 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
         urls.push(window.location.origin + cardShareUrl(revealed.token));
       }
       if (!urls.length) throw new Error("选中的分享都没有留存完整令牌，无法复制；请重新生成分享链接");
-      try {
-        await navigator.clipboard.writeText(urls.join("\n"));
-      } catch {
-        throw new Error(`浏览器拒绝了剪贴板写入，请手动复制：\n${urls.join("\n")}`);
-      }
-      return { copied: urls.length, skipped: targets.length - urls.length };
+      await copyShareText(urls.join("\n"), targets.length - urls.length);
     },
-    onSuccess: ({ copied, skipped }) =>
-      skipped
-        ? toast.success(`已复制 ${copied} 条分享链接，${skipped} 条未留存完整令牌已跳过`)
-        : toast.success(`已复制 ${copied} 条分享链接`),
     onError: (error: Error) => toast.error(error.message),
   });
 
@@ -573,43 +624,67 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
       : ` 选中项里另有 ${rest} 条已撤销或已不存在，会跳过。`;
   };
 
+  const renderShareRows = (cardShares: ArtifactCardShareManagement[]) => (
+    <ul className="mt-3 divide-y border-t border-border/60 px-1" aria-label="分享链接">
+      {cardShares.map((share, index) => {
+        const status = cardShareStatus(share);
+        const name = share.label || `分享链接 ${index + 1}`;
+        return (
+          <li className="group flex flex-wrap items-center gap-x-2 gap-y-1 py-3" key={share.id}>
+            <Checkbox
+              aria-label={`选择分享链接 ${index + 1}`}
+              className={selecting ? undefined : "opacity-0 focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100"}
+              checked={selectedIds.has(share.id)}
+              onClickCapture={(event) => {
+                shareShiftRef.current = event.shiftKey;
+              }}
+              onCheckedChange={(value) => {
+                setSelecting(true);
+                toggleSelected(share.id, value === true);
+              }}
+            />
+            <div className="min-w-32 flex-1">
+              <p className="break-words text-sm font-medium">{name}</p>
+              <p className="text-xs text-muted-foreground">{status.label} · 版本 {share.card_version}{share.view_count > 0 ? ` · ${share.view_count} 次查看` : ""}</p>
+              <p className="text-xs text-muted-foreground">{share.expires_at ? `有效期至 ${formatDate(share.expires_at)}` : "不限有效期"} · {share.max_views ? `最多 ${share.max_views} 次访问` : "不限访问次数"}</p>
+            </div>
+            <Button aria-label={`打开 ${name}`} disabled={!status.usable || !share.share_token_available} onClick={() => void openSharePreview(share)} size="icon-sm" title="打开页面" variant="ghost"><ExternalLink className="size-4" /></Button>
+            <Button aria-label={`复制 ${name}`} disabled={!share.share_token_available || copyLink.isPending} onClick={() => copyLink.mutate(share)} size="icon-sm" title="复制链接" variant="ghost"><Copy className="size-4" /></Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild><Button aria-label={`${name} 的更多操作`} size="icon-sm" title="更多分享操作" variant="ghost"><Ellipsis className="size-4" /></Button></DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {!share.revoked_at ? <DropdownMenuItem disabled={revoke.isPending} onSelect={() => revoke.mutate(share.id)}>撤销分享</DropdownMenuItem> : null}
+                {!status.usable ? <DropdownMenuItem disabled={deleteRecord.isPending} variant="destructive" onSelect={() => setDeleteTarget(share)}>删除记录</DropdownMenuItem> : null}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </li>
+        );
+      })}
+    </ul>
+  );
+
   return (
-    <Surface className="p-5">
-      <SectionHeading
-        description="集中查看所有已发布卡片的预览与分享状态。可勾选后批量复制链接、撤销分享或删除失效记录；删除记录会永久移除该卡片，因此仅对已撤销、已到期或次数用完的链接开放。"
-        title="已分享页面"
-      />
-      {shares.isPending ? <Skeleton className="mt-4 h-24 w-full" /> : null}
-      {shares.isError ? <p className="mt-4 text-sm text-destructive">{shares.error.message}</p> : null}
+    <div className="space-y-4">
+      {shares.isPending ? <Skeleton className="h-24 w-full" /> : null}
+      {shares.isError ? <p className="text-sm text-destructive">{shares.error.message}</p> : null}
       {!shares.isSuccess ? null : !rows.length ? (
-        <p className="mt-4 rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground">还没有分享页面</p>
+        <p className="rounded-2xl border border-dashed p-8 text-center text-sm text-muted-foreground">还没有分享页面</p>
       ) : (
         <>
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+          <div className="flex justify-end">
+            <Button aria-pressed={selecting} onClick={() => {
+              if (selecting) exitShareSelecting();
+              else setSelecting(true);
+            }} size="sm" variant={selecting ? "secondary" : "outline"}>
+              {selecting ? "退出多选" : "多选"}
+            </Button>
+          </div>
+          {selecting ? <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-3">
             <div className="flex items-center gap-2">
-              <Checkbox
-                aria-label="全选已分享页面"
-                checked={allSelected ? true : someSelected ? "indeterminate" : false}
-                disabled={!rows.length}
-                onCheckedChange={(value) =>
-                  setSelectedIds(value === true ? new Set(rows.map((share) => share.id)) : new Set())
-                }
-              />
-              <p className="text-[13px] text-muted-foreground">
-                共 <strong className="font-semibold tabular-nums text-foreground">{rows.length}</strong> 条分享
-                {selectedShares.length ? (
-                  <>
-                    {" · 已选 "}
-                    <strong className="font-semibold tabular-nums text-foreground">
-                      {selectedShares.length}
-                    </strong>
-                    {" 项"}
-                  </>
-                ) : null}
-              </p>
+              <Checkbox aria-label="全选已分享页面" checked={allSelected ? true : someSelected ? "indeterminate" : false} disabled={!rows.length} onCheckedChange={(value) => setSelectedIds(value === true ? new Set(rows.map((share) => share.id)) : new Set())} />
+              <p className="text-[13px] text-muted-foreground">已选 {selectedShares.length} 项</p>
             </div>
-            {selectedShares.length ? (
-              <div className="flex flex-wrap items-center gap-2">
+            {selectedShares.length ? <div className="flex flex-wrap items-center gap-2">
                 <Button
                   disabled={!copyableShares.length || copySelected.isPending}
                   onClick={() => copySelected.mutate(selectedShares)}
@@ -655,91 +730,44 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
                   取消选择
                 </Button>
               </div>
-            ) : null}
-          </div>
+            : null}
+          </div> : null}
 
-          <div className="artifact-card-grid mt-3">
-            {rows.map((share: ArtifactCardShareManagement) => {
-              const status = cardShareStatus(share);
-              const selected = selectedIds.has(share.id);
+          <div className="artifact-gallery-grid items-start">
+            {groupedRows.map(({ cardId, shares: cardShares, representative: share }) => {
+              const activeCount = cardShares.filter((item) => cardShareStatus(item).usable).length;
+              const cardSelected = cardShares.some((item) => selectedIds.has(item.id));
+              const allCardSelected = cardShares.every((item) => selectedIds.has(item.id));
               const previewCard = sharedCardPreviewModel(share);
               return (
                 <ArtifactCardShell
-                  ariaLabel={`${share.card_title} v${share.card_version}`}
+                  ariaLabel={`${share.card_title}，${cardShares.length} 个分享链接`}
                   card={previewCard}
+                  activationLabel={selecting ? `${allCardSelected ? "取消选择" : "选择"} ${share.card_title} 的分享` : undefined}
+                  headerAction={selecting ? <Checkbox
+                    aria-label={`全选 ${share.card_title} 的分享链接`}
+                    checked={allCardSelected ? true : cardSelected ? "indeterminate" : false}
+                    onCheckedChange={(value) => toggleGroup(cardShares, value === true)}
+                  /> : null}
+                  expandedContent={expandedCardId === cardId ? renderShareRows(cardShares) : null}
                   footer={
                     <>
-                      <Checkbox
-                        aria-label={`选择 ${share.card_title} 的分享`}
-                        checked={selected}
-                        onCheckedChange={(value) => toggleSelected(share.id, value === true)}
-                      />
-                      <div className="ml-auto flex flex-wrap items-center gap-1.5">
-                        <Button
-                          disabled={!share.share_token_available || copyLink.isPending}
-                          onClick={() => copyLink.mutate(share)}
-                          size="xs"
-                          title={
-                            !share.share_token_available
-                              ? "该链接生成时未留存完整令牌，无法复制；请重新生成分享链接"
-                              : status.usable
-                                ? "复制该分享的完整链接"
-                                : "复制链接（该链接已失效，打开会提示不存在）"
-                          }
-                          type="button"
-                          variant="outline"
-                        >
-                          <Copy className="size-3.5" />
-                          复制链接
-                        </Button>
-                        {!share.revoked_at ? (
-                          <Button
-                            disabled={revoke.isPending}
-                            onClick={() => revoke.mutate(share.id)}
-                            size="xs"
-                            title="立即让该链接失效"
-                            type="button"
-                            variant="outline"
-                          >
-                            撤销分享
-                          </Button>
-                        ) : null}
-                        <Button
-                          disabled={status.usable || deleteRecord.isPending}
-                          onClick={() => setDeleteTarget(share)}
-                          size="xs"
-                          title={
-                            status.usable
-                              ? "请先撤销分享，再删除记录"
-                              : "从列表中永久移除这条分享记录"
-                          }
-                          type="button"
-                          variant="outline"
-                        >
-                          <Trash2 className="size-3.5" />
-                          删除记录
-                        </Button>
-                      </div>
+                      {selecting ? <p className="text-xs text-muted-foreground">{cardShares.filter((item) => selectedIds.has(item.id)).length} / {cardShares.length} 条已选</p> : <Button className="rounded-xl" onClick={() => void openSharePreview(share)} size="sm" type="button">
+                        <ExternalLink className="size-4" />打开页面
+                      </Button>}
+                      <Button aria-label={`复制 ${share.card_title} 的分享链接`} className="ml-auto" disabled={!share.share_token_available || copyLink.isPending} onClick={() => copyLink.mutate(share)} size="icon-sm" title="复制分享链接" type="button" variant="ghost">
+                        <Copy className="size-4" />
+                      </Button>
+                      <Button aria-expanded={expandedCardId === cardId} aria-label="分享详情" className="text-muted-foreground" onClick={() => setExpandedCardId(expandedCardId === cardId ? null : cardId)} size="icon-sm" title="分享详情" type="button" variant="ghost">
+                        <Ellipsis className="size-4" />
+                      </Button>
                     </>
                   }
-                  key={share.id}
-                  meta={
-                    <>
-                      <Badge variant={status.usable ? "outline" : "secondary"}>
-                        {status.label}
-                      </Badge>
-                      <span className="text-xs text-muted-foreground">
-                        v{share.card_version} · {share.label || "未命名分享"}
-                      </span>
-                      <span className="ml-auto max-w-full truncate font-mono text-[11px] text-muted-foreground">
-                        {share.token_prefix}… · 查看 {share.view_count}
-                        {share.max_views ? ` / ${share.max_views}` : ""}
-                      </span>
-                    </>
-                  }
-                  metaAriaLabel="分享状态与分享信息"
-                  onActivate={() => void openSharePreview(share)}
-                  selected={selected}
+                  key={cardId}
+                  meta={<span className="inline-flex items-center gap-1.5"><span className={`size-2 rounded-full ${activeCount ? "bg-emerald-500" : "bg-muted-foreground/50"}`} />{activeCount ? `${activeCount} 个链接分享中` : "暂无有效分享"} · {cardShares.length} 个链接</span>}
+                  metaAriaLabel="分享链接状态"
+                  onActivate={() => selecting ? toggleGroup(cardShares, !allCardSelected) : void openSharePreview(share)}
+                  selected={cardSelected}
                   version={share.card_version}
                   workspaceId={workspaceId}
                 />
@@ -749,6 +777,16 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
         </>
       )}
 
+      <Dialog open={manualCopy !== null} onOpenChange={(open) => { if (!open) setManualCopy(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>手动复制分享链接</DialogTitle>
+            <DialogDescription>浏览器未允许写入剪贴板。请在下方复制链接。{manualCopy?.skipped ? ` 已跳过 ${manualCopy.skipped} 条无法复制的链接。` : ""}</DialogDescription>
+          </DialogHeader>
+          <Textarea aria-label="分享链接" rows={4} readOnly value={manualCopy?.text ?? ""} onFocus={(event) => event.currentTarget.select()} />
+          <DialogFooter><Button type="button" onClick={() => setManualCopy(null)}>完成</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
       <AlertDialog
         onOpenChange={(next) => {
           if (!next) setBatchTarget(null);
@@ -818,7 +856,7 @@ export function SharedCardPagesPanel({ workspaceId }: { workspaceId: string }) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </Surface>
+    </div>
   );
 }
 
@@ -1276,6 +1314,10 @@ function PublishVersionDialog({
         (current) => current && [file, ...current.filter((item) => item.id !== file.id)],
       );
       toast.success("文件已上传");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files-storage-summary") }),
+      ]);
     },
     onError: (error: Error) => toast.error(error.message),
   });
@@ -1292,10 +1334,6 @@ function PublishVersionDialog({
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") }),
-        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files-storage-summary") }),
-      ]);
     if (file) uploadMutation.mutate(file);
     event.target.value = "";
   };

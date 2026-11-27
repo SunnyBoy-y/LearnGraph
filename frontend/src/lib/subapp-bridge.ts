@@ -799,10 +799,30 @@ export function createSubappChannel(options: SubappChannelOptions): SubappChanne
     startPolling()
   }
 
+  function currentUnlockMessage(active: SubappActiveSession): Record<string, unknown> {
+    if (!currentToken) return active.unlockMessage
+    const payload = asRecord(active.unlockMessage.payload)
+    if (!payload) return active.unlockMessage
+    return {
+      ...active.unlockMessage,
+      payload: { ...payload, token: currentToken },
+    }
+  }
+
   function handleIframeLoad(): void {
     if (destroyed) return
     iframeLoaded = true
-    if (envelope) activate()
+    if (!envelope) return
+    if (!delivered) {
+      activate()
+      return
+    }
+    // Re-sync unlock + latest state when the iframe reloads (e.g. after pause fallback).
+    const frame = options.getIframe()
+    if (!frame) return
+    postRendererUnlock(frame, currentUnlockMessage(envelope))
+    lastStateVersion = 0
+    void pollStates()
   }
 
   async function decideConsent(

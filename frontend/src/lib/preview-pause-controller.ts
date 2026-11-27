@@ -164,6 +164,8 @@ export function createPreviewPauseController(
         // A preview can disappear while the host is changing routes.
       }
       if (action === "pause") {
+        const existingTimer = fallbackTimers.get(frame);
+        if (existingTimer) window.clearTimeout(existingTimer);
         const timer = window.setTimeout(() => {
           // Unsupported/remote previews cannot acknowledge the protocol. Blank
           // their browsing context to terminate timers, workers and audio.
@@ -254,7 +256,9 @@ export function createPreviewPauseController(
   if (typeof window !== "undefined") window.addEventListener("message", onFrameAck);
   const onFrameLoad = (event: Event) => {
     const frame = event.target instanceof HTMLIFrameElement ? event.target : null;
-    if (frame && paused) frame.contentWindow?.postMessage({ lg: 1, kind: "preview.control", action: "pause", requestId: ++requestId }, "*");
+    if (frame && paused && !suspendedFrames.has(frame)) {
+      frame.contentWindow?.postMessage({ lg: 1, kind: "preview.control", action: "pause", requestId: ++requestId }, "*");
+    }
   };
   const resolvedRoot = resolveRoot(root);
   resolvedRoot?.addEventListener("load", onFrameLoad, true);
