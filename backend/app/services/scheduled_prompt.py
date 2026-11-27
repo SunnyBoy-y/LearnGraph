@@ -10,6 +10,13 @@ from app.domain.models import ChatSession,Message,utc_now
 from app.domain.extension_models import ScheduledExtensionTask as Task,ScheduledExtensionRun as Run
 
 
+def _needs_user_input(content: str | None) -> bool:
+    if not content:
+        return False
+    first_line = content.lstrip().splitlines()[0].strip() if content.lstrip() else ""
+    return first_line.upper().startswith("[NEEDS_INPUT]")
+
+
 def execute_prompt(service,task,run,session_factory):
     from app.api.deps import WorkspaceContext
     from app.domain.schemas.chat import MessageCreateRequest
@@ -34,6 +41,8 @@ def execute_prompt(service,task,run,session_factory):
     context=WorkspaceContext(service.principal,service.workspace,authz.workspace_permissions(service.workspace))
     chat=build_chat_service(db,workspace_context=context,settings=service.settings,provider_id=task.provider_id,
         model_id=task.model_id,agent_mode=task.agent_mode,search_route='auto' if task.web_search else 'disabled')
+    chat.prompt_channel='scheduled'
+    chat.prompt_interactive=False
     if not getattr(chat.model_provider,'available',True):
         raise AppError(503,'scheduled_model_unavailable','Configure an available model before running prompt tasks')
     # Every request/tool result remains in normal chat messages/parts. Do not
@@ -114,6 +123,12 @@ def execute_prompt(service,task,run,session_factory):
     if latest is None or latest.status!='completed':
         raise AppError(502,'scheduled_prompt_incomplete','Prompt did not produce a completed response; see its conversation')
     waiting=any(part.get('status')=='pending' and part.get('type') in {'fetch_authorization','egress_authorization','user_confirmation'} for part in latest.parts or [])
-    return {'status':'failed' if waiting else 'succeeded','chat_session_id':session_id,'message_id':latest.id,
-            'text':latest.content[:24000], 'error_code':'scheduled_prompt_waiting_approval' if waiting else None,
-            'error_message':'Open the result conversation to review the approval request' if waiting else None}
+    needs_input=(not waiting) and _needs_user_input(latest.content)
+    failed=waiting or needs_input
+    error_code='scheduled_prompt_waiting_approval' if waiting else ('scheduled_prompt_needs_input' if needs_input else None)
+    error_message=(
+        'Open the result conversation to review the approval request' if waiting
+        else ('Open the result conversation to provide the missing information' if needs_input else None)
+    )
+    return {'status':'failed' if failed else 'succeeded','chat_session_id':session_id,'message_id':latest.id,
+            'text':latest.content[:24000], 'error_code':error_code, 'error_message':error_message}

@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+RECOMMENDATION_ICONS = (
+    "newspaper", "book-open", "briefcase", "chart-no-axes-column", "code-xml", "bell",
+    "shopping-bag", "radar", "file-text", "languages", "calendar-days", "sparkles",
+)
+RECOMMENDATION_THEMES = ("blue", "sage", "violet", "amber", "rose", "slate")
 
 
 class ScheduleSuggestionRequest(BaseModel):
@@ -17,8 +24,16 @@ class ScheduleSuggestion(BaseModel):
 
     name: str = Field(min_length=1, max_length=80)
     prompt: str = Field(min_length=1, max_length=1000)
-    # Validate syntax, not a small icon allowlist: the client loads Lucide dynamically.
-    icon: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+    description: str | None = Field(default=None, max_length=100)
+    schedule: str | None = Field(default=None, max_length=48)
+    icon: str | None = None
+    theme: str | None = None
+
+    @field_validator("icon", "theme", mode="before")
+    @classmethod
+    def allowed_visual_metadata(cls, value: Any, info):
+        allowed = RECOMMENDATION_ICONS if info.field_name == "icon" else RECOMMENDATION_THEMES
+        return value if isinstance(value, str) and value in allowed else None
 
 
 class ScheduleSuggestionResponse(BaseModel):

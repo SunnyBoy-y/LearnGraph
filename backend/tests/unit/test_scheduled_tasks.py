@@ -261,3 +261,36 @@ def test_nonmanager_cannot_read_or_schedule(env):
     service = ScheduledTaskService(env.db,env.service.workspace,nonowner,env.settings)
     with pytest.raises(AppError,match='workspace.manage'):
         service.list()
+
+
+def test_default_timeout_and_utc_timestamps_and_timeout_result_status(env, monkeypatch):
+    from datetime import timezone
+    from app.domain.schemas.scheduled_tasks import ScheduledTaskCreate, ScheduledTaskView, ScheduledTaskRunView
+    prompt_payload = ScheduledTaskCreate(
+        name='Daily news', task_type='prompt', trigger_type='time', schedule_mode='daily',
+        time_of_day='08:30', timezone='Asia/Shanghai', prompt='Summarize tech news',
+    )
+    assert prompt_payload.timeout_seconds == 300
+    task = env.service.create(prompt_payload)
+    task_view = ScheduledTaskView.model_validate(task)
+    for dt in (task_view.next_run_at, task_view.created_at, task_view.updated_at):
+        assert dt is not None and dt.tzinfo == timezone.utc
+
+    run = env.service.claim(task.id)
+    def fake_timeout(service, claimed_task, claimed_run, session_factory):
+        claimed_run.result_json = {'chat_session_id': 'sess-timeout', 'status': 'running', 'task_id': claimed_task.id}
+        service.db.commit()
+        raise AppError(504, 'scheduled_prompt_timeout', 'Scheduled prompt exceeded its execution timeout')
+
+    import app.services.scheduled_prompt as prompt_module
+    monkeypatch.setattr(prompt_module, 'execute_prompt', fake_timeout)
+    execute_run(task.id, run.id, env.settings, env.factory)
+    env.db.expire_all()
+    finished_run = env.service.runs(task.id)[0]
+    assert finished_run.status == 'failed'
+    assert finished_run.error_code == 'scheduled_prompt_timeout'
+    assert finished_run.result_json['status'] == 'failed'
+    assert finished_run.result_json['error_code'] == 'scheduled_prompt_timeout'
+    run_view = ScheduledTaskRunView.model_validate(finished_run)
+    for dt in (run_view.scheduled_for, run_view.started_at, run_view.finished_at):
+        assert dt is not None and dt.tzinfo == timezone.utc

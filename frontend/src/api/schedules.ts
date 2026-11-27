@@ -1,6 +1,14 @@
 import { apiClient, type ApiRequestOptions } from "./client";
 import type { ScheduledTask, ScheduledTaskInput, ScheduledTaskRun } from "@/types/schedules";
-export interface ScheduleSuggestion { name: string; prompt: string; icon: string }
+export interface ScheduleSuggestion {
+  id?: string;
+  name: string;
+  prompt: string;
+  description?: string | null;
+  schedule?: string | null;
+  icon?: string | null;
+  theme?: string | null;
+}
 export interface ScheduleSuggestionsResponse { suggestions: ScheduleSuggestion[]; metadata: Record<string, unknown> }
 const root = "/scheduled-tasks";
 export const generateScheduleSuggestions = (options?: ApiRequestOptions) => apiClient.post<ScheduleSuggestionsResponse, { count: number }>(`${root}/suggestions`, { count: 5 }, options);

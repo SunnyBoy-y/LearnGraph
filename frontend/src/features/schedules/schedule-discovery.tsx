@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowUp, ChevronDown, Plus, RefreshCw, Sparkles } from "lucide-react";
-import { DynamicIcon, iconNames, type IconName } from "lucide-react/dynamic";
+import { ArrowUp, ChevronDown, Plus, RefreshCw } from "lucide-react";
+import { TaskRecommendationCard } from "./task-recommendation-card";
 import { useQuery } from "@tanstack/react-query";
 import { generateScheduleSuggestions } from "@/api/schedules";
 import { workspaceQueryKey } from "@/lib/query-keys";
@@ -11,14 +11,7 @@ import { PromptInput, PromptInputSubmit, PromptInputTextarea } from "@/component
 import { Button } from "@/components/ui/button";
 import { setSessionComposerPrefs } from "@/lib/session-composer-prefs";
 
-const availableIcons = new Set<string>(iconNames);
-function SuggestionIcon({ name }: { name: string }) {
-  return availableIcons.has(name)
-    ? <DynamicIcon name={name as IconName} size={24} fallback={() => <Sparkles className="size-6" />} />
-    : <Sparkles className="size-6" />;
-}
-
-export function ScheduleDiscovery({ workspaceId, onManualCreate, children }: { workspaceId: string; onManualCreate: () => void; children?: ReactNode }) {
+export function ScheduleDiscovery({ workspaceId, onManualCreate, children }: { workspaceId: string; onManualCreate: (opener: HTMLButtonElement) => void; children?: ReactNode }) {
   const navigate = useNavigate();
   const [draft, setDraft] = useState("");
   const [expanded, setExpanded] = useState(true);
@@ -79,43 +72,40 @@ export function ScheduleDiscovery({ workspaceId, onManualCreate, children }: { w
       <PromptInput className="schedule-composer" maxFiles={0}
         onError={() => setError("请在任务对话中添加附件")}
         onSubmit={({ text }) => submit(text)}>
-        <Button type="button" variant="ghost" size="icon" className="schedule-composer__add" aria-label="新建任务" title="手动设置任务" disabled={pending} onClick={onManualCreate}>
-          <Plus className="size-5" />
-        </Button>
-        <PromptInputTextarea ref={textarea} aria-label="安排任务" placeholder="安排任务" rows={1} maxLength={32000}
+        <PromptInputTextarea ref={textarea} aria-label="安排任务" placeholder="你希望我定期做什么？" rows={1} maxLength={32000}
           value={draft} disabled={pending} onChange={event => { setDraft(event.target.value); setError(""); }} />
-        <PromptInputSubmit className="schedule-composer__send" aria-label="发送任务" disabled={pending || !draft.trim()} status={pending ? "submitted" : "ready"}>
-          {pending ? undefined : <ArrowUp className="size-5" />}
-        </PromptInputSubmit>
+        <div className="schedule-composer__toolbar">
+          <Button type="button" variant="ghost" size="icon" className="schedule-composer__add" aria-label="新建任务" title="手动设置任务" disabled={pending} onClick={event => onManualCreate(event.currentTarget)}>
+            <Plus className="size-5" />
+          </Button>
+          <PromptInputSubmit className="schedule-composer__send" aria-label="发送任务" disabled={pending || !draft.trim()} status={pending ? "submitted" : "ready"}>
+            {pending ? undefined : <ArrowUp className="size-5" />}
+          </PromptInputSubmit>
+        </div>
       </PromptInput>
       {error ? <p role="alert" className="mt-3 text-sm text-destructive">{error}</p> : null}
     </div>
     {children}
     <section className="schedule-suggestions" aria-label="推荐任务">
-      <div className="flex items-center justify-between">
-        <Button type="button" variant="ghost" className="schedule-section-toggle" aria-expanded={expanded} aria-controls="schedule-suggestions" onClick={() => setExpanded(value => !value)}>
-          推荐<ChevronDown className={`size-4 transition-transform ${expanded ? "" : "-rotate-90"}`} />
-        </Button>
-        <Button type="button" variant="ghost" size="icon" aria-label="刷新任务推荐" disabled={suggestions.isFetching} onClick={() => { void suggestions.refetch(); }}>
-          <RefreshCw className={`size-4 ${suggestions.isFetching ? "animate-spin motion-reduce:animate-none" : ""}`} />
-        </Button>
+      <div className="schedule-suggestions__header">
+        <h2><button type="button" className="schedule-section-toggle" aria-expanded={expanded} aria-controls="schedule-suggestions" onClick={() => setExpanded(value => !value)}>
+          试试这些任务<ChevronDown aria-hidden="true" className={`size-4 transition-transform ${expanded ? "" : "-rotate-90"}`} />
+        </button></h2>
+        {expanded ? <Button type="button" variant="ghost" size="sm" className="schedule-suggestions__refresh" title="刷新任务推荐" disabled={suggestions.isFetching} onClick={() => { void suggestions.refetch(); }}>
+          换一组<RefreshCw aria-hidden="true" className={`size-4 ${suggestions.isFetching ? "animate-spin motion-reduce:animate-none" : ""}`} />
+        </Button> : null}
       </div>
-      {expanded ? <ul id="schedule-suggestions" className="schedule-suggestions__list" aria-busy={suggestions.isFetching}>
-        {suggestions.isPending ? Array.from({ length: 3 }, (_, index) => <li key={index} aria-hidden="true" className="schedule-suggestion animate-pulse motion-reduce:animate-none">
-          <span className="size-6 rounded-md bg-muted" /><span className="space-y-3"><span className="block h-4 w-1/3 rounded bg-muted" /><span className="block h-4 w-4/5 rounded bg-muted" /></span>
+      <ul id="schedule-suggestions" hidden={!expanded} className="schedule-suggestions__list" aria-busy={suggestions.isFetching}>
+        {suggestions.isPending ? Array.from({ length: 3 }, (_, index) => <li key={index} aria-hidden="true" className="task-recommendation-card task-recommendation-card--loading animate-pulse motion-reduce:animate-none">
+          <span className="block size-5 rounded bg-muted" /><span className="block h-4 w-2/3 rounded bg-muted" /><span className="block h-4 w-1/3 rounded bg-muted" />
         </li>) : null}
-        {(suggestions.data?.suggestions ?? []).map(suggestion => <li key={suggestion.name}>
-          <button type="button" className="schedule-suggestion" disabled={pending} aria-label={`安排${suggestion.name}`} onClick={() => {
-            setDraft(suggestion.prompt);
-            setError("");
-            textarea.current?.focus();
-          }}>
-            <span className="schedule-suggestion__icon" aria-hidden="true"><SuggestionIcon name={suggestion.icon} /></span>
-            <span className="min-w-0"><span className="schedule-suggestion__name">{suggestion.name}</span><span className="schedule-suggestion__description">{suggestion.prompt}</span></span>
-            <Plus className="schedule-suggestion__add size-5" aria-hidden="true" />
-          </button>
-        </li>)}
-      </ul> : null}
+        {(suggestions.data?.suggestions ?? []).map(suggestion => <TaskRecommendationCard key={suggestion.id ?? suggestion.name} suggestion={suggestion} disabled={pending} onAdd={() => {
+          setDraft(suggestion.prompt);
+          setError("");
+          textarea.current?.focus();
+        }} />)}
+        {suggestions.isSuccess && !suggestions.data.suggestions.length ? <li className="schedule-empty">暂无推荐</li> : null}
+      </ul>
     </section>
   </>;
 }

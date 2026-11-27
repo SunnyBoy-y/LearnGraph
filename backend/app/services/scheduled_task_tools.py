@@ -34,6 +34,7 @@ def tool_definition():
             'a token configured by the user. Always state name, next trigger and remaining count after saving. '
             'Use read before updating unknown tasks; never claim a task exists without a successful tool result. '
             'Actions list/read/create/update/pause/resume/delete/runs/run/cancel/catalog. Failed runs are not automatically retried. '
+            'timeout_seconds defaults to 300s (up to 3600s for prompt tasks, 600s for skill/MCP); raise it for research or multi-step web_search tasks. '
             'Changing the schedule never grants extension permissions or bypasses workspace access.'),
         'parameters':{'type':'object','properties':{
             'action':{'type':'string','enum':['list','read','create','update','pause','resume','delete','runs','run','cancel','catalog']},

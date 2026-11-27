@@ -176,6 +176,33 @@ def test_prompt_cancellation_is_not_falsely_reported_as_success(env,monkeypatch)
     assert actual.result_json['chat_session_id']
 
 
+def test_prompt_needs_input_marker_is_marked_failed_not_succeeded(env,monkeypatch):
+    from app.services.chat import ChatService
+    from app.providers.ports.model import ProviderStreamEvent
+    class Model:
+        available=True;provider_id='schedule-test';model_id='schedule-test';remote_capability=True
+        thinking_mode='off';actual_reasoning_effort=None;search_route='disabled'
+        supports_structured_chat=True
+        def stream_chat(self,messages,**kwargs):
+            yield ProviderStreamEvent(type='text_delta',content='[NEEDS_INPUT]\n缺少需要汇总的目标项目名称。')
+            yield ProviderStreamEvent(type='completed',finish_reason='stop')
+        def generate_json(self,*args,**kwargs):return {}
+    monkeypatch.setattr(
+        'app.services.chat_service_factory.build_chat_service',
+        lambda db,*,workspace_context,settings,**kwargs: ChatService(
+            db,workspace_context.workspace_id,workspace_context.principal.user_id,Model(),settings=settings
+        ),
+    )
+    task=env.service.create(prompt(agent_mode=False))
+    run=env.service.claim(task.id)
+    execute_run(task.id,run.id,env.settings,env.factory)
+    env.db.expire_all()
+    actual=env.db.get(Run,run.id)
+    assert actual.status=='failed'
+    assert actual.error_code=='scheduled_prompt_needs_input'
+    assert '[NEEDS_INPUT]' in actual.result_json['text']
+
+
 @pytest.mark.parametrize('session_mode', [None, 'new', 'existing'], ids=['no-parent', 'new-with-parent', 'existing'])
 @pytest.mark.parametrize('trigger', ['manual', 'scheduled'])
 @pytest.mark.parametrize('structured', [False, True], ids=['text-provider', 'structured-provider'])

@@ -332,6 +332,8 @@ def execute_run(task_id, run_id, settings, session_factory, *, recovered=False):
                 run.error_message = result.get("error_message") or "The extension did not succeed"
         except AppError as exc:
             run.status, run.error_code, run.error_message = "failed", exc.code, exc.message[:1000]
+            if isinstance(run.result_json, dict) and run.result_json.get("status") in {"pending", "running", "queued"}:
+                run.result_json = {**run.result_json, "status": "failed", "error_code": exc.code}
         except Exception:
             logger.exception("Scheduled extension execution failed: %s", run_id)
             db.rollback()
@@ -339,6 +341,8 @@ def execute_run(task_id, run_id, settings, session_factory, *, recovered=False):
             if run is None:
                 return
             run.status, run.error_code, run.error_message = "failed", "scheduled_execution_failed", "Execution failed; inspect backend logs"
+            if isinstance(run.result_json, dict) and run.result_json.get("status") in {"pending", "running", "queued"}:
+                run.result_json = {**run.result_json, "status": "failed", "error_code": "scheduled_execution_failed"}
         if not _lock_run_owner(db, task_id, token):
             db.rollback()
             return

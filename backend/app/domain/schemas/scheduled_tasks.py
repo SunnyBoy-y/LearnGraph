@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -46,7 +46,7 @@ class ScheduledTaskCreate(BaseModel):
     mcp_server_id: str | None = Field(default=None,max_length=36)
     tool_name: str | None = Field(default=None,max_length=128)
     payload_json: dict[str,Any] = Field(default_factory=dict)
-    timeout_seconds: int = Field(default=60,ge=1,le=3600)
+    timeout_seconds: int = Field(default=300,ge=1,le=3600)
 
     @field_validator('name')
     @classmethod
@@ -147,11 +147,10 @@ class ScheduledTaskView(ScheduledTaskCreate):
     created_at: datetime
     updated_at: datetime
 
-    @field_validator('run_at')
+    @field_validator('run_at','next_run_at','last_run_at','created_at','updated_at',mode='before')
     @classmethod
-    def aware_run_at(cls,value):
-        from datetime import timezone
-        return value.replace(tzinfo=timezone.utc) if value is not None and value.tzinfo is None else value
+    def aware_utc_datetimes(cls,value):
+        return value.replace(tzinfo=timezone.utc) if isinstance(value,datetime) and value.tzinfo is None else value
 
 
 class ScheduledTaskRunView(BaseModel):
@@ -168,6 +167,11 @@ class ScheduledTaskRunView(BaseModel):
     cancel_requested: bool = False
     error_code: str | None
     error_message: str | None
+
+    @field_validator('scheduled_for','started_at','finished_at')
+    @classmethod
+    def aware_utc_datetimes(cls,value):
+        return value.replace(tzinfo=timezone.utc) if value is not None and value.tzinfo is None else value
 
 
 class ScheduledEventPublish(BaseModel):

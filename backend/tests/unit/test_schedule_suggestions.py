@@ -28,7 +28,7 @@ from app.services.schedule_suggestions import ScheduleSuggestionService
 
 def suggestion(index=0, **overrides):
     return {"name": f"Python复习{index}", "prompt": f"每周复习Python列表与循环的知识点并提供练习{index}",
-            "icon": "brain-circuit", **overrides}
+            "icon": "book-open", **overrides}
 
 
 @pytest.fixture()
@@ -110,7 +110,7 @@ def test_authorized_personalized_json_billing_and_no_side_effects(env):
     project(env)
     result = env.service.generate(ScheduleSuggestionRequest())
     assert len(result.suggestions) == 5
-    assert result.suggestions[0].icon == "brain-circuit"
+    assert result.suggestions[0].icon == "book-open"
     assert result.metadata["memory_used"] is True
     assert "我喜欢Python编程" in env.prompts[0] and "Python基础学习" in env.prompts[0]
     assert "不可信数据" in env.prompts[0] and "allowed_effect" in env.prompts[0]
@@ -239,11 +239,9 @@ def test_task_summaries_are_bounded_and_do_not_include_payload(env):
 
 @pytest.mark.parametrize("output", [
     "", "not json", "```json\n{\"suggestions\": []}\n```", "[]", "{}",
-    json.dumps({"suggestions": [{"name": "x", "prompt": "y", "icon": "BrainCircuit"}]}),
     json.dumps({"suggestions": [suggestion(name="n" * 81)]}),
     json.dumps({"suggestions": [suggestion(prompt="p" * 1001)]}),
     json.dumps({"suggestions": [suggestion(name="   ")]}),
-    json.dumps({"suggestions": [suggestion(icon="<svg onload=alert(1)>")]}),
     json.dumps({"suggestions": [suggestion(enabled=True)]}),
     json.dumps({"suggestions": [suggestion(i) for i in range(8)]}),
     json.dumps({"suggestions": [], "metadata": {"secret": "x"}}),
@@ -264,11 +262,13 @@ def test_empty_model_output_is_not_replaced_by_templates(env):
     assert env.service.generate(ScheduleSuggestionRequest()).suggestions == []
 
 
-@pytest.mark.parametrize("icon", ["accessibility", "a-arrow-down", "book-open-check", "chart-no-axes-combined", "rotate-3d"])
-def test_icons_are_not_a_fixed_small_mapping(env, icon):
+@pytest.mark.parametrize("icon,theme,expected", [("newspaper", "blue", "newspaper"), ("rotate-3d", "#fff", None), (None, None, None), ({"markup": "invalid"}, [], None)])
+def test_visual_metadata_is_optional_and_restricted(env, icon, theme, expected):
     project(env)
-    env.output = json.dumps({"suggestions": [suggestion(icon=icon)]})
-    assert env.service.generate(ScheduleSuggestionRequest()).suggestions[0].icon == icon
+    env.output = json.dumps({"suggestions": [suggestion(icon=icon, theme=theme)]})
+    item = env.service.generate(ScheduleSuggestionRequest()).suggestions[0]
+    assert item.icon == expected
+    assert item.theme == ("blue" if expected else None)
 
 
 @pytest.mark.parametrize("error,code,status", [
@@ -390,7 +390,7 @@ def test_http_empty_json_contract_validation_and_static_route_order(env):
         body = response.json()
         assert set(body) == {"suggestions", "metadata"}
         assert len(body["suggestions"]) == 5
-        assert set(body["suggestions"][0]) == {"name", "prompt", "icon"}
+        assert set(body["suggestions"][0]) == {"name", "prompt", "icon", "theme", "description", "schedule"}
         for count in (1, 7):
             assert client.post("/api/v1/scheduled-tasks/suggestions", json={"count": count}).status_code == 200
         for payload in ({"count": 8}, {"count": True}, {"context": "injection"}):
