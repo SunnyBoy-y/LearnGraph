@@ -208,7 +208,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 8
-      start_period: 30s
+      start_period: 180s
     stop_grace_period: 20s
     restart: unless-stopped
     logging:
@@ -227,6 +227,8 @@ services:
       LEARNGRAPH_DATA_ROOT: /data
       LEARNGRAPH_DATABASE_URL: sqlite:////data/learngraph.db
       LEARNGRAPH_DATABASE_MIGRATION_STATE_DIR: ${LEARNGRAPH_DATABASE_MIGRATION_STATE_DIR:-/data/database-migration}
+      # Separate process cannot share app's in-process SQLite write gate.
+      LEARNGRAPH_SQLITE_BUSY_TIMEOUT_MS: ${LEARNGRAPH_FEISHU_SQLITE_BUSY_TIMEOUT_MS:-10000}
     volumes:
       - "${LEARNGRAPH_DATA_DIR:-learngraph-data}:/data"
     depends_on:

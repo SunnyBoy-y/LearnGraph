@@ -282,6 +282,7 @@ class PrimaryDatabaseEngine(Engine):
         self.settings = settings
         self._condition = threading.Condition(threading.RLock())
         self._borrowed = 0
+        self._connecting = 0
         self._barrier = False
         self._uncertain = False
         self._last_manifest_check = 0.0
@@ -298,11 +299,12 @@ class PrimaryDatabaseEngine(Engine):
         def release(_dbapi, record, *_args):
             with self._condition:
                 lease = record.info.pop("_lg_route_lease", None)
-                if lease is not None:
-                    lease.close()
                 if record.info.pop("_lg_primary_borrowed", False):
                     self._borrowed -= 1
-                    self._condition.notify_all()
+                    if self._borrowed == 0 and self._connecting == 0:
+                        self._condition.notify_all()
+            if lease is not None:
+                lease.close()
 
         event.listen(physical.pool, "checkin", release)
         event.listen(physical.pool, "invalidate", release)
@@ -311,56 +313,100 @@ class PrimaryDatabaseEngine(Engine):
         # The preview is a separate, read-only process using the same manifest.
         if self.physical.dialect.name == "postgresql":
             return
-        self._last_manifest_check = time.monotonic()
-        record = read_json(state_root(self.settings) / "active.json")
-        if record and record.get("phase") == "activation_pending":
-            recover_activation(self.settings, record)
-            record = read_json(state_root(self.settings) / "active.json")
-        if record and record.get("phase") == "postgresql_active" and record["job_id"] != self._manifest_identity:
-            self.activate(postgres_engine(decrypt_url(self.settings, record), read_only=self.settings.sqlite_read_only, settings=self.settings), record["job_id"])
+        active_path = state_root(self.settings) / "active.json"
+        if not active_path.exists():
+            self._last_manifest_check = time.monotonic()
+            return
+        with self._condition:
+            if self.physical.dialect.name == "postgresql":
+                return
+            self._last_manifest_check = time.monotonic()
+            record = read_json(active_path)
+            if record and record.get("phase") == "activation_pending":
+                recover_activation(self.settings, record)
+                record = read_json(active_path)
+            if record and record.get("phase") == "postgresql_active" and record["job_id"] != self._manifest_identity:
+                target = postgres_engine(
+                    decrypt_url(self.settings, record),
+                    read_only=self.settings.sqlite_read_only,
+                    settings=self.settings,
+                )
+                try:
+                    self.activate(target, record["job_id"])
+                except BaseException:
+                    target.dispose()
+                    raise
+
+    def _begin_connect(self, uncertain_message: str) -> bool:
+        with self._condition:
+            while self._barrier:
+                self._condition.wait(0.1)
+            if self._uncertain:
+                raise DatabaseActivationError(uncertain_message)
+            self._connecting += 1
+            return self.physical.dialect.name == "sqlite"
+
+    def _end_connect(self) -> None:
+        with self._condition:
+            self._connecting -= 1
+            if self._connecting == 0 and self._borrowed == 0:
+                self._condition.notify_all()
 
     def connect(self):
-        with self._condition:
-            while self._barrier:
-                self._condition.wait(0.1)
-            if self._uncertain:
-                raise DatabaseActivationError("Database activation is recovering; SQLite fallback is forbidden")
-            lease = RouteLease(state_root(self.settings), exclusive=False) if self.physical.dialect.name == "sqlite" else None
-            try:
+        # Release _condition before entering physical.connect() so pool checkin
+        # callbacks (which also acquire _condition) cannot deadlock against a
+        # waiter blocked on a full QueuePool.
+        need_sqlite_lease = self._begin_connect(
+            "Database activation is recovering; SQLite fallback is forbidden"
+        )
+        lease = None
+        try:
+            if need_sqlite_lease:
+                lease = RouteLease(state_root(self.settings), exclusive=False)
                 self._refresh_route()
-                connection = self.physical.connect()
-                connection._lg_physical_dispatch = connection.dispatch
-                connection.dispatch = type(connection.dispatch)(connection.dispatch, self.dispatch)
-                connection._has_events = connection._has_events or self._has_events
-                # SessionTransaction caches a bind by Connection.engine. Keep
-                # the public identity here as well, or a second flush would
-                # open a second SQLite transaction and lock against itself.
-                connection.engine = self
-                if lease is not None:
-                    connection.info["_lg_route_lease"] = lease
-                return connection
-            except BaseException:
-                if lease is not None:
-                    lease.close()
-                raise
+            physical = self.physical
+            if physical.dialect.name != "sqlite" and lease is not None:
+                lease.close()
+                lease = None
+            connection = physical.connect()
+            connection._lg_physical_dispatch = connection.dispatch
+            connection.dispatch = type(connection.dispatch)(connection.dispatch, self.dispatch)
+            connection._has_events = connection._has_events or self._has_events
+            # SessionTransaction caches a bind by Connection.engine. Keep
+            # the public identity here as well, or a second flush would
+            # open a second SQLite transaction and lock against itself.
+            connection.engine = self
+            if lease is not None:
+                connection.info["_lg_route_lease"] = lease
+            return connection
+        except BaseException:
+            if lease is not None:
+                lease.close()
+            raise
+        finally:
+            self._end_connect()
 
     def raw_connection(self):
-        with self._condition:
-            while self._barrier:
-                self._condition.wait(0.1)
-            if self._uncertain:
-                raise DatabaseActivationError("Database activation is recovering")
-            lease = RouteLease(state_root(self.settings), exclusive=False) if self.physical.dialect.name == "sqlite" else None
-            try:
+        need_sqlite_lease = self._begin_connect("Database activation is recovering")
+        lease = None
+        try:
+            if need_sqlite_lease:
+                lease = RouteLease(state_root(self.settings), exclusive=False)
                 self._refresh_route()
-                connection = self.physical.raw_connection()
-                if lease is not None:
-                    connection.info["_lg_route_lease"] = lease
-                return connection
-            except BaseException:
-                if lease is not None:
-                    lease.close()
-                raise
+            physical = self.physical
+            if physical.dialect.name != "sqlite" and lease is not None:
+                lease.close()
+                lease = None
+            connection = physical.raw_connection()
+            if lease is not None:
+                connection.info["_lg_route_lease"] = lease
+            return connection
+        except BaseException:
+            if lease is not None:
+                lease.close()
+            raise
+        finally:
+            self._end_connect()
 
     def execution_options(self, **options):
         return RoutingOptionEngine(self, options)
@@ -370,7 +416,7 @@ class PrimaryDatabaseEngine(Engine):
         with self._condition:
             self._barrier = True
             deadline = time.monotonic() + timeout
-            while self._borrowed:
+            while self._borrowed or self._connecting:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._barrier = False
@@ -392,6 +438,8 @@ class PrimaryDatabaseEngine(Engine):
             if self.physical.dialect.name == "postgresql":
                 if self._manifest_identity and self._manifest_identity != job_id:
                     raise DatabaseActivationError("A primary database is already active")
+                if target is not self.physical:
+                    target.dispose()
                 self._uncertain = False
                 return
             if not self.settings.sqlite_read_only:

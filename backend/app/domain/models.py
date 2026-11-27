@@ -377,7 +377,7 @@ class ChatSession(Base, TimestampMixin, WorkspaceScopedMixin):
     goal_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     graph_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    parent_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    parent_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     source_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     memory_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # Separate "use existing memory" from "contribute new memory". The legacy
@@ -799,7 +799,7 @@ class MessageSubmission(Base, TimestampMixin, WorkspaceScopedMixin):
     session_id: Mapped[str] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
     idempotency_key_hash: Mapped[str] = mapped_column(String(64))
     request_hash: Mapped[str] = mapped_column(String(64))
-    user_message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"))
+    user_message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"), index=True)
     assistant_message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"), index=True)
     message_version_id: Mapped[str] = mapped_column(
         ForeignKey("message_versions.id"), index=True
@@ -2281,6 +2281,7 @@ class SandboxAgentEvent(Base, WorkspaceScopedMixin):
     __table_args__ = (
         UniqueConstraint("task_id", "seq", name="uq_sandbox_agent_event_seq"),
         Index("ix_sandbox_agent_events_type", "event_type"),
+        Index("ix_sandbox_agent_events_created_at", "created_at"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     task_id: Mapped[str] = mapped_column(

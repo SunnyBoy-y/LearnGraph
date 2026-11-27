@@ -65,11 +65,16 @@ def acquire_advisory_lock(
             expires = expires.replace(tzinfo=timezone.utc)
         if expires is None or expires < now:
             try:
-                changed = db.execute(update(AdvisoryLock).where(
-                    AdvisoryLock.name == name,
-                    AdvisoryLock.token == row.token,
-                    or_(AdvisoryLock.expires_at.is_(None), AdvisoryLock.expires_at < now),
-                ).values(token=token, expires_at=expires_at, updated_at=now))
+                changed = db.execute(
+                    update(AdvisoryLock)
+                    .where(
+                        AdvisoryLock.name == name,
+                        AdvisoryLock.token == row.token,
+                        or_(AdvisoryLock.expires_at.is_(None), AdvisoryLock.expires_at < now),
+                    )
+                    .values(token=token, expires_at=expires_at, updated_at=now)
+                    .execution_options(synchronize_session=False)
+                )
                 db.commit()
                 return token if changed.rowcount == 1 else None
             except IntegrityError:  # pragma: no cover - defensive

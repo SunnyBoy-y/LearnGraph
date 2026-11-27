@@ -22,10 +22,78 @@ from app.services.site_backup import RUNTIME_FILES, database_path, managed_roots
 from app.services.backup_io import copy_member, work_root, require_space, small_bytes
 
 
+def _unlink_sqlite_sidecars(path: Path) -> None:
+    """Remove SQLite WAL/SHM sidecar files so stale frames never shadow a restored DB."""
+    for suffix in ("-wal", "-shm"):
+        path.with_name(path.name + suffix).unlink(missing_ok=True)
+
+
 def _copy_database(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)) as src, closing(sqlite3.connect(target)) as dst:
-        src.backup(dst)
+    _unlink_sqlite_sidecars(target)
+    with (
+        closing(sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True, timeout=5)) as src,
+        closing(sqlite3.connect(target, timeout=5)) as dst,
+    ):
+        src.backup(dst, pages=256, sleep=0.02)
+    _unlink_sqlite_sidecars(target)
+
+
+def recover_sqlite_offline(settings: Settings) -> dict:
+    """Roll back an interrupted offline SQLite site restore using its durable journal."""
+    from app.core.database_routing import atomic_json, read_json, state_root
+
+    journal_path = state_root(settings) / "site-restore.json"
+    journal = read_json(journal_path)
+    if not journal or journal.get("state") in {"COMPLETED", "ROLLED_BACK"}:
+        return {"status": "no_pending_restore"}
+    if journal.get("engine") != "sqlite":
+        from app.services.site_restore_postgresql import recover_offline as recover_pg_offline
+
+        return recover_pg_offline(settings)
+
+    recovery_id = journal["id"]
+    database = Path(journal["database"])
+    database_before = Path(journal["database_before"])
+    if journal.get("had_database"):
+        if database_before.exists():
+            _copy_database(database_before, database)
+    else:
+        database.unlink(missing_ok=True)
+        _unlink_sqlite_sidecars(database)
+
+    env_file = Path(journal["env_file"])
+    env_before = Path(journal["env_before"])
+    if journal.get("had_env"):
+        if env_before.exists():
+            env_file.parent.mkdir(parents=True, exist_ok=True)
+            env_file.write_bytes(small_bytes(env_before))
+    else:
+        env_file.unlink(missing_ok=True)
+
+    for item in reversed(journal.get("external", [])):
+        target = Path(item["path"])
+        backup_path = Path(item["backup"]) if item.get("backup") else None
+        if item.get("existed"):
+            if backup_path is not None and backup_path.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(small_bytes(backup_path))
+                os.chmod(target, 0o600)
+        else:
+            target.unlink(missing_ok=True)
+
+    for item in reversed(journal.get("roots", [])):
+        root = Path(item["path"])
+        previous = Path(item["previous"])
+        if previous.exists():
+            if root.exists():
+                root.rename(root.with_name(root.name + ".failed-site-restore-" + recovery_id))
+            previous.rename(root)
+        elif not item.get("existed") and root.exists():
+            root.rename(root.with_name(root.name + ".failed-site-restore-" + recovery_id))
+
+    atomic_json(journal_path, {**journal, "state": "ROLLED_BACK"})
+    return {"status": "rolled_back", "restart_required": True}
 
 
 def restore_offline(payload: bytes, password: str, settings: Settings, env_file: Path) -> dict:
@@ -56,7 +124,7 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
     if backup_database_kind(members) == "postgresql":
         from app.services.site_restore_postgresql import restore_site
         return restore_site(members, settings, env_file, url)
-    from app.core.database_routing import read_json, source_is_sealed, state_root
+    from app.core.database_routing import atomic_json, read_json, source_is_sealed, state_root
     from sqlalchemy.engine import make_url
     source_url = make_url(settings.database_url)
     migration_job = read_json(state_root(settings) / "job.json")
@@ -101,7 +169,30 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
     external_files: list[tuple[Path, bytes | None]] = []
     had_database = database.exists()
     had_env = env_file.exists()
-    require_space(database.parent, database.stat().st_size * 2 + sum(info["size"] for info in members.entries.values()))
+    journal_path = state_root(settings) / "site-restore.json"
+    journal_roots = [
+        {
+            "path": str(root),
+            "previous": str(root.with_name(root.name + ".before-site-restore-" + recovery_id)),
+            "existed": root.exists(),
+        }
+        for root in roots.values()
+    ]
+    journal_external: list[dict] = []
+    journal = {
+        "id": recovery_id,
+        "engine": "sqlite",
+        "state": "IN_PROGRESS",
+        "database": str(database),
+        "database_before": str(database_before),
+        "had_database": had_database,
+        "env_file": str(env_file),
+        "env_before": str(env_before),
+        "had_env": had_env,
+        "roots": journal_roots,
+        "external": journal_external,
+    }
+    require_space(database.parent, (database.stat().st_size if had_database else 0) * 2 + sum(info["size"] for info in members.entries.values()))
     with TemporaryDirectory(prefix="lg-site-restore-", dir=work_root(settings)) as temporary:
         staging = Path(temporary)
         snapshot = staging / "site.db"
@@ -112,9 +203,12 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
         if had_env:
             env_before.write_bytes(small_bytes(env_file))
             os.chmod(env_before, 0o600)
+        # Pre-stage all managed root directories BEFORE mutating live paths or
+        # recording the IN_PROGRESS journal so extraction failures leave zero
+        # side effects on live data.
+        staged_roots: list[tuple[Path, Path, Path]] = []
         try:
             for label, root in roots.items():
-                # Stage beside the root for an atomic same-filesystem rename.
                 root.parent.mkdir(parents=True, exist_ok=True)
                 pending = root.with_name(root.name + ".site-restore-" + recovery_id)
                 pending.mkdir(mode=0o700)
@@ -124,6 +218,19 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         copy_member(members, name, target)
                 previous = root.with_name(root.name + ".before-site-restore-" + recovery_id)
+                staged_roots.append((root, pending, previous))
+        except BaseException:
+            import shutil
+            for _root, pending, _previous in staged_roots:
+                if pending.is_dir() and not pending.is_symlink():
+                    shutil.rmtree(pending, ignore_errors=True)
+            raise
+
+        # Persist the crash-recovery journal before touching any live path so an
+        # abrupt kill/power-loss blocks startup until --recover-pending runs.
+        atomic_json(journal_path, journal)
+        try:
+            for root, pending, previous in staged_roots:
                 existed = root.exists()
                 if existed:
                     root.rename(previous)
@@ -141,7 +248,21 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
                 if content is not None and restored.get(name):
                     target = Path(restored[name]).resolve()
                     if not any(target.is_relative_to(root) for root in roots.values()):
-                        external_files.append((target, small_bytes(target) if target.exists() else None))
+                        original = small_bytes(target) if target.exists() else None
+                        external_files.append((target, original))
+                        backup_copy = None
+                        if original is not None:
+                            backup_copy = target.with_name(target.name + ".before-site-restore-" + recovery_id)
+                            backup_copy.write_bytes(original)
+                            os.chmod(backup_copy, 0o600)
+                        journal_external.append(
+                            {
+                                "path": str(target),
+                                "backup": str(backup_copy) if backup_copy else None,
+                                "existed": original is not None,
+                            }
+                        )
+                        atomic_json(journal_path, journal)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(content)
                     os.chmod(target, 0o600)
@@ -149,10 +270,19 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
                 target = settings.storage_root.resolve().parent / name
                 original = small_bytes(target) if target.exists() else None
                 external_files.append((target, original))
+                backup_copy = None
                 if original is not None:
-                    previous = target.with_name(target.name + ".before-site-restore-" + recovery_id)
-                    previous.write_bytes(original)
-                    os.chmod(previous, 0o600)
+                    backup_copy = target.with_name(target.name + ".before-site-restore-" + recovery_id)
+                    backup_copy.write_bytes(original)
+                    os.chmod(backup_copy, 0o600)
+                journal_external.append(
+                    {
+                        "path": str(target),
+                        "backup": str(backup_copy) if backup_copy else None,
+                        "existed": original is not None,
+                    }
+                )
+                atomic_json(journal_path, journal)
                 content = members.get("config-files/" + name)
                 if content is None:
                     target.unlink(missing_ok=True)
@@ -161,7 +291,7 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
                     os.chmod(target, 0o600)
             _copy_database(snapshot, database)
             # Restore accounts/permissions but revoke historical sessions.
-            with closing(sqlite3.connect(database)) as connection:
+            with closing(sqlite3.connect(database, timeout=5)) as connection:
                 connection.execute("UPDATE auth_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE revoked_at IS NULL")
                 connection.commit()
             env_file.parent.mkdir(parents=True, exist_ok=True)
@@ -175,11 +305,13 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
             temporary_env.write_text(text, encoding="utf-8")
             os.chmod(temporary_env, 0o600)
             temporary_env.replace(env_file)
+            atomic_json(journal_path, {**journal, "state": "COMPLETED"})
         except Exception:
             if had_database:
                 _copy_database(database_before, database)
             else:
                 database.unlink(missing_ok=True)
+                _unlink_sqlite_sidecars(database)
             if had_env:
                 env_file.write_bytes(small_bytes(env_before))
             else:
@@ -194,6 +326,7 @@ def _restore_validated(members, settings: Settings, env_file: Path) -> dict:
                     root.rename(root.with_name(root.name + ".failed-site-restore-" + recovery_id))
                 if existed:
                     previous.rename(root)
+            atomic_json(journal_path, {**journal, "state": "ROLLED_BACK"})
             raise
     return {"status": "restored", "restart_required": True, "rollback_database": str(database_before) if had_database else None, "rollback_configuration": str(env_before) if had_env else None}
 
@@ -209,11 +342,10 @@ def main() -> None:
         parser.error("必须先停止 API、worker 和调度器，再加 --server-stopped")
     settings = Settings()
     if arguments.recover_pending:
-        from app.services.site_restore_postgresql import recover_offline
         from app.core.database_routing import OperationLease, state_root
         lease = OperationLease(state_root(settings))
         try:
-            print(json.dumps(recover_offline(settings), ensure_ascii=False))
+            print(json.dumps(recover_sqlite_offline(settings), ensure_ascii=False))
         finally:
             lease.close()
         return

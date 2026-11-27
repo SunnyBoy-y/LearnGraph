@@ -79,8 +79,19 @@ def backup(settings, destination: Path, *, owner=None) -> dict:
                 database_name = "database.postgresql.dump"
             elif info["engine"] == "sqlite":
                 source = Path(make_url(url).database).resolve()
-                with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as live, closing(sqlite3.connect(database)) as copy:
-                    live.backup(copy)
+                backup_timeout = max(5.0, float(settings.sqlite_busy_timeout_ms) / 1000.0)
+                with (
+                    closing(
+                        sqlite3.connect(
+                            source.as_uri() + "?mode=ro",
+                            uri=True,
+                            timeout=backup_timeout,
+                        )
+                    ) as live,
+                    closing(sqlite3.connect(database, timeout=backup_timeout)) as copy,
+                ):
+                    live.execute(f"PRAGMA busy_timeout={int(backup_timeout * 1000)}")
+                    live.backup(copy, pages=256, sleep=0.02)
                     if copy.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or copy.execute("PRAGMA foreign_key_check").fetchone():
                         raise AppError(422, "database_backup_invalid", "SQLite 备份校验失败")
                 metadata, database_name = {"engine": "sqlite"}, "database.sqlite3"

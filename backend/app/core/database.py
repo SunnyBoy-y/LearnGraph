@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import sqlite3
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from collections.abc import Generator
 from contextlib import nullcontext
@@ -26,6 +28,8 @@ class Base(DeclarativeBase):
 
 # Register the queue ledger even for database-only entry points (backup/migration).
 from app.domain import task_reliability_models as _task_reliability_models  # noqa: E402, F401
+from app.domain import queued_turn_models as _queued_turn_models  # noqa: E402, F401
+from app.domain import sandbox_checkpoint_models as _sandbox_checkpoint_models  # noqa: E402, F401
 
 
 settings = get_settings()
@@ -79,6 +83,8 @@ def _configure_sqlite_connection(dbapi_connection: Any, _: Any) -> None:
         if cursor.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
             raise RuntimeError("SQLite foreign key enforcement could not be enabled")
         cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA cache_size=-16000")
 
         # A read-only companion process (currently the standalone preview
         # origin) shares the database volume with the API.  It must not execute
@@ -91,18 +97,24 @@ def _configure_sqlite_connection(dbapi_connection: Any, _: Any) -> None:
         database_path = cursor.execute("PRAGMA database_list").fetchone()[2]
         is_network_path = str(database_path).startswith(("\\\\", "//"))
         # WAL is required for concurrent readers/writers on a local desktop DB.
-        # The previous 3.51.3 gate kept Python's bundled 3.45.x on rollback
-        # journal mode, which surfaces as OperationalError: database is locked
-        # under normal multi-request auth/session traffic.
+        # Check current mode read-only first so pool warmup connections avoid
+        # acquiring a write lock when the database is already in WAL mode.
         if database_path and not is_network_path and database_path != ":memory:":
-            journal_mode = cursor.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-            if str(journal_mode).casefold() != "wal":
+            current_mode = str(cursor.execute("PRAGMA journal_mode").fetchone()[0]).casefold()
+            if current_mode != "wal":
+                journal_mode = str(cursor.execute("PRAGMA journal_mode=WAL").fetchone()[0]).casefold()
+            else:
+                journal_mode = current_mode
+            if journal_mode != "wal":
                 logger.warning(
                     "SQLite WAL mode requested but journal_mode=%s; concurrent writes may lock",
                     journal_mode,
                 )
             else:
                 cursor.execute("PRAGMA synchronous=NORMAL")
+                # Cap persistent WAL file size at 64 MiB so checkpoints return
+                # excess pages to the OS instead of growing unboundedly.
+                cursor.execute("PRAGMA journal_size_limit=67108864")
         elif is_network_path:
             logger.warning(
                 "SQLite database is on a network path; keeping rollback journal mode"
@@ -157,19 +169,43 @@ _SQLITE_WRITE_STMT_PREFIXES = (
     "ALTER",
     "VACUUM",
     "REINDEX",
+    "ANALYZE",
+    "ATTACH",
+    "DETACH",
 )
-# First characters shared by every write prefix above: I/U/D/R/C/A/V. The
-# hot path (every SELECT/PRAGMA/BEGIN) short-circuits on this cheap set
-# membership before paying for the full prefix match — the gate event must
-# stay negligible on read-heavy traffic.
-_WRITE_STMT_FIRST_CHARS = frozenset("IUDCRAV")
+# Case-insensitive first-character fast-path set covering every write prefix
+# above plus WITH (writable CTE) and BEGIN (IMMEDIATE/EXCLUSIVE).
+_WRITE_STMT_FIRST_CHARS = frozenset("IUDCRAVWBiudcravwb")
+_SQL_LEADING_COMMENT_RE = re.compile(
+    r"^(?:\s|--[^\n]*(?:\n|$)|/\*[\s\S]*?\*/)+"
+)
+_CTE_WRITE_VERB_RE = re.compile(r"\b(?:INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
+_BEGIN_WRITE_RE = re.compile(r"^BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)\b", re.IGNORECASE)
+
+
+def _strip_sql_lead(statement: str) -> str:
+    stripped = statement.lstrip()
+    if not stripped:
+        return ""
+    if stripped.startswith(("--", "/*")):
+        match = _SQL_LEADING_COMMENT_RE.match(stripped)
+        if match:
+            stripped = stripped[match.end():]
+    return stripped
 
 
 def _is_write_statement(statement: str) -> bool:
-    stripped = statement.lstrip()
+    stripped = _strip_sql_lead(statement)
     if not stripped or stripped[0] not in _WRITE_STMT_FIRST_CHARS:
         return False
-    return stripped[:16].upper().startswith(_SQLITE_WRITE_STMT_PREFIXES)
+    head = stripped[:24].upper()
+    if head.startswith(_SQLITE_WRITE_STMT_PREFIXES):
+        return True
+    if head.startswith("BEGIN"):
+        return bool(_BEGIN_WRITE_RE.match(stripped[:40]))
+    if head.startswith("WITH") and (len(head) == 4 or not head[4].isalnum()):
+        return bool(_CTE_WRITE_VERB_RE.search(stripped))
+    return False
 
 
 # Module-level diagnostics (P4-L2). Updated under _METRICS_LOCK so concurrent
@@ -223,120 +259,167 @@ def reset_sqlite_metrics() -> None:
             _sqlite_metrics[key] = 0.0
 
 
-# ── v2.0: cross-thread-safe reentrant gate lock ──────────────────────────
+# ── v3.0: token-owned cross-thread-safe reentrant gate lock ──────────────
 #
-# threading.RLock release() must run on the acquiring thread; a connection
-# holding the write gate can legally be handed to another thread (asyncio
-# to_thread workers, pool checkin/invalidate), where a plain RLock release
-# raises RuntimeError and permanently leaks the gate. This class keeps the
-# RLock interface (acquire/release, per-thread reentrancy, timeout) but the
-# underlying mutex is a plain threading.Lock whose release() any thread may
-# call, protected by a global reference count. A watchdog (epoch-based) can
-# force-reset a stranded hold without corrupting stale per-thread counters.
+# Ownership is tracked globally via monotonic generation tokens rather than
+# per-thread TLS counters. A connection holding the write gate receives its
+# token and may release it from any thread (including brand-new threads that
+# never called acquire()). Clearing ownership on release immediately revokes
+# reentrancy for the original thread, preventing mutual-exclusion bypasses.
+# Watchdog resets record the evicted token so a late release (from any thread)
+# is a safe no-op and can never unlock a subsequent holder.
 class _CrossThreadRLock:
     __slots__ = (
         "_state_lock",
         "_mutex",
         "_held",
-        "_tls",
-        "_epoch",
-        "_held_since",
         "_owner_tid",
+        "_held_since",
+        "_generation",
+        "_active_token",
+        "_watchdog_reset_order",
+        "_watchdog_reset_tokens",
+        "_tls",
     )
+
+    _MAX_TRACKED_RESETS = 256
 
     def __init__(self) -> None:
         self._state_lock = threading.Lock()
-        self._mutex = threading.Lock()  # the actual serialization mutex
-        self._held = 0  # global hold count (protected by _state_lock)
-        self._tls = threading.local()  # per-thread reentrancy count
-        self._epoch = 0  # bumped on watchdog reset; invalidates stale TLS
-        self._held_since: float | None = None  # monotonic ts of first hold
-        self._owner_tid: int | None = None  # thread that first acquired
+        self._mutex = threading.Lock()
+        self._held = 0
+        self._owner_tid: int | None = None
+        self._held_since: float | None = None
+        self._generation = 0
+        self._active_token: int | None = None
+        self._watchdog_reset_order: deque[int] = deque()
+        self._watchdog_reset_tokens: set[int] = set()
+        # Only stores the most recent token acquired on this thread as a hint
+        # for legacy no-arg release() after a watchdog reset.
+        self._tls = threading.local()
 
-    def _sync_tls(self) -> bool:
-        # Called with _state_lock held. Returns True when this thread's TLS
-        # was stale (a watchdog force-reset happened since its last acquire)
-        # and has just been re-initialized. A per-thread counter acquired
-        # under an older epoch is stale and must be dropped.
-        if getattr(self._tls, "epoch", None) != self._epoch:
-            self._tls.epoch = self._epoch
-            self._tls.count = 0
-            return True
-        return False
+    def _record_watchdog_reset_token(self, token: int | None) -> None:
+        if token is None or token in self._watchdog_reset_tokens:
+            return
+        self._watchdog_reset_tokens.add(token)
+        self._watchdog_reset_order.append(token)
+        while len(self._watchdog_reset_order) > self._MAX_TRACKED_RESETS:
+            evicted = self._watchdog_reset_order.popleft()
+            self._watchdog_reset_tokens.discard(evicted)
 
-    def _mark_acquired(self) -> None:
-        # Called with _state_lock held.
-        self._tls.count = 1
-        self._held += 1
-        if self._held_since is None:
-            self._held_since = time.monotonic()
-            self._owner_tid = threading.get_ident()
+    def _mark_acquired(self, tid: int) -> int:
+        # Called with _state_lock held after _mutex is acquired.
+        self._generation += 1
+        token = self._generation
+        self._held = 1
+        self._owner_tid = tid
+        self._held_since = time.monotonic()
+        self._active_token = token
+        self._tls.last_token = token
+        return token
+
+    def acquire_token(self, blocking: bool = True, timeout: float = -1) -> int | None:
+        tid = threading.get_ident()
+        with self._state_lock:
+            if self._held > 0 and self._owner_tid == tid and self._active_token is not None:
+                self._held += 1
+                self._tls.last_token = self._active_token
+                return self._active_token
+            if not blocking:
+                if not self._mutex.acquire(blocking=False):
+                    return None
+                return self._mark_acquired(tid)
+            if self._held == 0 and self._mutex.acquire(blocking=False):
+                return self._mark_acquired(tid)
+        # Blocking wait WITHOUT holding _state_lock so releases and watchdog
+        # checks are never blocked by waiters.
+        wait = -1 if timeout is None or timeout < 0 else timeout
+        acquired = (
+            self._mutex.acquire(blocking=True)
+            if wait < 0
+            else self._mutex.acquire(blocking=True, timeout=wait)
+        )
+        if not acquired:
+            return None
+        with self._state_lock:
+            return self._mark_acquired(tid)
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
-        # Same-thread reentrancy (interface parity with threading.RLock).
-        with self._state_lock:
-            self._sync_tls()
-            if self._tls.count > 0:
-                self._tls.count += 1
-                return True
-            if not blocking:
-                acquired = self._mutex.acquire(blocking=False)
-                if not acquired:
-                    return False
-                self._mark_acquired()
-                return True
-            if self._held > 0:
-                pass  # fall through to the blocking wait below
-            else:
-                # Appears free; try to grab it under the state lock so two
-                # waiters cannot both conclude "free" and race the mutex.
-                if self._mutex.acquire(blocking=False):
-                    self._mark_acquired()
-                    return True
-        # Blocking wait WITHOUT holding _state_lock (a waiting thread must not
-        # block the watchdog or other threads' release bookkeeping).
-        wait = None if timeout is None or timeout < 0 else timeout
-        if not self._mutex.acquire(blocking=True, timeout=wait):
-            return False
-        with self._state_lock:
-            self._sync_tls()
-            self._mark_acquired()
-        return True
+        return self.acquire_token(blocking=blocking, timeout=timeout) is not None
 
-    def release(self) -> None:
-        # Thread-agnostic: a connection handed to another thread can fully
-        # release the gate here; a stale holder's later release is a no-op.
+    def release_token(self, token: int) -> None:
         release_mutex = False
+        over_release = False
         with self._state_lock:
-            if self._sync_tls():
-                # This thread's hold was force-cleared by a watchdog reset;
-                # there is nothing left to release and no imbalance to count.
+            if self._held > 0 and self._active_token == token:
+                self._held -= 1
+                if self._held == 0:
+                    if threading.get_ident() == self._owner_tid:
+                        self._tls.last_token = None
+                    self._owner_tid = None
+                    self._held_since = None
+                    self._active_token = None
+                    release_mutex = True
+            elif token in self._watchdog_reset_tokens:
+                self._watchdog_reset_tokens.discard(token)
+                if getattr(self._tls, "last_token", None) == token:
+                    self._tls.last_token = None
                 return
-            if self._tls.count > 1:
-                self._tls.count -= 1
-                return
-            if self._tls.count == 1:
-                self._tls.count = 0
-            if self._held <= 0:
-                # Over-release: count imbalance (double release or release after
-                # a watchdog reset already cleared global state). This must
-                # stay ~0; it signals a caller bug, not a leak.
-                _sqlite_metrics_bump("release_failures", 1.0)
-                logger.error(
-                    "SQLite write gate over-release by thread %s "
-                    "(held=%s, epoch=%s)",
-                    threading.get_ident(),
-                    self._held,
-                    self._epoch,
-                )
-                return
-            self._held -= 1
-            if self._held == 0:
-                self._held_since = None
-                self._owner_tid = None
-                release_mutex = True
+            else:
+                over_release = True
+                held_snapshot = self._held
+                active_snapshot = self._active_token
         if release_mutex:
             self._mutex.release()
+        elif over_release:
+            _sqlite_metrics_bump("release_failures", 1.0)
+            logger.error(
+                "SQLite write gate token over-release by thread %s "
+                "(token=%s, active=%s, held=%s)",
+                threading.get_ident(),
+                token,
+                active_snapshot,
+                held_snapshot,
+            )
+
+    def release(self) -> None:
+        tid = threading.get_ident()
+        release_mutex = False
+        over_release = False
+        with self._state_lock:
+            last_token = getattr(self._tls, "last_token", None)
+            if (
+                last_token is not None
+                and last_token in self._watchdog_reset_tokens
+                and (self._held <= 0 or self._owner_tid != tid)
+            ):
+                self._watchdog_reset_tokens.discard(last_token)
+                self._tls.last_token = None
+                return
+            if self._held <= 0:
+                over_release = True
+                held_snapshot = self._held
+                gen_snapshot = self._generation
+            else:
+                self._held -= 1
+                if self._held == 0:
+                    if tid == self._owner_tid:
+                        self._tls.last_token = None
+                    self._owner_tid = None
+                    self._held_since = None
+                    self._active_token = None
+                    release_mutex = True
+        if release_mutex:
+            self._mutex.release()
+        elif over_release:
+            _sqlite_metrics_bump("release_failures", 1.0)
+            logger.error(
+                "SQLite write gate over-release by thread %s "
+                "(held=%s, generation=%s)",
+                tid,
+                held_snapshot,
+                gen_snapshot,
+            )
 
     def held_seconds(self) -> float:
         with self._state_lock:
@@ -351,11 +434,9 @@ class _CrossThreadRLock:
     def watchdog_check(self, threshold_seconds: float) -> dict[str, Any]:
         """Force-reset the gate if a single hold exceeds the threshold.
 
-        Returns ``{"reset": bool, "held_seconds": float}``. A reset bumps
-        ``_epoch`` so every stale per-thread counter is invalidated before the
-        next acquire/release on that thread, and releases the underlying mutex
-        (thread-agnostic). This is the last line of defence: even a brand-new
-        leak path cannot wedge the service beyond the watchdog window.
+        Returns ``{"reset": bool, "held_seconds": float}``. The evicted token
+        is recorded so any late release (from the original thread or a handed-
+        off thread) is ignored safely and cannot release a subsequent holder.
         """
         reset = False
         owner = None
@@ -368,10 +449,12 @@ class _CrossThreadRLock:
                 return {"reset": False, "held_seconds": held_seconds}
             reset = True
             owner = self._owner_tid
+            self._record_watchdog_reset_token(self._active_token)
             self._held = 0
             self._held_since = None
             self._owner_tid = None
-            self._epoch += 1
+            self._active_token = None
+            self._generation += 1
         if reset:
             try:
                 self._mutex.release()
@@ -395,35 +478,37 @@ def record_sqlite_locked_retry() -> None:
     _sqlite_metrics_bump("locked_retries", 1.0)
 
 
-def _sqlite_acquire_gate(conn: Any) -> bool:
-    """Block for the single-writer gate; True on success, False on timeout.
+def _sqlite_acquire_gate(conn: Any) -> int | None:
+    """Block for the single-writer gate; return ownership token or None on timeout.
 
     On timeout the caller proceeds ungated — SQLite's own busy_timeout still
-    bounds the write — and MUST NOT record the connection as owning the gate:
-    a later commit would otherwise attempt a release from a thread that never
-    acquired it (``RuntimeError``), leaving the gate's ownership bookkeeping
-    corrupted (P0-2).
+    bounds the write — and MUST NOT record the connection as owning the gate.
     """
-    if _SQLITE_WRITE_LOCK.acquire(timeout=_SQLITE_WRITE_GATE_TIMEOUT_SECONDS):
-        return True
+    token = _SQLITE_WRITE_LOCK.acquire_token(timeout=_SQLITE_WRITE_GATE_TIMEOUT_SECONDS)
+    if token is not None:
+        return token
     _sqlite_metrics_bump("gate_timeouts", 1.0)
     logger.error(
         "SQLite write gate not acquired within %.0fs (leaked?); "
         "proceeding ungated for this statement",
         _SQLITE_WRITE_GATE_TIMEOUT_SECONDS,
     )
-    return False
+    return None
 
 
 def _sqlite_release_gate(conn: Any) -> None:
     marker = conn.info.pop(_WRITE_GATE_MARKER, None)
     if marker is None:
         return
-    held_ms = (time.monotonic() - marker) * 1000.0
-    # W2 enforcement: a write transaction held this long means a session kept
-    # dirty ORM state across a slow operation (typically an LLM call) — exactly
-    # the pattern that starves concurrent streams. Loudly flag it so the
-    # offending path gets fixed rather than silently degrading everyone.
+    token: int | None = None
+    wait_ms = 0.0
+    if isinstance(marker, tuple):
+        started_at = float(marker[0])
+        token = marker[1] if len(marker) > 1 else None
+        wait_ms = float(marker[2]) if len(marker) > 2 else 0.0
+    else:
+        started_at = float(marker)
+    held_ms = (time.monotonic() - started_at) * 1000.0
     if held_ms > 10_000:
         logger.warning(
             "SQLite write transaction held %.0f ms (long window; another writer "
@@ -437,15 +522,38 @@ def _sqlite_release_gate(conn: Any) -> None:
             record.info.pop(_WRITE_GATE_MARKER, None)
         except Exception:  # pragma: no cover - defensive
             pass
-    # v2.0: the gate lock is thread-agnostic — release() is legal from any
-    # thread (cross-thread connection handoff is the designed path, not a
-    # bug). Over-release (count imbalance) is counted inside the lock object.
-    _SQLITE_WRITE_LOCK.release()
-    # P0-3 lock-order fix: bump metrics only AFTER releasing the gate so this
-    # path never holds GATE while taking METRICS (the acquire path takes
-    # METRICS before GATE; holding them in reverse order is a deadlock hazard).
-    # Release is non-blocking, so moving the bump after it loses no accuracy.
+    if token is not None:
+        _SQLITE_WRITE_LOCK.release_token(token)
+    else:
+        _SQLITE_WRITE_LOCK.release()
+    # Bump metrics only AFTER releasing the gate to keep lock ordering acyclic.
     _sqlite_metrics_bump("write_ms", held_ms)
+    if wait_ms > 0.0:
+        _sqlite_metrics_bump("gate_wait_ms", wait_ms)
+
+
+def _sqlite_ensure_tx_before_savepoint(conn: Any, cursor: Any, statement: str) -> None:
+    """Keep pysqlite SAVEPOINT nested inside an explicit outer transaction.
+
+    Under pysqlite's default isolation_level='', plain SELECT does not open a
+    SQLite transaction (preventing WAL snapshot pinning and SQLITE_BUSY_SNAPSHOT
+    on read-then-write paths), but a SAVEPOINT executed outside a transaction
+    acts as a top-level transaction that commits immediately on RELEASE
+    SAVEPOINT even when the outer SQLAlchemy session rolls back. Emitting BEGIN
+    right before SAVEPOINT preserves both non-transactional reads and atomic
+    begin_nested() semantics.
+    """
+    stripped = _strip_sql_lead(statement)
+    if len(stripped) < 10 or stripped[0] not in "Ss":
+        return
+    if not stripped[:10].upper().startswith("SAVEPOINT "):
+        return
+    try:
+        driver_conn = conn.connection.driver_connection
+    except Exception:
+        return
+    if driver_conn is not None and not getattr(driver_conn, "in_transaction", True):
+        cursor.execute("BEGIN")
 
 
 def _sqlite_before_cursor_execute(
@@ -456,39 +564,34 @@ def _sqlite_before_cursor_execute(
     context: Any,
     executemany: bool,
 ) -> None:
+    _sqlite_ensure_tx_before_savepoint(conn, cursor, statement)
     if not _is_write_statement(statement):
         return
     if conn.info.get(_WRITE_GATE_MARKER):
         return  # this connection already owns the gate for its transaction
+    wait_ms = 0.0
     # Fair queue probe: a non-blocking attempt makes contention observable.
-    if not _SQLITE_WRITE_LOCK.acquire(blocking=False):
+    token = _SQLITE_WRITE_LOCK.acquire_token(blocking=False)
+    if token is None:
         _sqlite_metrics_bump("gate_contentions", 1.0)
-        if not _sqlite_acquire_gate(conn):
-            # Timed out (leaked gate / long window): proceed ungated, but do
-            # NOT mark this connection as owning the gate — a later commit
-            # would try to release a lock this thread never acquired and
-            # corrupt the gate's ownership bookkeeping (P0-2).
+        wait_started = time.monotonic()
+        token = _sqlite_acquire_gate(conn)
+        wait_ms = (time.monotonic() - wait_started) * 1000.0
+        if token is None:
+            _sqlite_metrics_bump("gate_wait_ms", wait_ms)
             return
-    conn.info[_WRITE_GATE_MARKER] = time.monotonic()
-    # Mirror onto the pool record so the checkin/invalidate safety nets can
-    # release a stranded hold even if the commit/rollback event path failed.
+    conn.info[_WRITE_GATE_MARKER] = (time.monotonic(), token, wait_ms)
+    # Mirror token onto the pool record so checkin/invalidate safety nets can
+    # release only this exact hold if the commit/rollback path was bypassed.
     record = getattr(conn, "_connection_record", None)
     if record is not None:
         try:
-            record.info[_WRITE_GATE_MARKER] = True
+            record.info[_WRITE_GATE_MARKER] = token
         except Exception:  # pragma: no cover - defensive
             pass
 
 
 def _sqlite_on_commit(conn: Any) -> None:
-    # Engine-level ``commit`` fires immediately BEFORE the DBAPI commit
-    # executes. Releasing here is deliberately early by a sub-millisecond
-    # window (the DBAPI commit is the very next statement this thread runs);
-    # a writer that grabs the gate in that window simply waits on SQLite's
-    # busy handler for the commit to land — bounded and negligible. There is
-    # no engine-level after-commit event in SQLAlchemy 2.x (that lives on
-    # Session), and Session events cannot reliably map back to the connection
-    # that held the gate.
     _sqlite_release_gate(conn)
 
 
@@ -496,41 +599,41 @@ def _sqlite_on_rollback(conn: Any) -> None:
     _sqlite_release_gate(conn)
 
 
+def session_holds_write_gate(db: Session) -> bool:
+    """True when ``db`` currently holds an uncommitted SQLite/PostgreSQL write lock."""
+    tx = db.get_transaction()
+    if tx is None:
+        return False
+    for entry in getattr(tx, "_connections", {}).values():
+        connection = entry[0] if isinstance(entry, tuple) else entry
+        info = getattr(connection, "info", None)
+        if isinstance(info, dict) and (
+            info.get(_WRITE_GATE_MARKER) or info.get("_lg_pg_writer")
+        ):
+            return True
+    return False
+
+
 def _sqlite_pool_safety_release(dbapi_conn: Any, connection_record: Any) -> None:
-    """Pool-side safety net: release a gate hold stranded on a connection
-    record (connection returned/invalidated without a commit/rollback event —
-    practically unreachable, but the gate must never wedge the process)."""
+    """Pool-side safety net: release a gate hold stranded on a connection record."""
     try:
-        if connection_record.info.pop(_WRITE_GATE_MARKER, None) is not None:
-            # v2.0: thread-agnostic release; over-release is counted inside
-            # the lock object and only signals a caller bug, never a leak.
+        marker = connection_record.info.pop(_WRITE_GATE_MARKER, None)
+        if isinstance(marker, int) and not isinstance(marker, bool):
+            _SQLITE_WRITE_LOCK.release_token(marker)
+        elif marker is not None:
             _SQLITE_WRITE_LOCK.release()
     except Exception:  # pragma: no cover - defensive
         pass
 
 
 def install_sqlite_write_gate(target_engine: Any) -> None:
-    """Attach the single-writer gate events to ``target_engine``.
-
-    Called once for the application engine at import; unit tests may call it on
-    a throwaway engine to exercise the gate against a real SQLite file. The
-    gate itself (``_SQLITE_WRITE_LOCK``) is process-global, which is correct:
-    the deployment is a single uvicorn process, and all sessions — including
-    ad-hoc sessionmakers — share the one SQLite write lock.
-
-    Registered events, in hot-path cost order:
-    * ``before_cursor_execute`` — every statement; a first-character
-      short-circuit makes the read path a single set membership check.
-    * ``commit`` / ``rollback`` — once per transaction; releases the gate.
-    * pool ``checkin`` / ``invalidate`` — once per connection return/invalid;
-      safety net that releases a stranded hold even if a statement ran outside
-      a transaction (no commit/rollback event fired).
-    """
+    """Attach the single-writer gate and savepoint-atomicity events to ``target_engine``."""
+    if getattr(target_engine, "_lg_sqlite_write_gate_installed", False):
+        return
+    target_engine._lg_sqlite_write_gate_installed = True
     event.listen(target_engine, "before_cursor_execute", _sqlite_before_cursor_execute)
     event.listen(target_engine, "commit", _sqlite_on_commit)
     event.listen(target_engine, "rollback", _sqlite_on_rollback)
-    # checkin/invalidate are Pool events (not Engine dispatch), so they must be
-    # registered on the pool object.
     event.listen(target_engine.pool, "checkin", _sqlite_pool_safety_release)
     event.listen(target_engine.pool, "invalidate", _sqlite_pool_safety_release)
 
@@ -879,6 +982,8 @@ def describe_pending_sqlite_migrations() -> list[str]:
         learning_package_models,
         provider_balance_models,
         provider_import_models,
+        queued_turn_models,
+        sandbox_checkpoint_models,
     )
     from app.core.migrations import MIGRATIONS
     from app.core.migrations.native_billing import native_billing_shape_needs_repair
@@ -961,9 +1066,8 @@ def _copy_sqlite_database(source: Path, destination: Path) -> None:
     try:
         destination_connection = sqlite3.connect(str(destination))
         try:
-            # ``pages=-1`` copies everything in one step; ``sleep`` only matters
-            # if a writer holds the database (the API then retries internally).
-            source_connection.backup(destination_connection, pages=-1, sleep=0.05)
+            # Copy in bounded page batches so concurrent writers can interleave.
+            source_connection.backup(destination_connection, pages=256, sleep=0.02)
         finally:
             destination_connection.close()
     finally:
@@ -1088,6 +1192,8 @@ def _init_database_under_route_lease() -> None:
         learning_package_models,
         provider_balance_models,
         provider_import_models,
+        queued_turn_models,
+        sandbox_checkpoint_models,
     )
     from app.core.migrations import apply_schema_migrations
 
@@ -1103,6 +1209,7 @@ def _init_database_under_route_lease() -> None:
                     connection.exec_driver_sql("BEGIN IMMEDIATE")
                     ensure_voice_event_type_column(connection)
                     Base.metadata.create_all(bind=connection)
+                    _ensure_sqlite_skill_package_columns(connection)
                     _apply_sqlite_additive_migrations(connection)
                     apply_schema_migrations(connection)
                     from app.core.migrations.native_billing import apply_native_billing_migration, native_billing_shape_needs_repair
@@ -1121,6 +1228,7 @@ def _init_database_under_route_lease() -> None:
                 finally:
                     connection.exec_driver_sql("PRAGMA foreign_keys=ON")
                     connection.commit()
+            _verify_sqlite_metadata_shape()
         else:
             with engine.begin() as connection:
                 if connection.dialect.name == "postgresql":
@@ -1132,7 +1240,6 @@ def _init_database_under_route_lease() -> None:
             if engine.dialect.name == "postgresql":
                 from app.core.postgresql_search import install_search
                 install_search(engine)
-        _ensure_sqlite_skill_package_columns()
         _verify_schema_revisions()
 
     if not is_sqlite:
@@ -1144,20 +1251,23 @@ def _init_database_under_route_lease() -> None:
 
     # 1) Read-only precheck: what (if anything) would this startup change?
     # 2) If nothing, the phases are pure reads — no write lock, no snapshot.
-    # 3) Otherwise snapshot first, then migrate under the lock-contention retry.
+    # 3) Otherwise snapshot first (skipping full DB copy for index-only repairs),
+    #    then migrate under the lock-contention retry.
     pending = describe_pending_sqlite_migrations()
     if not pending:
         _verify_sqlite_metadata_shape()
         _verify_schema_revisions()
         return
     backup: Path | None = None
+    needs_backup = any(not item.startswith("create index ") for item in pending)
     if pending:
         logger.info(
             "SQLite schema migration pending (%d change(s)): %s",
             len(pending),
             "; ".join(pending),
         )
-        backup = backup_sqlite_before_migration(pending)
+        if needs_backup:
+            backup = backup_sqlite_before_migration(pending)
     _run_startup_step_retrying_locked("database initialization", _run_phases)
     if pending:
         logger.info(
@@ -1234,7 +1344,7 @@ CURRENT_SCHEMA_DESCRIPTION = "Temporal event_at projection and search index"
 
 def _compute_schema_checksum() -> str:
     """Hash of all table/schema metadata for drift detection."""
-    from app.domain import extension_models, graph_cover_models, im_models, migration_models, models, learning_package_models  # noqa: F401
+    from app.domain import extension_models, graph_cover_models, im_models, migration_models, models, learning_package_models, queued_turn_models, sandbox_checkpoint_models  # noqa: F401
 
     h = hashlib.sha256()
     for table_name in sorted(Base.metadata.tables):
@@ -1532,7 +1642,7 @@ def ensure_sqlite_session_search_projection(connection: Any) -> None:
         )
 
 
-def _ensure_sqlite_skill_package_columns() -> None:
+def _ensure_sqlite_skill_package_columns(connection: Any = None) -> None:
     """Additive columns for D-077 skill packages on existing SQLite databases."""
 
     if not is_sqlite:
@@ -1549,19 +1659,25 @@ def _ensure_sqlite_skill_package_columns() -> None:
         "is_official": "BOOLEAN DEFAULT 0",
         "last_used_at": "DATETIME",
     }
-    with engine.begin() as connection:
+
+    def _apply(conn: Any) -> None:
         existing = {
             row[1]
-            for row in connection.exec_driver_sql("PRAGMA table_info(skills)").fetchall()
+            for row in conn.exec_driver_sql("PRAGMA table_info(skills)").fetchall()
         }
         if not existing:
             return
         for name, ddl in columns.items():
             if name not in existing:
-                connection.exec_driver_sql(f"ALTER TABLE skills ADD COLUMN {name} {ddl}")
-    if is_sqlite:
-        _apply_sqlite_additive_migrations()
-        _verify_sqlite_metadata_shape()
+                conn.exec_driver_sql(f"ALTER TABLE skills ADD COLUMN {name} {ddl}")
+
+    if connection is not None:
+        _apply(connection)
+        return
+    with engine.begin() as conn:
+        _apply(conn)
+    _apply_sqlite_additive_migrations()
+    _verify_sqlite_metadata_shape()
 
 
 def _apply_sqlite_additive_migrations(connection: Any = None) -> None:
@@ -1944,6 +2060,17 @@ def _apply_sqlite_additive_migrations(connection: Any = None) -> None:
             "token_key_provider": "VARCHAR(32)",
             "token_key_version": "INTEGER",
         },
+        "im_inbound": {
+            "media_json": "TEXT NOT NULL DEFAULT ''",
+            "tts_requested": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+        "im_outbound": {
+            "media_json": "TEXT NOT NULL DEFAULT ''",
+        },
+        "im_bindings": {
+            "preferred_provider_id": "VARCHAR(36)",
+            "preferred_model_id": "VARCHAR(160)",
+        },
     }
     with (nullcontext(connection) if connection is not None else engine.begin()) as connection:
         for table_name, columns in additions.items():
@@ -2071,6 +2198,23 @@ def _apply_sqlite_additive_migrations(connection: Any = None) -> None:
         connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_message_stream_events_created_at "
             "ON message_stream_events(created_at)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_sandbox_agent_events_created_at "
+            "ON sandbox_agent_events(created_at)"
+        )
+        # Session deletion and FK cascade/check paths filter by these columns.
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_chat_sessions_parent_session_id "
+            "ON chat_sessions(workspace_id, parent_session_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_message_submissions_user_message_id "
+            "ON message_submissions(user_message_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_im_bindings_session_id "
+            "ON im_bindings(session_id)"
         )
         # B1-7: TTL lease table for cross-process sweep mutual exclusion.
         connection.exec_driver_sql(

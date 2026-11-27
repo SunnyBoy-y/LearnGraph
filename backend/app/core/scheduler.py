@@ -28,6 +28,7 @@ from app.domain.models import (
     SandboxAgentCommand,
     SandboxSession,
     Workspace,
+    WorkspaceSetting,
     utc_now,
 )
 from app.domain.schemas.learning import MasterySchedulerTickView
@@ -305,22 +306,80 @@ def run_workspace_memory_retention(
         }
 
 
+_EVAL_WORKSPACE_SETTING_KEY = "memory.eval_context"
+
+
+def _sweep_workspace_ids(db) -> list[str]:
+    """Return workspace IDs eligible for background memory maintenance sweeps.
+
+    Excludes isolated benchmark/eval workspaces (tagged with
+    ``memory.eval_context``) so hundreds of historical eval sandboxes do not
+    consume periodic scheduler and profile-refresh cycles.
+    """
+
+    eval_ws = select(WorkspaceSetting.workspace_id).where(
+        WorkspaceSetting.key == _EVAL_WORKSPACE_SETTING_KEY
+    )
+    return list(
+        db.scalars(select(Workspace.id).where(Workspace.id.not_in(eval_ws)))
+    )
+
+
+def _stale_profile_owner_ids(db, workspace_id: str, *, limit: int = 3) -> list[str]:
+    """Return owners whose *latest* profile snapshot is ``stale``.
+
+    Older superseded snapshots also carry ``status == 'stale'``; querying raw
+    rows without filtering to each owner's max version caused ready profiles to
+    be re-scanned on every 120s sweep.
+    """
+
+    latest_versions = (
+        select(
+            MemoryProfileSnapshot.owner_subject_id.label("owner_subject_id"),
+            func.max(MemoryProfileSnapshot.version).label("max_version"),
+        )
+        .where(MemoryProfileSnapshot.workspace_id == workspace_id)
+        .group_by(MemoryProfileSnapshot.owner_subject_id)
+        .subquery()
+    )
+    rows = db.scalars(
+        select(MemoryProfileSnapshot.owner_subject_id)
+        .join(
+            latest_versions,
+            (
+                MemoryProfileSnapshot.owner_subject_id
+                == latest_versions.c.owner_subject_id
+            )
+            & (MemoryProfileSnapshot.version == latest_versions.c.max_version),
+        )
+        .where(
+            MemoryProfileSnapshot.workspace_id == workspace_id,
+            MemoryProfileSnapshot.status == "stale",
+        )
+        .order_by(MemoryProfileSnapshot.updated_at.desc())
+        .limit(limit)
+    ).all()
+    return list(dict.fromkeys(rows))
+
+
 def run_memory_retention_sweeps(*, now: datetime | None = None) -> dict[str, int]:
     # P3-S1: defer while agent streams are generating.
     if _should_defer_sweep("sweep.retention"):
         return {
             "content_keys_destroyed": 0,
             "journal_entries_removed": 0,
+            "expired_drafts_closed": 0,
             "reviewed": 0,
             "lapsed": 0,
             "zones_reviewed": 0,
             "zones_changed": 0,
         }
     with SessionLocal() as db:
-        workspace_ids = list(db.scalars(select(Workspace.id)))
+        workspace_ids = _sweep_workspace_ids(db)
     totals = {
         "content_keys_destroyed": 0,
         "journal_entries_removed": 0,
+        "expired_drafts_closed": 0,
         "reviewed": 0,
         "lapsed": 0,
         "zones_reviewed": 0,
@@ -333,7 +392,7 @@ def run_memory_retention_sweeps(*, now: datetime | None = None) -> dict[str, int
             logger.exception("Memory retention sweep failed for workspace %s", workspace_id)
             continue
         for key in totals:
-            totals[key] += result[key]
+            totals[key] += result.get(key, 0)
     _note_sweep_ran("sweep.retention")
     return totals
 
@@ -421,7 +480,7 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
         "profiles_rewritten": 0,
     }
     with SessionLocal() as db:
-        workspace_ids = list(db.scalars(select(Workspace.id)))
+        workspace_ids = _sweep_workspace_ids(db)
     for workspace_id in workspace_ids:
         try:
             with SessionLocal() as db:
@@ -451,22 +510,7 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
 
                 config = load_enhancement_config(db, workspace.id)
                 if config["summarization"]["enabled"]:
-                    owner_ids = list(
-                        dict.fromkeys(
-                            db.scalars(
-                                select(MemoryProfileSnapshot.owner_subject_id)
-                                .where(
-                                    MemoryProfileSnapshot.workspace_id
-                                    == workspace.id,
-                                    MemoryProfileSnapshot.status == "stale",
-                                )
-                                .order_by(
-                                    MemoryProfileSnapshot.updated_at.desc()
-                                )
-                                .limit(3)
-                            ).all()
-                        )
-                    )
+                    owner_ids = _stale_profile_owner_ids(db, workspace.id, limit=3)
                     owner_has_snapshot = db.scalar(
                         select(MemoryProfileSnapshot.id)
                         .where(
@@ -476,13 +520,10 @@ def run_memory_extraction_sweeps() -> dict[str, int]:
                         )
                         .limit(1)
                     )
-                    owner_has_profile_atoms = bool(
-                        _eligible_profile_records(db, workspace.id)
-                    )
                     if (
                         workspace.owner_user_id
                         and owner_has_snapshot is None
-                        and owner_has_profile_atoms
+                        and bool(_eligible_profile_records(db, workspace.id))
                     ):
                         owner_ids.insert(0, workspace.owner_user_id)
                     for owner_id in owner_ids:
@@ -1278,7 +1319,7 @@ def run_stream_events_retention(*, now: datetime | None = None) -> int:
         return 0
     if _should_defer_sweep("sweep.stream_events_retention"):
         return 0
-    cutoff = utc_now() - timedelta(days=retention_days)
+    cutoff = (now or utc_now()) - timedelta(days=retention_days)
     with SessionLocal() as lock_db:
         lock_token = acquire_advisory_lock(
             lock_db, "sweep.stream_events_retention", ttl_seconds=600
@@ -1286,19 +1327,43 @@ def run_stream_events_retention(*, now: datetime | None = None) -> int:
     if lock_token is None:
         return 0
     try:
+        from app.core.database import active_stream_count
+
+        batch_size = 2_000
+        deleted = 0
         with SessionLocal() as db:
             terminal_message_ids = select(Message.id).where(
                 Message.status.in_(("completed", "failed", "cancelled")),
                 Message.updated_at < cutoff,
             )
-            result = db.execute(
-                delete(MessageStreamEvent).where(
-                    MessageStreamEvent.message_id.in_(terminal_message_ids),
-                    MessageStreamEvent.created_at < cutoff,
+            while True:
+                if deleted > 0 and active_stream_count() > 0:
+                    # Yield the single SQLite writer between batches if an
+                    # interactive stream started while purging a backlog.
+                    break
+                batch_ids = list(
+                    db.scalars(
+                        select(MessageStreamEvent.id)
+                        .where(
+                            MessageStreamEvent.message_id.in_(terminal_message_ids),
+                            MessageStreamEvent.created_at < cutoff,
+                        )
+                        .order_by(MessageStreamEvent.id)
+                        .limit(batch_size)
+                    ).all()
                 )
-            )
-            deleted = int(result.rowcount or 0)
-            db.commit()
+                if not batch_ids:
+                    break
+                result = db.execute(
+                    delete(MessageStreamEvent).where(
+                        MessageStreamEvent.id.in_(batch_ids)
+                    )
+                )
+                batch_deleted = int(result.rowcount or 0)
+                commit_with_locked_retry(db)
+                deleted += batch_deleted
+                if len(batch_ids) < batch_size:
+                    break
         if deleted:
             logger.info(
                 "Stream-event retention purged %s rows (older than %s days)",
@@ -1393,7 +1458,11 @@ def run_hot_table_archive(*, now: datetime | None = None) -> dict[str, int]:
                 )
                 db.commit()
                 table_total = 0
+                from app.core.database import active_stream_count
+
                 while True:
+                    if table_total > 0 and active_stream_count() > 0:
+                        break
                     if db.connection().dialect.name == "postgresql":
                         inserted = int(db.execute(text(
                             f"WITH removed AS (DELETE FROM {source} WHERE id IN ("
@@ -1405,28 +1474,43 @@ def run_hot_table_archive(*, now: datetime | None = None) -> dict[str, int]:
                         if inserted < batch:
                             break
                         continue
+                    # Use the exact same strictly-ordered subquery for both
+                    # INSERT and DELETE inside one write transaction so SQLite
+                    # never archives one row set and deletes a different one.
+                    batch_selector = (
+                        f"SELECT rowid FROM {source} "
+                        f"WHERE created_at < :cutoff "
+                        f"ORDER BY created_at, rowid LIMIT :batch"
+                    )
                     inserted = int(
                         db.execute(
                             text(
                                 f"INSERT INTO {archive} "
-                                f"SELECT * FROM {source} WHERE created_at < :cutoff "
-                                f"LIMIT :batch"
+                                f"SELECT * FROM {source} WHERE rowid IN ({batch_selector})"
                             ),
                             {"cutoff": cutoff, "batch": batch},
                         ).rowcount
                         or 0
                     )
                     if not inserted:
+                        db.rollback()
                         break
-                    db.execute(
-                        text(
-                            f"DELETE FROM {source} WHERE rowid IN ("
-                            f"SELECT rowid FROM {source} "
-                            f"WHERE created_at < :cutoff LIMIT :batch)"
-                        ),
-                        {"cutoff": cutoff, "batch": batch},
+                    deleted = int(
+                        db.execute(
+                            text(
+                                f"DELETE FROM {source} WHERE rowid IN ({batch_selector})"
+                            ),
+                            {"cutoff": cutoff, "batch": batch},
+                        ).rowcount
+                        or 0
                     )
-                    db.commit()
+                    if deleted != inserted:
+                        db.rollback()
+                        raise RuntimeError(
+                            f"Hot-table archive row mismatch for {source}: "
+                            f"inserted={inserted} deleted={deleted}"
+                        )
+                    commit_with_locked_retry(db)
                     table_total += inserted
                     if inserted < batch:
                         break
