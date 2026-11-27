@@ -122,23 +122,29 @@ export function MetricStrip({ items }: { items: Metric[] }) {
   )
 }
 
+const SUCCESS_TONE = 'border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success-foreground)]'
+const WARNING_TONE = 'border-[var(--warning-border)] bg-[var(--warning-soft)] text-[var(--warning-foreground)]'
+const INFO_TONE = 'border-[var(--info-border)] bg-[var(--info-soft)] text-[var(--info-foreground)]'
+const DANGER_TONE = 'border-[var(--danger-border)] bg-[var(--danger-soft)] text-[var(--danger-foreground)]'
+const NEUTRAL_TONE = 'border-border bg-muted text-muted-foreground'
+
 const statusTone: Record<string, string> = {
-  available: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300',
-  enabled: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300',
-  healthy: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300',
-  approved: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300',
-  consumed: 'border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-800 dark:bg-slate-950/40 dark:text-slate-300',
-  claimed: 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300',
-  fresh: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300',
-  due: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
-  failed: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
-  conflicted: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
-  pending: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300',
-  reviewing: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300',
-  degraded: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300',
-  unavailable: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300',
-  local_mock: 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300',
-  local_rule_based: 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300',
+  available: SUCCESS_TONE,
+  enabled: SUCCESS_TONE,
+  healthy: SUCCESS_TONE,
+  approved: SUCCESS_TONE,
+  consumed: NEUTRAL_TONE,
+  claimed: INFO_TONE,
+  fresh: SUCCESS_TONE,
+  due: DANGER_TONE,
+  failed: DANGER_TONE,
+  conflicted: DANGER_TONE,
+  pending: WARNING_TONE,
+  reviewing: WARNING_TONE,
+  degraded: WARNING_TONE,
+  unavailable: DANGER_TONE,
+  local_mock: INFO_TONE,
+  local_rule_based: INFO_TONE,
 }
 
 const statusLabel: Record<string, string> = {
@@ -252,5 +258,5 @@ export function Timeline({ items }: { items: Array<{ time?: string; title: strin
 }
 
 export function SuccessNotice({ children }: { children: ReactNode }) {
-  return <div className="flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/35 dark:text-emerald-200"><CheckCircle2 className="mt-0.5 size-4 shrink-0" />{children}</div>
+  return <div className="flex items-start gap-2 rounded-xl border border-[var(--success-border)] bg-[var(--success-soft)] px-4 py-3 text-sm text-[var(--success-foreground)]"><CheckCircle2 className="mt-0.5 size-4 shrink-0" />{children}</div>
 }

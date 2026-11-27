@@ -17,8 +17,7 @@
 .message-component.stream-ui .genui-rail-list :is(.genui-rail-list__description,.genui-rail-list__detail) p { margin: 0; font-size: inherit; line-height: inherit; }
 .message-component.stream-ui .genui-rail-list :is(.genui-rail-list__description,.genui-rail-list__detail) p+p { margin-top: 8px; }
 .genui-rail-list__number { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
-.genui-rail-list__marker[data-status="completed"] { color: #16834a; }
-.dark .genui-rail-list__marker[data-status="completed"] { color: #68cf96; }
+.genui-rail-list__marker[data-status="completed"] { color: var(--success-foreground); }
 .genui-rail-list__marker[data-status="error"] { color: var(--destructive); }
 .genui-rail-list__marker[data-status="pending"] { color: var(--muted-foreground); }
 .genui-rail-list__marker[data-status="active"] svg { animation: rail-list-spin 1.8s linear infinite; }
