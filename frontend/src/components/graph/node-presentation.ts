@@ -95,6 +95,26 @@ export const NODE_TYPE_PROFILES: Record<NodeTypeId, NodeTypeProfile> = {
   },
 };
 
+const LAB_STATES: Record<string, string> = { completed: "实验已完成", in_progress: "实验中" };
+const EXAM_STATES: Record<string, string> = { active: "测评中", grading: "评分中", needs_review: "待复核", failed: "未通过", passed: "已通过" };
+
+export function nodeExecutionLabel(type: NodeTypeId, state?: string | null) {
+  if (type === "lab") return LAB_STATES[state ?? ""] ?? "未运行";
+  if (type === "assessment") return EXAM_STATES[state ?? ""] ?? "未测评";
+  return undefined;
+}
+
+export const NODE_PRIMARY_ACTIONS: Record<NodeTypeId, string> = {
+  root: "查看学习路线",
+  concept: "学习概念",
+  principle: "探索原理",
+  method: "开始练习",
+  application: "进入场景",
+  lab: "运行实验",
+  assessment: "进入测评",
+  open: "查看交付任务",
+};
+
 /** Legend / filter order (root first because it anchors the whole graph). */
 export const NODE_TYPE_ORDER: NodeTypeId[] = [
   "root",

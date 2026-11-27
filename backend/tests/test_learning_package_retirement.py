@@ -46,6 +46,24 @@ def test_old_package_jobs_cancel_without_running_handlers(queue_db, monkeypatch,
     grade.assert_not_called()
 
 
+@pytest.mark.parametrize("kind,key,handler", [
+    ("learning.node_activity.build", "build_id", "run_build_stage"),
+    ("learning.node_activity.grade", "attempt_id", "grade_attempt"),
+])
+def test_node_activity_jobs_dispatch(queue_db, monkeypatch, kind, key, handler):
+    execute = Mock(return_value=True)
+    monkeypatch.setattr(lp, handler, execute)
+    with queue_db() as db:
+        job = dq.DurableQueue(db).enqueue(workspace_id="w", kind=kind, payload={key: "activity"})
+        job_id = job.id
+    assert dq.run_one_durable_job("node-activity-test") is True
+    execute.assert_called_once()
+    assert execute.call_args.args[0] == job_id
+    assert execute.call_args.args[2] == "activity"
+    with queue_db() as db:
+        assert db.get(DurableJob, job_id).status == "completed"
+
+
 def test_worker_keeps_sticker_reconciliation_without_package_sweep(monkeypatch):
     from app.services import stickers
 
@@ -77,6 +95,8 @@ def test_package_router_is_unregistered():
     app.include_router(api_router)
     paths = set(app.openapi()["paths"])
     assert not any("/learning-pages" in path for path in paths)
+    assert "/api/v1/node-activities/nodes/{node_id}" in paths
+    assert "/api/v1/node-activities/attempts/{attempt_id}/submit" in paths
     assert "/api/v1/graphs" in paths
     assert "/api/v1/practice/sessions" in paths
 

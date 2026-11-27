@@ -13,7 +13,6 @@ import {
   Archive,
   ArrowDownWideNarrow,
   ChevronDown,
-  ChevronLeft,
   ChevronRight,
   Download,
   File,
@@ -32,10 +31,16 @@ import {
   MoreHorizontal,
   RefreshCcw,
   Search,
+  SlidersHorizontal,
   Trash2,
   UploadCloud,
+  X,
+  SquareCheck,
+  Paperclip,
+  BookOpen,
+  Box,
 } from "lucide-react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { toast } from '@/lib/notifications';
 
 import {
@@ -57,11 +62,15 @@ import {
   uploadFile,
 } from "@/api";
 import { FileDiagnosticsDialog } from "@/components/resources/file-diagnostics-dialog";
+import { FilePreviewContent } from "@/components/resources/file-preview-content";
 import { SourceAssociationDialog } from "@/components/resources/source-association-dialog";
 import { SourceDetailDialog } from "@/components/resources/source-detail-dialog";
 import { PaperSearchPanel } from "@/features/resources/paper-panels";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { ResearchDomainAllowlistEditor } from "@/components/shared/domain-allowlist-editor";
+import { useActionConfirmation } from "@/components/shared/use-action-confirmation";
+import { applyRangeSelection, useEscapeKey, useListSelection } from "@/lib/list-selection";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import { resolveFilePreviewKind } from "@/lib/file-preview";
@@ -74,6 +83,7 @@ import {
   StatePill,
   Surface,
 } from "@/components/shared/page-elements";
+import { Pagination } from "@/components/shared/pagination";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -81,6 +91,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -100,9 +111,11 @@ import type { SearchResponse } from "@/types/search";
 import type { SearchResult } from "@/types/search";
 import type { FileParserCapability, FileRecord } from "@/types/files";
 import type { SourceRecord } from "@/types/workflow";
+import { FileGraphLinks } from "./file-graph-links";
 import "./file-library.css";
 
 const FILE_PAGE_SIZE = 20;
+const FILE_PAGE_SIZES = [20, 40, 60];
 const MAX_BATCH_DELETE_FILES = 100; // FileBatchSelection API limit.
 
 function bytes(value: number) {
@@ -123,7 +136,33 @@ const indexStatuses: Record<IndexStatus, { label: string; description: string; c
   unavailable: { label: "缺少解析器", description: "当前环境缺少此格式所需的解析器。", color: "text-amber-700 dark:text-amber-400" },
 };
 
-const fileFilters: FileFilter[] = ["all", "indexed", "attachment", "pending", "processing", "failed", "unavailable"];
+const primaryFilters: FileFilter[] = ["all", "indexed", "attachment"];
+const secondaryFilters: IndexStatus[] = ["pending", "processing", "failed", "unavailable"];
+/** 筛选菜单里的状态顺序：先看"能不能用"，再看处理链路的状态。 */
+const statusFilterMenu: FileFilter[] = [...primaryFilters, ...secondaryFilters];
+const originFilters = [
+  { value: "all", label: "全部文件", icon: null },
+  { value: "learning", label: "学习资料", icon: BookOpen },
+  { value: "conversation", label: "会话附件", icon: Paperclip },
+  { value: "generated", label: "生成文件", icon: Box },
+] as const;
+type OriginFilter = typeof originFilters[number]["value"];
+
+function fileOrigin(file: FileRecord) {
+  return file.origin ?? (file.source === "chat_attachment" ? "conversation" : !file.source || file.source === "upload" ? "learning" : "other");
+}
+
+/** 已应用的筛选条件：只在用户真的筛过之后才出现。 */
+function FileFilterChip({ label, onClear }: { label: string; onClear: () => void }) {
+  return (
+    <span className="file-library-chip">
+      {label}
+      <button aria-label={`移除筛选 ${label}`} onClick={onClear} type="button">
+        <X aria-hidden="true" className="size-3" />
+      </button>
+    </span>
+  );
+}
 
 const fileSorts = [
   ["recent", "最近上传"], ["oldest", "最早上传"],
@@ -326,22 +365,63 @@ function uploadExtension(name: string) {
   return name.slice(index).toLowerCase();
 }
 
+let pendingLibraryReturn: { url: string; mainTop: number; documentTop: number } | undefined;
+
 export function SourcesPage() {
   const { workspaceId = "" } = useParams();
+  const { pathname, search } = useLocation();
+  const libraryUrl = pathname + search;
   const inputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [policyOpen, setPolicyOpen] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
-  const [fileFilter, setFileFilter] = useState<FileFilter>("all");
-  const [typeFilter, setTypeFilter] = useState<FileCategory>("all");
-  const [viewMode, setViewMode] = useState<"list" | "grid">("list");
-  const [fileSort, setFileSort] = useState<FileSort>("recent");
-  const [fileSearch, setFileSearch] = useState("");
-  const [filePage, setFilePage] = useState(1);
+  const [params, setParams] = useSearchParams();
+  const readOption = <T extends string,>(key: string, values: readonly T[], fallback: T): T =>
+    values.find((value) => value === params.get(key)) ?? fallback;
+  const fileFilter = readOption("status", [...primaryFilters, ...secondaryFilters], "all");
+  const typeFilter = readOption("type", fileCategories.map(([value]) => value), "all");
+  const originFilter = readOption("origin", originFilters.map(({ value }) => value), "all");
+  const fileSort = readOption("sort", fileSorts.map(([value]) => value), "recent");
+  const fileSearch = params.get("q") ?? "";
+  const viewMode = params.get("view") === "list" ? "list" : "grid";
+  const pageParam = params.get("page");
+  const pageNumber = Number(pageParam);
+  const filePage = pageParam && /^\d+$/.test(pageParam) && Number.isSafeInteger(pageNumber) && pageNumber > 0 ? pageNumber : 1;
+  const sizeParam = params.get("pageSize");
+  const pageSize = FILE_PAGE_SIZES.find((size) => String(size) === sizeParam) ?? FILE_PAGE_SIZE;
+  const listTop = useRef<HTMLDivElement>(null);
+  const scrollAfterChange = useRef(false);
+  const updateParams = (changes: Record<string, string>, replace = false) => {
+    const next = new URLSearchParams(params);
+    for (const [key, value] of Object.entries(changes)) {
+      if (value) next.set(key, value);
+      else next.delete(key);
+    }
+    if (next.toString() !== params.toString()) setParams(next, { replace, preventScrollReset: true });
+  };
+  const setFileFilter = (value: FileFilter) => updateParams({ status: value === "all" ? "" : value, page: "1" });
+  const setTypeFilter = (value: FileCategory) => updateParams({ type: value === "all" ? "" : value, page: "1" });
+  const setOriginFilter = (value: OriginFilter) => updateParams({ origin: value === "all" ? "" : value, page: "1" });
+  const setFileSort = (value: FileSort) => updateParams({ sort: value === "recent" ? "" : value, page: "1" });
+  const setFileSearch = (value: string) => updateParams({ q: value, page: "1" }, true);
+  const setViewMode = (value: "list" | "grid") => updateParams({ view: value === "grid" ? "" : value });
+  const [multiSelect, setMultiSelect] = useState(false);
+  const [inspectedId, setInspectedId] = useState<string | null>(null);
+  const inspectorTrigger = useRef<HTMLElement | null>(null);
+  const inspectorClose = useRef<HTMLButtonElement>(null);
+
   const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const fileAnchorRef = useRef<string | null>(null);
+  const fileShiftRef = useRef(false);
+  const exitFileMultiSelect = useCallback(() => {
+    setMultiSelect(false);
+    setSelectedFileIds(new Set());
+    fileAnchorRef.current = null;
+  }, []);
+  useEscapeKey(multiSelect, exitFileMultiSelect);
   const [deleteTarget, setDeleteTarget] = useState<FileRecord | null>(null);
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [diagnosticFile, setDiagnosticFile] = useState<FileRecord | null>(null);
@@ -366,7 +446,7 @@ export function SourcesPage() {
     queryFn: listSourceRecords,
   });
   const upload = useMutation({
-    mutationFn: (file: File) => uploadFile(file),
+    mutationFn: (file: File) => uploadFile(file, { source: "library_upload" }),
     onSuccess: (file) => {
       toast.success(`${file.original_name} 已安全存储`);
       void Promise.all([
@@ -553,8 +633,44 @@ export function SourcesPage() {
   });
 
   useEffect(() => {
-    setFilePage(1);
-  }, [fileFilter, fileSearch, fileSort, typeFilter]);
+    const list = listTop.current;
+    if (!list) return;
+    if (pendingLibraryReturn?.url === libraryUrl) {
+      const { mainTop, documentTop } = pendingLibraryReturn;
+      pendingLibraryReturn = undefined;
+      const main = list.closest<HTMLElement>(".workspace-main");
+      if (main) main.scrollTop = mainTop;
+      if (document.scrollingElement) document.scrollingElement.scrollTop = documentTop;
+      return;
+    }
+    if (!scrollAfterChange.current) return;
+    scrollAfterChange.current = false;
+    list.scrollIntoView?.({ block: "start", behavior: "instant" });
+  }, [files.data, libraryUrl]);
+
+  const openDocument = (fileId: string, panel?: "chat" | "graph") => {
+    pendingLibraryReturn = {
+      url: libraryUrl,
+      mainTop: listTop.current?.closest<HTMLElement>(".workspace-main")?.scrollTop ?? 0,
+      documentTop: document.scrollingElement?.scrollTop ?? 0,
+    };
+    const query = new URLSearchParams({ fromLibrary: search });
+    if (panel) query.set("panel", panel);
+    navigate(`../documents/${encodeURIComponent(fileId)}?${query}`);
+  };
+
+  const closeInspector = useCallback(() => {
+    setInspectedId(null);
+    inspectorTrigger.current?.focus({ preventScroll: true });
+  }, []);
+  useEffect(() => {
+    if (!inspectedId) return;
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented && !document.querySelector('[data-state="open"][role="dialog"], [data-state="open"][role="menu"]')) closeInspector();
+    };
+    window.addEventListener("keydown", onEscape);
+    return () => window.removeEventListener("keydown", onEscape);
+  }, [closeInspector, inspectedId]);
 
   useEffect(() => {
     // 资料库整页接管拖入：dragover/drop 默认行为必须拦掉，否则浏览器会直接打开文件
@@ -626,25 +742,39 @@ export function SourcesPage() {
   const activeFileIds = new Set(batchParse.isPending ? batchParse.variables : []);
   if (parse.isPending) activeFileIds.add(parse.variables);
   const indexStatus = (file: FileRecord) => fileStatus(file, activeFileIds.has(file.id));
-  const counts: Record<FileFilter, number> = { all: files.data.length, indexed: 0, attachment: 0, pending: 0, processing: 0, failed: 0, unavailable: 0 };
+  const originFiles = files.data.filter((file) => originFilter === "all" || fileOrigin(file) === originFilter);
+  const counts: Record<FileFilter, number> = { all: originFiles.length, indexed: 0, attachment: 0, pending: 0, processing: 0, failed: 0, unavailable: 0 };
   const normalizedFileSearch = fileSearch.trim().toLocaleLowerCase();
-  const filteredFiles = files.data.filter((file) => {
+  const filteredFiles = originFiles.filter((file) => {
     const status = indexStatus(file);
     counts[status]++;
     return (fileFilter === "all" || status === fileFilter) &&
       (typeFilter === "all" || fileCategory(file) === typeFilter) &&
       (!normalizedFileSearch || file.original_name.toLocaleLowerCase().includes(normalizedFileSearch));
   }).sort((a, b) => compareFiles(a, b, fileSort));
+  const originCounts = files.data.reduce<Record<string, number>>(
+    (acc, file) => {
+      acc.all = (acc.all ?? 0) + 1;
+      const origin = fileOrigin(file);
+      acc[origin] = (acc[origin] ?? 0) + 1;
+      return acc;
+    },
+    { all: 0, learning: 0, conversation: 0, generated: 0 },
+  );
+  const hasActiveFilters =
+    originFilter !== "all" ||
+    fileFilter !== "all" ||
+    typeFilter !== "all" ||
+    Boolean(fileSearch.trim());
+  const resetLibraryFilters = () =>
+    updateParams({ status: "", type: "", origin: "", q: "", page: "1" });
   const totalPages = Math.max(
     1,
-    Math.ceil(filteredFiles.length / FILE_PAGE_SIZE),
+    Math.ceil(filteredFiles.length / pageSize),
   );
   const safePage = Math.min(filePage, totalPages);
-  const pageStart = (safePage - 1) * FILE_PAGE_SIZE;
-  const pagedFiles = filteredFiles.slice(
-    pageStart,
-    pageStart + FILE_PAGE_SIZE,
-  );
+  const pageStart = (safePage - 1) * pageSize;
+  const pagedFiles = filteredFiles.slice(pageStart, pageStart + pageSize);
   const pageFileIds = pagedFiles.map((file) => file.id);
   const selectedOnPageCount = pageFileIds.filter((id) =>
     selectedFileIds.has(id),
@@ -664,13 +794,13 @@ export function SourcesPage() {
   const selectedToRetry = selectedFiles.filter((file) => indexStatus(file) === "failed" && canIndex(file));
   const currentDiagnosticFile = files.data.find((file) => file.id === diagnosticFile?.id);
   const storageBytes = storageSummary.data?.total_bytes ?? files.data.reduce((sum, file) => sum + file.size_bytes, 0);
-  const fileActions = (file: FileRecord) => (
+  const fileActions = (file: FileRecord, labelled = false) => (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button aria-label={`打开 ${file.original_name} 的更多操作`} size="icon-sm" variant="ghost"><MoreHorizontal className="size-4" /></Button>
+        <Button aria-label={labelled ? undefined : `打开 ${file.original_name} 的更多操作`} size={labelled ? "sm" : "icon-sm"} variant={labelled ? "outline" : "ghost"}><MoreHorizontal className="size-4" />{labelled ? "更多操作" : null}</Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-48">
-        <DropdownMenuItem onSelect={() => navigate(`../documents/${file.id}`)}><FileText />打开学习</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => openDocument(file.id)}><FileText />打开学习</DropdownMenuItem>
         <DropdownMenuItem disabled={download.isPending || batchDownload.isPending} onSelect={() => download.mutate(file)}><Download />下载文件</DropdownMenuItem>
         {canIndex(file) ? <DropdownMenuItem disabled={indexBusy} onSelect={() => parse.mutate(file.id)}><RefreshCcw />{indexStatus(file) === "failed" ? "重新解析" : "建立索引"}</DropdownMenuItem> : null}
         <DropdownMenuItem onSelect={() => setDiagnosticFile(file)}><Search />解析与引用诊断</DropdownMenuItem>
@@ -679,14 +809,36 @@ export function SourcesPage() {
       </DropdownMenuContent>
     </DropdownMenu>
   );
+  const inspectedFile = files.data.find((file) => file.id === inspectedId);
   const chooseFiles = () => inputRef.current?.click();
-  const toggleFileSelected = (fileId: string, checked: boolean) => {
+  const toggleMultiSelect = () => {
+    setMultiSelect(!multiSelect);
+    if (multiSelect) {
+      setSelectedFileIds(new Set());
+      fileAnchorRef.current = null;
+    } else setInspectedId(null);
+  };
+  const toggleFileSelected = (fileId: string, checked: boolean, shiftKey?: boolean) => {
+    const useShift = shiftKey ?? fileShiftRef.current;
+    fileShiftRef.current = false;
     setSelectedFileIds((current) => {
+      if (useShift && fileAnchorRef.current) {
+        return applyRangeSelection(current, pageFileIds, fileAnchorRef.current, fileId, checked);
+      }
       const next = new Set(current);
       if (checked) next.add(fileId);
       else next.delete(fileId);
       return next;
     });
+    fileAnchorRef.current = fileId;
+  };
+  const activateFile = (file: FileRecord, trigger: HTMLElement, shiftKey = false) => {
+    if (multiSelect) toggleFileSelected(file.id, !selectedFileIds.has(file.id), shiftKey);
+    else {
+      inspectorTrigger.current = trigger;
+      setInspectedId(file.id);
+      requestAnimationFrame(() => inspectorClose.current?.focus({ preventScroll: true }));
+    }
   };
   const togglePageSelection = (checked: boolean) => {
     setSelectedFileIds((current) => {
@@ -697,6 +849,13 @@ export function SourcesPage() {
       }
       return next;
     });
+  };
+  const allFilteredIds = filteredFiles.map((file) => file.id);
+  const allFilteredSelected =
+    allFilteredIds.length > 0 && allFilteredIds.every((id) => selectedFileIds.has(id));
+  const otherPageSelectedCount = Math.max(0, selectedFiles.length - selectedOnPageCount);
+  const selectAllFiltered = () => {
+    setSelectedFileIds(new Set(allFilteredIds));
   };
   return (
     <PageFrame className="file-library-page max-w-[1600px] gap-3 pb-16">
@@ -728,7 +887,12 @@ export function SourcesPage() {
             document.body,
           )
         : null}
-      <PageIntro title="资料库" />
+      <PageIntro title="资料库" actions={
+        <Button className="h-9 shrink-0" disabled={upload.isPending} onClick={chooseFiles} size="sm">
+          {upload.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <UploadCloud className="size-4" />}
+          {upload.isPending ? "上传中…" : "上传资料"}
+        </Button>
+      } />
       <Input
         className="hidden"
         multiple
@@ -740,44 +904,67 @@ export function SourcesPage() {
         type="file"
       />
 
-      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b pb-3">
-        <div aria-label="资料状态筛选" className="flex min-w-0 flex-wrap gap-1" role="group">
-          {fileFilters.filter((filter) => filter !== "unavailable" || counts[filter] > 0 || fileFilter === filter).map((filter) => (
-            <Button
-              aria-pressed={fileFilter === filter}
-              className="h-8 shrink-0 rounded-md px-2.5"
-              key={filter}
-              onClick={() => setFileFilter(filter)}
-              size="sm"
-              variant={fileFilter === filter ? "secondary" : "ghost"}
+      <div className="file-library-body">
+      <div className="file-library-results min-w-0">
+        {/* 文件来源是一级分类导航：只表达"这批文件从哪来"，不再叠加第二层状态导航。 */}
+        <nav aria-label="文件来源" className="file-library-origin">
+          {originFilters.map(({ value, label, icon: Icon }) => (
+            <button
+              aria-current={originFilter === value ? "page" : undefined}
+              className="file-library-origin__tab"
+              key={value}
+              onClick={() => setOriginFilter(value)}
+              type="button"
             >
-              {filter === "all" ? "全部" : indexStatuses[filter].label}
-              <span className="text-xs font-normal tabular-nums text-muted-foreground">{counts[filter]}</span>
-            </Button>
+              {Icon ? <Icon aria-hidden="true" className="size-3.5" /> : null}
+              <span className="truncate">{label}</span>
+              <span className="file-library-origin__count tabular-nums">{originCounts[value] ?? 0}</span>
+            </button>
           ))}
-        </div>
-        <span aria-label={`上传资料占用 ${bytes(storageBytes)}`} className="inline-flex shrink-0 items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
-          <HardDrive aria-hidden="true" className="size-3.5" /> {bytes(storageBytes)}
-        </span>
-      </div>
+        </nav>
 
-      <div className="flex flex-wrap items-center gap-2">
-          <div className="relative min-w-[180px] flex-1">
-            <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              aria-label="搜索资料"
-              className="h-9 pl-9"
-              onChange={(event) => setFileSearch(event.target.value)}
-              placeholder="搜索文件名"
-              value={fileSearch}
-            />
-          </div>
+        {/* 搜索、筛选、类型、排序、视图、多选合成一条工具栏。 */}
+        <div className="file-library-toolbar">
+          <ClearableSearchInput
+            aria-label="搜索资料"
+            containerClassName="min-w-[180px] flex-1"
+            inputClassName="h-9"
+            onChange={setFileSearch}
+            placeholder="搜索文件名"
+            value={fileSearch}
+          />
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                aria-label="筛选资料"
+                className="h-9 shrink-0"
+                variant={fileFilter === "all" ? "outline" : "secondary"}
+              >
+                <SlidersHorizontal className="size-4" />
+                筛选
+                {fileFilter === "all" ? null : (
+                  <span className="text-xs font-normal">{indexStatuses[fileFilter].label}</span>
+                )}
+                <ChevronDown className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuLabel>索引状态</DropdownMenuLabel>
+              {statusFilterMenu.map((filter) => (
+                <DropdownMenuItem key={filter} onSelect={() => setFileFilter(filter)}>
+                  <span className="flex-1">{filter === "all" ? "全部" : indexStatuses[filter].label}</span>
+                  <span className="text-xs tabular-nums text-muted-foreground">{counts[filter]}</span>
+                  {fileFilter === filter ? <span aria-label="已选" className="ml-1">✓</span> : null}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
                 aria-label="按文件类型筛选"
                 className="h-9 shrink-0"
-                variant="outline"
+                variant={typeFilter === "all" ? "outline" : "secondary"}
               >
                 {fileCategories.find(([value]) => value === typeFilter)?.[1]}
                 <ChevronRight className="size-3.5 rotate-90" />
@@ -813,15 +1000,75 @@ export function SourcesPage() {
             <Button aria-label="列表视图" aria-pressed={viewMode === "list"} size="icon-sm" variant={viewMode === "list" ? "secondary" : "ghost"} onClick={() => setViewMode("list")}><List className="size-4" /></Button>
             <Button aria-label="网格视图" aria-pressed={viewMode === "grid"} size="icon-sm" variant={viewMode === "grid" ? "secondary" : "ghost"} onClick={() => setViewMode("grid")}><LayoutGrid className="size-4" /></Button>
           </div>
-          <Button className="ml-auto h-9 shrink-0" disabled={upload.isPending} onClick={chooseFiles} size="sm">
-            {upload.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <UploadCloud className="size-4" />}
-            {upload.isPending ? "上传中…" : "上传资料"}
+          <Button aria-pressed={multiSelect} className="h-9 shrink-0" onClick={toggleMultiSelect} size="sm" variant={multiSelect ? "secondary" : "outline"}>
+            <SquareCheck className="size-4" />{multiSelect ? "退出多选" : "多选"}
           </Button>
-      </div>
+        </div>
+
+        {/* 数量与容量只是一句低强调的说明；用过的筛选条件才变成可移除的标签。 */}
+        <div className="file-library-meta">
+          <span aria-label={`共 ${filteredFiles.length} 个文件，占用 ${bytes(storageBytes)}`} className="file-library-stats">
+            <HardDrive aria-hidden="true" className="size-3.5" />
+            {filteredFiles.length} 个文件 · {bytes(storageBytes)}
+          </span>
+          {hasActiveFilters ? (
+            <div aria-label="已应用的筛选" className="flex flex-wrap items-center gap-1.5">
+              {originFilter !== "all" ? (
+                <FileFilterChip
+                  label={`来源：${originFilters.find(({ value }) => value === originFilter)?.label ?? originFilter}`}
+                  onClear={() => setOriginFilter("all")}
+                />
+              ) : null}
+              {fileFilter !== "all" ? (
+                <FileFilterChip label={`状态：${indexStatuses[fileFilter].label}`} onClear={() => setFileFilter("all")} />
+              ) : null}
+              {typeFilter !== "all" ? (
+                <FileFilterChip
+                  label={`类型：${fileCategories.find(([value]) => value === typeFilter)?.[1] ?? typeFilter}`}
+                  onClear={() => setTypeFilter("all")}
+                />
+              ) : null}
+              {fileSearch.trim() ? (
+                <FileFilterChip label={`搜索：${fileSearch.trim()}`} onClear={() => setFileSearch("")} />
+              ) : null}
+              <Button className="h-6 px-1.5 text-xs text-muted-foreground" onClick={resetLibraryFilters} size="xs" variant="ghost">
+                清除筛选
+              </Button>
+            </div>
+          ) : null}
+        </div>
+
+      {multiSelect && pageFileIds.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex w-fit items-center gap-2 text-sm">
+            <Checkbox
+              aria-label="全选当前页"
+              checked={allPageSelected || (somePageSelected ? "indeterminate" : false)}
+              onCheckedChange={(value) => togglePageSelection(value === true)}
+            />
+            全选当前页
+          </label>
+          {filteredFiles.length > pageFileIds.length ? (
+            <Button
+              onClick={() => (allFilteredSelected ? setSelectedFileIds(new Set()) : selectAllFiltered())}
+              size="xs"
+              type="button"
+              variant="link"
+            >
+              {allFilteredSelected
+                ? "取消全选筛选结果"
+                : `选择全部 ${filteredFiles.length} 个筛选结果`}
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
 
       {selectedFiles.length > 0 ? (
         <div aria-label="批量操作" className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/35 px-3 py-2">
-          <span aria-live="polite" className="mr-1 text-xs font-medium tabular-nums">已选 {selectedFiles.length} 项</span>
+          <span aria-live="polite" className="mr-1 text-xs font-medium tabular-nums">
+            已选 {selectedFiles.length} 项
+            {otherPageSelectedCount > 0 ? `（本页 ${selectedOnPageCount} 项，其他页 ${otherPageSelectedCount} 项）` : ""}
+          </span>
           <Button disabled={download.isPending || batchDownload.isPending} onClick={() => batchDownload.mutate(selectedFiles)} size="xs" variant="outline">
             {batchDownload.isPending ? <LoaderCircle className="animate-spin" /> : <Download />} 批量下载
           </Button>
@@ -839,21 +1086,21 @@ export function SourcesPage() {
         </div>
       ) : null}
 
-      <div>
+      <div ref={listTop} className="scroll-mt-3">
         {pagedFiles.length > 0 && (viewMode === "grid" ? (
           <div className="file-library-grid grid gap-3">
             {pagedFiles.map((file) => {
               const isSelected = selectedFileIds.has(file.id);
               return (
-                <article key={file.id} className={`group relative flex min-w-0 flex-col rounded-xl border bg-card p-2 transition-colors ${isSelected ? "border-ring" : "hover:border-foreground/25"}`}>
-                  <Checkbox className="file-library-card-checkbox absolute left-4 top-4 z-10 bg-background" aria-label={`选择 ${file.original_name}`} checked={isSelected} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
-                  <button type="button" aria-label={`查看 ${file.original_name}`} className="block w-full rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={() => navigate(`../documents/${file.id}`)}><FileThumbnail file={file} /></button>
+                <article key={file.id} className={`group relative flex min-w-0 flex-col rounded-xl border bg-card p-2 transition-colors ${isSelected || inspectedId === file.id ? "border-ring ring-1 ring-ring" : "hover:border-foreground/25"}`}>
+                  {multiSelect ? <Checkbox className="absolute left-4 top-4 z-10 bg-background" aria-label={`选择 ${file.original_name}`} checked={isSelected} onClickCapture={(event) => { fileShiftRef.current = event.shiftKey; }} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} /> : null}
+                  <button type="button" aria-label={`查看 ${file.original_name}`} aria-pressed={multiSelect ? isSelected : inspectedId === file.id} className="block w-full rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={(event) => activateFile(file, event.currentTarget, event.shiftKey)}><FileThumbnail file={file} /></button>
                   <div className="flex min-w-0 items-start gap-1 px-1 pt-1.5">
-                    <button type="button" className="file-library-name line-clamp-2 min-h-10 min-w-0 flex-1 text-left text-sm leading-5 font-medium hover:underline" title={file.original_name} onClick={() => setDiagnosticFile(file)}>{file.original_name}</button>
+                    <button type="button" className="file-library-name line-clamp-2 min-h-10 min-w-0 flex-1 text-left text-sm leading-5 font-medium hover:underline" title={file.original_name} onClick={(event) => activateFile(file, event.currentTarget, event.shiftKey)}>{file.original_name}</button>
                     {fileActions(file)}
                   </div>
                   <p className="truncate px-1 text-xs text-muted-foreground">{uploadExtension(file.original_name).slice(1).toUpperCase() || fileType(file)} · {bytes(file.size_bytes)}</p>
-                  <div className="mx-1 mt-2 flex items-center justify-between gap-2 border-t pt-1">
+                  <div className="mx-1 mt-1 flex items-center justify-between gap-2">
                     <time className="min-w-0 truncate text-xs text-muted-foreground" dateTime={file.created_at} title={file.created_at}>{formatUploadTime(file.created_at)}</time>
                     <IndexStatusButton status={indexStatus(file)} onClick={() => setDiagnosticFile(file)} />
                   </div>
@@ -865,13 +1112,8 @@ export function SourcesPage() {
           <table className="file-library-table w-full table-fixed text-left text-sm">
             <thead className="bg-muted/35 text-xs text-muted-foreground">
               <tr>
-                <th className="w-11 rounded-tl-xl px-3 py-2.5" scope="col">
-                  <label className="inline-flex items-center gap-2 font-normal">
-                    <Checkbox aria-label="全选当前页" checked={allPageSelected || (somePageSelected ? "indeterminate" : false)} onCheckedChange={(value) => togglePageSelection(value === true)} />
-                    <span className="file-library-mobile-select">全选当前页</span>
-                  </label>
-                </th>
-                <th className="px-2 py-2.5 font-medium" scope="col">文件名称</th>
+                {multiSelect ? <th className="w-11 rounded-tl-xl px-3 py-2.5" scope="col"><span className="sr-only">选择</span></th> : null}
+                <th className={`${multiSelect ? "px-2" : "rounded-tl-xl pl-4 pr-2"} py-2.5 font-medium`} scope="col">文件名称</th>
                 <th className="w-23 px-2 py-2.5 font-medium" scope="col">类型</th>
                 <th className="w-23 px-2 py-2.5 font-medium" scope="col">大小</th>
                 <th className="w-25 px-2 py-2.5 font-medium" scope="col">索引状态</th>
@@ -882,14 +1124,15 @@ export function SourcesPage() {
             <tbody className="divide-y">
               {pagedFiles.map((file) => {
                 const isSelected = selectedFileIds.has(file.id);
-                const openFile = () => navigate(`../documents/${file.id}`);
                 return (
-                  <tr className={`h-[52px] cursor-pointer transition-colors hover:bg-muted/40 ${isSelected ? "bg-muted/35" : ""}`} key={file.id} onClick={openFile}>
-                    <td className="px-3 py-1" onClick={(event) => event.stopPropagation()}>
-                      <Checkbox aria-label={`选择 ${file.original_name}`} checked={isSelected} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
-                    </td>
-                    <td className="px-2 py-1">
-                      <button className="flex w-full min-w-0 items-center gap-2 rounded-sm text-left font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={(event) => { event.stopPropagation(); openFile(); }} title={file.original_name} type="button">
+                  <tr className={`h-[52px] cursor-pointer transition-colors hover:bg-muted/40 ${isSelected || inspectedId === file.id ? "bg-muted/35" : ""}`} key={file.id} onClick={(event) => activateFile(file, event.currentTarget, event.shiftKey)}>
+                    {multiSelect ? (
+                      <td className="px-3 py-1" onClick={(event) => event.stopPropagation()}>
+                        <Checkbox aria-label={`选择 ${file.original_name}`} checked={isSelected} onClickCapture={(event) => { fileShiftRef.current = event.shiftKey; }} onCheckedChange={(value) => toggleFileSelected(file.id, value === true)} />
+                      </td>
+                    ) : null}
+                    <td className={multiSelect ? "px-2 py-1" : "pl-4 pr-2 py-1"}>
+                      <button className="flex w-full min-w-0 items-center gap-2 rounded-sm text-left font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" onClick={(event) => { event.stopPropagation(); activateFile(file, event.currentTarget, event.shiftKey); }} title={file.original_name} type="button">
                         <FileIcon file={file} />
                         <span className="file-library-name line-clamp-2 min-w-0 leading-5">{file.original_name}</span>
                       </button>
@@ -927,11 +1170,7 @@ export function SourcesPage() {
               </p>
               <Button
                 className="mt-3"
-                onClick={() => {
-                  setFileFilter("all");
-                  setTypeFilter("all");
-                  setFileSearch("");
-                }}
+                onClick={() => updateParams({ status: "", origin: "", type: "", q: "", page: "1" })}
                 size="xs"
                 variant="outline"
               >
@@ -940,32 +1179,89 @@ export function SourcesPage() {
             </div>
           </div>
         ) : (
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-            <p aria-live="polite" className="text-xs tabular-nums text-muted-foreground">
-              第 {pageStart + 1}–{pageStart + pagedFiles.length} 项 · 共 {filteredFiles.length} 项
-            </p>
-            <div className="flex items-center gap-1">
-              <Button
-                disabled={safePage <= 1}
-                onClick={() => setFilePage(safePage - 1)}
-                size="sm"
-                variant="outline"
-              >
-                <ChevronLeft className="size-4" />
-                上一页
-              </Button>
-              <Button
-                disabled={safePage >= totalPages}
-                onClick={() => setFilePage(safePage + 1)}
-                size="sm"
-                variant="outline"
-              >
-                下一页
-                <ChevronRight className="size-4" />
-              </Button>
-            </div>
+          <div className="mt-3">
+            <Pagination
+              page={safePage} pageSize={pageSize} total={filteredFiles.length} sizes={FILE_PAGE_SIZES}
+              onPageChange={(page) => {
+                scrollAfterChange.current = true;
+                updateParams({ page: String(page), pageSize: String(pageSize) });
+              }}
+              onPageSizeChange={(size) => {
+                scrollAfterChange.current = true;
+                updateParams({ page: "1", pageSize: String(size) });
+              }}
+            />
           </div>
         )}
+      </div>
+      </div>
+      {inspectedFile ? (
+        <aside aria-label="文件详情" className="file-library-inspector" data-open="true">
+          <header className="file-library-inspector__header">
+            <h2 className="text-sm font-semibold">文件详情</h2>
+            <Button ref={inspectorClose} aria-label="关闭文件详情" onClick={closeInspector} size="icon-sm" variant="ghost"><X className="size-4" /></Button>
+          </header>
+          <div className="file-library-inspector__body">
+            <div className="min-w-0">
+              <h3 className="file-library-name text-base font-semibold">{inspectedFile.original_name}</h3>
+              <p className="mt-0.5 text-xs text-muted-foreground">{fileType(inspectedFile)} · {bytes(inspectedFile.size_bytes)}</p>
+            </div>
+            {resolveFilePreviewKind(inspectedFile.original_name, inspectedFile.mime_type) === "unsupported" ? (
+              <div className="file-library-inspector-preview" data-kind="unsupported"><FileThumbnail file={inspectedFile} /></div>
+            ) : (
+              <div
+                className="file-library-inspector-preview"
+                data-kind={resolveFilePreviewKind(inspectedFile.original_name, inspectedFile.mime_type)}
+              >
+                <FilePreviewContent fileId={inspectedFile.id} filename={inspectedFile.original_name} mimeType={inspectedFile.mime_type} fileSize={inspectedFile.size_bytes} />
+              </div>
+            )}
+            <div className="file-library-inspector__actions">
+              <Button className="h-9 flex-1" onClick={() => openDocument(inspectedFile.id, "chat")}>围绕此文件提问</Button>
+              <Button
+                aria-label="下载"
+                disabled={download.isPending || batchDownload.isPending}
+                onClick={() => download.mutate(inspectedFile)}
+                size="icon-sm"
+                variant="outline"
+              >
+                <Download className="size-4" />
+              </Button>
+              {fileActions(inspectedFile)}
+            </div>
+            <dl className="file-library-inspector__meta">
+              <dt>上传时间</dt><dd><time dateTime={inspectedFile.created_at}>{formatUploadTime(inspectedFile.created_at)}</time></dd>
+              <dt>文件来源</dt><dd>{originFilters.find(({ value }) => value === fileOrigin(inspectedFile))?.label ?? "其他来源"}</dd>
+              {inspectedFile.source_session_id ? (
+                <>
+                  <dt>来源会话</dt>
+                  <dd className="file-library-name">
+                    <button className="underline-offset-4 hover:underline" onClick={() => navigate(`../chat/${encodeURIComponent(inspectedFile.source_session_id!)}`)} type="button">{inspectedFile.source_session_title || "查看会话"} ›</button>
+                  </dd>
+                </>
+              ) : null}
+              <dt>知识索引</dt>
+              <dd>{indexStatuses[indexStatus(inspectedFile)].label}</dd>
+            </dl>
+            <details className="file-library-inspector__notes">
+              <summary>索引状态说明</summary>
+              <p className={`mt-2 text-xs ${indexStatuses[indexStatus(inspectedFile)].color}`}>{indexStatuses[indexStatus(inspectedFile)].description}</p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <Button onClick={() => setDiagnosticFile(inspectedFile)} size="xs" variant="outline">查看索引详情</Button>
+                {canIndex(inspectedFile) ? (
+                  <Button disabled={indexBusy} onClick={() => parse.mutate(inspectedFile.id)} size="xs" variant="outline">
+                    {indexStatus(inspectedFile) === "failed" ? "重新解析" : "建立索引"}
+                  </Button>
+                ) : null}
+                {indexStatus(inspectedFile) === "indexed" ? (
+                  <Button onClick={() => openDocument(inspectedFile.id, "graph")} size="xs" variant="outline">从文件构建图谱</Button>
+                ) : null}
+              </div>
+            </details>
+            <FileGraphLinks key={inspectedFile.id} fileId={inspectedFile.id} />
+          </div>
+        </aside>
+      ) : null}
       </div>
       <DeleteImpactDialog
         error={deleteImpact.error?.message ?? remove.error?.message}
@@ -1025,37 +1321,14 @@ export function SourcesPage() {
         />
       ) : null}
       {sources.data?.length ? (
-        <Surface className="p-5">
-          <SectionHeading
-            description="正文按规范化 URL 或内容哈希复用，关联关系单独保存。"
-            title="网页资料"
-          />
-          <div className="mt-4 divide-y">
-            {sources.data.map((source) => (
-              <div className="flex items-center gap-3 py-3" key={source.id}>
-                <Globe2 className="size-4 text-muted-foreground" />
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium">{source.title}</p>
-                  <p className="truncate text-xs text-muted-foreground">
-                    {source.final_url}
-                  </p>
-                </div>
-                <StatePill
-                  label={source.cache_status}
-                  status={source.cache_status}
-                />
-                <Button
-                  aria-label={`查看 ${source.title} 的详情与关联`}
-                  onClick={() => setSourceDetail(source)}
-                  size="xs"
-                  variant="outline"
-                >
-                  详情与关联
-                </Button>
-              </div>
-            ))}
-          </div>
-        </Surface>
+        <WebSourcesSection
+          onInspect={(source) => setSourceDetail(source)}
+          onRequestDelete={(source) => {
+            removeSource.reset();
+            setSourceDeleteTarget(source);
+          }}
+          sources={sources.data}
+        />
       ) : null}
       {sources.isError ? (
         <Surface className="p-5" role="alert">
@@ -1200,6 +1473,244 @@ export function SourcesPage() {
         </DialogContent>
       </Dialog>
     </PageFrame>
+  );
+}
+
+function WebSourcesSection({
+  sources,
+  onInspect,
+  onRequestDelete,
+}: {
+  sources: SourceRecord[];
+  onInspect: (source: SourceRecord) => void;
+  onRequestDelete: (source: SourceRecord) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(12);
+  const { confirm, dialog } = useActionConfirmation();
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLocaleLowerCase();
+    if (!q) return sources;
+    return sources.filter((source) =>
+      `${source.title || ""} ${source.final_url || ""} ${source.authorized_domain || ""}`
+        .toLocaleLowerCase()
+        .includes(q),
+    );
+  }, [search, sources]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const paged = useMemo(
+    () => filtered.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [filtered, pageSize, safePage],
+  );
+  const visibleIds = useMemo(() => paged.map((source) => source.id), [paged]);
+  const selection = useListSelection(visibleIds);
+
+  const selectedSources = useMemo(
+    () => sources.filter((source) => selection.selectedIds.has(source.id)),
+    [selection.selectedIds, sources],
+  );
+
+  const batchDelete = useMutation({
+    mutationFn: async (targets: SourceRecord[]) => {
+      const deleted: string[] = [];
+      for (const source of targets) {
+        try {
+          const impact = await getSourceDeleteImpact(source.id);
+          await deleteSourceConfirmed(source.id, impact.confirmation_text);
+          deleted.push(source.id);
+        } catch {
+          // continue deleting remaining selected web sources
+        }
+      }
+      return { deleted, failed: targets.length - deleted.length };
+    },
+    onSuccess: async ({ deleted, failed }) => {
+      selection.removeIds(deleted);
+      await queryClient.invalidateQueries({ queryKey: ["source-records"] });
+      if (failed === 0) toast.success(`已删除 ${deleted.length} 条网页资料`);
+      else if (deleted.length > 0) toast.warning(`已删除 ${deleted.length} 条网页资料，${failed} 条失败`);
+      else toast.error("批量删除网页资料失败");
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "批量删除网页资料失败"),
+  });
+
+  const allFilteredIds = useMemo(() => filtered.map((item) => item.id), [filtered]);
+  const allFilteredSelected =
+    allFilteredIds.length > 0 && allFilteredIds.every((id) => selection.selectedIds.has(id));
+
+  return (
+    <Surface className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <SectionHeading
+          description="正文按规范化 URL 或内容哈希复用，关联关系单独保存。"
+          title="网页资料"
+        />
+        <Button
+          aria-pressed={selection.multiSelect}
+          onClick={selection.toggleMultiSelect}
+          size="sm"
+          type="button"
+          variant={selection.multiSelect ? "secondary" : "outline"}
+        >
+          <SquareCheck className="size-4" />
+          {selection.multiSelect ? "退出多选" : "多选"}
+        </Button>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <ClearableSearchInput
+          aria-label="搜索网页资料"
+          containerClassName="min-w-48 flex-1 sm:max-w-sm"
+          inputClassName="h-9"
+          onChange={(value) => {
+            setSearch(value);
+            setPage(1);
+          }}
+          placeholder="搜索标题、网址或域名…"
+          value={search}
+        />
+        {selection.multiSelect && paged.length > 0 ? (
+          <>
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                aria-label="全选当前页网页资料"
+                checked={selection.visibleCheckboxState}
+                disabled={batchDelete.isPending}
+                onCheckedChange={(checked) => selection.toggleVisible(checked === true)}
+              />
+              全选当前页
+            </label>
+            {filtered.length > paged.length ? (
+              <Button
+                disabled={batchDelete.isPending}
+                onClick={() =>
+                  allFilteredSelected ? selection.clear() : selection.selectAll(allFilteredIds)
+                }
+                size="xs"
+                type="button"
+                variant="link"
+              >
+                {allFilteredSelected ? "取消全选" : `全选筛选结果 (${filtered.length})`}
+              </Button>
+            ) : null}
+          </>
+        ) : null}
+      </div>
+
+      {selection.multiSelect && selection.selectedCount > 0 ? (
+        <div
+          aria-label="网页资料批量操作"
+          className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border bg-muted/35 px-3 py-2 text-xs"
+          role="region"
+        >
+          <span className="font-medium tabular-nums">
+            已选 {selection.selectedCount} 条
+            {selection.otherSelectedCount > 0
+              ? `（本页 ${selection.selectedVisibleCount} 条，其他页 ${selection.otherSelectedCount} 条）`
+              : ""}
+          </span>
+          <div className="ml-auto flex items-center gap-1.5">
+            <Button
+              disabled={batchDelete.isPending}
+              onClick={() =>
+                confirm({
+                  title: `删除选中的 ${selectedSources.length} 条网页资料？`,
+                  description: "删除后将解除对应来源引用并永久移除网页缓存，此操作不可撤销。",
+                  label: `删除 ${selectedSources.length} 条`,
+                  destructive: true,
+                  run: () => batchDelete.mutate(selectedSources),
+                })
+              }
+              size="xs"
+              type="button"
+              variant="destructive"
+            >
+              <Trash2 className="size-3.5" />
+              {batchDelete.isPending ? "删除中…" : "批量删除"}
+            </Button>
+            <Button disabled={batchDelete.isPending} onClick={selection.clear} size="xs" type="button" variant="ghost">
+              取消选择
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {!filtered.length ? (
+        <p className="py-8 text-center text-sm text-muted-foreground">
+          没有匹配「{search.trim()}」的网页资料。
+        </p>
+      ) : (
+        <div className="mt-4 divide-y">
+          {paged.map((source) => {
+            const selected = selection.selectedIds.has(source.id);
+            return (
+              <div
+                className={`flex items-center gap-3 py-3 ${selected ? "rounded-lg bg-primary/5 px-2" : ""}`}
+                key={source.id}
+              >
+                {selection.multiSelect ? (
+                  <Checkbox
+                    aria-label={`选择网页资料 ${source.title}`}
+                    disabled={batchDelete.isPending}
+                    {...selection.checkboxProps(source.id)}
+                  />
+                ) : null}
+                <Globe2 className="size-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">{source.title}</p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {source.final_url}
+                  </p>
+                </div>
+                <StatePill
+                  label={source.cache_status}
+                  status={source.cache_status}
+                />
+                <Button
+                  aria-label={`查看 ${source.title} 的详情与关联`}
+                  onClick={() => onInspect(source)}
+                  size="xs"
+                  variant="outline"
+                >
+                  详情与关联
+                </Button>
+                <Button
+                  aria-label={`删除网页资料 ${source.title}`}
+                  disabled={batchDelete.isPending}
+                  onClick={() => onRequestDelete(source)}
+                  size="icon-xs"
+                  title="删除网页资料"
+                  variant="ghost"
+                >
+                  <Trash2 className="size-3.5 text-destructive" />
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {filtered.length > pageSize || pageSize !== 12 ? (
+        <div className="mt-3 border-t pt-3">
+          <Pagination
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+            page={safePage}
+            pageSize={pageSize}
+            sizes={[12, 24, 48]}
+            total={filtered.length}
+          />
+        </div>
+      ) : null}
+      {dialog}
+    </Surface>
   );
 }
 

@@ -9,6 +9,7 @@ import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
 import { IncrementalMarkdown } from "@/components/ai-elements/incremental-markdown";
 import { Button } from "@/components/ui/button";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { adaptivePollInterval } from "@/lib/network-quality";
 import { useReducedMotionPreference } from "@/lib/motion-preferences";
 import type {
   ActivitySpec,
@@ -584,9 +585,11 @@ function LearningPackageCanvasContent({
     enabled: Boolean(nodeId),
     retry: false,
     refetchInterval: (current) =>
-      ["queued", "running"].includes(current.state.data?.build?.status ?? "")
-        ? 2_000
-        : false,
+      adaptivePollInterval(
+        ["queued", "running"].includes(current.state.data?.build?.status ?? "")
+          ? 2_000
+          : false,
+      ),
   });
   const enrollment = query.data?.enrollment ?? null;
   const setEnrollment = (row: Enrollment) => {

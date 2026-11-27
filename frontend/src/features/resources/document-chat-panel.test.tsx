@@ -17,7 +17,7 @@ vi.mock("@/api/sessions", () => ({
 
 function renderPanel(sessionId = "") {
   const send = vi.fn();
-  renderWithProviders(<DocumentChatPanel compact file={file} sessionId={sessionId} workspaceId={file.workspace_id}
+  renderWithProviders(<DocumentChatPanel file={file} sessionId={sessionId} workspaceId={file.workspace_id}
     selection={null} onClearSelection={vi.fn()} onSessionChange={vi.fn()} onSendToFullChat={send} />);
   return send;
 }
@@ -30,7 +30,7 @@ async function openMenu() {
   return trigger;
 }
 
-describe("compact document model selector", () => {
+describe("document chat model selector", () => {
   beforeEach(() => {
     vi.mocked(listProviders).mockResolvedValue(providers);
     vi.mocked(discoverProviderModels).mockImplementation(async (id) => ({
@@ -70,12 +70,9 @@ describe("compact document model selector", () => {
     await userEvent.click(screen.getByRole("menuitemradio", { name: /demo-model-b/ }));
     expect(getSessionComposerPrefs("existing-document-session").modelId).toBe("demo-model-b");
     await userEvent.click(trigger);
-    const slider = screen.getByRole("slider");
-    vi.spyOn(slider, "getBoundingClientRect").mockReturnValue({ left: 0, width: 400 } as DOMRect);
-    fireEvent(slider, new MouseEvent("pointerdown", { bubbles: true, clientX: 0 }));
-    fireEvent.pointerUp(slider);
+    await userEvent.click(screen.getByRole("radio", { name: "极速" }));
     await userEvent.keyboard("{Escape}");
-    expect(trigger).toHaveTextContent("快");
+    expect(trigger).toHaveTextContent("极速");
     expect(getSessionComposerPrefs("existing-document-session")).toMatchObject({ responseMode: "fast", thinkingMode: "off" });
     await userEvent.type(screen.getByRole("textbox", { name: "询问当前文档" }), "解释{Enter}");
     expect(send).toHaveBeenCalledWith("解释", expect.objectContaining({ thinkingMode: "off", responseMode: "fast" }));

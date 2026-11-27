@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 import { Ban, Image as ImageIcon, PenTool, Sparkles } from "lucide-react";
 import { toast } from '@/lib/notifications';
+import { adaptivePollInterval } from '@/lib/network-quality';
 
 import {
   cancelAIGraphCover,
@@ -251,7 +252,7 @@ export function GraphCoverAIEditor({
   const job = useQuery({
     queryKey: jobKey,
     queryFn: () => getAIGraphCoverStatus(graphId),
-    refetchInterval: (query) => (query.state.data?.active ? 3000 : false),
+    refetchInterval: (query) => adaptivePollInterval(query.state.data?.active ? 3000 : false),
   });
   const active = Boolean(job.data?.active);
   /** 同一个任务只结算一次：避免每次重新取数都重复提示/重复刷新。 */
@@ -445,7 +446,7 @@ export function GraphCoverAIBadge({ graphId }: { graphId: string }) {
   const job = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graph-cover-ai", graphId),
     queryFn: () => getAIGraphCoverStatus(graphId),
-    refetchInterval: (query) => (query.state.data?.active ? 3000 : false),
+    refetchInterval: (query) => adaptivePollInterval(query.state.data?.active ? 3000 : false),
   });
   // 每个任务只结算一次：站内重新取数不能让同一条失败反复弹提示。
   const settledJobId = useRef<string | null>(null);

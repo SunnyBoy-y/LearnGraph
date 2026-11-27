@@ -12,6 +12,7 @@ export interface GraphNode {
   teaching_strategy?: string
   mastery_stars: number
   achievement_score?: number | null
+  execution_state?: string | null
   retrieval_state: string
   evidence_state: string
   attention_state: string

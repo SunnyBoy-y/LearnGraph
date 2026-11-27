@@ -8,18 +8,23 @@ import {
   FolderOpen,
   Image as ImageIcon,
   LoaderCircle,
+  SquareCheck,
   Video,
 } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { fileStreamUrl, listSessionFiles } from "@/api/files";
 import { useFileStreamUrl } from "@/hooks/use-file-stream-url";
 import { FilePreviewDialog } from "@/components/resources/file-preview-dialog";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { documentHref } from "@/lib/document-citations";
+import { useListSelection } from "@/lib/list-selection";
 import { downloadViaNative, toAbsoluteApiUrl } from "@/lib/native-download";
+import { toast } from "@/lib/notifications";
 import type { SessionFile } from "@/types/files";
 
 const ORIGIN_LABELS: Record<string, string> = {
@@ -119,6 +124,68 @@ export function SessionFilesList({
 
   const list = files.data ?? [];
   const [previewFile, setPreviewFile] = useState<SessionFile | null>(null);
+  const [search, setSearch] = useState("");
+  const [downloadingBatch, setDownloadingBatch] = useState(false);
+
+  const fileKey = (file: SessionFile) => file.file_id ?? file.path ?? file.filename;
+
+  const filteredList = useMemo(() => {
+    const list = files.data ?? [];
+    const q = search.trim().toLocaleLowerCase();
+    if (!q) return list;
+    return list.filter((file) =>
+      `${file.filename} ${file.path ?? ""}`.toLocaleLowerCase().includes(q),
+    );
+  }, [files.data, search]);
+
+  const visibleKeys = useMemo(() => filteredList.map(fileKey), [filteredList]);
+  const selection = useListSelection(visibleKeys);
+  const selectedFiles = useMemo(
+    () => (files.data ?? []).filter((file) => selection.selectedIds.has(fileKey(file))),
+    [files.data, selection.selectedIds],
+  );
+  const downloadableSelected = useMemo(
+    () => selectedFiles.filter((file) => Boolean(file.file_id)),
+    [selectedFiles],
+  );
+
+  async function downloadSingle(file: SessionFile) {
+    if (!file.file_id) return;
+    if (
+      downloadViaNative(
+        toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.file_id)}/content`),
+        file.filename,
+      )
+    ) {
+      return;
+    }
+    const url = await fileStreamUrl(file.file_id);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = file.filename;
+    anchor.click();
+  }
+
+  async function downloadSelected() {
+    if (!downloadableSelected.length || downloadingBatch) return;
+    setDownloadingBatch(true);
+    let ok = 0;
+    try {
+      for (const file of downloadableSelected) {
+        try {
+          await downloadSingle(file);
+          ok += 1;
+        } catch {
+          // continue downloading remaining selected files
+        }
+      }
+      if (ok === downloadableSelected.length) toast.success(`已触发下载 ${ok} 个文件`);
+      else if (ok > 0) toast.warning(`已触发下载 ${ok} 个文件，${downloadableSelected.length - ok} 个失败`);
+      else toast.error("批量下载失败");
+    } finally {
+      setDownloadingBatch(false);
+    }
+  }
 
   if (!enabled) {
     return (
@@ -153,104 +220,176 @@ export function SessionFilesList({
           </span>
         </div>
       ) : (
-        <ul className="grid gap-1 p-2">
-          {list.map((file) => {
-            const { label } = fileKindLabel(file);
-            const originLabel = ORIGIN_LABELS[file.origin] ?? file.origin;
-            const href =
-              file.file_id && workspaceId
-                ? documentHref(workspaceId, file.file_id)
-                : "";
-            return (
-              <li key={file.file_id ?? file.path ?? file.filename}>
-                <div
-                  className="group flex cursor-pointer items-center gap-2 rounded-lg border p-2 transition-colors hover:bg-muted/60"
-                  onClick={() => setPreviewFile(file)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      setPreviewFile(file);
-                    }
-                  }}
-                  role="button"
-                  tabIndex={0}
-                  title={`预览 ${file.filename}`}
+        <div className="space-y-2 p-2">
+          <div className="flex items-center gap-1.5">
+            <ClearableSearchInput
+              aria-label="搜索会话文件"
+              containerClassName="min-w-0 flex-1"
+              inputClassName="h-7 text-xs"
+              onChange={setSearch}
+              placeholder="搜索文件名或路径…"
+              value={search}
+            />
+            <Button
+              aria-label={selection.multiSelect ? "退出多选" : "多选会话文件"}
+              aria-pressed={selection.multiSelect}
+              onClick={selection.toggleMultiSelect}
+              size="icon-xs"
+              title={selection.multiSelect ? "退出多选 (Esc)" : "多选"}
+              type="button"
+              variant={selection.multiSelect ? "secondary" : "ghost"}
+            >
+              <SquareCheck className="size-3.5" />
+            </Button>
+          </div>
+
+          {selection.multiSelect && filteredList.length > 0 ? (
+            <div
+              aria-label="会话文件批量操作"
+              className="flex flex-wrap items-center gap-1.5 rounded-lg border bg-muted/30 px-2 py-1.5 text-[11px]"
+              role="region"
+            >
+              <label className="flex items-center gap-1.5">
+                <Checkbox
+                  aria-label="全选当前文件"
+                  checked={selection.visibleCheckboxState}
+                  disabled={downloadingBatch}
+                  onCheckedChange={(checked) => selection.toggleVisible(checked === true)}
+                />
+                全选
+              </label>
+              <span className="tabular-nums text-muted-foreground">
+                已选 {selection.selectedCount}
+              </span>
+              <div className="ml-auto flex items-center gap-1">
+                <Button
+                  disabled={downloadingBatch || !downloadableSelected.length}
+                  onClick={() => void downloadSelected()}
+                  size="xs"
+                  type="button"
+                  variant="outline"
                 >
-                  <SessionFileThumb file={file} />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-xs font-medium" title={file.filename}>
-                      {file.filename}
-                    </p>
-                    <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
-                      <span>{formatFileSize(file.size_bytes)}</span>
-                      <span>·</span>
-                      <span>{label}</span>
-                      {file.path ? (
-                        <span className="truncate font-mono" title={file.path}>
-                          {file.path}
+                  <Download className="size-3" />
+                  下载{downloadableSelected.length ? ` (${downloadableSelected.length})` : ""}
+                </Button>
+                {selection.selectedCount > 0 ? (
+                  <Button disabled={downloadingBatch} onClick={selection.clear} size="xs" type="button" variant="ghost">
+                    清空
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+
+          {!filteredList.length ? (
+            <p className="py-6 text-center text-xs text-muted-foreground">
+              没有匹配「{search.trim()}」的文件。
+            </p>
+          ) : (
+            <ul className="grid gap-1">
+              {filteredList.map((file) => {
+                const key = fileKey(file);
+                const { label } = fileKindLabel(file);
+                const originLabel = ORIGIN_LABELS[file.origin] ?? file.origin;
+                const href =
+                  file.file_id && workspaceId
+                    ? documentHref(workspaceId, file.file_id)
+                    : "";
+                const selected = selection.multiSelect && selection.selectedIds.has(key);
+                return (
+                  <li key={key}>
+                    <div
+                      className={`group flex cursor-pointer items-center gap-2 rounded-lg border p-2 transition-colors hover:bg-muted/60 ${selected ? "border-ring bg-primary/5" : ""}`}
+                      onClick={(event) => {
+                        if (selection.multiSelect) {
+                          selection.toggleItem(key, { shiftKey: event.shiftKey });
+                          return;
+                        }
+                        setPreviewFile(file);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          if (selection.multiSelect) selection.toggleItem(key);
+                          else setPreviewFile(file);
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      title={selection.multiSelect ? `勾选 ${file.filename}` : `预览 ${file.filename}`}
+                    >
+                      {selection.multiSelect ? (
+                        <span onClick={(event) => event.stopPropagation()}>
+                          <Checkbox
+                            aria-label={`选择文件 ${file.filename}`}
+                            disabled={downloadingBatch}
+                            {...selection.checkboxProps(key)}
+                          />
                         </span>
                       ) : null}
-                    </p>
-                    <div className="mt-1 flex items-center gap-1">
-                      <Badge
-                        variant={ORIGIN_TONES[file.origin] ?? "outline"}
-                        className="px-1.5 py-0 text-[9px] font-normal"
-                      >
-                        {originLabel}
-                      </Badge>
+                      <SessionFileThumb file={file} />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-xs font-medium" title={file.filename}>
+                          {file.filename}
+                        </p>
+                        <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
+                          <span>{formatFileSize(file.size_bytes)}</span>
+                          <span>·</span>
+                          <span>{label}</span>
+                          {file.path ? (
+                            <span className="truncate font-mono" title={file.path}>
+                              {file.path}
+                            </span>
+                          ) : null}
+                        </p>
+                        <div className="mt-1 flex items-center gap-1">
+                          <Badge
+                            variant={ORIGIN_TONES[file.origin] ?? "outline"}
+                            className="px-1.5 py-0 text-[9px] font-normal"
+                          >
+                            {originLabel}
+                          </Badge>
+                        </div>
+                      </div>
+                      <div className="flex flex-none flex-col gap-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100">
+                        {file.file_id ? (
+                          <>
+                            <Button
+                              aria-label={`打开 ${file.filename}`}
+                              className="size-6"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (href) navigate(href);
+                              }}
+                              size="icon-xs"
+                              type="button"
+                              variant="ghost"
+                            >
+                              <ExternalLink className="size-3.5" />
+                            </Button>
+                            <Button
+                              aria-label={`下载 ${file.filename}`}
+                              className="size-6"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void downloadSingle(file);
+                              }}
+                              size="icon-xs"
+                              type="button"
+                              variant="ghost"
+                            >
+                              <Download className="size-3.5" />
+                            </Button>
+                          </>
+                        ) : null}
+                      </div>
                     </div>
-                  </div>
-                  <div className="flex flex-none flex-col gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-                    {file.file_id ? (
-                      <>
-                        <Button
-                          aria-label={`打开 ${file.filename}`}
-                          className="size-6"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            if (href) navigate(href);
-                          }}
-                          size="icon-xs"
-                          type="button"
-                          variant="ghost"
-                        >
-                          <ExternalLink className="size-3.5" />
-                        </Button>
-                        <Button
-                          aria-label={`下载 ${file.filename}`}
-                          className="size-6"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            if (
-                              file.file_id &&
-                              downloadViaNative(
-                                toAbsoluteApiUrl(`/api/v1/files/${encodeURIComponent(file.file_id)}/content`),
-                                file.filename,
-                              )
-                            ) {
-                              return;
-                            }
-                            void fileStreamUrl(file.file_id!).then((url) => {
-                              const anchor = document.createElement("a");
-                              anchor.href = url;
-                              anchor.download = file.filename;
-                              anchor.click();
-                            });
-                          }}
-                          size="icon-xs"
-                          type="button"
-                          variant="ghost"
-                        >
-                          <Download className="size-3.5" />
-                        </Button>
-                      </>
-                    ) : null}
-                  </div>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
       )}
       <SessionFilePreviewDialog
         file={previewFile}

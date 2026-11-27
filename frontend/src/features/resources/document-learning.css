@@ -1,0 +1,193 @@
+/*
+ * 文件学习工作台外壳。
+ *
+ * 布局判断依据工作台自身的可用宽度（容器查询），而不是浏览器窗口宽度：
+ * 侧边导航展开/收起、学习面板占用都会改变这里真正拿到的空间。
+ * 窄屏只显示一个面板，面板切换是一条普通文档流里的轻量导航；
+ * 宽屏查看区与对话区并排。所有面板始终挂载，切换布局不会重建会话。
+ */
+.document-learning-workspace {
+  container: learning / inline-size;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: calc(100svh - 7rem);
+}
+
+.document-pane-tabs {
+  position: sticky;
+  /* 与页面标题栏的吸顶位置对齐；这是全局 chrome 偏移，不参与工作台布局判断。 */
+  top: 7.1rem;
+  z-index: 10;
+  display: grid;
+  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+  padding: 4px;
+}
+@media (min-width: 1024px) {
+  .document-pane-tabs { top: 4.25rem; }
+}
+.document-pane-tabs > button { min-width: 0; }
+
+.document-learning-body {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+.document-learning-body > * { min-width: 0; min-height: 0; }
+
+/* 窄屏：一次只显示一个面板。 */
+.document-learning-outline,
+.document-learning-main,
+.document-learning-workspace .document-learning-chat-dock { display: none; }
+.document-learning-outline[data-pane-active="true"],
+.document-learning-main[data-pane-active="true"],
+.document-learning-workspace .document-learning-chat-dock[data-pane-active="true"] {
+  display: flex;
+  flex-direction: column;
+}
+
+.document-learning-main { overflow: auto; background: var(--card); }
+.document-learning-outline {
+  border-right: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 35%, var(--background));
+  overflow: hidden;
+}
+.document-learning-outline__scroll { overflow: auto; min-height: 0; flex: 1; padding: 16px; }
+
+/*
+ * 对话区回到正常文档流：输入框贴底，消息区独立滚动。
+ * 选择器带上工作台前缀，避免被旧的浮层样式按加载顺序覆盖。
+ */
+.document-learning-workspace .document-learning-chat-dock {
+  position: static;
+  inset: auto;
+  width: auto;
+  height: auto;
+  min-height: 0;
+  transform: none;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: var(--background);
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.document-learning-chat-dock__inner { display: flex; height: 100%; min-height: 0; flex-direction: column; }
+.document-learning-chat-dock__chat { min-height: 0; flex: 1; }
+.document-learning-workspace .document-learning-chat-dock[data-open="false"] { display: none; }
+
+.document-learning-image { flex: 1; min-height: 20rem; }
+
+@container learning (min-width: 46rem) {
+  .document-pane-tabs { display: none; }
+  .document-learning-body { grid-template-columns: minmax(0, 1fr) minmax(20rem, 26rem); }
+  /* 宽屏下查看区始终可见，data-pane-active 只服务窄屏单面板。 */
+  .document-learning-workspace .document-learning-main { display: flex; flex-direction: column; }
+  .document-learning-workspace .document-learning-chat-dock[data-open="true"] { display: flex; }
+  .document-learning-workspace[data-tools-open="false"] .document-learning-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .document-learning-workspace[data-outline-open="true"] .document-learning-body {
+    grid-template-columns: 13rem minmax(0, 1fr);
+  }
+  .document-learning-workspace[data-outline-open="true"] .document-learning-outline[data-open="true"] {
+    display: flex;
+    flex-direction: column;
+  }
+  .document-learning-workspace[data-outline-open="true"][data-tools-open="true"] .document-learning-body {
+    grid-template-columns: 13rem minmax(0, 1fr) minmax(20rem, 26rem);
+  }
+}
+
+@container learning (max-width: 45.99rem) {
+  .doc-outline-toggle,
+  .doc-tools-toggle { display: none; }
+}
+
+/* 图片查看区：图片是视觉中心，除比例约束外不加任何容器装饰。 */
+.file-image-viewer {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  background: color-mix(in oklab, var(--muted) 55%, var(--background));
+}
+.file-image-viewer--loading,
+.file-image-viewer--error {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+.file-image-viewer--error { color: var(--destructive); }
+.file-image-viewer:fullscreen { background: var(--background); }
+
+.file-image-stage {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+}
+.file-image-stage__image {
+  display: block;
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  flex: none;
+  object-fit: contain;
+  border-radius: 2px;
+  box-shadow: none;
+  user-select: none;
+}
+.file-image-stage[data-fitted="true"] .file-image-stage__image {
+  max-width: none;
+  max-height: none;
+}
+
+.file-image-tools {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border-top: 1px solid var(--border);
+  background: var(--background);
+  padding: 4px 8px;
+}
+.file-image-tools__zoom {
+  min-width: 3.25rem;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+/* 资料库等处的图片预览：高度由真实比例决定，不再撑满固定容器。 */
+.document-image-preview { display: grid; justify-items: center; gap: 12px; padding: 12px; }
+.document-image-preview .document-blob-image { max-height: min(76svh, 40rem); box-shadow: none; }
+
+.document-reader-selection-toolbar {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  max-width: calc(100vw - 16px);
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+}

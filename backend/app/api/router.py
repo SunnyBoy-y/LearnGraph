@@ -22,6 +22,7 @@ from app.api.routers import (
     health,
     image_generations,
     im,
+    learning_packages,
     learning_state,
     memory,
     memory_eval,
@@ -87,6 +88,7 @@ for router in (
     # Memory V2 static routes must be registered before V1 /memory/{memory_id}.
     memory_v2.router,    tasks.router,
     episodes.router,
+    learning_packages.router,
     learning_state.router,
     memory.router,
     mcp_skills.router,

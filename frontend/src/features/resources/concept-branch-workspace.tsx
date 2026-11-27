@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, useMotionValue } from "motion/react";
 import { BookOpenText, ExternalLink, GripHorizontal, Merge, Network, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from '@/lib/notifications';
@@ -37,8 +37,9 @@ export function ConceptBranchWorkspace({
   })) });
   const sessions = { data: branchQueries.flatMap(query => query.data ? [query.data] : []) };
   const [activeId, setActiveId] = useState(branchIds.at(-1) ?? "");
-  const [position, setPosition] = useState({ x: 72, y: 92 });
-  const dragRef = useRef<{ x: number; y: number; startX: number; startY: number } | null>(null);
+  const x = useMotionValue(72);
+  const y = useMotionValue(92);
+  const dragRef = useRef<{ pointerId: number; x: number; y: number; startX: number; startY: number } | null>(null);
   const branches = useMemo(
     () => branchIds.map((id) => sessions.data?.find((session) => session.id === id)).filter(Boolean),
     [branchIds, sessions.data],
@@ -114,27 +115,36 @@ export function ConceptBranchWorkspace({
 
   return (
     <motion.section
-      animate={{ opacity: 1, scale: 1, x: position.x, y: position.y }}
+      animate={{ opacity: 1, scale: 1 }}
       aria-label="概念解释分支"
       className="concept-branch-window"
-      initial={reducedMotion ? false : { opacity: 0, scale: 0.96, x: position.x, y: position.y + 12 }}
-      transition={{ duration: reducedMotion || dragRef.current ? 0 : 0.18 }}
+      initial={reducedMotion ? false : { opacity: 0, scale: 0.96 }}
+      style={{ x, y }}
+      transition={{ duration: reducedMotion ? 0 : 0.18 }}
     >
       <header
         className="concept-branch-window__drag"
         onPointerDown={(event) => {
           if ((event.target as Element).closest("button")) return;
           event.currentTarget.setPointerCapture(event.pointerId);
-          dragRef.current = { x: position.x, y: position.y, startX: event.clientX, startY: event.clientY };
+          dragRef.current = { pointerId: event.pointerId, x: x.get(), y: y.get(), startX: event.clientX, startY: event.clientY };
         }}
         onPointerMove={(event) => {
-          if (!dragRef.current) return;
-          setPosition({
-            x: Math.max(8, dragRef.current.x + event.clientX - dragRef.current.startX),
-            y: Math.max(8, dragRef.current.y + event.clientY - dragRef.current.startY),
-          });
+          const drag = dragRef.current;
+          if (!drag || drag.pointerId !== event.pointerId) return;
+          x.set(Math.max(8, drag.x + event.clientX - drag.startX));
+          y.set(Math.max(8, drag.y + event.clientY - drag.startY));
         }}
-        onPointerUp={() => { dragRef.current = null; }}
+        onPointerUp={(event) => {
+          if (dragRef.current?.pointerId !== event.pointerId) return;
+          event.currentTarget.releasePointerCapture?.(event.pointerId);
+          dragRef.current = null;
+        }}
+        onPointerCancel={(event) => {
+          if (dragRef.current?.pointerId !== event.pointerId) return;
+          event.currentTarget.releasePointerCapture?.(event.pointerId);
+          dragRef.current = null;
+        }}
       >
         <GripHorizontal className="size-4" />
         <div className="min-w-0 flex-1">

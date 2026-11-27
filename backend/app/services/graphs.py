@@ -163,6 +163,33 @@ class GraphService:
                 GraphNode.graph_id == graph.id, LearningAchievement.workspace_id == self.workspace_id,
                 LearningAchievement.user_id == self.actor_id)).all()
         awards = {node_id: score for node_id, score, digest in award_rows if node_fingerprints.get(node_id) == digest}
+        from app.domain.learning_package_models import LearningEnrollment
+
+        execution = {}
+        lab_ids = [node.id for node in nodes if node.node_type in {"lab", "practice"}]
+        exam_ids = [node.id for node in nodes if node.node_type == "assessment"]
+        if lab_ids:
+            rows = self.db.execute(select(LearningPackage.node_id, LearningPackage.fingerprint, LearningEnrollment.progress)
+                .join(LearningEnrollment, LearningEnrollment.package_id == LearningPackage.id)
+                .where(LearningPackage.node_id.in_(lab_ids), LearningPackage.workspace_id == self.workspace_id,
+                       LearningEnrollment.workspace_id == self.workspace_id, LearningEnrollment.user_id == self.actor_id)
+                .order_by(LearningEnrollment.updated_at.desc(), LearningEnrollment.id.desc()))
+            for node_id, digest, progress in rows:
+                if node_fingerprints[node_id] == digest and node_id not in execution:
+                    activity = (progress or {}).get("activity") or {}
+                    execution[node_id] = (
+                        "completed" if activity.get("completed")
+                        else "in_progress" if activity.get("history") else "not_started"
+                    )
+        if exam_ids:
+            rows = self.db.execute(select(LearningAttempt.node_id, LearningPackage.fingerprint, LearningAttempt.status)
+                .join(LearningPackage, LearningPackage.id == LearningAttempt.package_id)
+                .where(LearningAttempt.node_id.in_(exam_ids), LearningAttempt.workspace_id == self.workspace_id,
+                       LearningPackage.workspace_id == self.workspace_id, LearningAttempt.user_id == self.actor_id)
+                .order_by(LearningAttempt.created_at.desc(), LearningAttempt.id.desc()))
+            for node_id, digest, status in rows:
+                if node_fingerprints[node_id] == digest:
+                    execution.setdefault(node_id, status)
         learning_page_nodes = self._learning_page_node_ids(graph.id)
         return GraphView.model_validate({
             **graph.__dict__,
@@ -170,6 +197,7 @@ class GraphService:
                 {
                     **node.__dict__,
                     "achievement_score": awards.get(node.id),
+                    "execution_state": execution.get(node.id),
                     "has_learning_page": node.id in learning_page_nodes,
                 }
                 for node in nodes

@@ -39,7 +39,7 @@ export interface LearningBuildPreview {
 export interface LearningPageData { node: {id: string; label: string; description: string; graph_id: string; graph_title?:string; graph_status?:string; node_type: string}; package: {id: string; manifest: Manifest; created_at: string} | null; preview?: LearningBuildPreview | null; stale: boolean; enrollment?: Enrollment | null; latest_attempt?: {id:string;status:string} | null; build: Build | null; achievement: {score: number; attempt_id: string; outdated?:boolean} | null }
 export interface Enrollment { id: string; package_id: string; revision: number; progress: {sections: string[]; activity: ActivityState} }
 export interface Attempt { id: string; node_id: string; package_id: string; status: string; revision: number; answers: Record<string, string | string[]>; activity: ActivityState; activity_spec: ActivitySpec | null; paper: Paper; result: {score?: number; pass_score?: number; message: string; critical_passed?: boolean; practical_passed?: boolean; questions?: {id: string; points: number; max_points: number; feedback: string}[]} | null }
-const url = '/learning-pages'
+const url = '/node-activities'
 // These endpoints only enqueue work or read status; model generation is never
 // part of their HTTP response. A lost connection must not freeze the controls.
 async function statusRequest<T>(request: (signal: AbortSignal) => Promise<T>, parent?: AbortSignal): Promise<T> {

@@ -66,7 +66,6 @@ export interface FilePreviewCanvasProps {
   className?: string;
   onEmbeddedImage?: EmbeddedImageHandler;
   onTextSelection?: TextSelectionHandler;
-  imageActions?: ReactNode;
   /** 图片预览是否支持点击放大（复用共享灯箱）。 */
   imageZoom?: boolean;
   audioDetails?: ReactNode;
@@ -89,7 +88,6 @@ function FilePreviewDocument({
   className,
   onEmbeddedImage,
   onTextSelection,
-  imageActions,
   imageZoom = false,
   audioDetails,
   pdfPage,
@@ -170,9 +168,9 @@ function FilePreviewDocument({
       ) : kind === "video" ? (
         <VideoPreview blob={blob} url={mediaUrl} filename={filename} />
       ) : kind === "image" ? (
-        <div className="grid min-h-[36rem] place-items-center gap-4 bg-muted/30 p-8">
+        /* 图片高度交给真实宽高比决定，不再占用统一的固定容器。 */
+        <div className="document-image-preview">
           <BlobImage alt={filename} blob={blob} url={mediaUrl} zoomable={imageZoom} />
-          {imageActions}
         </div>
       ) : kind === "html" && blob ? (
         <HtmlDocumentViewer blob={blob} filename={filename} />

@@ -244,7 +244,7 @@ export function useGoalSetupFlow({
 
   function currentGraphRevision() {
     const revision = graph.data?.revision;
-    if (!revision) throw new Error("候选图谱 Revision 尚未载入，请稍后重试。");
+    if (!revision) throw new Error("候选图谱版本尚未载入，请稍后重试。");
     return revision;
   }
 
@@ -261,7 +261,7 @@ export function useGoalSetupFlow({
   }
   const prepareGraph = useMutation({
     mutationFn: async () => {
-      if (!result || !draft) throw new Error("Goal 草稿尚未准备完成。");
+      if (!result || !draft) throw new Error("学习目标草稿尚未准备完成。");
       const savedGoal = await confirmGoal(result.goal.id, draft);
       // Root-first streaming generation: the root preview event arrives before
       // level-1 children, so the UI can render it while the rest still streams.
@@ -571,8 +571,10 @@ export function useGoalSetupFlow({
     observedGraphRevision.current = revision;
   }, [graph.data?.revision]);
 
+  // Effects from the render that changes scope still hold the previous flow's data.
+  const previewMatchesScope = activeScopeKey.current === scopeKey;
   useEffect(() => {
-    if (!enabled || !previewEnabled) return;
+    if (!enabled || !previewEnabled || !previewMatchesScope) return;
     const currentGraph = graph.data;
     const building = stage === "graph_building";
     // While the candidate is still streaming, prefer the incremental preview so
@@ -586,6 +588,7 @@ export function useGoalSetupFlow({
     window.dispatchEvent(
       new CustomEvent("learngraph:goal-graph-preview", {
         detail: {
+          scopeKey,
           submittedPrompt,
           title: result?.goal.title,
           answers: result?.questions
@@ -593,15 +596,15 @@ export function useGoalSetupFlow({
             .filter(Boolean),
           questionCount: result?.questions.length ?? 0,
           phase:
-            stage === "capture"
-              ? "draft"
-              : clarify.isPending || building
-                ? "building"
-                : stage === "graph_review"
-                  ? "reviewing"
-                  : stage === "complete"
-                    ? "approved"
-                    : "clarifying",
+            stage === "graph_building"
+              ? "building"
+              : stage === "graph_review"
+                ? "reviewing"
+                : stage === "complete"
+                  ? "approved"
+                  : stage !== "capture" || clarify.isPending
+                    ? "clarifying"
+                    : "draft",
           graphNodes: previewNodes,
           graphEdges: previewEdges,
         },
@@ -613,7 +616,9 @@ export function useGoalSetupFlow({
     enabled,
     graph.data,
     previewEnabled,
+    previewMatchesScope,
     result,
+    scopeKey,
     stage,
     streamPreview.edges,
     streamPreview.nodes,
@@ -852,7 +857,7 @@ function GoalSummaryReview({ flow }: { flow: GoalSetupController }) {
     value: answerText(question, flow.answers[question.key]),
   }));
   return (
-    <section className="goal-flow-review topic-preview-panel" aria-label="Goal 摘要审核">
+    <section className="goal-flow-review topic-preview-panel" aria-label="审核学习目标摘要">
       <div className="topic-preview-head">
         <div>
           <strong>确认学习目标</strong>

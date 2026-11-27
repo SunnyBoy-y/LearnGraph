@@ -1,12 +1,16 @@
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { createPortal } from "react-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { createUuid } from "@/lib/uuid";
+import { adaptivePollInterval } from "@/lib/network-quality";
 import {
   ArrowLeft,
   BookOpenText,
@@ -26,7 +30,6 @@ import { toast } from '@/lib/notifications';
 import {
   cancelDocumentJob,
   createDocumentJob,
-  downloadFile,
   getDocumentJob,
   listDocumentJobEvents,
   listDocumentRevisions,
@@ -56,8 +59,13 @@ import {
 import {
   FilePreviewContent,
 } from "@/components/resources/file-preview-content";
-import { PREVIEW_BUFFER_LIMIT } from "@/lib/seekable-file";
-import { requiresLearningIndex, resolveFilePreviewKind } from "@/lib/file-preview";
+import { DocumentImageViewer } from "@/components/resources/document-image-viewer";
+import { requiresLearningIndex } from "@/lib/file-preview";
+import {
+  fileQuestionSuggestions,
+  fileViewerLabel,
+  resolveFileCapabilities,
+} from "@/lib/file-capabilities";
 import {
   isRealtimeTranscriptionModel,
   providerCapabilityString,
@@ -72,6 +80,7 @@ import type {
   DocumentQueryScope,
   FileTextChunk,
 } from "@/types/files";
+import "./document-learning.css";
 
 
 async function sha256(value: string) {
@@ -213,6 +222,13 @@ function formatEventTime(value: string) {
 }
 
 
+function formatFileSize(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+
 function ChunkText({
   chunks,
   activeChunkId,
@@ -266,10 +282,40 @@ export function DocumentLearningPage() {
   const [scopeFileIds, setScopeFileIds] = useState<string[]>([fileId]);
   const [jobEventsExpanded, setJobEventsExpanded] = useState(false);
   const [outlineOpen, setOutlineOpen] = useState(false);
-  const [rightPanel, setRightPanel] = useState<"chat" | "evidence" | "graph">("chat");
-  const [mobilePane, setMobilePane] = useState<"outline" | "reader" | "chat">("reader");
+  const initialPanel = searchParams.get("panel");
+  const [desktopToolsOpen, setDesktopToolsOpen] = useState(initialPanel === "chat" || initialPanel === "graph");
+  const [rightPanel, setRightPanel] = useState<"chat" | "evidence" | "graph">(initialPanel === "graph" ? "graph" : "chat");
+  const [mobilePane, setMobilePane] = useState<"outline" | "reader" | "chat">(initialPanel === "chat" || initialPanel === "graph" ? "chat" : "reader");
   const [chatQuestion, setChatQuestion] = useState<{ id: string; text: string }>();
-  const [selectionMenu, setSelectionMenu] = useState<{ left: number; top: number } | null>(null);
+  const [selectionMenu, setSelectionMenu] = useState<DOMRect | null>(null);
+  const selectionToolbar = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const menu = selectionToolbar.current;
+    if (!selectionMenu || !menu) return;
+    const padding = 8;
+    const viewport = window.visualViewport;
+    const left = viewport?.offsetLeft ?? 0;
+    const top = viewport?.offsetTop ?? 0;
+    const right = left + (viewport?.width ?? window.innerWidth);
+    const bottom = top + (viewport?.height ?? window.innerHeight);
+    const above = selectionMenu.top - menu.offsetHeight - padding;
+    const x = selectionMenu.left + (selectionMenu.width - menu.offsetWidth) / 2;
+    const y = above >= top + padding ? above : selectionMenu.bottom + padding;
+    menu.style.left = `${Math.max(left + padding, Math.min(x, right - menu.offsetWidth - padding))}px`;
+    menu.style.top = `${Math.max(top + padding, Math.min(y, bottom - menu.offsetHeight - padding))}px`;
+    const close = () => setSelectionMenu(null);
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", onKey);
+    viewport?.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", onKey);
+      viewport?.removeEventListener("resize", close);
+    };
+  }, [selectionMenu]);
   const [embeddedImages, setEmbeddedImages] = useState<Array<{ id: string; blob: Blob; filename: string; locator: Record<string, unknown> }>>([]);
   const [dismissedBranches, setDismissedBranches] = useState<string[]>([]);
   const conceptBranchesKey = workspaceQueryKey(workspaceId, "sessions", "document-concept-branches", fileId);
@@ -328,22 +374,24 @@ export function DocumentLearningPage() {
     queryFn: () => getDocumentJob(jobId),
     enabled: Boolean(jobId),
     refetchInterval: (state) =>
-      isDocumentJobTerminal(state.state.data?.status)
-        ? false
-        : 800,
+      adaptivePollInterval(
+        isDocumentJobTerminal(state.state.data?.status)
+          ? false
+          : 800,
+      ),
   });
   const jobEvents = useQuery({
     queryKey: ["document-job-events", jobId],
     queryFn: () => listDocumentJobEvents(jobId),
     enabled: Boolean(jobId && job.data?.file_id === fileId),
-    refetchInterval: isDocumentJobTerminal(job.data?.status) ? false : 800,
+    refetchInterval: () => adaptivePollInterval(isDocumentJobTerminal(job.data?.status) ? false : 800),
   });
   const transcriptions = useQuery({
     queryKey: ["audio-transcriptions", fileId],
     queryFn: () => listAudioTranscriptions(fileId),
     enabled: Boolean(fileId && (file?.mime_type.startsWith("audio/") || /\.(mp3|m4a|wav|webm|ogg|flac|aac)$/iu.test(file?.original_name ?? ""))),
     refetchInterval: (query) =>
-      query.state.data?.[0]?.status === "running" ? 1_000 : false,
+      adaptivePollInterval(query.state.data?.[0]?.status === "running" ? 1_000 : false),
   });
   const transcriptionProviders = (providers.data ?? []).filter((provider) =>
     provider.enabled &&
@@ -362,7 +410,7 @@ export function DocumentLearningPage() {
 
   useEffect(() => {
     if (!jobId || job.data?.status === undefined) return;
-    setJobEventsExpanded(!isDocumentJobTerminal(job.data.status));
+    setJobEventsExpanded(false);
   }, [job.data?.status, jobId]);
 
   useEffect(() => {
@@ -435,7 +483,7 @@ export function DocumentLearningPage() {
           file.parse_capability,
         )
       ) {
-        toast.error("该选区尚未绑定可验证的文档 Revision，请先建立索引。");
+        toast.error("该选区还未关联到已索引的原文，请先建立索引。");
       }
       return;
     }
@@ -446,11 +494,9 @@ export function DocumentLearningPage() {
       toast.warning("选区未能精确定位到分块，将以整文件上下文 + 选区提示发送。");
     }
     setSelected({ chunk: chunk ?? null, text });
-    setSelectionMenu(
-      firstLineRect
-        ? { left: Math.max(8, firstLineRect.left + firstLineRect.width / 2), top: Math.max(8, firstLineRect.top - 10) }
-        : null,
-    );
+    const selection = window.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : undefined;
+    setSelectionMenu(firstLineRect ?? range?.getBoundingClientRect?.() ?? null);
   }
 
   async function openConceptBranch() {
@@ -618,28 +664,41 @@ export function DocumentLearningPage() {
   }
   const currentFile = file;
 
-  const previewKind = resolveFilePreviewKind(file.original_name, file.mime_type);
+  const capabilities = resolveFileCapabilities(
+    file.original_name,
+    file.mime_type,
+    file.parse_capability,
+  );
+  const previewKind = capabilities.previewKind;
   const isAudio = previewKind === "audio";
   const indexRequired = requiresLearningIndex(
     file.original_name,
     file.mime_type,
     file.parse_capability,
   );
-  const hasOriginalPreview = previewKind !== "unsupported";
-  // 仅 PDF / DOCX / DOC 支持证据检索与图谱构建；其余格式隐藏这两个标签页。
+  const hasOriginalPreview = capabilities.preview;
+  // 证据检索与图谱构建都要有可定位的索引片段；图片、表格、音视频不适用。
   const supportsEvidenceAndGraph =
-    /\.(pdf|docx|doc)$/i.test(file.original_name) ||
-    [
-      "application/pdf",
-      "application/msword",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ].includes(file.mime_type);
+    capabilities.citationLocation && capabilities.indexedQA;
   // HTML 页面在沙箱 iframe 中整体预览，证据检索与图谱构建不适用。
-  const chatOnlyPanel = previewKind === "html" || !supportsEvidenceAndGraph;
+  const chatOnlyPanel = !supportsEvidenceAndGraph;
   const effectiveRightPanel = chatOnlyPanel ? "chat" : rightPanel;
-  // Chat-only previews use the fifth, compact composer; indexed PDF/DOCX
-  // previews keep their evidence/graph tabs available in the expanded dock.
-  const compactChat = chatOnlyPanel && effectiveRightPanel === "chat";
+  const fileSizeLabel = formatFileSize(file.size_bytes);
+  const surfaceLabel =
+    capabilities.surface === "image"
+      ? "图片"
+      : capabilities.surface === "data"
+        ? "表格"
+        : capabilities.surface === "media"
+          ? "音视频"
+          : capabilities.surface === "other"
+            ? "文件"
+            : "文档";
+  // 只有真正具备版本历史的文件才谈"版本"；图片等文件显示类型与体积。
+  const headerMeta =
+    capabilities.versionHistory && revisions.data?.[0]
+      ? `版本 ${revisions.data[0].revision_no} · ${chunks.data?.length ?? 0} 个可定位内容块`
+      : `${surfaceLabel} · ${fileSizeLabel}`;
   const confirmedGoals = (goals.data ?? []).filter((item) =>
     ["confirmed", "candidate_ready", "approved"].includes(item.status),
   );
@@ -654,6 +713,13 @@ export function DocumentLearningPage() {
       retryableDocumentJobStatuses.has(documentJob.status),
   );
   const originalUnavailable = Boolean(previewError);
+  const indexHelp = file.parse_status !== "indexed" ? (
+    <div className="mt-2 space-y-2 text-xs text-muted-foreground">
+      <p>{jobIsActive ? "正在准备文档内容，完成后即可使用。" : "请先建立文档索引，再使用此功能。"}</p>
+      {jobCanRetry ? <Button size="xs" variant="outline" disabled={retryJob.isPending} onClick={() => retryJob.mutate()}>重试建立索引</Button> :
+        !jobId && indexRequired ? <Button size="xs" variant="outline" disabled={startJob.isPending} onClick={() => startJob.mutate()}>建立索引</Button> : null}
+    </div>
+  ) : null;
 
   async function sendDocumentQuestionToFullChat(
     content: string,
@@ -680,26 +746,27 @@ export function DocumentLearningPage() {
   return (
     <div className="min-h-[calc(100svh-3.5rem)] bg-background lg:min-h-svh">
       <header className="sticky top-14 z-20 flex flex-wrap items-center gap-3 border-b bg-background/95 px-4 py-3 backdrop-blur lg:top-0">
-        <Button aria-label="返回资料库" onClick={() => navigate(`/w/${workspaceId}/sources`)} size="icon-sm" variant="ghost">
+        <Button aria-label="返回资料库" onClick={() => navigate({ pathname: `/w/${workspaceId}/sources`, search: searchParams.get("fromLibrary") ?? "" }, { replace: searchParams.has("fromLibrary"), preventScrollReset: true })} size="icon-sm" variant="ghost">
           <ArrowLeft />
         </Button>
         <div className="min-w-0 flex-1">
           <h1 className="truncate text-sm font-semibold">{file.original_name}</h1>
-          <p className="text-[11px] text-muted-foreground">
-            {revisions.data?.[0]
-              ? `版本 ${revisions.data[0].revision_no} · ${chunks.data?.length ?? 0} 个可定位内容块`
-              : "尚未建立文档版本"}
-          </p>
+          <p className="text-[11px] text-muted-foreground">{headerMeta}</p>
         </div>
-        <Button
-          aria-pressed={outlineOpen}
-          className="hidden 2xl:inline-flex"
-          onClick={() => setOutlineOpen((current) => !current)}
-          size="sm"
-          variant="ghost"
-        >
-          <PanelLeft className="size-3.5" />
-          {outlineOpen ? "隐藏目录" : "显示目录"}
+        {capabilities.outline ? (
+          <Button
+            aria-pressed={outlineOpen}
+            className="doc-outline-toggle"
+            onClick={() => setOutlineOpen((current) => !current)}
+            size="sm"
+            variant="ghost"
+          >
+            <PanelLeft className="size-3.5" />
+            {outlineOpen ? "隐藏目录" : "显示目录"}
+          </Button>
+        ) : null}
+        <Button aria-pressed={desktopToolsOpen} className="doc-tools-toggle" onClick={() => setDesktopToolsOpen((open) => !open)} size="sm" variant="ghost">
+          <PanelRight className="size-3.5" />{desktopToolsOpen ? "收起学习面板" : "展开学习面板"}
         </Button>
         {(savedBranches.data?.length ?? 0) > conceptBranches.length ? (
           <Button onClick={() => setDismissedBranches((current) => current.filter((id) => !savedBranches.data?.some((branch) => branch.id === id)))} size="sm" variant="ghost">
@@ -722,9 +789,8 @@ export function DocumentLearningPage() {
       {jobId && (!documentJob || jobIsActive) ? (
         <div className="border-b bg-muted/20 px-5 py-2">
           <div className="mx-auto flex max-w-5xl flex-wrap items-center gap-2 text-xs">
-            <span className="font-medium">持久任务</span>
+            <span className="flex-1 font-medium">文档索引</span>
             {documentJob ? <Badge variant="outline">{documentJobStatusLabel(documentJob.status)}</Badge> : null}
-            <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground" title={jobId}>{jobId}</span>
             <Button
               aria-label="刷新文档处理任务状态和事件"
               disabled={job.isFetching || jobEvents.isFetching}
@@ -755,7 +821,7 @@ export function DocumentLearningPage() {
       {job.isError ? (
         <div className="border-b border-destructive/20 bg-destructive/5 px-5 py-3" role="alert">
           <div className="mx-auto flex max-w-5xl flex-wrap items-center gap-3 text-xs">
-            <span className="font-semibold text-destructive">无法读取持久任务</span>
+            <span className="font-semibold text-destructive">无法读取索引进度</span>
             <span className="min-w-0 flex-1 text-muted-foreground">{job.error.message}</span>
             <Button disabled={job.isFetching} onClick={() => void job.refetch()} size="sm" variant="outline">重新读取</Button>
             <Button onClick={() => setActiveJobId("")} size="sm" variant="ghost">清除任务引用</Button>
@@ -780,7 +846,7 @@ export function DocumentLearningPage() {
       {documentJob && jobIsActive ? (
         <div className="border-b bg-primary/5 px-5 py-2">
           <div className="mx-auto flex max-w-5xl items-center gap-3 text-xs">
-            <span className="min-w-0 flex-1 truncate font-medium">正在建立索引 · {documentJob.stage}</span>
+            <span className="min-w-0 flex-1 truncate font-medium">正在建立索引</span>
             <span className="tabular-nums text-muted-foreground">{documentJob.progress}%</span>
           </div>
         </div>
@@ -794,7 +860,7 @@ export function DocumentLearningPage() {
             <span className="min-w-0 flex-1 text-muted-foreground">
               {documentJob.error_code && documentJob.error_message
                 ? `${documentJob.error_code} · ${documentJob.error_message}`
-                : "任务没有被标记为成功；可从持久状态重新排队。"}
+                : "可以重试建立索引。"}
             </span>
             <Button
               disabled={retryJob.isPending}
@@ -815,7 +881,7 @@ export function DocumentLearningPage() {
           open={jobEventsExpanded}
         >
           <summary className="mx-auto flex max-w-5xl cursor-pointer list-none items-center gap-2 text-xs font-medium">
-            持久事件
+            技术详情
             {documentJob ? <Badge variant="outline">{documentJobStatusLabel(documentJob.status)}</Badge> : null}
             <span className="font-mono text-[10px] text-muted-foreground">{jobEvents.data?.length ?? 0}</span>
           </summary>
@@ -825,7 +891,7 @@ export function DocumentLearningPage() {
             ) : null}
             {jobEvents.isError ? (
               <div className="flex flex-wrap items-center gap-2 p-3 text-destructive" role="alert">
-                <span className="min-w-0 flex-1">无法读取持久事件：{jobEvents.error.message}</span>
+                <span className="min-w-0 flex-1">无法读取索引日志：{jobEvents.error.message}</span>
                 <Button disabled={jobEvents.isFetching} onClick={() => void jobEvents.refetch()} size="xs" variant="outline">重新读取</Button>
               </div>
             ) : null}
@@ -844,88 +910,96 @@ export function DocumentLearningPage() {
         </details>
       ) : null}
 
-      <div className="sticky top-[7.1rem] z-20 grid grid-cols-3 border-b bg-background p-1 xl:hidden">
-        <Button
-          aria-pressed={mobilePane === "outline"}
-          onClick={() => setMobilePane("outline")}
-          size="sm"
-          variant={mobilePane === "outline" ? "secondary" : "ghost"}
-        >
-          <PanelLeft className="size-3.5" />定位
-        </Button>
-        <Button
-          aria-pressed={mobilePane === "reader"}
-          onClick={() => setMobilePane("reader")}
-          size="sm"
-          variant={mobilePane === "reader" ? "secondary" : "ghost"}
-        >
-          <BookOpenText className="size-3.5" />原文
-        </Button>
-        <Button
-          aria-pressed={mobilePane === "chat"}
-          onClick={() => setMobilePane("chat")}
-          size="sm"
-          variant={mobilePane === "chat" ? "secondary" : "ghost"}
-        >
-          <PanelRight className="size-3.5" />对话
-        </Button>
-      </div>
-
       <div
-        className={cn(
-          "grid min-h-[calc(100svh-7rem)] xl:min-h-[calc(100svh-4.25rem)] xl:grid-cols-[minmax(0,1fr)]",
-          outlineOpen && "2xl:grid-cols-[13rem_minmax(0,1fr)]",
-        )}
+        className="document-learning-workspace"
+        data-outline-open={capabilities.outline && outlineOpen}
+        data-surface={capabilities.surface}
+        data-tools-open={desktopToolsOpen}
       >
-        <aside
-          className={cn(
-            "border-r bg-muted/15",
-            mobilePane === "outline" ? "block" : "hidden",
-            outlineOpen ? "2xl:block" : "2xl:hidden",
-            "xl:hidden",
-          )}
-        >
-          <div className="sticky top-[7.5rem] max-h-[calc(100svh-7.5rem)] overflow-auto p-4 2xl:top-[4.25rem] 2xl:max-h-[calc(100svh-4.25rem)]">
-            <div className="mb-3 flex items-center gap-2 text-xs font-semibold"><BookOpenText className="size-4" />文档定位</div>
-            <nav aria-label="文档内容定位" className="space-y-0.5">
-              {(chunks.data ?? []).map((chunk) => (
-                <button
-                  className={cn(
-                    "block w-full truncate rounded-md px-2 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
-                    activeChunkId === chunk.id && "bg-primary/10 text-primary",
-                  )}
-                  key={chunk.id}
-                  onClick={() => focusHit({
-                    rank: chunk.ordinal,
-                    score: 0,
-                    chunk_id: chunk.id,
-                    file_id: chunk.file_id,
-                    document_revision_id: chunk.document_revision_id,
-                    filename: file.original_name,
-                    locator: chunk.locator,
-                    locator_json: chunk.locator_json,
-                    section_path: chunk.section_path,
-                    quote: chunk.content,
-                    content_hash: chunk.content_hash,
-                  })}
-                  title={`${chunkOutlineLabel(chunk)} · ${chunk.locator}`}
-                  type="button"
-                >
-                  <span className="mr-2 font-mono text-[10px]">{String(chunk.ordinal).padStart(2, "0")}</span>
-                  {chunkOutlineLabel(chunk)}
-                </button>
-              ))}
-            </nav>
-            {!chunks.data?.length && indexRequired ? (
-              <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
-                原文件仍可预览；建立索引后这里会显示可验证定位。
-              </p>
-            ) : null}
-          </div>
-        </aside>
+        {/*
+          窄屏时这里是一条普通文档流里的轻量导航；宽屏由容器查询隐藏，
+          面板本身始终挂载，切换布局不会重建会话或丢掉草稿。
+        */}
+        <div aria-label="学习面板切换" className="document-pane-tabs" role="tablist">
+          {capabilities.outline ? (
+            <Button
+              aria-selected={mobilePane === "outline"}
+              onClick={() => setMobilePane("outline")}
+              role="tab"
+              size="sm"
+              variant={mobilePane === "outline" ? "secondary" : "ghost"}
+            >
+              <PanelLeft className="size-3.5" />定位
+            </Button>
+          ) : null}
+          <Button
+            aria-selected={mobilePane === "reader"}
+            onClick={() => setMobilePane("reader")}
+            role="tab"
+            size="sm"
+            variant={mobilePane === "reader" ? "secondary" : "ghost"}
+          >
+            <BookOpenText className="size-3.5" />{fileViewerLabel(capabilities)}
+          </Button>
+          <Button
+            aria-selected={mobilePane === "chat"}
+            onClick={() => setMobilePane("chat")}
+            role="tab"
+            size="sm"
+            variant={mobilePane === "chat" ? "secondary" : "ghost"}
+          >
+            <PanelRight className="size-3.5" />对话
+          </Button>
+        </div>
 
-        <div className="document-learning-reader-shell">
-        <main className={cn("min-w-0 bg-card xl:block", mobilePane === "reader" ? "block" : "hidden")}>
+        <div className="document-learning-body">
+          {capabilities.outline ? (
+            <aside
+              className="document-learning-outline"
+              data-open={outlineOpen}
+              data-pane-active={mobilePane === "outline"}
+            >
+              <div className="document-learning-outline__scroll">
+                <div className="mb-3 flex items-center gap-2 text-xs font-semibold"><BookOpenText className="size-4" />文档定位</div>
+                <nav aria-label="文档内容定位" className="space-y-0.5">
+                  {(chunks.data ?? []).map((chunk) => (
+                    <button
+                      className={cn(
+                        "block w-full truncate rounded-md px-2 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+                        activeChunkId === chunk.id && "bg-primary/10 text-primary",
+                      )}
+                      key={chunk.id}
+                      onClick={() => focusHit({
+                        rank: chunk.ordinal,
+                        score: 0,
+                        chunk_id: chunk.id,
+                        file_id: chunk.file_id,
+                        document_revision_id: chunk.document_revision_id,
+                        filename: file.original_name,
+                        locator: chunk.locator,
+                        locator_json: chunk.locator_json,
+                        section_path: chunk.section_path,
+                        quote: chunk.content,
+                        content_hash: chunk.content_hash,
+                      })}
+                      title={`${chunkOutlineLabel(chunk)} · ${chunk.locator}`}
+                      type="button"
+                    >
+                      <span className="mr-2 font-mono text-[10px]">{String(chunk.ordinal).padStart(2, "0")}</span>
+                      {chunkOutlineLabel(chunk)}
+                    </button>
+                  ))}
+                </nav>
+                {!chunks.data?.length && indexRequired ? (
+                  <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
+                    原文件仍可预览；建立索引后这里会显示可验证定位。
+                  </p>
+                ) : null}
+              </div>
+            </aside>
+          ) : null}
+
+          <main className="document-learning-main" data-pane-active={mobilePane === "reader"}>
           {originalUnavailable ? (
             <div className="flex flex-wrap items-center gap-3 border-b border-destructive/20 bg-destructive/5 px-5 py-3 text-xs" role="alert">
               <div className="min-w-0 flex-1">
@@ -940,7 +1014,14 @@ export function DocumentLearningPage() {
               </Button>
             </div>
           ) : null}
-          {hasOriginalPreview ? (
+          {capabilities.imageTools && hasOriginalPreview ? (
+            <DocumentImageViewer
+              alt={file.original_name}
+              className="document-learning-image"
+              fileId={file.id}
+              key={`${file.id}:${previewAttempt}`}
+            />
+          ) : hasOriginalPreview ? (
             <FilePreviewContent
               key={`${file.id}:${previewAttempt}`}
               fileId={file.id}
@@ -1020,34 +1101,7 @@ export function DocumentLearningPage() {
               </section>
               ) : undefined}
               filename={file.original_name}
-              imageActions={previewKind === "image" ? (
-              <div className="flex flex-wrap items-center justify-center gap-2">
-                <Button
-                  onClick={() => {
-                    if (file.size_bytes > PREVIEW_BUFFER_LIMIT) { toast.error("图片过大，请缩小图片后再发送给模型。"); return; }
-                    void downloadFile(file.id).then((imageBlob) => setEmbeddedImages((current) => [
-                      ...current,
-                      {
-                        id: createUuid(),
-                        blob: imageBlob,
-                        filename: file.original_name,
-                        locator: { file_id: file.id, kind: "primary_image" },
-                      },
-                    ])).catch((reason: unknown) => toast.error(reason instanceof Error ? reason.message : "无法读取图片"));
-                  }}
-                  size="sm"
-                  type="button"
-                >
-                  <Sparkles className="size-3.5" />
-                  发送给模型解析
-                </Button>
-                <p className="text-xs text-muted-foreground">
-                  将本图加入右侧对话附件；发送时由原生多模态或识图 Provider 处理
-                </p>
-              </div>
-              ) : undefined}
               mimeType={file.mime_type}
-              imageZoom
               onEmbeddedImage={(image) => setEmbeddedImages((current) => [
                 ...current,
                 { id: createUuid(), ...image },
@@ -1087,24 +1141,15 @@ export function DocumentLearningPage() {
               </div>
             </div>
           ) : null}
-        </main>
+          </main>
 
-        <aside
-          aria-label="文档学习对话"
-          className={cn(
-            "document-learning-chat-dock",
-            compactChat && "document-learning-chat-dock--compact",
-            mobilePane === "chat" ? "block" : "hidden",
-            "xl:block",
-          )}
-          role="dialog"
-        >
-          <div className={cn(
-            "flex min-h-0 flex-col",
-            compactChat
-              ? "document-learning-chat-dock__compact-inner"
-              : "h-full overflow-hidden rounded-2xl bg-background/95",
-          )}>
+          <aside
+            aria-label="文档学习对话"
+            className="document-learning-chat-dock"
+            data-open={desktopToolsOpen}
+            data-pane-active={mobilePane === "chat"}
+          >
+            <div className="document-learning-chat-dock__inner">
             {!chatOnlyPanel ? (
               <div className="grid h-10 flex-none grid-cols-3 border-b p-1">
                 <Button aria-pressed={effectiveRightPanel === "chat"} onClick={() => setRightPanel("chat")} size="sm" variant={effectiveRightPanel === "chat" ? "secondary" : "ghost"}>
@@ -1120,11 +1165,10 @@ export function DocumentLearningPage() {
             ) : null}
 
             {effectiveRightPanel === "chat" ? (
-              <div className={cn("min-h-0", !compactChat && "flex-1")}>
+              <div className="document-learning-chat-dock__chat">
                 <DocumentChatPanel
                   embeddedImages={embeddedImages}
                   file={file}
-                  compact={compactChat}
                   onSendToFullChat={sendDocumentQuestionToFullChat}
                   onRemoveEmbeddedImage={(id) => setEmbeddedImages((current) => current.filter((image) => image.id !== id))}
                   onClearSelection={() => setSelected(null)}
@@ -1132,6 +1176,7 @@ export function DocumentLearningPage() {
                   questionSeed={chatQuestion}
                   selection={pendingSelection}
                   sessionId={chatSessionId}
+                  suggestions={fileQuestionSuggestions(capabilities)}
                   workspaceId={workspaceId}
                 />
               </div>
@@ -1140,7 +1185,7 @@ export function DocumentLearningPage() {
             {effectiveRightPanel === "evidence" ? (
               <div className="min-h-0 flex-1 overflow-auto p-4">
                 <div className="flex items-center gap-2"><Focus className="size-4 text-primary" /><h2 className="text-sm font-semibold">证据检索</h2></div>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">先查看真实 FTS5 命中，再决定是否发送给模型。</p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">先查找原文片段，再将问题带入文档对话。</p>
                 {selected ? (
                   <div className="mt-4 border-l-2 border-primary bg-primary/5 px-3 py-2 text-xs">
                     <div className="flex items-center justify-between gap-2"><strong>已限定选区</strong><button className="text-muted-foreground hover:text-foreground" onClick={() => setSelected(null)} type="button">清除</button></div>
@@ -1154,7 +1199,6 @@ export function DocumentLearningPage() {
                     <option value="section">当前章节</option>
                     <option value="files">所选资料</option>
                   </select>
-                  <Badge className="font-mono" variant="outline">FTS5</Badge>
                 </div>
                 <details className="mt-3 border-y py-2 text-xs">
                   <summary className="cursor-pointer select-none text-muted-foreground">资料范围 · {scopeFileIds.length} 份已索引文件</summary>
@@ -1179,9 +1223,10 @@ export function DocumentLearningPage() {
                 <Button className="mt-2 w-full" disabled={!query.trim() || preview.isPending || file.parse_status !== "indexed"} onClick={() => preview.mutate()}>
                   {preview.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}预览证据
                 </Button>
+                {indexHelp}
                 {preview.data ? (
                   <section className="mt-5">
-                    <div className="flex items-center justify-between"><h3 className="text-xs font-semibold">检索命中</h3><span className="font-mono text-[10px] text-muted-foreground">{preview.data.hits.length} hits</span></div>
+                    <div className="flex items-center justify-between"><h3 className="text-xs font-semibold">检索命中</h3><span className="font-mono text-[10px] text-muted-foreground">{preview.data.hits.length} 条结果</span></div>
                     <div className="mt-2 divide-y border-y">
                       {preview.data.hits.map((hit) => (
                         <button className="block w-full py-3 text-left hover:bg-muted/40" key={hit.chunk_id} onClick={() => focusHit(hit)} type="button">
@@ -1211,26 +1256,32 @@ export function DocumentLearningPage() {
                 <div className="flex items-center gap-2"><Network className="size-4" /><h2 className="text-sm font-semibold">从文档构建图谱</h2></div>
                 <p className="mt-1 text-[11px] leading-5 text-muted-foreground">模型只生成带来源的候选变更；确认前不会发布图谱。</p>
                 <select aria-label="选择已确认目标" className="mt-4 h-9 w-full rounded-md border bg-background px-2 text-xs" onChange={(event) => setGoalId(event.target.value)} value={goalId}>
-                  <option value="">选择已确认 Goal</option>
+                  <option value="">选择已确认的学习目标</option>
                   {confirmedGoals.map((goal) => <option key={goal.id} value={goal.id}>{goal.title}</option>)}
                 </select>
                 <Button className="mt-2 w-full" disabled={!goalId || graphSession.isPending || file.parse_status !== "indexed"} onClick={() => graphSession.mutate()} variant="secondary">
                   {graphSession.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />}生成候选图谱
                 </Button>
+                {indexHelp}
+                {!confirmedGoals.length && goals.isSuccess ? (
+                  <p className="mt-2 text-xs text-muted-foreground">请先确认一个学习目标。 <Link className="underline" to={`/w/${workspaceId}/goals/new/clarify`}>创建学习目标</Link></p>
+                ) : !goalId && confirmedGoals.length ? <p className="mt-2 text-xs text-muted-foreground">选择一个学习目标后即可生成图谱。</p> : null}
                 <p className="mt-6 border-t pt-4 text-[10px] leading-5 text-muted-foreground">阅读、滚动和检索不会直接提高掌握度。</p>
               </div>
             ) : null}
-          </div>
-        </aside>
+            </div>
+          </aside>
         </div>
       </div>
-      {selectionMenu && pendingSelection ? (
+      {selectionMenu && pendingSelection ? createPortal(
         <div
-          className="document-selection-menu"
-          style={{ left: selectionMenu.left, top: selectionMenu.top }}
+          aria-label="划词操作"
+          role="toolbar"
+          className="document-reader-selection-toolbar"
+          ref={selectionToolbar}
         >
           <Button
-            onClick={() => { setRightPanel("chat"); setMobilePane("chat"); setSelectionMenu(null); }}
+            onClick={() => { setRightPanel("chat"); setMobilePane("chat"); setDesktopToolsOpen(true); setSelectionMenu(null); }}
             size="sm"
             variant="ghost"
           >
@@ -1240,7 +1291,7 @@ export function DocumentLearningPage() {
             单独解释
           </Button>
         </div>
-      ) : null}
+      , document.body) : null}
       {conceptBranches.length ? (
         <ConceptBranchWorkspace
           branchIds={conceptBranches}

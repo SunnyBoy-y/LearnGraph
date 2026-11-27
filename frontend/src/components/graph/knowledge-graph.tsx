@@ -1759,7 +1759,8 @@ export function KnowledgeGraph({
         onInit={setFlowInstance}
         onMove={(event, viewport) => {
           if (event) userInteracted.current = true;
-          setZoom(current => Math.abs(current - viewport.zoom) < 0.001 ? current : viewport.zoom);
+          const quantized = Math.round(viewport.zoom * 100) / 100;
+          setZoom(current => Math.round(current * 100) === Math.round(quantized * 100) ? current : quantized);
         }}
         onNodeClick={handleNodeClick}
         onNodeDragStart={() => { userInteracted.current = true; }}

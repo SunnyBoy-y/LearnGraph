@@ -10,6 +10,29 @@ import {
   type NodeTypeId,
 } from "./node-presentation";
 
+export function GraphTypeFilter({ counts, value, onChange }: {
+  counts: ReadonlyMap<NodeTypeId, number>;
+  value: NodeTypeId | "all";
+  onChange: (type: NodeTypeId | "all") => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return <div className="graph-legend--floating">
+    <button type="button" className="graph-legend graph-legend--collapsed" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+      {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+      节点筛选{value === "all" ? "" : ` · ${NODE_TYPE_PROFILES[value].label}`}
+    </button>
+    {expanded && <section className="graph-legend graph-legend__group" aria-label="节点类型筛选">
+      <ul>{NODE_TYPE_ORDER.filter(id => (counts.get(id) ?? 0) > 0).map(id => {
+        const { icon: Icon, label, tone } = NODE_TYPE_PROFILES[id];
+        return <li key={id}><button type="button" className="flex w-full items-center gap-2 rounded px-1 py-1 text-left hover:bg-muted aria-pressed:bg-muted" aria-pressed={value === id} onClick={() => onChange(value === id ? "all" : id)}>
+          <span className={`graph-legend__type is-${tone}`}><Icon aria-hidden="true" /></span>{label}<em>{counts.get(id)}</em>
+        </button></li>;
+      })}</ul>
+      {value !== "all" && <button type="button" className="graph-legend__foot" onClick={() => onChange("all")}>重置类型筛选</button>}
+    </section>}
+  </div>;
+}
+
 const LEGEND_COLLAPSED_KEY = "learngraph:graph-legend-collapsed";
 
 /**
@@ -22,18 +45,21 @@ export function GraphLegend({
   statusCounts,
   pageCount = 0,
   className,
+  defaultCollapsed = false,
 }: {
   typeCounts: ReadonlyMap<NodeTypeId, number>;
   statusCounts: ReadonlyMap<NodeLearningStatusId, number>;
   /** Nodes whose learning page (交互页) is already generated. */
   pageCount?: number;
   className?: string;
+  defaultCollapsed?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(() => {
     try {
-      return window.localStorage.getItem(LEGEND_COLLAPSED_KEY) === "1";
+      const preference = window.localStorage.getItem(LEGEND_COLLAPSED_KEY);
+      return preference === null ? defaultCollapsed : preference === "1";
     } catch {
-      return false;
+      return defaultCollapsed;
     }
   });
 

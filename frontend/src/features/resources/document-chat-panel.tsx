@@ -14,10 +14,8 @@ import {
   ExternalLink,
   FileText,
   LoaderCircle,
-  Mic,
   MessageSquareText,
   Plus,
-  Search,
   Square,
   X,
   Image as ImageIcon,
@@ -41,13 +39,11 @@ import {
 } from "@/components/chat/question-set-pager";
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
+import { MessageReading } from "@/components/chat/message-reading";
 import { migrateThinkingPreference } from "@/lib/thinking-effort-migration";
 import { PartUIStateProvider, patchMessagesUIState } from "@/lib/part-ui-state";
-import {
-  ThinkingSlider,
-  supportedThinkingStops,
-  thinkingStopIndex,
-} from "@/components/chat/thinking-slider";
+import { GenerationConfigMenu } from "@/components/chat/generation-config";
+import { buildModelSelectorGroups } from "@/lib/generation-config";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
 import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
 import {
@@ -57,26 +53,11 @@ import {
   toolCallCount,
 } from "@/features/chat/chat-message-parts";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuLabel,
-  DropdownMenuItem,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { discoverProviderModels, listProviders } from "@/api/providers";
 import {
   capabilityThinkingModes,
-  fuzzyModelMatch,
-  modelChoiceValue,
-  modelProtocolLabel,
-  parseModelChoiceValue,
   providerModelOptions,
   modelSupportsAgent,
   thinkingLabels,
@@ -134,7 +115,6 @@ export type DocumentChatPreferences = Pick<
 
 interface DocumentChatPanelProps {
   autoSubmitSeed?: boolean;
-  compact?: boolean;
   embeddedImages?: Array<{ id: string; blob: Blob; filename: string; locator: Record<string, unknown> }>;
   file: FileRecord;
   onSendToFullChat?: (content: string, preferences: DocumentChatPreferences) => Promise<void> | void;
@@ -144,6 +124,8 @@ interface DocumentChatPanelProps {
   questionSeed?: { id: string; text: string };
   selection: PendingDocumentSelection | null;
   sessionId: string;
+  /** 尚未开始对话时的提问建议；按当前文件能力生成。 */
+  suggestions?: string[];
   workspaceId: string;
 }
 
@@ -169,7 +151,11 @@ async function sha256(value: string) {
 }
 
 
-function appendPart(parts: MessagePart[], incoming: MessagePart): MessagePart[] {
+function appendPart(
+  parts: MessagePart[],
+  incoming: MessagePart,
+  replaceData = false,
+): MessagePart[] {
   const index = parts.findIndex((part) => part.id === incoming.id);
   if (index === -1) {
     return [
@@ -185,6 +171,10 @@ function appendPart(parts: MessagePart[], incoming: MessagePart): MessagePart[] 
       ? {
           ...part,
           ...incoming,
+          data:
+            replaceData && incoming.data !== undefined
+              ? { ...incoming.data }
+              : { ...(part.data ?? {}), ...(incoming.data ?? {}) },
           content:
             incoming.content ??
             `${part.content ?? ""}${incoming.content_delta ?? ""}`,
@@ -231,7 +221,6 @@ function messageParts(message: Message): MessagePart[] {
 
 export function DocumentChatPanel({
   autoSubmitSeed = false,
-  compact = false,
   embeddedImages = [],
   file,
   onSendToFullChat,
@@ -241,6 +230,7 @@ export function DocumentChatPanel({
   questionSeed,
   selection,
   sessionId,
+  suggestions = [],
   workspaceId,
 }: DocumentChatPanelProps) {
   const navigate = useNavigate();
@@ -315,25 +305,9 @@ export function DocumentChatPanel({
     modelOptions.find((model) => model.id === selectedModelId) ?? modelOptions[0];
   const supportsAgentMode = modelSupportsAgent(activeProvider, selectedModel);
   const effectiveAgentMode = responseMode === "agentic" && supportsAgentMode;
-  const availableModelChoices = useMemo(
-    () =>
-      modelProviders.flatMap((provider, index) =>
-        providerModelOptions(
-          provider,
-          providerModelQueries[index]?.data?.models,
-        ).map((model) => ({ provider, model })),
-      ),
+  const modelGroups = useMemo(
+    () => buildModelSelectorGroups(modelProviders, providerModelQueries),
     [modelProviders, providerModelQueries],
-  );
-  const filteredModelChoices = useMemo(
-    () =>
-      availableModelChoices.filter(({ provider, model }) =>
-        fuzzyModelMatch(
-          `${model.id} ${provider.display_name} ${modelProtocolLabel(provider.provider_type)}`,
-          modelSearch,
-        ),
-      ),
-    [availableModelChoices, modelSearch],
   );
   const thinkingModes = useMemo(
     () =>
@@ -442,29 +416,16 @@ export function DocumentChatPanel({
     setThinkingMode(nextThinking);
     if (sessionId) {
       persistComposerPrefs(sessionId, {
-        responseMode: "agentic",
+        responseMode: mode,
         thinkingMode: nextThinking,
       });
     }
   }
 
-  /** 「响应与思考力度」滑块：档位 0 = 极速，其后每档 = 智能体 + 一个思考力度。 */
-  const thinkingStops = useMemo(() => supportedThinkingStops(thinkingModes, thinkingRequired), [thinkingModes, thinkingRequired]);
-  function handleThinkingSliderChange(index: number) {
-    const stop = thinkingStops[index];
-    if (!stop) return;
-    if (stop.responseMode === "fast") {
-      setMode("fast");
-      return;
-    }
-    const nextThinking = stop.thinking as ThinkingMode;
-    setResponseMode("agentic");
+  function handleThinkingChange(nextThinking: ThinkingMode) {
     setThinkingMode(nextThinking);
     if (sessionId) {
-      persistComposerPrefs(sessionId, {
-        responseMode: "agentic",
-        thinkingMode: nextThinking,
-      });
+      persistComposerPrefs(sessionId, { thinkingMode: nextThinking });
     }
   }
 
@@ -514,7 +475,14 @@ export function DocumentChatPanel({
     [],
   );
 
-  async function send(event?: FormEvent, contentOverride?: string) {
+  async function send(
+    event?: FormEvent,
+    contentOverride?: string,
+    options?: {
+      uiAction?: MessageCreateRequest["ui_action"];
+      analysisOnly?: boolean;
+    },
+  ) {
     event?.preventDefault();
     const content = contentOverride?.trim() || draft.trim();
     if (!content || status === "submitted" || status === "streaming") return;
@@ -714,6 +682,8 @@ export function DocumentChatPanel({
             : undefined,
       agent_mode: effectiveAgentMode,
       document_selection: documentSelection,
+      ...(options?.uiAction ? { ui_action: options.uiAction } : {}),
+      ...(options?.analysisOnly ? { analysis_only: true } : {}),
     };
     const idempotencyKey = `document-chat-${createUuid()}`;
     const seenEventIds = new Set<string>();
@@ -804,7 +774,7 @@ export function DocumentChatPanel({
                   };
                 }
                 return isMessagePart(data.part)
-                  ? { ...message, parts: appendPart(message.parts, data.part) }
+                  ? { ...message, parts: appendPart(message.parts, data.part, type === "part.replaced") }
                   : message;
               }),
             );
@@ -894,180 +864,71 @@ export function DocumentChatPanel({
   const sessionClosed = activeSession?.status === "closed";
   const busy = status === "submitted" || status === "streaming";
 
-  const compactModeLabel = responseMode === "fast"
-    ? "快"
-    : thinkingLabels[thinkingMode];
-
-  // Both document layouts use the same model and thinking controls.
   const modelMenu = (
-    <DropdownMenu
+    <GenerationConfigMenu
       open={modeMenuOpen}
-      onOpenChange={(open) => {
-        setModeMenuOpen(open);
-        if (!open) setModelSearch("");
+      onOpenChange={setModeMenuOpen}
+      align="end"
+      side="bottom"
+      layout="inline"
+      groups={modelGroups}
+      providerId={activeProvider?.id ?? ""}
+      modelId={selectedModel?.id ?? ""}
+      responseMode={responseMode}
+      thinkingMode={thinkingMode}
+      thinkingModes={thinkingModes}
+      supportsAgent={supportsAgentMode}
+      thinkingRequired={thinkingRequired}
+      modelError={Boolean(discoveredModels?.isError)}
+      onModelChange={(providerId, modelId) => {
+        setSelectedProviderId(providerId);
+        setSelectedModelId(modelId);
+        if (sessionId) {
+          persistComposerPrefs(sessionId, { providerId, modelId });
+        }
       }}
-    >
-      <DropdownMenuTrigger asChild>
+      onModeChange={setMode}
+      onThinkingChange={handleThinkingChange}
+      onManageModels={() => {
+        setModeMenuOpen(false);
+        navigate(`/w/${workspaceId}/settings/providers`);
+      }}
+      onRefreshModels={() => void discoveredModels?.refetch()}
+      modelSearch={modelSearch}
+      onModelSearchChange={setModelSearch}
+      trigger={
         <button
           aria-label="选择响应模式、思考力度和模型"
-          className={compact ? "document-chat-compact__mode" : "chat-mode-chip"}
-          // 回复途中同样允许切换：本次回答沿用发送时锁定的模型，改动只对
-          // 下一条消息生效。
+          className="chat-mode-chip"
           disabled={!modelProviders.length}
-          title={selectedModel ? `${selectedModel.id} · ${thinkingLabels[thinkingMode]}` : "响应模式与模型"}
+          title={
+            selectedModel
+              ? `${selectedModel.id} · ${thinkingLabels[thinkingMode]}`
+              : "生成配置"
+          }
           type="button"
         >
           <span>
-            {compact
-              ? compactModeLabel
-              : modeMenuOpen
-                ? "思考强度"
-                : responseMode === "fast"
-                  ? "极速"
-                  : thinkingLabels[thinkingMode]}
+            {modeMenuOpen
+              ? "生成配置"
+              : responseMode === "fast"
+                ? "极速"
+                : thinkingLabels[thinkingMode]}
           </span>
           <ChevronDown aria-hidden="true" className="size-3.5" />
         </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" side={compact ? "top" : "bottom"} className="w-64" collisionPadding={12}>
-        <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
-        <div className="px-2 py-1">
-          <ThinkingSlider
-            onChange={handleThinkingSliderChange}
-            stops={thinkingStops}
-            value={thinkingStopIndex(responseMode, thinkingMode, thinkingStops)}
-          />
-        </div>
-        {!thinkingModes.length ? (
-          <p className="px-2 pb-1 text-[10px] text-muted-foreground">
-            当前模型未声明推理能力，按服务商默认执行。
-          </p>
-        ) : null}
-        <DropdownMenuSeparator />
-        <DropdownMenuLabel>模型</DropdownMenuLabel>
-        <div className="relative px-1 pb-1">
-          <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            aria-label="搜索模型"
-            className="h-8 pl-8 font-mono text-xs"
-            onChange={(event) => setModelSearch(event.target.value)}
-            onKeyDown={(event) => event.stopPropagation()}
-            onPointerDown={(event) => event.stopPropagation()}
-            placeholder="搜索模型名称或 Provider…"
-            value={modelSearch}
-          />
-        </div>
-        <div className="max-h-[min(50vh,20rem)] overflow-y-auto">
-          {filteredModelChoices.length ? (
-            <DropdownMenuRadioGroup
-              onValueChange={(value) => {
-                const choice = parseModelChoiceValue(value);
-                if (!choice) return;
-                setSelectedProviderId(choice.providerId);
-                setSelectedModelId(choice.modelId);
-                if (sessionId) {
-                  persistComposerPrefs(sessionId, {
-                    providerId: choice.providerId,
-                    modelId: choice.modelId,
-                  });
-                }
-              }}
-              value={
-                activeProvider && selectedModel
-                  ? modelChoiceValue(activeProvider.id, selectedModel.id)
-                  : ""
-              }
-            >
-              {filteredModelChoices.map(({ provider, model }) => (
-                <DropdownMenuRadioItem
-                  key={`${provider.id}:${model.id}`}
-                  value={modelChoiceValue(provider.id, model.id)}
-                >
-                  <span className="flex min-w-0 flex-col">
-                    <span className="truncate font-mono">{model.id}</span>
-                    <span className="text-[10px] text-muted-foreground">
-                      {provider.display_name} ·{" "}
-                      {modelProtocolLabel(provider.provider_type)}
-                    </span>
-                  </span>
-                </DropdownMenuRadioItem>
-              ))}
-            </DropdownMenuRadioGroup>
-          ) : (
-            <DropdownMenuItem disabled>
-              {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
-            </DropdownMenuItem>
-          )}
-        </div>
-      </DropdownMenuContent>
-    </DropdownMenu>
+      }
+    />
   );
 
-  if (compact) {
-    return (
-      <section className="document-chat-compact" aria-label="文档学习对话">
-        <form className="document-chat-compact__form" onSubmit={(event) => void send(event)}>
-          <button
-            aria-label="添加文件"
-            className="document-chat-compact__plus"
-            onClick={() => toast.message("当前文件会随消息作为附件发送")}
-            type="button"
-          >
-            <Plus aria-hidden="true" className="size-4" />
-          </button>
-          <Textarea
-            aria-label="询问当前文档"
-            className="document-chat-compact__textarea"
-            disabled={
-              onSendToFullChat
-                ? false
-                : !activeProvider || sessionClosed || unavailableSession
-            }
-            onChange={(event) => setDraft(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void send();
-              }
-            }}
-            placeholder="输入消息，或输入 @ 选择模式 / 文件..."
-            ref={composerRef}
-            rows={1}
-            value={draft}
-          />
-          {modelMenu}
-          {draft.trim() ? (
-            <button
-              aria-label="发送文档问题"
-              className="document-chat-compact__mic"
-              disabled={busy}
-              type="submit"
-            >
-              {busy ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin" /> : <ArrowUp aria-hidden="true" className="size-4" />}
-            </button>
-          ) : (
-            <button
-              aria-label="麦克风"
-              className="document-chat-compact__mic"
-              onClick={() => toast.message("麦克风输入可在完整对话中使用")}
-              type="button"
-            >
-              <Mic aria-hidden="true" className="size-4" />
-            </button>
-          )}
-        </form>
-      </section>
-    );
-  }
-
   return (
-    <section className="flex h-full min-h-0 flex-col bg-background" aria-label="文档学习对话">
+    <section className="document-chat-panel flex h-full min-h-0 flex-col bg-background" aria-label="文档学习对话">
       <header className="flex h-12 flex-none items-center gap-2 border-b px-3">
         <MessageSquareText className="size-4" />
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-xs font-semibold">文档学习对话</h2>
           <p className="truncate text-[10px] text-muted-foreground">
-            {activeProvider ? `${activeProvider.display_name} · 持久会话` : "真实模型未配置"}
+            {activeProvider ? `${activeProvider.display_name} · 已保存的对话` : "尚未配置对话模型"}
           </p>
         </div>
         {modelMenu}
@@ -1140,21 +1001,181 @@ export function DocumentChatPanel({
           ) : null}
           {!messages.length && !history.isPending && !unavailableSession ? (
             <ConversationEmptyState
-              className="min-h-64 px-5"
-              description="选中原文后直接提问，回答、引用和 Provider Trace 会保存到正式 Session。"
+              className="min-h-56 px-5"
+              description="当前文件已作为对话上下文，直接提问即可。"
               icon={<MessageSquareText className="size-5" />}
-              title="围绕原文件继续学习"
-            />
+              title="围绕这个文件开始学习"
+            >
+              {suggestions.length ? (
+                <div className="mt-3 flex w-full flex-col gap-1.5">
+                  {suggestions.map((suggestion) => (
+                    <Button
+                      className="h-auto justify-start whitespace-normal py-2 text-left text-xs font-normal"
+                      disabled={(!activeProvider && !onSendToFullChat) || busy || sessionClosed || unavailableSession}
+                      key={suggestion}
+                      onClick={() => void send(undefined, suggestion)}
+                      variant="outline"
+                    >
+                      {suggestion}
+                    </Button>
+                  ))}
+                </div>
+              ) : null}
+            </ConversationEmptyState>
           ) : null}
           {messages.map((message) => {
             const parts = messageParts(message);
             const streaming = message.status === "streaming";
+            const messageSettled =
+              message.status !== "streaming" && message.status !== "pending";
+            const interactive =
+              messageSettled && status !== "streaming" && status !== "submitted";
+            const handleComponentAction = (action: {
+              componentId: string;
+              componentType: string;
+              event: string;
+              payload: Record<string, unknown>;
+            }) => {
+              if (action.componentType === "code_trainer") {
+                if (
+                  action.event !== "submit" ||
+                  typeof action.payload.prompt !== "string" ||
+                  action.payload.prompt.length > 50000
+                ) {
+                  return;
+                }
+                return send(undefined, action.payload.prompt, { analysisOnly: true });
+              }
+              if (action.componentType === "stream_ui") {
+                if (
+                  action.event !== "explain" &&
+                  action.event !== "graph.node.explain" &&
+                  action.event !== "document.block.explain"
+                ) {
+                  return;
+                }
+                const uiAction = {
+                  part_id: action.componentId,
+                  revision: Number(action.payload.revision),
+                  action: action.event,
+                  ...(typeof action.payload.node_id === "string"
+                    ? { node_id: action.payload.node_id }
+                    : {}),
+                  ...(typeof action.payload.block_id === "string"
+                    ? { block_id: action.payload.block_id }
+                    : {}),
+                  ...(action.payload.view_state && typeof action.payload.view_state === "object"
+                    ? { view_state: action.payload.view_state as Record<string, unknown> }
+                    : {}),
+                } satisfies NonNullable<MessageCreateRequest["ui_action"]>;
+                const userMessage =
+                  typeof action.payload.userMessage === "string" &&
+                  action.payload.userMessage.trim()
+                    ? action.payload.userMessage.trim()
+                    : uiAction.node_id
+                      ? `请解释图谱节点「${uiAction.node_id}」及其关联。`
+                      : "请解释当前图表，分析其中的主要信息。";
+                return send(undefined, userMessage, { uiAction });
+              }
+              if (action.componentType === "graph_update_proposal") {
+                toast.message("图谱变更请在主画布中审核");
+                return;
+              }
+              if (
+                action.event !== "submit" &&
+                action.event !== "create_plan" &&
+                action.event !== "open_plan"
+              ) {
+                return;
+              }
+              if (
+                action.event === "submit" &&
+                typeof action.payload.summaryText === "string" &&
+                action.payload.summaryText.trim()
+              ) {
+                void send(undefined, action.payload.summaryText.trim());
+                return;
+              }
+              const labels = Array.isArray(action.payload.labels)
+                ? action.payload.labels.filter(
+                    (item): item is string =>
+                      typeof item === "string" && Boolean(item.trim()),
+                  )
+                : [];
+              let answer =
+                labels.join("、") ||
+                (typeof action.payload.answer === "string"
+                  ? action.payload.answer
+                  : typeof action.payload.value === "string"
+                    ? action.payload.value
+                    : "");
+              if (!answer && action.componentType === "question_batch") {
+                const answers = Array.isArray(action.payload.answers)
+                  ? action.payload.answers
+                  : [];
+                answer = answers
+                  .map((item, index) => {
+                    const record =
+                      item && typeof item === "object"
+                        ? (item as Record<string, unknown>)
+                        : {};
+                    const prompt =
+                      typeof record.prompt === "string" ? record.prompt : `问题 ${index + 1}`;
+                    const value =
+                      typeof record.labels === "string"
+                        ? record.labels
+                        : typeof record.value === "string"
+                          ? record.value
+                          : "（跳过）";
+                    return `${index + 1}. ${prompt} → ${value}`;
+                  })
+                  .filter(Boolean)
+                  .join("；");
+              }
+              if (!answer && action.componentType === "goal_draft_editor") {
+                const draftPayload =
+                  (action.payload.draft as Record<string, unknown> | undefined) ??
+                  action.payload;
+                answer = `请按我修改后的字段确认目标草稿：${JSON.stringify(draftPayload)}`;
+              }
+              if (!answer) {
+                if (action.event === "create_plan") {
+                  const location =
+                    typeof action.payload.location === "string"
+                      ? action.payload.location
+                      : "当前城市";
+                  const condition =
+                    typeof action.payload.condition === "string"
+                      ? action.payload.condition
+                      : "";
+                  const temperature =
+                    typeof action.payload.temperature_c === "number"
+                      ? `${action.payload.temperature_c}°C`
+                      : "";
+                  answer = `请根据${location}的天气（${condition} ${temperature}）生成明日学习计划`;
+                } else if (action.event === "open_plan") {
+                  answer = "请根据卡片中的指标继续分析并给出下一步学习建议";
+                } else {
+                  answer = "跳过该问题";
+                }
+              }
+              if (action.event === "submit" && action.componentType !== "question_batch") {
+                answer = `我的回答：${answer}`;
+              }
+              void send(undefined, answer);
+            };
             const renderPart = (part: MessagePart) => (
               <ChatStreamPartRenderer
+                interactive={interactive}
                 key={part.id}
+                onAction={handleComponentAction}
                 part={part}
+                settled={messageSettled}
                 siblingParts={parts}
-                streaming={streaming}
+                streaming={
+                  streaming &&
+                  (part.status === "streaming" || part.status === "pending")
+                }
               />
             );
             const renderAnswerParts = (answerParts: MessagePart[]) =>
@@ -1162,8 +1183,27 @@ export function DocumentChatPanel({
                 if (group.kind === "question_set") {
                   return (
                     <QuestionSetPager
-                      interactive={!streaming}
+                      interactive={interactive}
                       key={`question-set-${group.parts.map((part) => part.id).join("-")}`}
+                      onSubmit={(submission) =>
+                        void handleComponentAction({
+                          componentId:
+                            group.questions[0]?.componentId ?? group.parts[0].id,
+                          componentType:
+                            group.questions.length > 1
+                              ? "question_set"
+                              : group.questions[0]?.componentType ?? "question_set",
+                          event: "submit",
+                          payload: {
+                            answer: submission.summaryText,
+                            summaryText: submission.summaryText,
+                            results: submission.results,
+                            labels: submission.results.flatMap((item) => item.labels),
+                            graded_count: submission.gradedCount,
+                            correct_count: submission.correctCount,
+                          },
+                        })
+                      }
                       questions={group.questions}
                       storageKey={group.parts.map((part) => part.id).join(":")}
                     />
@@ -1181,24 +1221,24 @@ export function DocumentChatPanel({
                   // Model-authored |layout=side: text left, artifact right.
                   return (
                     <div
-                      className="grid gap-3 sm:grid-cols-2 sm:items-start"
+                      className="grid min-w-0 gap-3 sm:grid-cols-2 sm:items-start"
                       key={`side-pair-${group.artifact.id}`}
                     >
-                      <div>{renderPart(group.text)}</div>
-                      <div>{renderPart(group.artifact)}</div>
+                      <div className="min-w-0">{renderPart(group.text)}</div>
+                      <div className="min-w-0">{renderPart(group.artifact)}</div>
                     </div>
                   );
                 }
                 return renderPart(group.part);
               });
+            const displaySegments = groupPartsForDisplay(parts, {
+              boundary: message.finalAnswerStarted,
+              live: message.status === "streaming",
+            });
             return (
               <AiMessage from={message.role === "user" ? "user" : "assistant"} key={message.id}>
-                <MessageContent className={message.role === "assistant" ? "w-full gap-2" : undefined}>
-                  {groupPartsForDisplay(parts, {
-                    boundary: message.finalAnswerStarted,
-                    live: message.status === "streaming",
-                  }).map(segment =>
-                    segment.kind === "chain" ? (
+                <MessageContent className={message.role === "assistant" ? "message-reading-surface message-reading-surface--compact w-full gap-2 overflow-visible" : undefined} data-message-content={message.role === "assistant" ? true : undefined}>
+                  {message.role === "assistant" ? <MessageReading process={displaySegments.filter(segment => segment.kind === "chain").map(segment => (
                       <ThinkingChain
                         chainParts={segment.parts}
                         completedDurationSec={thinkingDurationSeconds(
@@ -1209,6 +1249,17 @@ export function DocumentChatPanel({
                         )}
                         key={`chain-${message.id}`}
                         messageStatus={message.status}
+                        renderPart={(part) =>
+                          isReasoningTextPart(part) ? (
+                            <ReasoningSummaryRow
+                              key={part.id}
+                              part={part}
+                              streaming={streaming}
+                            />
+                          ) : (
+                            renderPart(part)
+                          )
+                        }
                         startedAt={
                           typeof message.provider_trace.generation_started_at ===
                           "string"
@@ -1219,30 +1270,18 @@ export function DocumentChatPanel({
                           message.finalAnswerStarted?.thinkingDurationMs
                         }
                         toolCallCount={toolCallCount(parts)}
-                      >
-                        {segment.parts.map((part) =>
-                          isReasoningTextPart(part) ? (
-                            <ReasoningSummaryRow
-                              key={part.id}
-                              part={part}
-                              streaming={streaming}
-                            />
-                          ) : (
-                            renderPart(part)
-                          ),
-                        )}
-                      </ThinkingChain>
-                    ) : (
-                      <div
-                        className="message-answer-segment"
-                        key={`parts-${message.id}`}
-                      >
+                      />
+                  ))}>
+                    {displaySegments.filter(segment => segment.kind === "parts").map(segment => (
+                      <div className="message-answer-segment answer-flow" key={`parts-${message.id}`}>
                         {renderAnswerParts(segment.parts)}
                       </div>
-                    ),
-                  )}
+                    ))}
+                  </MessageReading> : renderAnswerParts(parts)}
                 </MessageContent>
-                <StreamStatsBadge messageId={message.id} status={message.status} providerTrace={message.provider_trace} />
+                {message.role === "assistant" ? (
+                  <StreamStatsBadge messageId={message.id} status={message.status} providerTrace={message.provider_trace} />
+                ) : null}
               </AiMessage>
             );
           })}

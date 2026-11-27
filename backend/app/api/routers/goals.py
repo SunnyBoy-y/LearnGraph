@@ -285,7 +285,11 @@ def candidate_graph_stream(
         ).start()
         yield ": graph-stream-ready\n\n"
         while True:
-            item = events.get()
+            try:
+                item = events.get(timeout=12.0)
+            except Empty:
+                yield ": keepalive\n\n"
+                continue
             if item is None:
                 break
             yield item
@@ -294,7 +298,7 @@ def candidate_graph_stream(
         generate(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },

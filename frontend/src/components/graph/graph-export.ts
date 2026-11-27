@@ -46,6 +46,9 @@ export type GraphExportEdge = {
   spine?: boolean;
   active?: boolean;
   dim?: boolean;
+  points?: { x: number; y: number }[];
+  path?: string;
+  directed?: boolean;
 };
 
 const FONT_STACK =
@@ -135,15 +138,16 @@ function renderEdge(edge: GraphExportEdge, arrow: boolean): string {
   );
   const dx = end.x - edge.sourceX;
   const path =
-    Math.abs(dx) < 16
+    edge.path ??
+    edge.points?.map((point, index) => `${index ? "L" : "M"}${round(point.x)},${round(point.y)}`).join(" ") ?? (Math.abs(dx) < 16
       ? `M ${round(edge.sourceX)} ${round(edge.sourceY)} L ${round(end.x)} ${round(end.y)}`
       : (() => {
           const midX = edge.sourceX + dx * 0.46;
           return `M ${round(edge.sourceX)} ${round(edge.sourceY)} C ${round(midX)} ${round(edge.sourceY)}, ${round(midX)} ${round(end.y)}, ${round(end.x)} ${round(end.y)}`;
-        })();
+        })());
   return (
     `<path d="${path}" fill="none" stroke="${color}" stroke-width="${width}"` +
-    (arrow ? ' marker-end="url(#lg-arrow)"' : "") +
+    ((edge.directed ?? arrow) ? ' marker-end="url(#lg-arrow)"' : "") +
     "/>"
   );
 }
@@ -167,10 +171,10 @@ function typeLabel(node: GraphExportNode): string {
 /** Status chip colors, kept in step with the canvas card tones. */
 const STATUS_CHIP_TONES: Record<string, { bg: string; fg: string }> = {
   unlearned: { bg: "#eef2ef", fg: "#4a554e" },
-  learning: { bg: "#e8f1fb", fg: "#2b6ca3" },
-  mastered: { bg: "#e6f6ef", fg: "#0b8f70" },
-  due: { bg: "#fff0cf", fg: "#9a6200" },
-  locked: { bg: "#f1f1ee", fg: "#8a8f8a" },
+  learning: { bg: "#e8f1fb", fg: "#1f5a8a" },
+  mastered: { bg: "#e6f6ef", fg: "#086b54" },
+  due: { bg: "#fff0cf", fg: "#8a5600" },
+  locked: { bg: "#f1f1ee", fg: "#5e635e" },
 };
 
 function statusChipTone(node: GraphExportNode) {
@@ -337,6 +341,12 @@ export function buildGraphSvg(
     minY = Math.min(minY, node.y);
     maxX = Math.max(maxX, node.x + node.width);
     maxY = Math.max(maxY, node.y + node.height);
+  }
+  for (const edge of edges) for (const point of edge.points ?? []) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
   }
   const left = Math.floor(minX - padding);
   const top = Math.floor(minY - labelPadding);

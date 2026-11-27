@@ -9,7 +9,7 @@ from app.domain.schemas.learning_packages import PolicyPatch, BuildRequest, Prog
 from app.services.authorization import AuthorizationService
 from app.services.learning_packages import LearningPackageService
 
-router = APIRouter(prefix="/learning-pages", tags=["learning-pages"])
+router = APIRouter(prefix="/node-activities", tags=["node-activities"])
 
 
 def service(db, context):
@@ -83,6 +83,8 @@ def control_build(build_id: str, action: str, db: DB, context: CurrentWorkspace)
             row.status = "cancelled"
             db.execute(update(DurableJob).where(DurableJob.id == row.job_id).values(status="cancelled", lease_token=None))
     elif action == "retry" and visible_status == "failed":
+        if job is None or job.kind != "learning.node_activity.build":
+            raise AppError(409, "build_retired", "此任务属于旧版学习页，请重新创建学习活动。")
         from app.services.learning_packages import build_allowed
         if not build_allowed(db, row, service(db, context).node(row.node_id)):
             raise AppError(409, "build_ineligible", "节点资格已变化，无法继续预构建。")

@@ -1,7 +1,164 @@
-.file-library-page > header { border-bottom: 0; padding-bottom: 0; }
+.file-library-page > header { border-bottom: 0; padding-bottom: 0; flex-direction: row; align-items: center; justify-content: space-between; }
 
-.file-library-grid {
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, max(224px, calc((100% - 3rem) / 5))), 1fr));
+.file-library-body { container: library-body / inline-size; }
+.file-library-results { container: library-results / inline-size; }
+.file-library-grid { grid-template-columns: minmax(0, 1fr); }
+@container library-results (min-width: 360px) {
+  .file-library-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container library-results (min-width: 640px) {
+  .file-library-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@container library-results (min-width: 900px) {
+  .file-library-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+/* 一级分类：文件来源。 */
+.file-library-origin {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+  scrollbar-width: none;
+}
+.file-library-origin::-webkit-scrollbar { display: none; }
+.file-library-origin__tab {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  padding: 8px 10px 10px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+.file-library-origin__tab:hover { color: var(--foreground); }
+.file-library-origin__tab[aria-current="page"] { color: var(--foreground); font-weight: 600; }
+.file-library-origin__tab[aria-current="page"]::after {
+  position: absolute;
+  right: 8px;
+  bottom: -1px;
+  left: 8px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--foreground);
+  content: "";
+}
+.file-library-origin__count { color: var(--muted-foreground); font-size: 11px; font-weight: 400; }
+
+/* 统一工具栏与低强调统计。 */
+.file-library-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.file-library-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 2px 12px;
+}
+.file-library-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.file-library-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  padding: 2px 4px 2px 9px;
+  font-size: 11px;
+}
+.file-library-chip button {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+.file-library-chip button:hover { background: color-mix(in oklab, var(--foreground) 10%, transparent); color: var(--foreground); }
+
+/* 覆盖式详情抽屉：打开详情不再挤压列表和筛选工具栏。 */
+.file-library-inspector {
+  position: fixed;
+  z-index: 45;
+  inset: 3.5rem 0 0 auto;
+  display: flex;
+  width: min(100%, 26rem);
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--card);
+  box-shadow: -12px 0 32px rgb(0 0 0 / 8%);
+}
+.file-library-inspector__header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding: 6px 8px 6px 16px;
+}
+.file-library-inspector__body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+  padding: 16px;
+}
+.file-library-inspector__actions { display: flex; align-items: center; gap: 6px; }
+.file-library-inspector__meta {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px 12px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+  font-size: 13px;
+}
+.file-library-inspector__meta > dt { color: var(--muted-foreground); }
+.file-library-inspector__meta > dd { text-align: right; }
+.file-library-inspector__notes { font-size: 12px; }
+.file-library-inspector__notes > summary { cursor: pointer; color: var(--muted-foreground); }
+
+/*
+ * 预览高度由真实内容比例决定：图片不再被固定容器压成一条细线。
+ */
+.file-library-inspector-preview {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--muted) 45%, var(--background));
+}
+.file-library-inspector-preview[data-kind="image"] {
+  max-height: min(22rem, 42vh);
+  padding: 6px;
+}
+.file-library-inspector-preview[data-kind="image"] .document-blob-image {
+  width: auto;
+  max-height: min(20rem, 38vh);
+  object-fit: contain;
+  box-shadow: none;
+}
+.file-library-inspector-preview[data-kind="image"] .document-blob-image__zoom { width: auto; }
+.file-library-inspector-preview:not([data-kind="image"]) {
+  max-height: 22rem;
+  overflow: auto;
 }
 
 .file-library-name { overflow-wrap: anywhere; }
@@ -22,7 +179,7 @@
 .dark .file-library-tone--violet { --file-tone: #c5b4ea; }
 .file-library-tone {
   color: var(--file-tone);
-  background: color-mix(in oklab, var(--file-tone) 11%, var(--card));
+  background: color-mix(in oklab, var(--file-tone) 7%, var(--card));
 }
 .file-library-format { color: var(--card); background: var(--file-tone); }
 

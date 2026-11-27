@@ -25,7 +25,7 @@ WHITELIST_DOCUMENT_EXTENSIONS = (
     BUILT_IN_DOCUMENT_EXTENSIONS | ISOLATED_DOCUMENT_EXTENSIONS
 )
 OPTIONAL_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff"}
-AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac"}
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".opus", ".amr", ".flac", ".aac"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".flv", ".wmv"}
 
 # Explicitly never allowed in fast/thinking (even if metadata is malformed).

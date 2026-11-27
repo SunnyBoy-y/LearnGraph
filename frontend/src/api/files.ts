@@ -1,5 +1,13 @@
 import type { ActionResponse } from "@/types/common";
+import {
+  adaptiveChunkUploadThreshold,
+  adaptivePollInterval,
+  adaptiveUploadChunkSize,
+  computeJitteredBackoffMs,
+  networkQualityStore,
+} from "@/lib/network-quality";
 import { createUuid } from "@/lib/uuid";
+import { authStore } from "./auth-store";
 import type {
   DocumentJob,
   DocumentJobStatus,
@@ -19,7 +27,7 @@ import type {
 } from "@/types/files";
 import type { DeleteImpact } from "@/types/workflow";
 
-import { apiClient } from "./client";
+import { apiClient, ApiError } from "./client";
 import type { ApiRequestOptions } from "./client";
 
 export function listFiles(options?: {
@@ -66,13 +74,284 @@ export function listFileParserCapabilities(): Promise<FileParserCapability[]> {
   return apiClient.get<FileParserCapability[]>("/files/parser-capabilities");
 }
 
-export function uploadFile(
+export interface UploadProgress {
+  loadedBytes: number;
+  totalBytes: number;
+  percent: number;
+  chunkIndex?: number;
+  totalChunks?: number;
+  resumed?: boolean;
+}
+
+export interface ChunkUploadSession {
+  upload_id: string;
+  filename: string;
+  total_size: number;
+  chunk_size: number;
+  total_chunks: number;
+  uploaded_chunks: number[];
+  already_exists: boolean;
+  existing_file: FileRecord | null;
+}
+
+interface ChunkUploadPartResponse {
+  upload_id: string;
+  chunk_index: number;
+  size_bytes: number;
+  uploaded_chunks: number[];
+}
+
+const RESUME_STORAGE_PREFIX = "learngraph:chunk-upload:v1:";
+const MAX_CHUNK_RETRIES = 4;
+
+function resumeStorageKey(file: File, source?: string): string {
+  const workspaceId = authStore.getWorkspaceId() ?? "default";
+  return `${RESUME_STORAGE_PREFIX}${workspaceId}:${source ?? "upload"}:${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function readSavedUploadId(key: string): string | null {
+  try {
+    if (typeof window === "undefined") return null;
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { uploadId?: unknown; savedAt?: unknown };
+    if (
+      typeof parsed.uploadId !== "string" ||
+      !parsed.uploadId ||
+      typeof parsed.savedAt !== "number" ||
+      Date.now() - parsed.savedAt > 23 * 3600 * 1000
+    ) {
+      window.localStorage.removeItem(key);
+      return null;
+    }
+    return parsed.uploadId;
+  } catch {
+    return null;
+  }
+}
+
+function saveUploadId(key: string, uploadId: string): void {
+  try {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      key,
+      JSON.stringify({ uploadId, savedAt: Date.now() }),
+    );
+  } catch {
+    // Private mode / quota errors never block uploading.
+  }
+}
+
+function clearSavedUploadId(key: string): void {
+  try {
+    if (typeof window === "undefined") return;
+    window.localStorage.removeItem(key);
+  } catch {
+    // Ignore storage cleanup failures.
+  }
+}
+
+function isTransientNetworkFailure(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    return error.status === 0 || error.status === 502 || error.status === 503 || error.status === 504;
+  }
+  return !(error instanceof DOMException && error.name === "AbortError");
+}
+
+function waitWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const finish = () => {
+      clearTimeout(timer);
+      if (typeof window !== "undefined") window.removeEventListener("online", finish);
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = () => {
+      clearTimeout(timer);
+      if (typeof window !== "undefined") window.removeEventListener("online", finish);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (typeof window !== "undefined" && navigator.onLine === false) {
+      window.addEventListener("online", finish, { once: true });
+    }
+    const timer = setTimeout(finish, ms);
+  });
+}
+
+async function uploadFileChunked(
   file: File,
-  options: ApiRequestOptions = {},
+  options: ApiRequestOptions & {
+    source?: "library_upload" | "chat_attachment";
+    onProgress?: (progress: UploadProgress) => void;
+    chunkSize?: number;
+  } = {},
 ): Promise<FileRecord> {
+  const { source, onProgress, chunkSize: explicitChunkSize, ...requestOptions } = options;
+  const storageKey = resumeStorageKey(file, source);
+  let session: ChunkUploadSession | null = null;
+  let resumed = false;
+
+  const savedId = readSavedUploadId(storageKey);
+  if (savedId) {
+    try {
+      const existing = await apiClient.get<ChunkUploadSession>(
+        `/files/uploads/${encodeURIComponent(savedId)}`,
+        requestOptions,
+      );
+      if (existing.total_size === file.size && existing.filename === (file.name || "upload.bin")) {
+        session = existing;
+        resumed = existing.uploaded_chunks.length > 0;
+      }
+    } catch {
+      clearSavedUploadId(storageKey);
+    }
+  }
+
+  if (!session) {
+    const chunkSize = explicitChunkSize ?? adaptiveUploadChunkSize();
+    session = await apiClient.post<ChunkUploadSession>(
+      "/files/uploads/init",
+      {
+        filename: file.name || "upload.bin",
+        total_size: file.size,
+        chunk_size: chunkSize,
+        content_type: file.type || "application/octet-stream",
+        source: source ?? "upload",
+      },
+      requestOptions,
+    );
+    if (session.already_exists && session.existing_file) {
+      onProgress?.({
+        loadedBytes: file.size,
+        totalBytes: file.size,
+        percent: 100,
+        totalChunks: session.total_chunks,
+        resumed: true,
+      });
+      return session.existing_file;
+    }
+    saveUploadId(storageKey, session.upload_id);
+  }
+
+  const uploadedSet = new Set<number>(session.uploaded_chunks);
+  const computeLoadedBytes = () => {
+    let bytes = 0;
+    for (const idx of uploadedSet) {
+      const start = idx * session.chunk_size;
+      const end = Math.min(file.size, start + session.chunk_size);
+      bytes += Math.max(0, end - start);
+    }
+    return bytes;
+  };
+
+  onProgress?.({
+    loadedBytes: computeLoadedBytes(),
+    totalBytes: file.size,
+    percent: Math.round((computeLoadedBytes() / Math.max(1, file.size)) * 100),
+    totalChunks: session.total_chunks,
+    resumed,
+  });
+
+  for (let chunkIndex = 0; chunkIndex < session.total_chunks; chunkIndex += 1) {
+    if (uploadedSet.has(chunkIndex)) continue;
+    if (requestOptions.signal?.aborted) {
+      throw requestOptions.signal.reason ?? new DOMException("Aborted", "AbortError");
+    }
+    const start = chunkIndex * session.chunk_size;
+    const end = Math.min(file.size, start + session.chunk_size);
+    const slice = file.slice(start, end);
+
+    let chunkAttempt = 0;
+    for (;;) {
+      try {
+        await apiClient.putRaw<ChunkUploadPartResponse>(
+          `/files/uploads/${encodeURIComponent(session.upload_id)}/chunks/${chunkIndex}`,
+          slice,
+          {
+            ...requestOptions,
+            headers: {
+              ...(requestOptions.headers instanceof Headers
+                ? Object.fromEntries(requestOptions.headers.entries())
+                : (requestOptions.headers as Record<string, string> | undefined)),
+              "Content-Type": "application/octet-stream",
+              "Idempotency-Key": `chunk-${session.upload_id}-${chunkIndex}`,
+            },
+          },
+        );
+        uploadedSet.add(chunkIndex);
+        const loadedBytes = computeLoadedBytes();
+        onProgress?.({
+          loadedBytes,
+          totalBytes: file.size,
+          percent: Math.min(99, Math.round((loadedBytes / Math.max(1, file.size)) * 100)),
+          chunkIndex,
+          totalChunks: session.total_chunks,
+          resumed,
+        });
+        break;
+      } catch (error) {
+        if (requestOptions.signal?.aborted || !isTransientNetworkFailure(error) || chunkAttempt >= MAX_CHUNK_RETRIES) {
+          throw error;
+        }
+        chunkAttempt += 1;
+        const delay = computeJitteredBackoffMs(800, chunkAttempt - 1, 10_000);
+        await waitWithSignal(delay, requestOptions.signal);
+      }
+    }
+  }
+
+  const record = await apiClient.post<FileRecord>(
+    `/files/uploads/${encodeURIComponent(session.upload_id)}/complete`,
+    undefined,
+    {
+      ...requestOptions,
+      headers: {
+        ...(requestOptions.headers instanceof Headers
+          ? Object.fromEntries(requestOptions.headers.entries())
+          : (requestOptions.headers as Record<string, string> | undefined)),
+        "Idempotency-Key": `chunk-complete-${session.upload_id}`,
+      },
+    },
+  );
+  clearSavedUploadId(storageKey);
+  onProgress?.({
+    loadedBytes: file.size,
+    totalBytes: file.size,
+    percent: 100,
+    totalChunks: session.total_chunks,
+    resumed,
+  });
+  return record;
+}
+
+export async function uploadFile(
+  file: File,
+  options: ApiRequestOptions & {
+    source?: "library_upload" | "chat_attachment";
+    onProgress?: (progress: UploadProgress) => void;
+    chunkSize?: number;
+    forceChunked?: boolean;
+  } = {},
+): Promise<FileRecord> {
+  const { source, onProgress, chunkSize, forceChunked, ...requestOptions } = options;
+  if (forceChunked || file.size >= adaptiveChunkUploadThreshold()) {
+    return uploadFileChunked(file, { source, onProgress, chunkSize, ...requestOptions });
+  }
+  onProgress?.({ loadedBytes: 0, totalBytes: file.size, percent: 0 });
   const formData = new FormData();
   formData.set("file", file);
-  return apiClient.upload<FileRecord>("/files", formData, options);
+  const record = await apiClient.upload<FileRecord>(
+    source ? `/files?source=${source}` : "/files",
+    formData,
+    requestOptions,
+  );
+  onProgress?.({ loadedBytes: file.size, totalBytes: file.size, percent: 100 });
+  return record;
 }
 
 export function parseFile(fileId: string): Promise<DocumentJob> {
@@ -96,23 +375,51 @@ function isDocumentJobTerminal(status?: DocumentJobStatus): boolean {
 }
 
 /**
- * Poll a parse document job until it reaches a terminal state (800 ms interval).
- * Resolves with the terminal job; throws on failure/cancellation/timeout.
+ * Poll a parse document job until it reaches a terminal state.
+ * Adapts poll spacing on weak networks and tolerates transient network errors
+ * with jittered backoff instead of aborting on the first packet drop.
  */
 export async function pollParseJob(
   job: DocumentJob,
-  options: { intervalMs?: number; timeoutMs?: number } = {},
+  options: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal; maxConsecutiveErrors?: number } = {},
 ): Promise<DocumentJob> {
-  const intervalMs = options.intervalMs ?? 800;
+  const baseIntervalMs = options.intervalMs ?? 800;
   const timeoutMs = options.timeoutMs ?? 120_000;
+  const maxConsecutiveErrors = options.maxConsecutiveErrors ?? 5;
   const deadline = Date.now() + timeoutMs;
   let current = job;
+  let consecutiveErrors = 0;
+
   while (!isDocumentJobTerminal(current.status)) {
+    if (options.signal?.aborted) {
+      throw options.signal.reason ?? new DOMException("Aborted", "AbortError");
+    }
     if (Date.now() > deadline) {
       throw new Error('解析任务超时，请稍后在解析页面查看进度');
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    current = await getDocumentJob(job.id);
+    const adaptive = adaptivePollInterval(baseIntervalMs, {
+      pauseWhenOffline: false,
+      pauseWhenHidden: false,
+    });
+    const waitMs =
+      consecutiveErrors > 0
+        ? computeJitteredBackoffMs(baseIntervalMs, consecutiveErrors, 10_000)
+        : typeof adaptive === "number"
+          ? adaptive
+          : baseIntervalMs * (networkQualityStore.getSnapshot().tier === "good" ? 1 : 3);
+    await waitWithSignal(waitMs, options.signal);
+    try {
+      current = await getDocumentJob(job.id);
+      consecutiveErrors = 0;
+    } catch (error) {
+      if (options.signal?.aborted || !isTransientNetworkFailure(error)) {
+        throw error;
+      }
+      consecutiveErrors += 1;
+      if (consecutiveErrors > maxConsecutiveErrors) {
+        throw error;
+      }
+    }
   }
   if (current.status === 'failed') {
     throw new Error(current.error_message || current.error_code || '解析任务失败');
@@ -177,6 +484,12 @@ export function listFileChunks(fileId: string): Promise<FileTextChunk[]> {
   return apiClient.get<FileTextChunk[]>(
     `/files/${encodeURIComponent(fileId)}/chunks`,
   );
+}
+
+export function linkFileToGraph(fileId: string, graphId: string): Promise<FileReference> {
+  return apiClient.post<FileReference>(`/files/${encodeURIComponent(fileId)}/references`, {
+    target_type: "graph", target_id: graphId, relation: "learning_material",
+  });
 }
 
 export function listFileReferences(fileId: string): Promise<FileReference[]> {

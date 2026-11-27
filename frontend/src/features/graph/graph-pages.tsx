@@ -41,6 +41,7 @@ import {
   ShieldCheck,
   Sparkles,
   Split,
+  SquareCheck,
   Target,
   Trash2,
 } from "lucide-react";
@@ -54,6 +55,7 @@ import { toast } from '@/lib/notifications';
 
 import {
   ApiError,
+  createAction,
   createSession,
   deleteGoal,
   getCapabilityReport,
@@ -72,9 +74,15 @@ import {
 import defaultGraphCover from "@/assets/graph-cover-default.webp";
 import { cn } from "@/lib/utils";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { isOfflineOrNetworkError, offlineOutbox } from "@/lib/offline-outbox";
 import { saveBlobViaNative } from "@/lib/native-download";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
 import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
-import { GraphLegend } from "@/components/graph/graph-legend";
+import { Pagination } from "@/components/shared/pagination";
+import { useActionConfirmation } from "@/components/shared/use-action-confirmation";
+import { useEscapeKey, useListSelection } from "@/lib/list-selection";
+import { GraphTypeFilter } from "@/components/graph/graph-legend";
+import { WorkbenchGraph } from "@/components/graph/workbench-graph";
 import { GraphReviewDialog } from "@/components/graph/graph-review-dialog";
 import { GraphCoverAIBadge, GraphCoverAIEditor } from "@/features/graph/graph-cover-ai";
 import {
@@ -112,12 +120,14 @@ import {
   type MetricLevel,
 } from "@/components/graph/node-metrics";
 import {
+  NODE_PRIMARY_ACTIONS,
   NODE_STATUS_PROFILES,
   NODE_TYPE_ORDER,
   NODE_TYPE_PROFILES,
   graphLevelLabel,
   isPrerequisiteSatisfied,
   masteryLevelLabel,
+  nodeExecutionLabel,
   resolveLearningStatus,
   resolveNodeTypeProfile,
   type NodeLearningStatusId,
@@ -429,6 +439,34 @@ function toWorkbenchKnowledgeGraph(
   const hasDeclaredRoot = graph.nodes.some(
     (node) => node.node_type === "root",
   );
+  const byId = new Map(graph.nodes.map(node => [node.id, node]));
+  const children = new Map<string, string[]>();
+  for (const edge of graph.edges) {
+    if (edge.relation === "contains") children.set(edge.source_node_id, [...(children.get(edge.source_node_id) ?? []), edge.target_node_id]);
+  }
+  function goalProgress(id: string) {
+    const seen = new Set([id]);
+    const pending = [...(children.get(id) ?? [])];
+    let completed = 0;
+    let total = 0;
+    while (pending.length) {
+      const childId = pending.pop()!;
+      if (seen.has(childId)) continue;
+      seen.add(childId);
+      const child = byId.get(childId);
+      if (!child) continue;
+      pending.push(...(children.get(childId) ?? []));
+      const type = resolveNodeTypeProfile(child.node_type).id;
+      if (type === "root") continue;
+      total++;
+      const done = type === "lab" ? child.execution_state === "completed"
+        : type === "assessment" ? child.achievement_score != null
+        : type === "open" ? child.execution_state === "completed"
+        : resolveLearningStatus({ stars: child.mastery_stars, attentionState: child.attention_state, retrievalState: child.retrieval_state }).id === "mastered";
+      if (done) completed++;
+    }
+    return { completed, total };
+  }
   const nodes: KnowledgeNode[] = graph.nodes.map((node, index) => ({
     id: node.id,
     type: "knowledge",
@@ -441,6 +479,8 @@ function toWorkbenchKnowledgeGraph(
       description: node.description,
       stars: node.mastery_stars,
       achievementScore: node.achievement_score,
+      executionState: node.execution_state,
+      goalProgress: node.node_type === "root" ? goalProgress(node.id) : undefined,
       state: node.retrieval_state,
       evidence: node.evidence_state,
       focused: node.attention_state === "focused",
@@ -448,6 +488,7 @@ function toWorkbenchKnowledgeGraph(
       targetWeight: node.target_weight,
       exploreCount: exploreCounts[node.id] ?? 0,
       mastered: node.attention_state === "mastered",
+      attention_state: node.attention_state,
       // 装饰标记：该节点的学习页（交互页）已经生成，卡片右上角挂一枚徽章。
       hasLearningPage: Boolean(node.has_learning_page),
       blockedByPrerequisite: blockedNodeIds.has(node.id),
@@ -564,12 +605,33 @@ export function GraphBookshelf({
   onStartGoal: () => void;
   onStartLearning: (book: ShelfBook) => void;
 }) {
-  const [view, setView] = useState<"shelf" | "list">("shelf");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const queryClient = useQueryClient();
+  const view: "shelf" | "list" = searchParams.get("view") === "list" ? "list" : "shelf";
+  const search = searchParams.get("q") ?? "";
+  const status = searchParams.get("status") || "all";
+  const sort = searchParams.get("sort") === "recent" ? "recent" : "default";
+  const requestedPage = Number(searchParams.get("page") || "1");
+  const requestedPageSize = Number(searchParams.get("pageSize") || "12");
+  const pageSize = [12, 24, 48].includes(requestedPageSize) ? requestedPageSize : 12;
+  const updateShelfParams = (patch: Record<string, string>, replace = false) => {
+    const next = new URLSearchParams(searchParams);
+    for (const [key, value] of Object.entries(patch)) {
+      if (value) next.set(key, value);
+      else next.delete(key);
+    }
+    if (next.toString() !== searchParams.toString()) {
+      setSearchParams(next, { replace, preventScrollReset: true });
+    }
+  };
+  const setView = (next: "shelf" | "list") => updateShelfParams({ view: next === "shelf" ? "" : next });
+  const setSearch = (next: string) => updateShelfParams({ q: next, page: "" }, true);
+  const setStatus = (next: string) => updateShelfParams({ status: next === "all" ? "" : next, page: "" });
+  const setSort = (next: string) => updateShelfParams({ sort: next === "default" ? "" : next, page: "" });
   const [coverBook, setCoverBook] = useState<ShelfBook>();
   const [historyBook, setHistoryBook] = useState<ShelfBook>();
-  const [search, setSearch] = useState("");
-  const [status, setStatus] = useState("all");
-  const [sort, setSort] = useState("default");
+  const [batchBusy, setBatchBusy] = useState(false);
+  const { confirm, dialog: confirmDialog } = useActionConfirmation();
   const { workspaceId = "" } = useParams();
   const revisions = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "graph-revisions", historyBook?.graphId),
@@ -577,13 +639,36 @@ export function GraphBookshelf({
     enabled: Boolean(historyBook?.graphId),
   });
   const term = search.trim().toLocaleLowerCase();
-  const visibleBooks = books.filter((book) => (
-    (status === "all" || shelfStatus(book) === status) &&
-    (!term || `${book.title} ${book.summary}`.toLocaleLowerCase().includes(term))
-  ));
-  if (sort === "recent") {
-    visibleBooks.sort((a, b) => (b.lastStudiedAt ? Date.parse(b.lastStudiedAt) : 0) - (a.lastStudiedAt ? Date.parse(a.lastStudiedAt) : 0));
-  }
+  const visibleBooks = useMemo(() => {
+    const list = books.filter((book) => (
+      (status === "all" || shelfStatus(book) === status) &&
+      (!term || `${book.title} ${book.summary}`.toLocaleLowerCase().includes(term))
+    ));
+    if (sort === "recent") {
+      list.sort((a, b) => (b.lastStudiedAt ? Date.parse(b.lastStudiedAt) : 0) - (a.lastStudiedAt ? Date.parse(a.lastStudiedAt) : 0));
+    }
+    return list;
+  }, [books, sort, status, term]);
+
+  const totalPages = Math.max(1, Math.ceil(visibleBooks.length / pageSize));
+  const safePage = Math.min(Math.max(1, Number.isSafeInteger(requestedPage) ? requestedPage : 1), totalPages);
+  const pagedBooks = useMemo(
+    () => visibleBooks.slice((safePage - 1) * pageSize, safePage * pageSize),
+    [pageSize, safePage, visibleBooks],
+  );
+  const pageBookIds = useMemo(() => pagedBooks.map((book) => book.id), [pagedBooks]);
+  const selection = useListSelection(pageBookIds);
+  const selectedBooks = useMemo(
+    () => books.filter((book) => selection.selectedIds.has(book.id)),
+    [books, selection.selectedIds],
+  );
+  const selectedExportableBooks = useMemo(
+    () => selectedBooks.filter((book) => Boolean(book.graphId)),
+    [selectedBooks],
+  );
+  const allFilteredIds = useMemo(() => visibleBooks.map((book) => book.id), [visibleBooks]);
+  const allFilteredSelected =
+    allFilteredIds.length > 0 && allFilteredIds.every((id) => selection.selectedIds.has(id));
 
   async function shareBook(book: ShelfBook) {
     const path = `/w/${encodeURIComponent(workspaceId)}/graphs/${encodeURIComponent(book.graphId!)}`;
@@ -604,6 +689,58 @@ export function GraphBookshelf({
     }
   }
 
+  async function exportSelectedBooks() {
+    if (!selectedExportableBooks.length || batchBusy) return;
+    setBatchBusy(true);
+    try {
+      const exported: Graph[] = [];
+      for (const book of selectedExportableBooks) {
+        try {
+          exported.push(await getGraph(book.graphId!));
+        } catch {
+          // skip failed graph export
+        }
+      }
+      if (!exported.length) {
+        toast.error("无法导出选中的图谱");
+        return;
+      }
+      downloadJsonFile(`learngraph-graphs-${exported.length}.json`, exported);
+      toast.success(`已导出 ${exported.length} 本图谱`);
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function deleteSelectedBooks(targets: ShelfBook[]) {
+    if (!targets.length || batchBusy) return;
+    setBatchBusy(true);
+    try {
+      const deletedIds: string[] = [];
+      for (const book of targets) {
+        try {
+          const impact = await getGoalDeleteImpact(book.goalId);
+          await deleteGoal(book.goalId, impact.confirmation_text);
+          deletedIds.push(book.id);
+        } catch {
+          // continue deleting remaining selected books
+        }
+      }
+      selection.removeIds(deletedIds);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "graphs") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "goals") }),
+        queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "dashboard") }),
+      ]);
+      const failed = targets.length - deletedIds.length;
+      if (failed === 0) toast.success(`已删除 ${deletedIds.length} 项`);
+      else if (deletedIds.length > 0) toast.warning(`已删除 ${deletedIds.length} 项，${failed} 项失败`);
+      else toast.error("批量删除失败");
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
   return (
     <section className="graph-library graph-library--compact" aria-label="图谱书架">
       <GraphCoverEditor book={coverBook} onClose={() => setCoverBook(undefined)} />
@@ -612,10 +749,14 @@ export function GraphBookshelf({
         <Button onClick={onStartGoal} size="sm"><BookPlus className="size-4" />新建学习意向</Button>
       </header>
       <div className="graph-library__toolbar">
-        <div className="graph-library__search">
-          <Search aria-hidden="true" className="size-4" />
-          <Input type="search" aria-label="搜索学习图谱" placeholder="搜索学习图谱…" value={search} onChange={(event) => setSearch(event.target.value)} />
-        </div>
+        <ClearableSearchInput
+          aria-label="搜索学习图谱"
+          containerClassName="graph-library__search"
+          onChange={setSearch}
+          placeholder="搜索学习图谱…"
+          type="search"
+          value={search}
+        />
         <Select value={status} onValueChange={setStatus}>
           <SelectTrigger aria-label="按学习状态筛选" size="sm"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -638,16 +779,110 @@ export function GraphBookshelf({
           <Button aria-label="卡片视图" aria-pressed={view === "shelf"} onClick={() => setView("shelf")} size="icon-sm" title="卡片视图" variant={view === "shelf" ? "secondary" : "ghost"}><LayoutGrid /></Button>
           <Button aria-label="列表视图" aria-pressed={view === "list"} onClick={() => setView("list")} size="icon-sm" title="列表视图" variant={view === "list" ? "secondary" : "ghost"}><List /></Button>
         </div>
+        {books.length ? (
+          <Button
+            aria-pressed={selection.multiSelect}
+            disabled={batchBusy}
+            onClick={selection.toggleMultiSelect}
+            size="sm"
+            type="button"
+            variant={selection.multiSelect ? "secondary" : "outline"}
+          >
+            <SquareCheck className="size-4" />
+            {selection.multiSelect ? "退出多选" : "多选"}
+          </Button>
+        ) : null}
       </div>
+      {selection.multiSelect && pagedBooks.length > 0 ? (
+        <div
+          aria-label="图谱书架批量操作"
+          className="flex flex-wrap items-center gap-2 rounded-xl border bg-muted/30 px-3 py-2 text-xs"
+          role="region"
+        >
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox
+              aria-label="全选当前页图谱"
+              checked={selection.visibleCheckboxState}
+              disabled={batchBusy}
+              onCheckedChange={(checked) => selection.toggleVisible(checked === true)}
+            />
+            全选当前页
+          </label>
+          {visibleBooks.length > pagedBooks.length ? (
+            <Button
+              disabled={batchBusy}
+              onClick={() => (allFilteredSelected ? selection.clear() : selection.selectAll(allFilteredIds))}
+              size="xs"
+              type="button"
+              variant="link"
+            >
+              {allFilteredSelected ? "取消全选" : `全选筛选结果 (${visibleBooks.length})`}
+            </Button>
+          ) : null}
+          <span className="tabular-nums text-muted-foreground">
+            已选 {selection.selectedCount} 项
+            {selection.otherSelectedCount > 0 ? `（本页 ${selection.selectedVisibleCount} 项，其他页 ${selection.otherSelectedCount} 项）` : ""}
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-1.5">
+            <Button
+              disabled={batchBusy || !selectedExportableBooks.length}
+              onClick={() => void exportSelectedBooks()}
+              size="xs"
+              type="button"
+              variant="outline"
+            >
+              <Download className="size-3.5" />
+              批量导出{selectedExportableBooks.length ? ` (${selectedExportableBooks.length})` : ""}
+            </Button>
+            <Button
+              disabled={batchBusy || !selectedBooks.length}
+              onClick={() =>
+                confirm({
+                  title: `永久删除选中的 ${selectedBooks.length} 个图谱 / 学习目标？`,
+                  description: "删除后将同时移除对应的知识图谱、节点与学习路线，此操作不可撤销。",
+                  label: `删除 ${selectedBooks.length} 项`,
+                  destructive: true,
+                  run: () => void deleteSelectedBooks(selectedBooks),
+                })
+              }
+              size="xs"
+              type="button"
+              variant="destructive"
+            >
+              <Trash2 className="size-3.5" />
+              批量删除
+            </Button>
+            {selection.selectedCount > 0 ? (
+              <Button disabled={batchBusy} onClick={selection.clear} size="xs" type="button" variant="ghost">
+                取消选择
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       <div className={cn("graph-library__shelves", view === "list" && "graph-library__shelves--list")}>
-        {visibleBooks.map((entry) => {
-          const selected = selectedId === entry.id;
+        {pagedBooks.map((entry) => {
+          const selected = selection.multiSelect ? selection.selectedIds.has(entry.id) : selectedId === entry.id;
           const percent = Math.round(entry.masteryProgress * 100);
           const state = shelfStatus(entry);
           const showProgress = Boolean(entry.graphId && !entry.needsReview);
           return (
-            <article className={cn("graph-library__book", selected && "is-active")} key={entry.id}>
-              <button aria-pressed={selected} aria-label={`打开「${entry.title}」`} className="graph-library__book-open" onClick={() => onOpen(entry)} type="button">
+            <article className={cn("graph-library__book relative", selected && "is-active ring-1 ring-ring")} key={entry.id}>
+              {selection.multiSelect ? (
+                <Checkbox
+                  aria-label={`选择图谱「${entry.title}」`}
+                  className="absolute left-3 top-3 z-10 bg-background"
+                  disabled={batchBusy}
+                  {...selection.checkboxProps(entry.id)}
+                />
+              ) : null}
+              <button aria-pressed={selected} aria-label={selection.multiSelect ? `勾选「${entry.title}」` : `打开「${entry.title}」`} className="graph-library__book-open" onClick={(event) => {
+                if (selection.multiSelect) {
+                  selection.toggleItem(entry.id, { shiftKey: event.shiftKey });
+                  return;
+                }
+                onOpen(entry);
+              }} type="button">
                 <span className="graph-library__spine" style={{ backgroundImage: `url("${entry.cover}"), url("${defaultGraphCover}")`, backgroundSize: "cover", backgroundPosition: "center" }} />
                 <span className="graph-library__book-copy">
                   <strong title={entry.title}>{entry.title}</strong>
@@ -680,12 +915,10 @@ export function GraphBookshelf({
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="min-w-36">
                     {entry.graphId && <>
-                      <DropdownMenuItem disabled>重命名（暂未支持）</DropdownMenuItem>
                       <DropdownMenuItem onSelect={() => setCoverBook(entry)}>更换封面</DropdownMenuItem>
                       <DropdownMenuItem onSelect={() => setHistoryBook(entry)}>版本记录</DropdownMenuItem>
                       <DropdownMenuItem onSelect={() => void shareBook(entry)}>分享图谱链接</DropdownMenuItem>
                       <DropdownMenuItem onSelect={() => void exportBook(entry)}>导出图谱（JSON）</DropdownMenuItem>
-                      <DropdownMenuItem disabled>归档（暂未支持）</DropdownMenuItem>
                       <DropdownMenuSeparator />
                     </>}
                     <DropdownMenuItem variant="destructive" onSelect={() => onDelete(entry)}><Trash2 />{entry.graphId ? "删除图谱" : "删除学习目标"}</DropdownMenuItem>
@@ -698,9 +931,20 @@ export function GraphBookshelf({
         {!books.length ? (
           <div className="graph-library__empty"><p>还没有学习图谱</p><Button onClick={onStartGoal} size="sm" variant="outline">创建第一本图谱</Button></div>
         ) : !visibleBooks.length ? (
-          <div className="graph-library__empty"><p>没有匹配的图谱</p><Button onClick={() => { setSearch(""); setStatus("all"); }} size="sm" variant="outline">清除搜索和筛选</Button></div>
+          <div className="graph-library__empty"><p>没有匹配的图谱</p><Button onClick={() => updateShelfParams({ q: "", status: "", page: "" })} size="sm" variant="outline">清除搜索和筛选</Button></div>
         ) : null}
       </div>
+      {visibleBooks.length > pageSize || pageSize !== 12 ? (
+        <Pagination
+          onPageChange={(nextPage) => updateShelfParams({ page: nextPage === 1 ? "" : String(nextPage) })}
+          onPageSizeChange={(size) => updateShelfParams({ page: "", pageSize: size === 12 ? "" : String(size) })}
+          page={safePage}
+          pageSize={pageSize}
+          sizes={[12, 24, 48]}
+          total={visibleBooks.length}
+        />
+      ) : null}
+      {confirmDialog}
       <Dialog open={Boolean(historyBook)} onOpenChange={(open) => { if (!open) setHistoryBook(undefined); }}>
         <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
           <DialogHeader><DialogTitle>版本记录</DialogTitle><DialogDescription>{historyBook?.title}{historyBook?.revision != null && ` · 当前修订 ${historyBook.revision}`}</DialogDescription></DialogHeader>
@@ -1003,17 +1247,6 @@ export function GraphWorkspacePage() {
     return map;
   }, [blockedNodeIds, effectiveGraph]);
 
-  /**
-   * 已生成学习页（交互页）的节点数。图例据此说明卡片右上角那枚装饰徽章，
-   * 与类型 / 状态一样，缺省时保留词条但置灰。
-   */
-  const nodePageCount = useMemo(
-    () =>
-      (effectiveGraph?.nodes ?? []).filter((node) => node.has_learning_page)
-        .length,
-    [effectiveGraph],
-  );
-
   /** Types actually present in this graph — the legend marks the rest as unused. */
   const nodeTypeCounts = useMemo(() => {
     const counts = new Map<NodeTypeId, number>();
@@ -1122,14 +1355,6 @@ export function GraphWorkspacePage() {
     if (!workbenchGraph) return new Map<string, number>();
     return getKnowledgeGraphTreeDepths(workbenchGraph.nodes, workbenchGraph.edges);
   }, [workbenchGraph]);
-
-  const nodeStatusCounts = useMemo(() => {
-    const counts = new Map<NodeLearningStatusId, number>();
-    nodeStatusViews.forEach((view) => {
-      counts.set(view.statusId, (counts.get(view.statusId) ?? 0) + 1);
-    });
-    return counts;
-  }, [nodeStatusViews]);
 
   /** Upstream / downstream / cross relations of the selected node. */
   const selectedNodeRelations = useMemo(() => {
@@ -1273,6 +1498,31 @@ export function GraphWorkspacePage() {
     if (!multiSelect && selectedNode) setSelectedNodeIds([selectedNode.id]);
   }, [multiSelect, selectedNode]);
 
+  const exitCanvasMultiSelect = useCallback(() => {
+    setMultiSelect(false);
+  }, []);
+  useEscapeKey(multiSelect, exitCanvasMultiSelect);
+
+  const batchAddNodesToPlan = useMutation({
+    mutationFn: async (nodesToAdd: GraphNode[]) => {
+      if (!activeGraph) return 0;
+      const results = await Promise.allSettled(
+        nodesToAdd.map((node) => createAction(`学习：${node.label}`, activeGraph.id)),
+      );
+      return results.filter((result) => result.status === "fulfilled").length;
+    },
+    onSuccess: (count) => {
+      if (!count) {
+        toast.error("加入学习计划失败");
+        return;
+      }
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "actions") });
+      void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "dashboard") });
+      toast.success(`已将 ${count} 个节点加入学习计划`);
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "加入学习计划失败"),
+  });
+
   const focus = useMutation({
     mutationFn: ({ nodeId, state }: { nodeId: string; state: string }) =>
       updateGraphNode(activeGraphId, nodeId, { attention_state: state }),
@@ -1291,7 +1541,22 @@ export function GraphWorkspacePage() {
         queryKey: workspaceQueryKey(workspaceId, "mastery"),
       });
     },
-    onError: async (error) => {
+    onError: async (error, variables) => {
+      if (isOfflineOrNetworkError(error)) {
+        offlineOutbox.enqueue({
+          label: "更新节点关注状态",
+          method: "PATCH",
+          path: `/graphs/${encodeURIComponent(activeGraphId)}/nodes/${encodeURIComponent(variables.nodeId)}`,
+          body: { attention_state: variables.state },
+          workspaceId,
+          invalidateKeys: [
+            workspaceQueryKey(workspaceId, "graph", activeGraphId),
+            workspaceQueryKey(workspaceId, "mastery"),
+          ],
+        });
+        toast.info("当前网络不可用，节点状态更改已暂存本地，恢复后将自动同步。");
+        return;
+      }
       if (
         error instanceof ApiError &&
         error.code === "graph_revision_conflict"
@@ -1347,7 +1612,44 @@ export function GraphWorkspacePage() {
         queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
       });
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (isOfflineOrNetworkError(error)) {
+        offlineOutbox.enqueue({
+          label: `保存节点「${variables.label}」`,
+          method: "PATCH",
+          path: `/graphs/${encodeURIComponent(activeGraphId)}/nodes/${encodeURIComponent(variables.nodeId)}`,
+          body: {
+            expected_revision: activeGraphRevision,
+            label: variables.label,
+            description: variables.description,
+            target_weight: variables.targetWeight,
+          },
+          workspaceId,
+          invalidateKeys: [workspaceQueryKey(workspaceId, "graph", activeGraphId)],
+        });
+        queryClient.setQueryData<Graph>(
+          workspaceQueryKey(workspaceId, "graph", activeGraphId),
+          (current) =>
+            current
+              ? {
+                  ...current,
+                  nodes: current.nodes.map((node) =>
+                    node.id === variables.nodeId
+                      ? {
+                          ...node,
+                          label: variables.label,
+                          description: variables.description,
+                          target_weight: variables.targetWeight,
+                        }
+                      : node,
+                  ),
+                }
+              : current,
+        );
+        setEditingNode(false);
+        toast.info("当前网络不可用，节点内容已暂存本地，恢复后将自动同步。");
+        return;
+      }
       toast.error(error.message);
       void queryClient.invalidateQueries({
         queryKey: workspaceQueryKey(workspaceId, "graph", activeGraphId),
@@ -1451,7 +1753,9 @@ export function GraphWorkspacePage() {
         else next.delete("shelf");
         setSearchParams(next, { replace: true });
       }
-      await Promise.all([
+      // Refresh related queries in the background so goalDeleteConfirming
+      // clears immediately after the dialog closes.
+      void Promise.allSettled([
         queryClient.invalidateQueries({
           queryKey: workspaceQueryKey(workspaceId, "goals"),
         }),
@@ -1648,6 +1952,29 @@ export function GraphWorkspacePage() {
   /** Shared "start studying this node" entry (node card, plan item, inspector). */
   function startNodeLearning(node: { id: string; label: string }) {
     if (!activeGraph) return;
+    const source = activeGraph.nodes.find((item) => item.id === node.id);
+    const type = resolveNodeTypeProfile(source?.node_type).id;
+    if (type === "root") {
+      openPlanPanel();
+      return;
+    }
+    if (type === "lab" || type === "assessment") {
+      navigate(`${base}/learn/nodes/${encodeURIComponent(node.id)}?mode=activity&tab=${type === "lab" ? "lab" : "exam"}`);
+      return;
+    }
+    if (type === "method" || type === "application") {
+      if (activeGraph.status !== "published") {
+        toast.warning("请先审核并发布图谱，再开始练习。");
+        return;
+      }
+      navigate(`${base}/practice?tab=free&node=${encodeURIComponent(node.id)}`);
+      return;
+    }
+    const prompt = type === "principle"
+      ? `请围绕「${node.label}」解释内在机制，逐步推导因果关系，最后请我用自己的话解释一个反例。`
+      : type === "open"
+        ? `请围绕「${node.label}」明确任务目标、交付物和验收标准，先请我提出方案，不要把计划或对话当成已经完成的交付。`
+        : `请围绕学习节点「${node.label}」讲清定义、边界和易混概念，最后请我用自己的话解释。`;
     window.dispatchEvent(
       new CustomEvent("learngraph:open-learning-project", {
         detail: {
@@ -1655,7 +1982,8 @@ export function GraphWorkspacePage() {
           title: activeGraph.title,
           nodeId: node.id,
           nodeLabel: node.label,
-          prompt: `请围绕学习节点「${node.label}」生成图文并茂的学习内容，并按知识点逐段呈现。`,
+          intent: "study",
+          prompt,
         },
       }),
     );
@@ -2255,26 +2583,6 @@ export function GraphWorkspacePage() {
                     <SelectItem value="focused">重点节点</SelectItem>
                   </SelectContent>
                 </Select>
-                <Select
-                  onValueChange={(value) =>
-                    setNodeTypeFilter(value as "all" | NodeTypeId)
-                  }
-                  value={nodeTypeFilter}
-                >
-                  <SelectTrigger aria-label="筛选节点类型" className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">全部类型</SelectItem>
-                    {NODE_TYPE_ORDER.filter((id) => nodeTypeCounts.has(id)).map(
-                      (id) => (
-                        <SelectItem key={id} value={id}>
-                          {NODE_TYPE_PROFILES[id].label} · {nodeTypeCounts.get(id)}
-                        </SelectItem>
-                      ),
-                    )}
-                  </SelectContent>
-                </Select>
                 <div
                   aria-label="展开层级"
                   className="graph-depth-control"
@@ -2354,12 +2662,6 @@ export function GraphWorkspacePage() {
                 </Button>
               </div>
               <div className="graph-workbench-canvas__graph">
-                <GraphLegend
-                  className="graph-legend--floating"
-                  pageCount={nodePageCount}
-                  statusCounts={nodeStatusCounts}
-                  typeCounts={nodeTypeCounts}
-                />
                 {activeGraph.nodes.length === 1 &&
                 !nodeSearch.trim() &&
                 nodeStateFilter === "all" &&
@@ -2391,27 +2693,25 @@ export function GraphWorkspacePage() {
                     </div>
                   </div>
                 ) : filteredWorkbenchGraph?.nodes.length ? (
-                  <KnowledgeGraph
+                  <WorkbenchGraph
+                    graphId={activeGraph.id}
                     currentId={currentLearningId}
                     edges={filteredWorkbenchGraph.edges}
-                    layout="tree"
                     matchIds={searchMatchIds}
-                    maxDepth={effectiveDepthLimit}
                     multiple={multiSelect}
                     nodes={filteredWorkbenchGraph.nodes}
+                    maxDepth={effectiveDepthLimit}
+                    depthById={nodeDepthById}
                     planEdges={planPathEdges}
-                    initialFit="focus"
                     onCanvasApi={handleCanvasApi}
                     onSelect={selectWorkbenchNode}
-                     onOpenExplore={(node) => { selectWorkbenchNode(node); setExplorePanelOpen(true); }}
+                    onOpenExplore={(node) => { selectWorkbenchNode(node); setExplorePanelOpen(true); }}
                     onSelectionChange={updateWorkbenchSelection}
                     onStudy={studyFromNode}
-                    rootEmphasis
                     selectedId={selectedNode?.id}
                     selectedIds={selectedNodeIds}
-                    showHeading={false}
-                    showZoomControls
                     title={activeGraph.title}
+                    legend={<GraphTypeFilter counts={nodeTypeCounts} value={nodeTypeFilter} onChange={setNodeTypeFilter} />}
                   />
                 ) : (
                   <div className="graph-workbench-filter-empty" role="status">
@@ -2441,12 +2741,34 @@ export function GraphWorkspacePage() {
                       <span>已选择 {selectedNodeIds.length}/8 个节点</span>
                     </div>
                     <Button
+                      disabled={selectedNodeIds.length === 0 || batchAddNodesToPlan.isPending}
+                      onClick={() => {
+                        const picked = (effectiveGraph?.nodes ?? []).filter((node) =>
+                          selectedNodeIds.includes(node.id),
+                        );
+                        if (picked.length) batchAddNodesToPlan.mutate(picked);
+                      }}
+                      size="sm"
+                      variant="outline"
+                    >
+                      <CalendarClock className="size-4" />
+                      加入计划
+                    </Button>
+                    <Button
                       disabled={selectedNodeIds.length < 2}
                       onClick={openJointStudy}
                       size="sm"
                     >
                       <ListTree className="size-4" />
                       联合学习
+                    </Button>
+                    <Button
+                      aria-label="退出节点多选"
+                      onClick={exitCanvasMultiSelect}
+                      size="xs"
+                      variant="ghost"
+                    >
+                      退出
                     </Button>
                   </div>
                 ) : null}
@@ -2675,7 +2997,10 @@ function GraphNodeInspector({
   const downstream = relations?.downstream ?? [];
   const related = relations?.related ?? [];
   const relationCount = upstream.length + downstream.length + related.length;
-  const primaryLabel = statusProfile?.ctaLabel ?? "学习此节点";
+  const nodeType = resolveNodeTypeProfile(node.node_type).id;
+  const primaryLabel = nodeType === "concept" && statusId && !["unlearned", "locked"].includes(statusId)
+    ? statusProfile?.ctaLabel ?? NODE_PRIMARY_ACTIONS.concept
+    : NODE_PRIMARY_ACTIONS[nodeType];
   const locked = statusId === "locked";
 
   return (
@@ -2939,6 +3264,12 @@ function GraphNodeInspector({
                 <span>学习状态</span>
                 <strong>{statusLabel ?? "未学习"}</strong>
               </div>
+              {(nodeType === "lab" || nodeType === "assessment") && (
+                <div className="graph-node-panel__fact">
+                  <span>执行状态</span>
+                  <strong>{nodeExecutionLabel(nodeType, node.execution_state)}</strong>
+                </div>
+              )}
               <div className="graph-node-panel__fact">
                 <span>掌握度</span>
                 <strong>

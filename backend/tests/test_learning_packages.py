@@ -143,6 +143,53 @@ def test_activity_rules_and_private_projection(db):
     with pytest.raises(AppError): svc(db,"intruder").owned(LearningAttempt,attempt["id"])
 
 
+def test_experiment_completion_records_once_per_learner_enrollment(db):
+    published(db)
+    api = svc(db)
+    run = api.start("n")
+
+    def action(service, enrollment, action_id):
+        return service.progress(enrollment["id"], ProgressPatch(
+            expected_revision=enrollment["revision"], action_id=action_id))
+
+    run = action(api, run, "heat")
+    assert db.scalars(select(Evidence)).all() == []
+    previous = run
+    run = action(api, run, "cook")
+    assert run["progress"]["activity"]["completed"]
+    with pytest.raises(AppError) as error:
+        action(api, previous, "cook")
+    assert error.value.code == "progress_conflict"
+    db.rollback()
+
+    other = svc(db, "other")
+    with pytest.raises(AppError):
+        other.progress(run["id"], ProgressPatch(expected_revision=run["revision"], reset_activity=True))
+    reset = api.progress(run["id"], ProgressPatch(expected_revision=run["revision"], reset_activity=True))
+    action(api, action(api, reset, "heat"), "cook")
+    other_run = other.start("n")
+    action(other, action(other, other_run, "heat"), "cook")
+    evidence = db.scalars(select(Evidence)).all()
+    assert {item.source_ref: item.metadata_json["actor_id"] for item in evidence} == {
+        f"learning-experiment:{run['id']}": "learner",
+        f"learning-experiment:{other_run['id']}": "other",
+    }
+    assert len(evidence) == 2
+    assert all(item.source_version_id == "pkg" for item in evidence)
+
+
+def test_stale_experiment_does_not_write_evidence(db):
+    published(db)
+    api = svc(db)
+    run = api.start("n")
+    run = api.progress(run["id"], ProgressPatch(expected_revision=run["revision"], action_id="heat"))
+    db.get(GraphNode, "n").description = "节点要求已变更"
+    db.commit()
+    run = api.progress(run["id"], ProgressPatch(expected_revision=run["revision"], action_id="cook"))
+    assert run["progress"]["activity"]["completed"]
+    assert db.scalars(select(Evidence)).all() == []
+
+
 def test_build_preview_redacts_private_answers_and_exposes_completed_sections(db):
     node(db)
     build = LearningBuild(
@@ -184,7 +231,7 @@ def test_server_grading_requires_practice_and_badge_is_personal(db, monkeypatch,
     if complete:
         for action in ["heat","cook"]: attempt=api.patch_attempt(attempt["id"],attempt["revision"],action_id=action)
     api.submit(attempt["id"]); api.submit(attempt["id"])
-    job=lease(db,"learning.package.grade")
+    job=lease(db,"learning.node_activity.grade")
     lp.grade_attempt(job.id,job.lease_token,attempt["id"])
     lp.grade_attempt(job.id,job.lease_token,attempt["id"])
     db.expire_all()
@@ -207,11 +254,11 @@ def test_pipeline_checkpoints_and_engagement_publication_race(db,monkeypatch):
     monkeypatch.setattr(lp,"generate_checked",generate_checked)
     build=svc(db).enqueue("n","auto")
     for stage in range(6):
-        job=lease(db,"learning.package.build")
+        job=lease(db,"learning.node_activity.build")
         assert not lp.run_build_stage(job.id,job.lease_token,build.id)
         DurableQueue(db,worker_id=job.lease_owner).rearm(job,now=utc_now()-timedelta(seconds=1))
     svc(db).engage(db.get(GraphNode,"n")); db.commit()
-    job=lease(db,"learning.package.build")
+    job=lease(db,"learning.node_activity.build")
     assert lp.run_build_stage(job.id,job.lease_token,build.id)
     db.expire_all()
     assert db.get(LearningBuild,build.id).status=="skipped"
@@ -233,7 +280,7 @@ def test_malformed_scene_uses_local_interactive_fallback_and_keeps_exam(db, monk
         if validator: validator(value)
         return value
     monkeypatch.setattr(lp,"generate_checked",generate_checked)
-    job=lease(db,"learning.package.build")
+    job=lease(db,"learning.node_activity.build")
     assert not lp.run_build_stage(job.id,job.lease_token,build.id)
     db.expire_all()
     stored=db.get(LearningBuild,build.id)
@@ -258,7 +305,7 @@ def test_demand_adopts_auto_and_publishes_no_chat(db,monkeypatch):
     build.stage=6
     build.checkpoints={"blueprint":BLUEPRINT,"lesson":LESSON,"activity":ACTIVITY,"exam":EXAM,"scene":{"html":""}}
     db.commit()
-    job=lease(db,"learning.package.build")
+    job=lease(db,"learning.node_activity.build")
     assert lp.run_build_stage(job.id,job.lease_token,build.id)
     db.expire_all()
     assert svc(db).page("n")["package"]
@@ -267,7 +314,7 @@ def test_demand_adopts_auto_and_publishes_no_chat(db,monkeypatch):
 def test_lost_lease_never_replays_and_interrupted_stage_replays_within_budget(db,monkeypatch):
     """租约失效绝不触碰模型；被中断的阶段按上限自动重放，超限才交回人工。"""
     node(db); build=svc(db).enqueue("n","on_demand")
-    job=lease(db,"learning.package.build")
+    job=lease(db,"learning.node_activity.build")
     calls=[]
     def generate_checked(_workspace_id,_actor_id,schema,_prompt,validator=None,normalize=None,*,label="",attempts=None,notes=None,**_kwargs):
         calls.append(label)

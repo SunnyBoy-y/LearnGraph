@@ -27,7 +27,28 @@ def test_upload_and_list(client, register_user, auth_headers):
     fid = r.json()["id"]
     r = client.get("/api/v1/files", headers=headers)
     assert r.status_code == 200
-    assert any(f["id"] == fid for f in r.json())
+    assert next(f for f in r.json() if f["id"] == fid)["origin"] == "learning"
+
+
+def test_list_file_origins_keep_upload_context_separate_from_index_state(client, register_user, auth_headers):
+    token, ws, _, _ = register_user()
+    headers = auth_headers(token, ws)
+    expected = {}
+    for source, origin in (("library_upload", "learning"), ("chat_attachment", "conversation")):
+        response = client.post(
+            f"/api/v1/files?source={source}", headers=headers,
+            files={"file": (f"{source}.zip", b"test bytes", "application/zip")},
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["source"] == source
+        expected[response.json()["id"]] = origin
+    response = client.get("/api/v1/files", headers=headers)
+    assert response.status_code == 200, response.text
+    records = {item["id"]: item for item in response.json()}
+    for file_id, origin in expected.items():
+        assert records[file_id]["origin"] == origin
+        assert records[file_id]["parse_capability"] == "attachment_only"
+        assert records[file_id]["source_session_id"] is None
 
 
 def test_file_content_and_chunks(client, register_user, auth_headers):

@@ -5,8 +5,11 @@ from pathlib import Path
 import hashlib
 import json
 import logging
+import math
+import shutil
 import time
 from typing import Any
+from uuid import uuid4
 
 from fastapi import UploadFile
 
@@ -754,7 +757,7 @@ class FileService:
         self.db.refresh(reference)
         return reference
 
-    async def upload(self, upload: UploadFile) -> FileRecord:
+    async def upload(self, upload: UploadFile, *, source: str = "upload") -> FileRecord:
         original_name = upload.filename or "upload.bin"
 
         # Executables, scripts and disk images are rejected before a single byte
@@ -799,6 +802,21 @@ class FileService:
             chunks(),
             self.settings.max_upload_bytes,
         )
+        return self._finalize_stored_upload(
+            original_name=original_name,
+            content_type=upload.content_type or "application/octet-stream",
+            stored=stored,
+            source=source,
+        )
+
+    def _finalize_stored_upload(
+        self,
+        *,
+        original_name: str,
+        content_type: str,
+        stored: Any,
+        source: str = "upload",
+    ) -> FileRecord:
         # Dedup: identical name + hash → return the first copy only.
         existing_same = self.db.scalar(
             select(FileRecord).where(
@@ -861,12 +879,13 @@ class FileService:
                 workspace_id=self.workspace_id,
                 original_name=resolved_name,
                 object_key=stored.object_key,
-                mime_type=upload.content_type or "application/octet-stream",
+                mime_type=content_type or "application/octet-stream",
                 size_bytes=stored.size_bytes,
                 sha256=stored.sha256,
                 storage_status="stored",
                 parse_capability=capability,
                 parse_status="not_requested",
+                source=source,
             )
         )
         self.audit.record(
@@ -884,6 +903,243 @@ class FileService:
         self.db.commit()
         self.db.refresh(record)
         return record
+
+    def _chunk_uploads_root(self) -> Path:
+        root = Path(self.settings.storage_root).expanduser() / ".chunk_uploads" / self.workspace_id
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _chunk_session_dir(self, upload_id: str) -> Path:
+        safe_id = upload_id.strip()
+        if not safe_id or len(safe_id) > 64 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in safe_id):
+            raise AppError(400, "invalid_upload_id", "Invalid chunk upload identifier")
+        root = self._chunk_uploads_root().resolve()
+        candidate = (root / safe_id).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise AppError(400, "invalid_upload_id", "Invalid chunk upload identifier") from exc
+        return candidate
+
+    def _cleanup_stale_chunk_uploads(self, max_age_seconds: int = 24 * 3600) -> None:
+        root = self._chunk_uploads_root()
+        cutoff = time.time() - max_age_seconds
+        try:
+            for entry in root.iterdir():
+                if not entry.is_dir():
+                    continue
+                meta_path = entry / "meta.json"
+                mtime = meta_path.stat().st_mtime if meta_path.is_file() else entry.stat().st_mtime
+                if mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            pass
+
+    def _read_chunk_meta(self, upload_id: str) -> tuple[Path, dict[str, Any]]:
+        session_dir = self._chunk_session_dir(upload_id)
+        meta_path = session_dir / "meta.json"
+        if not meta_path.is_file():
+            raise AppError(404, "upload_session_not_found", "Upload session not found or expired")
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AppError(404, "upload_session_not_found", "Upload session metadata is unreadable") from exc
+        if meta.get("workspace_id") != self.workspace_id or meta.get("actor_id") != self.actor_id:
+            raise AppError(404, "upload_session_not_found", "Upload session not found in this workspace")
+        return session_dir, meta
+
+    @staticmethod
+    def _list_uploaded_chunk_indices(session_dir: Path, total_chunks: int) -> list[int]:
+        uploaded: list[int] = []
+        for idx in range(total_chunks):
+            if (session_dir / f"part-{idx:06d}.bin").is_file():
+                uploaded.append(idx)
+        return uploaded
+
+    def init_chunk_upload(
+        self,
+        *,
+        filename: str,
+        total_size: int,
+        chunk_size: int,
+        content_type: str = "application/octet-stream",
+        source: str = "upload",
+        sha256: str | None = None,
+    ) -> dict[str, Any]:
+        uploaded_name = Path(filename or "upload.bin").name[:255] or "upload.bin"
+        uploaded_extension = Path(uploaded_name).suffix.casefold()
+        if uploaded_extension in _SPECIAL_BINARY_EXTENSIONS:
+            raise AppError(
+                415,
+                "unsupported_file_type",
+                f"「{uploaded_name}」属于不允许上传的可执行文件/脚本/磁盘镜像类型。",
+                {"extension": uploaded_extension},
+            )
+        if total_size > self.settings.max_upload_bytes:
+            raise AppError(
+                413,
+                "file_too_large",
+                f"File exceeds maximum upload size of {self.settings.max_upload_bytes} bytes",
+            )
+        quota_bytes = self.settings.workspace_storage_quota_bytes
+        if quota_bytes and quota_bytes > 0:
+            used = self.db.scalar(
+                select(func.coalesce(func.sum(FileRecord.size_bytes), 0)).where(
+                    FileRecord.workspace_id == self.workspace_id,
+                    FileRecord.lifecycle_status != "deleted",
+                )
+            ) or 0
+            if used + total_size > quota_bytes:
+                raise AppError(
+                    413,
+                    "workspace_storage_quota_exceeded",
+                    "This workspace has reached its storage quota; delete files or raise the quota",
+                )
+
+        if sha256:
+            existing = self.lookup_by_name_and_hash(original_name=uploaded_name, sha256=sha256)
+            if existing is not None:
+                return {
+                    "upload_id": "",
+                    "filename": existing.original_name,
+                    "total_size": existing.size_bytes,
+                    "chunk_size": chunk_size,
+                    "total_chunks": max(1, math.ceil(existing.size_bytes / chunk_size)),
+                    "uploaded_chunks": [],
+                    "already_exists": True,
+                    "existing_file": existing,
+                }
+
+        total_chunks = max(1, math.ceil(total_size / chunk_size))
+        if total_chunks > 2048:
+            raise AppError(400, "too_many_chunks", "Chunk count exceeds limit (2048); use a larger chunk_size")
+
+        self._cleanup_stale_chunk_uploads()
+        upload_id = uuid4().hex
+        session_dir = self._chunk_session_dir(upload_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "upload_id": upload_id,
+            "workspace_id": self.workspace_id,
+            "actor_id": self.actor_id,
+            "filename": uploaded_name,
+            "total_size": total_size,
+            "chunk_size": chunk_size,
+            "total_chunks": total_chunks,
+            "content_type": content_type or "application/octet-stream",
+            "source": source,
+            "expected_sha256": sha256.strip().casefold() if sha256 else None,
+            "created_at": time.time(),
+        }
+        (session_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        return {
+            "upload_id": upload_id,
+            "filename": uploaded_name,
+            "total_size": total_size,
+            "chunk_size": chunk_size,
+            "total_chunks": total_chunks,
+            "uploaded_chunks": [],
+            "already_exists": False,
+            "existing_file": None,
+        }
+
+    def get_chunk_upload_status(self, upload_id: str) -> dict[str, Any]:
+        session_dir, meta = self._read_chunk_meta(upload_id)
+        total_chunks = int(meta["total_chunks"])
+        return {
+            "upload_id": upload_id,
+            "filename": meta["filename"],
+            "total_size": int(meta["total_size"]),
+            "chunk_size": int(meta["chunk_size"]),
+            "total_chunks": total_chunks,
+            "uploaded_chunks": self._list_uploaded_chunk_indices(session_dir, total_chunks),
+            "already_exists": False,
+            "existing_file": None,
+        }
+
+    def store_upload_chunk(self, upload_id: str, chunk_index: int, data: bytes) -> dict[str, Any]:
+        session_dir, meta = self._read_chunk_meta(upload_id)
+        total_chunks = int(meta["total_chunks"])
+        total_size = int(meta["total_size"])
+        chunk_size = int(meta["chunk_size"])
+        if chunk_index < 0 or chunk_index >= total_chunks:
+            raise AppError(400, "invalid_chunk_index", f"chunk_index must be in [0, {total_chunks - 1}]")
+        is_last = chunk_index == total_chunks - 1
+        expected_size = total_size - chunk_index * chunk_size if is_last else chunk_size
+        if len(data) != expected_size:
+            raise AppError(
+                400,
+                "invalid_chunk_size",
+                f"Expected {expected_size} bytes for chunk {chunk_index}, received {len(data)}",
+            )
+        part_path = session_dir / f"part-{chunk_index:06d}.bin"
+        tmp_path = session_dir / f"part-{chunk_index:06d}.{uuid4().hex[:8]}.tmp"
+        tmp_path.write_bytes(data)
+        tmp_path.replace(part_path)
+        return {
+            "upload_id": upload_id,
+            "chunk_index": chunk_index,
+            "size_bytes": len(data),
+            "uploaded_chunks": self._list_uploaded_chunk_indices(session_dir, total_chunks),
+        }
+
+    async def complete_chunk_upload(self, upload_id: str) -> FileRecord:
+        session_dir, meta = self._read_chunk_meta(upload_id)
+        total_chunks = int(meta["total_chunks"])
+        total_size = int(meta["total_size"])
+        missing = [
+            idx for idx in range(total_chunks)
+            if not (session_dir / f"part-{idx:06d}.bin").is_file()
+        ]
+        if missing:
+            raise AppError(
+                400,
+                "missing_upload_chunks",
+                f"Cannot complete upload; missing {len(missing)} chunk(s)",
+                {"missing_chunks": missing[:50]},
+            )
+        actual_total = sum((session_dir / f"part-{idx:06d}.bin").stat().st_size for idx in range(total_chunks))
+        if actual_total != total_size:
+            raise AppError(
+                400,
+                "upload_size_mismatch",
+                f"Uploaded bytes ({actual_total}) do not match declared total_size ({total_size})",
+            )
+
+        async def assembled_chunks() -> AsyncIterator[bytes]:
+            for idx in range(total_chunks):
+                part_path = session_dir / f"part-{idx:06d}.bin"
+                with part_path.open("rb") as handle:
+                    while block := handle.read(1024 * 1024):
+                        yield block
+
+        stored = await self.storage.store(
+            self.workspace_id,
+            meta["filename"],
+            assembled_chunks(),
+            self.settings.max_upload_bytes,
+        )
+        expected_sha = meta.get("expected_sha256")
+        if expected_sha and stored.sha256 != expected_sha:
+            raise AppError(
+                400,
+                "upload_checksum_mismatch",
+                "Assembled file SHA-256 does not match the declared checksum",
+            )
+        try:
+            record = self._finalize_stored_upload(
+                original_name=meta["filename"],
+                content_type=meta.get("content_type") or "application/octet-stream",
+                stored=stored,
+                source=meta.get("source") or "upload",
+            )
+        finally:
+            shutil.rmtree(session_dir, ignore_errors=True)
+        return record
+
+    def abort_chunk_upload(self, upload_id: str) -> None:
+        session_dir, _ = self._read_chunk_meta(upload_id)
+        shutil.rmtree(session_dir, ignore_errors=True)
 
     def parse(self, file_id: str) -> FileRecord:
         # Keep the compatibility endpoint, but route it through the same

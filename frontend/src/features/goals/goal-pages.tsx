@@ -193,7 +193,7 @@ export function GoalConfirmPage() {
       void queryClient.invalidateQueries({
         queryKey: workspaceQueryKey(workspaceId, "goals"),
       });
-      toast.success(`Goal「${data.title}」已确认`);
+      toast.success(`已确认学习目标「${data.title}」`);
     },
   });
   const candidate = useMutation({
@@ -221,7 +221,7 @@ export function GoalConfirmPage() {
   if (goals.isPending)
     return (
       <PageFrame>
-        <LoadingState label="正在读取 GoalDraft…" />
+        <LoadingState label="正在读取学习目标…" />
       </PageFrame>
     );
   if (goals.isError)
@@ -238,14 +238,14 @@ export function GoalConfirmPage() {
       <PageFrame>
         <EmptyState
           description="请先完成目标澄清问卷。"
-          title="没有可确认的 Goal"
+          title="没有可确认的学习目标"
         />
       </PageFrame>
     );
   if (!draft || !planningDraft)
     return (
       <PageFrame>
-        <LoadingState label="正在准备 GoalDraft…" />
+        <LoadingState label="正在准备学习目标…" />
       </PageFrame>
     );
 
@@ -281,13 +281,13 @@ export function GoalConfirmPage() {
       <PageIntro
         actions={<StatePill status={goal.status} />}
         description="这些字段会约束候选图谱和路线。未确认的假设会保持显式，不会被悄悄当作事实。"
-        eyebrow="Goal · 2/3"
+        eyebrow="学习目标 · 2/3"
         title="确认结构化学习目标"
       />
       <Surface className="p-5">
         <SectionHeading
           description="直接在卡片内修改，生成初始图谱时会使用当前内容。"
-          title="Goal 卡片"
+          title="目标详情"
         />
         <div className="goal-draft-grid mt-5">
           <GoalDraftField
@@ -332,9 +332,9 @@ export function GoalConfirmPage() {
         />
         <div className="goal-draft-grid mt-5">
           <label className="goal-draft-field">
-            <span>目标权重（1–100）</span>
+            <span>计划优先级（1–100）</span>
             <Input
-              aria-label="目标权重"
+              aria-label="计划优先级"
               max={100}
               min={1}
               onChange={(event) =>
@@ -556,7 +556,7 @@ export function GraphReviewPage() {
   function currentGraphRevision() {
     const revision = graph.data?.revision;
     if (!revision)
-      throw new Error("候选图谱 Revision 尚未载入，请稍后重试。");
+      throw new Error("候选图谱版本尚未载入，请稍后重试。");
     return revision;
   }
   async function handleGraphMutationError(error: Error) {
@@ -565,7 +565,7 @@ export function GraphReviewPage() {
       error.status === 409 &&
       error.code === "graph_revision_conflict"
     ) {
-      toast.error("候选图谱已被其他操作更新，请按最新 Revision 重新审核。");
+      toast.error("候选图谱已被其他操作更新，请按最新版本重新审核。");
       await graph.refetch();
       return;
     }
@@ -694,7 +694,7 @@ export function GraphReviewPage() {
     return (
       <PageFrame>
         <EmptyState
-          description="先从 Goal 确认页生成候选图谱。"
+          description="先从学习目标确认页生成候选图谱。"
           title="没有候选图谱"
         />
       </PageFrame>
@@ -710,7 +710,7 @@ export function GraphReviewPage() {
       <PageIntro
         actions={<StatePill status={graph.data.status} />}
         description="节点与知识卡片双向联动。正式图谱只能由你发布，后台不会静默改写。"
-        eyebrow="Goal · 3/3"
+        eyebrow="学习目标 · 3/3"
         title="审核初始图谱"
       />
       {graph.data.status === "published" ? (

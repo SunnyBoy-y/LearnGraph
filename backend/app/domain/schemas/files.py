@@ -23,6 +23,10 @@ class FileView(ORMModel):
     parser_version: str | None
     error_message: str | None
     created_at: datetime
+    source: str = "upload"
+    origin: Literal["learning", "conversation", "generated", "other"] | None = None
+    source_session_id: str | None = None
+    source_session_title: str | None = None
 
 
 class FileStorageSummary(BaseModel):
@@ -303,3 +307,30 @@ class DocumentQueryPreviewView(BaseModel):
     hits: list[DocumentQueryHitView]
     warnings: list[str] = Field(default_factory=list)
     selection_status: DocumentSelectionStatus = "none"
+
+
+class ChunkUploadInitRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    total_size: int = Field(ge=1)
+    chunk_size: int = Field(default=1024 * 1024, ge=64 * 1024, le=16 * 1024 * 1024)
+    content_type: str = Field(default="application/octet-stream", max_length=255)
+    source: Literal["upload", "library_upload", "chat_attachment"] = "upload"
+    sha256: str | None = Field(default=None, min_length=64, max_length=64)
+
+
+class ChunkUploadSessionView(BaseModel):
+    upload_id: str
+    filename: str
+    total_size: int
+    chunk_size: int
+    total_chunks: int
+    uploaded_chunks: list[int] = Field(default_factory=list)
+    already_exists: bool = False
+    existing_file: FileView | None = None
+
+
+class ChunkUploadPartView(BaseModel):
+    upload_id: str
+    chunk_index: int
+    size_bytes: int
+    uploaded_chunks: list[int] = Field(default_factory=list)

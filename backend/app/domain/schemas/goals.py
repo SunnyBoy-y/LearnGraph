@@ -292,7 +292,7 @@ class ModelGraphNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
     label: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=2000)
-    node_type: str = Field(pattern="^(root|concept|practice|assessment)$")
+    node_type: str = Field(pattern="^(root|concept|principle|method|application|practice|lab|assessment|open)$")
     target_weight: int = Field(default=50, ge=1, le=100)
     teaching_strategy: str = Field(
         default="",

@@ -221,7 +221,13 @@ class LearningPackageService:
         self.db.refresh(guard)
         if trigger in {"auto", "manual"} and (guard.first_engaged_at or guard.epoch == 0):
             raise AppError(409, "node_prebuild_excluded", "旧节点或已开始学习的节点不参与预构建；可主动创建学习页。")
-        existing = self.db.scalar(select(LearningBuild).where(LearningBuild.node_id == node.id, LearningBuild.status.in_(ACTIVE)))
+        existing = self.db.scalar(
+            select(LearningBuild).join(DurableJob, DurableJob.id == LearningBuild.job_id).where(
+                LearningBuild.node_id == node.id, LearningBuild.status.in_(ACTIVE),
+                DurableJob.kind == "learning.node_activity.build",
+                DurableJob.status.in_(("queued", "leased")),
+            ).order_by(LearningBuild.created_at.desc(), LearningBuild.id.desc()).limit(1)
+        )
         if existing:
             if trigger == "on_demand":
                 # Explicit use takes ownership of an in-flight preparation.
@@ -238,7 +244,7 @@ class LearningPackageService:
             job_id=job_id, trigger=trigger, epoch=policy.epoch if policy else 0, fingerprint=fingerprint(node),
             status="queued", stage=0, checkpoints={})
         self.db.add(build)
-        self.db.add(DurableJob(id=job_id, workspace_id=self.workspace_id, kind="learning.package.build",
+        self.db.add(DurableJob(id=job_id, workspace_id=self.workspace_id, kind="learning.node_activity.build",
             dedupe_key=f"learning.build:{build_id}", payload={"build_id": build_id}, max_attempts=1))
         if commit:
             self.db.commit()
@@ -481,6 +487,8 @@ class LearningPackageService:
 
     def progress(self, enrollment_id: str, payload):
         row = self.owned(LearningEnrollment, enrollment_id)
+        if row.revision != payload.expected_revision:
+            raise AppError(409, "progress_conflict", "进度已在另一页面更新，请重新载入。")
         package = self.db.get(LearningPackage, row.package_id)
         progress = deepcopy(row.progress)
         progress["activity"] = complete_training_activity(package.private_activity, progress.get("activity"))
@@ -496,6 +504,24 @@ class LearningPackageService:
             LearningEnrollment.revision == payload.expected_revision).values(progress=progress, revision=payload.expected_revision + 1))
         if changed.rowcount != 1:
             raise AppError(409, "progress_conflict", "进度已在另一页面更新，请重新载入。")
+        if payload.action_id and progress["activity"].get("completed"):
+            node = self.node(package.node_id)
+            if node.node_type in {"lab", "practice"} and package.fingerprint == fingerprint(node):
+                ref = f"learning-experiment:{row.id}"
+                recorded = self.db.scalar(select(Evidence.id).where(
+                    Evidence.workspace_id == self.workspace_id, Evidence.node_id == node.id,
+                    Evidence.source_ref == ref,
+                ).limit(1))
+                if recorded is None:
+                    activity = progress["activity"]
+                    self.db.add(Evidence(
+                        workspace_id=self.workspace_id, node_id=node.id, source_type="exercise",
+                        summary="已完成节点实验", confidence=0.9, status="accepted",
+                        result="correct", source_ref=ref, source_version_id=package.id,
+                        source_content_hash=hashlib.sha256(json.dumps(activity, sort_keys=True).encode()).hexdigest(),
+                        metadata_json={"actor_id": self.actor_id, "package_id": package.id,
+                                       "execution_kind": "experiment", "activity": activity},
+                    ))
         self.db.commit()
         self.db.refresh(row)
         return self.enrollment_view(row)
@@ -571,7 +597,7 @@ class LearningPackageService:
         changed = self.db.execute(update(LearningAttempt).where(LearningAttempt.id == row.id,
             LearningAttempt.status == "active").values(status="grading", revision=LearningAttempt.revision + 1))
         if changed.rowcount:
-            self.db.add(DurableJob(workspace_id=self.workspace_id, kind="learning.package.grade",
+            self.db.add(DurableJob(workspace_id=self.workspace_id, kind="learning.node_activity.grade",
                 dedupe_key=f"learning.grade:{row.id}", payload={"attempt_id": row.id}, max_attempts=1))
         self.db.commit()
         self.db.refresh(row)
@@ -671,7 +697,7 @@ FAILURE_ADVICE = {
 
 def activity_required(node: GraphNode, snapshot: dict) -> bool:
     """Whether this node needs an interactive activity at all."""
-    if node.node_type == "practice":
+    if node.node_type in {"practice", "lab"}:
         return True
     return bool(str(snapshot.get("blueprint", {}).get("activity_brief", "")).strip())
 

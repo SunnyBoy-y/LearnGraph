@@ -1459,7 +1459,7 @@ class GoalService:
                 trunk_chunk = self._structured(
                     "为图谱生成「主干」（trunk）：根节点之下的第一层主干模块，"
                     "构成整张图谱的主干骨架，覆盖该学科的主要模块并按学习顺序排列。"
-                    "node_type 使用 concept（知识点）、practice（练习）或 assessment（验收），layer 全部填 1。"
+                    "node_type 使用 concept（概念）、principle（原理）、method（方法）、application（应用）、lab（交互实验）、assessment（测评关卡）或 open（开放性任务），layer 全部填 1。"
                     "edges 里 source_index=-1 表示根节点；主干模块之间的先后关系用 prerequisite。"
                     "本批次生成 "
                     + f"{trunk_min}-{trunk_max} 个"
@@ -1535,7 +1535,7 @@ class GoalService:
                     + "layer=2：挂在 layer=1 节点之下的孙节点，每个 layer=1 节点下"
                     + f" {layer2_count}-{layer2_count + 1} 个。"
                     + "每个节点的 layer 字段必须填写：直接子节点填 1，孙节点填 2。"
-                    + "node_type 使用 concept（知识点）、practice（练习）或 assessment（验收）。"
+                    + "node_type 使用 concept（概念）、principle（原理）、method（方法）、application（应用）、lab（交互实验）、assessment（测评关卡）或 open（开放性任务）。"
                     + "edges：source_index=-1 表示挂载父节点（本主干节点）；"
                     + "layer=1→layer=2 用本批 nodes 索引（先列 layer=1 节点，再列 layer=2 节点）；"
                     + "本批次只属于这一个主干分支，不要重复已生成的标签；已生成的节点标签："
@@ -1786,7 +1786,7 @@ class GoalService:
         )
         node_ids = {node.id for node in nodes}
         violations: list[dict[str, Any]] = []
-        allowed_node_types = {"root", "concept", "practice", "assessment"}
+        allowed_node_types = {"root", "concept", "principle", "method", "application", "lab", "practice", "assessment", "open"}
         allowed_relations = {
             "contains",
             "prerequisite",

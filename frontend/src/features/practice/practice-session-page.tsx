@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, Lightbulb, LogOut, XCircle } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from '@/lib/notifications';
+import { isOfflineOrNetworkError, offlineOutbox } from '@/lib/offline-outbox';
 
 import {
   answerPracticeQuestion,
@@ -121,8 +122,28 @@ export function PracticeSessionPage() {
         }
       }
     },
-    onError: (error) =>
-      toast.error(error instanceof Error ? error.message : "提交失败"),
+    onError: (error) => {
+      if (isOfflineOrNetworkError(error) && current) {
+        offlineOutbox.enqueue({
+          label: "提交练习作答",
+          method: "POST",
+          path: `/practice/sessions/${encodeURIComponent(practiceSessionId)}/answer`,
+          body: {
+            exercise_id: current.exercise_id,
+            answer,
+            duration_ms: Date.now() - startedAtRef.current,
+          },
+          workspaceId,
+          invalidateKeys: [
+            workspaceQueryKey(workspaceId, "practice-session", practiceSessionId),
+            workspaceQueryKey(workspaceId, "practice-overview"),
+          ],
+        });
+        toast.info("网络已断开，本题作答已暂存本地，恢复后将自动提交。");
+        return;
+      }
+      toast.error(error instanceof Error ? error.message : "提交失败");
+    },
   });
 
   const hintMutation = useMutation({
@@ -160,8 +181,25 @@ export function PracticeSessionPage() {
       }
       navigate(`/w/${workspaceId}/practice/report/${report.session.id}`);
     },
-    onError: (error) =>
-      toast.error(error instanceof Error ? error.message : "无法完成练习"),
+    onError: (error, abandon) => {
+      if (isOfflineOrNetworkError(error)) {
+        offlineOutbox.enqueue({
+          label: abandon ? "退出练习会话" : "提交练习交卷",
+          method: "POST",
+          path: `/practice/sessions/${encodeURIComponent(practiceSessionId)}/complete`,
+          body: { abandon },
+          workspaceId,
+          invalidateKeys: [
+            workspaceQueryKey(workspaceId, "practice-session", practiceSessionId),
+            workspaceQueryKey(workspaceId, "practice-overview"),
+            workspaceQueryKey(workspaceId, "practice-wrong-book"),
+          ],
+        });
+        toast.info("网络已断开，交卷请求已暂存本地，恢复后将自动同步。");
+        return;
+      }
+      toast.error(error instanceof Error ? error.message : "无法完成练习");
+    },
   });
 
   const nextUnanswered = useMemo(
@@ -513,7 +551,7 @@ export function PracticeSessionPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>继续练习</AlertDialogCancel>
-            <AlertDialogAction onClick={() => completeMutation.mutate(false)}>
+            <AlertDialogAction onClick={() => navigate(`/w/${workspaceId}/practice`)}>
               保存并退出
             </AlertDialogAction>
             <AlertDialogAction

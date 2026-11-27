@@ -37,6 +37,7 @@
     "cmdk": "^1.1.1",
     "d3-dsv": "^3.0.1",
     "docx-preview": "^0.4.0",
+    "elkjs": "^0.12.2",
     "esbuild-wasm": "^0.28.2",
     "exceljs": "^4.4.0",
     "lucide-react": "^1.24.0",

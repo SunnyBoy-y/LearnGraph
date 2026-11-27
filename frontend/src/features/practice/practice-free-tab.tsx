@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Minus, Plus, Sparkles } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -11,6 +11,7 @@ import {
   listFiles,
 } from "@/api";
 import { ApiError } from "@/api/client";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
 import {
   ErrorState,
   SectionHeading,
@@ -29,6 +30,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useAuth } from "@/features/auth/auth-context-value";
+import { applyRangeSelection } from "@/lib/list-selection";
 import { workspaceQueryKey } from "@/lib/query-keys";
 import type { PracticeSessionMode } from "@/types/practice";
 import { evidenceStateLabel, retrievalStateLabel } from "./practice-format";
@@ -61,18 +63,23 @@ export function PracticeFreeTab() {
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
   const presetNode = searchParams.get("node") ?? "";
-  const [nodeId, setNodeId] = useState(presetNode);
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[] | null>(() =>
+    presetNode ? [presetNode] : null,
+  );
+  const [nodeSearch, setNodeSearch] = useState("");
   const [questionType, setQuestionType] = useState("mixed");
   const [difficulty, setDifficulty] = useState("auto");
   const [count, setCount] = useState(5);
   const [fileIds, setFileIds] = useState<string[]>([]);
   const [batchId, setBatchId] = useState<string | null>(null);
-  // 模型侧失败（没有可用模型 / 模型被 Provider 拒绝）时，光弹一个 toast 用户
-  // 不知道该改哪里：把原因留在页面上，并给出直达「设置 → 功能模型」的入口。
   const [modelError, setModelError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (presetNode) setNodeId(presetNode);
+    if (presetNode) {
+      setSelectedNodeIds((current) =>
+        current?.includes(presetNode) ? current : [presetNode, ...(current ?? [])],
+      );
+    }
   }, [presetNode]);
 
   const mastery = useQuery({
@@ -84,7 +91,38 @@ export function PracticeFreeTab() {
     queryFn: () => listFiles(),
   });
 
-  const resolvedNodeId = nodeId || mastery.data?.[0]?.node_id || "";
+  const resolvedNodeIds = useMemo(() => {
+    if (selectedNodeIds !== null) return selectedNodeIds;
+    const first = mastery.data?.[0]?.node_id;
+    return first ? [first] : [];
+  }, [mastery.data, selectedNodeIds]);
+
+  const filteredMastery = useMemo(() => {
+    const list = mastery.data ?? [];
+    const q = nodeSearch.trim().toLocaleLowerCase();
+    if (!q) return list;
+    return list.filter((node) => node.label.toLocaleLowerCase().includes(q));
+  }, [mastery.data, nodeSearch]);
+
+  const visibleNodeIds = useMemo(
+    () => filteredMastery.map((node) => node.node_id),
+    [filteredMastery],
+  );
+  const nodeAnchorRef = useRef<string | null>(null);
+  const nodeShiftRef = useRef(false);
+
+  const toggleNode = (targetId: string, shiftKey = false) => {
+    const anchorId = nodeAnchorRef.current;
+    nodeAnchorRef.current = targetId;
+    setSelectedNodeIds((current) => {
+      const base = current ?? resolvedNodeIds;
+      const nextChecked = !base.includes(targetId);
+      return Array.from(applyRangeSelection(
+        new Set(base), visibleNodeIds, shiftKey ? anchorId : null, targetId, nextChecked,
+      ));
+    });
+  };
+
   const indexedFiles = useMemo(
     () => (files.data ?? []).filter((file) => file.parse_status === "indexed"),
     [files.data],
@@ -94,7 +132,7 @@ export function PracticeFreeTab() {
     mutationFn: (mode: PracticeSessionMode) =>
       createPracticeSession({
         mode,
-        node_ids: [resolvedNodeId],
+        node_ids: resolvedNodeIds,
         question_type: questionType,
         count,
         difficulty:
@@ -121,20 +159,28 @@ export function PracticeFreeTab() {
   });
 
   const generateOnly = useMutation({
-    mutationFn: () =>
-      generateExercises({
-        node_id: resolvedNodeId,
-        question_type: questionType as
-          | "single_choice"
-          | "multiple_choice"
-          | "true_false"
-          | "fill_blank"
-          | "short_answer"
-          | "mixed",
-        count: Math.min(10, count),
-        difficulty: difficulty === "auto" ? "medium" : (difficulty as "easy" | "medium" | "hard"),
-        file_ids: fileIds,
-      }),
+    mutationFn: async () => {
+      const targets = resolvedNodeIds.slice(0, 5);
+      const perNodeCount = Math.max(1, Math.ceil(Math.min(10, count) / Math.max(1, targets.length)));
+      const batches = await Promise.all(
+        targets.map((id) =>
+          generateExercises({
+            node_id: id,
+            question_type: questionType as
+              | "single_choice"
+              | "multiple_choice"
+              | "true_false"
+              | "fill_blank"
+              | "short_answer"
+              | "mixed",
+            count: perNodeCount,
+            difficulty: difficulty === "auto" ? "medium" : (difficulty as "easy" | "medium" | "hard"),
+            file_ids: fileIds,
+          }),
+        ),
+      );
+      return batches.flat();
+    },
     onSuccess: (items) => {
       const batch = items[0]?.generation_batch_id ?? null;
       setBatchId(batch);
@@ -179,28 +225,99 @@ export function PracticeFreeTab() {
     );
   }
 
+  const labelById = new Map(mastery.data.map((node) => [node.node_id, node.label]));
+  const allVisibleChecked =
+    visibleNodeIds.length > 0 && visibleNodeIds.every((id) => resolvedNodeIds.includes(id));
+
   return (
     <div className="grid gap-5 xl:grid-cols-12">
       <Surface className="p-5 xl:col-span-7">
         <SectionHeading
-          description="选择你想强化的内容；没有题库的知识点会先用远程模型出题。"
+          description="支持勾选单个或多个知识点联合组卷；没有题库的知识点会先用远程模型出题。"
           title="自由练习"
         />
         <div className="mt-5 space-y-4">
-          <div className="grid gap-2 sm:grid-cols-[6rem_1fr] sm:items-center">
-            <Label htmlFor="practice-node">知识点</Label>
-            <Select onValueChange={setNodeId} value={resolvedNodeId}>
-              <SelectTrigger id="practice-node">
-                <SelectValue placeholder="选择节点" />
-              </SelectTrigger>
-              <SelectContent>
-                {mastery.data.map((node) => (
-                  <SelectItem key={node.node_id} value={node.node_id}>
-                    {node.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="grid gap-2 sm:grid-cols-[6rem_1fr] sm:items-start">
+            <Label className="sm:pt-2">知识点</Label>
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <ClearableSearchInput
+                  aria-label="筛选知识点"
+                  containerClassName="min-w-40 flex-1"
+                  inputClassName="h-8 text-xs"
+                  onChange={setNodeSearch}
+                  placeholder="搜索知识点…"
+                  value={nodeSearch}
+                />
+                <Button
+                  disabled={!visibleNodeIds.length}
+                  onClick={() => {
+                    nodeAnchorRef.current = null;
+                    setSelectedNodeIds(
+                      allVisibleChecked
+                        ? resolvedNodeIds.filter((id) => !visibleNodeIds.includes(id))
+                        : [...new Set([...resolvedNodeIds, ...visibleNodeIds])],
+                    );
+                  }}
+                  size="xs"
+                  type="button"
+                  variant="outline"
+                >
+                  {allVisibleChecked ? "取消全选" : "全选当前"}
+                </Button>
+                {resolvedNodeIds.length > 1 ? (
+                  <Button
+                    onClick={() => {
+                      nodeAnchorRef.current = null;
+                      setSelectedNodeIds([resolvedNodeIds[0]]);
+                    }}
+                    size="xs"
+                    type="button"
+                    variant="ghost"
+                  >
+                    仅保留首项
+                  </Button>
+                ) : null}
+              </div>
+              <div className="max-h-44 space-y-1.5 overflow-auto rounded-xl border p-3">
+                {filteredMastery.length ? (
+                  filteredMastery.map((node) => {
+                    const checked = resolvedNodeIds.includes(node.node_id);
+                    return (
+                      <label
+                        className="flex cursor-pointer items-center justify-between gap-2 rounded-md px-1.5 py-1 text-sm hover:bg-muted/40"
+                        key={node.node_id}
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <Checkbox
+                            aria-label={`选择知识点：${node.label}`}
+                            checked={checked}
+                            onClickCapture={(event) => { nodeShiftRef.current = event.shiftKey; }}
+                            onCheckedChange={() => {
+                              const shiftKey = nodeShiftRef.current;
+                              nodeShiftRef.current = false;
+                              toggleNode(node.node_id, shiftKey);
+                            }}
+                          />
+                          <span className="truncate">{node.label}</span>
+                        </span>
+                        <span className="shrink-0 text-[11px] text-muted-foreground">
+                          {node.exercise_correct_count ?? 0}/{node.exercise_attempt_count ?? 0}
+                        </span>
+                      </label>
+                    );
+                  })
+                ) : (
+                  <p className="text-xs text-muted-foreground">没有匹配的知识点。</p>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                已选 {resolvedNodeIds.length} 个知识点
+                {resolvedNodeIds.length
+                  ? `：${resolvedNodeIds.slice(0, 3).map((id) => labelById.get(id) ?? id).join("、")}${resolvedNodeIds.length > 3 ? ` 等 ${resolvedNodeIds.length} 项` : ""}`
+                  : ""}
+              </p>
+            </div>
           </div>
 
           <div className="grid gap-2 sm:grid-cols-[6rem_1fr] sm:items-center">
@@ -318,14 +435,14 @@ export function PracticeFreeTab() {
 
           <div className="flex flex-wrap items-center gap-2 border-t pt-4">
             <Button
-              disabled={start.isPending || !resolvedNodeId}
+              disabled={start.isPending || !resolvedNodeIds.length}
               onClick={() => start.mutate(batchId ? "material" : "custom")}
             >
               <Sparkles className="size-4" />
               {start.isPending ? "准备中…" : "开始练习"}
             </Button>
             <Button
-              disabled={generateOnly.isPending || !resolvedNodeId}
+              disabled={generateOnly.isPending || !resolvedNodeIds.length}
               onClick={() => generateOnly.mutate()}
               variant="outline"
             >
@@ -354,32 +471,35 @@ export function PracticeFreeTab() {
 
       <Surface className="p-5 xl:col-span-5">
         <SectionHeading
-          description="按最近练习情况排序，可直接开始对应知识点的练习"
+          description="按最近练习情况排序，可点击快速勾选或加入多选组卷"
           title="知识点一览"
         />
         <ul className="mt-4 max-h-[28rem] divide-y overflow-y-auto pr-1">
-          {mastery.data.map((node) => (
-            <li
-              className="flex items-center justify-between gap-3 py-3"
-              key={node.node_id}
-            >
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium">{node.label}</p>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  {retrievalStateLabel(node.retrieval_state)} ·{" "}
-                  {evidenceStateLabel(node.evidence_state)} · 练习正确{" "}
-                  {node.exercise_correct_count ?? 0}/{node.exercise_attempt_count ?? 0}
-                </p>
-              </div>
-              <Button
-                onClick={() => setNodeId(node.node_id)}
-                size="sm"
-                variant="outline"
+          {mastery.data.map((node) => {
+            const active = resolvedNodeIds.includes(node.node_id);
+            return (
+              <li
+                className="flex items-center justify-between gap-3 py-3"
+                key={node.node_id}
               >
-                选择
-              </Button>
-            </li>
-          ))}
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{node.label}</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    {retrievalStateLabel(node.retrieval_state)} ·{" "}
+                    {evidenceStateLabel(node.evidence_state)} · 练习正确{" "}
+                    {node.exercise_correct_count ?? 0}/{node.exercise_attempt_count ?? 0}
+                  </p>
+                </div>
+                <Button
+                  onClick={() => toggleNode(node.node_id)}
+                  size="sm"
+                  variant={active ? "secondary" : "outline"}
+                >
+                  {active ? "已选" : "选择"}
+                </Button>
+              </li>
+            );
+          })}
         </ul>
       </Surface>
     </div>

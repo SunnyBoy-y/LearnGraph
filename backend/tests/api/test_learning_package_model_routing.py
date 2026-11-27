@@ -45,6 +45,13 @@ def test_retired_routes_never_resolve_a_provider(client, learning_headers, monke
 
     provider = Mock(side_effect=AssertionError("Retired package route invoked a provider"))
     monkeypatch.setattr(provider_factory, "model_provider_for_workspace", provider)
-    response = client.request(method, f"/api/v1/learning-pages{path}", headers=learning_headers)
+    bodies = {
+        "/nodes/node/build": {},
+        "/enrollments/enrollment": {"expected_revision": 0, "reset_activity": True},
+        "/nodes/node/attempts": {"request_key": "request-01"},
+        "/attempts/attempt/answers": {"expected_revision": 0, "answers": {}},
+        "/attempts/attempt/activity": {"expected_revision": 0, "reset_activity": True},
+    }
+    response = client.request(method, f"/api/v1/node-activities{path}", headers=learning_headers, json=bodies.get(path))
     assert response.status_code == 404, response.text
     provider.assert_not_called()

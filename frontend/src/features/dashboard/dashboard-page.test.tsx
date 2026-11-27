@@ -112,15 +112,95 @@ describe("学习空间", () => {
     expect(screen.getByRole("link", { name: "继续练习" })).toHaveAttribute("href", `${base}/practice/session/practice`);
   });
 
-  it("archives historical tasks from the plan page", async () => {
+  it("keeps history off the default view and opens the inline editor from either entry", async () => {
     const user = userEvent.setup();
     const old = action("old", "历史学习任务", iso(8));
     vi.mocked(listActions).mockResolvedValue([old]);
-    vi.mocked(updateAction).mockResolvedValue({ ...old, status: "archived" });
     renderPage("learning-plan");
-    await user.click(await screen.findByText("历史任务（1）"));
-    expect(screen.getByRole("button", { name: "重新安排" })).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "归档" }));
+    expect(await screen.findByText("暂无安排中的学习任务")).toBeVisible();
+    expect(screen.queryByText(old.title)).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "学习任务名称" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新建任务" }));
+    expect(screen.getByRole("textbox", { name: "学习任务名称" })).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("textbox", { name: "学习任务名称" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "添加任务" }));
+    expect(screen.getByRole("textbox", { name: "学习任务名称" })).toHaveFocus();
+  });
+
+  it("preserves the home add link and creates a scheduled task with its graph", async () => {
+    const user = userEvent.setup();
+    vi.mocked(listGraphs).mockResolvedValue([graph]);
+    vi.mocked(createAction).mockImplementation(async (title, graphId, dueAt) => {
+      const created = { ...action("new", title, dueAt), graph_id: graphId ?? null };
+      vi.mocked(listActions).mockResolvedValue([created]);
+      return created;
+    });
+    renderPage();
+    await user.click(await screen.findByRole("link", { name: "添加学习任务" }));
+    await user.type(await screen.findByRole("textbox", { name: "学习任务名称" }), "复习进程调度");
+    await user.selectOptions(await screen.findByRole("combobox", { name: "所属图谱" }), graph.id);
+    await user.selectOptions(screen.getByRole("combobox", { name: "任务日期" }), "tomorrow");
+    await user.click(screen.getByRole("button", { name: "添加任务" }));
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    await waitFor(() => expect(createAction).toHaveBeenCalledWith("复习进程调度", graph.id, tomorrow.toISOString()));
+    const upcoming = await screen.findByRole("region", { name: "接下来" });
+    expect(within(upcoming).getByText("复习进程调度")).toBeVisible();
+    expect(within(upcoming).getByRole("link", { name: graph.title })).toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "学习任务名称" })).not.toBeInTheDocument();
+  });
+
+  it("expands history groups on demand and archives through the task menu", async () => {
+    const user = userEvent.setup();
+    const old = { ...action("old", "学习：刀工与腌制预处理", iso(8)), graph_id: graph.id, roadmap_id: "roadmap" };
+    vi.mocked(listActions).mockResolvedValue([old]);
+    vi.mocked(listGraphs).mockResolvedValue([graph]);
+    vi.mocked(updateAction).mockImplementation(async () => {
+      const archived = { ...old, status: "archived" };
+      vi.mocked(listActions).mockResolvedValue([archived]);
+      return archived;
+    });
+    renderPage("learning-plan");
+    await user.click(await screen.findByRole("tab", { name: "历史任务，1 项" }));
+    const group = await screen.findByRole("button", { name: /操作系统原理/ });
+    expect(group).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("刀工与腌制预处理")).not.toBeInTheDocument();
+    await user.click(group);
+    expect(screen.queryByText(old.title)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "重新安排：刀工与腌制预处理" })).toHaveAttribute("href", `${base}/graphs/${graph.id}?panel=plan`);
+    await user.click(screen.getByRole("button", { name: "更多操作：刀工与腌制预处理" }));
+    await user.click(await screen.findByRole("menuitem", { name: "归档" }));
     await waitFor(() => expect(updateAction).toHaveBeenCalledWith(old.id, { status: "archived" }));
+    await user.click(screen.getByRole("tab", { name: "已归档" }));
+    await user.click(await screen.findByRole("button", { name: /操作系统原理/ }));
+    expect(screen.getByText("刀工与腌制预处理")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /更多操作/ })).not.toBeInTheDocument();
+  });
+
+  it("searches history and moves a rescheduled personal task back to Today", async () => {
+    const user = userEvent.setup();
+    const old = action("old", "学习: 线程同步", iso(8));
+    const completed = { ...action("done", "进程与线程"), status: "completed", roadmap_id: "roadmap", completed_at: iso(2) };
+    vi.mocked(listActions).mockResolvedValue([old, completed]);
+    vi.mocked(updateAction).mockImplementation(async (_id, changes) => {
+      const updated = { ...old, ...changes };
+      vi.mocked(listActions).mockResolvedValue([updated, completed]);
+      return updated;
+    });
+    renderPage("learning-plan");
+    await user.click(await screen.findByRole("tab", { name: "历史任务，2 项" }));
+    const search = screen.getByRole("searchbox", { name: "搜索历史任务" });
+    await user.type(search, "进程");
+    expect(screen.getByText("已完成")).toBeVisible();
+    expect(screen.queryByText("线程同步")).not.toBeInTheDocument();
+    await user.clear(search);
+    await user.type(search, "同步");
+    await user.click(screen.getByRole("button", { name: "重新安排：线程同步" }));
+    expect(screen.getByLabelText("重新安排日期：线程同步")).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    await user.click(await screen.findByRole("tab", { name: "当前任务，1 项" }));
+    expect(within(screen.getByRole("region", { name: "今天" })).getByText(old.title)).toBeVisible();
   });
 });

@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote
 
-from typing import Annotated
+from typing import Annotated, Literal
+from sqlalchemy import select
 from fastapi import APIRouter, Depends, File, Header, Query, Request, Response, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse
@@ -11,7 +12,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.api.deps import AppSettings, CurrentWorkspace, DB, bearer, current_principal, workspace_context
 from app.core.errors import AppError
 from app.domain.schemas.common import ActionResponse
+from app.domain.models import ChatSession, FileReference, ImageGenerationTask, Message, SessionWorkspaceEntry
 from app.domain.schemas.files import (
+    ChunkUploadInitRequest,
+    ChunkUploadPartView,
+    ChunkUploadSessionView,
     DocumentJobCreate,
     DocumentJobView,
     FileParserCapabilityView,
@@ -104,11 +109,59 @@ def list_files(
     accessible = authz.filter_accessible_ids(
         context.workspace, "file", [item.id for item in records], "read"
     )
-    return [
-        FileView.model_validate(item)
-        for item in records
-        if item.id in accessible
-    ]
+    visible = [FileView.model_validate(item) for item in records if item.id in accessible]
+    if q is not None or limit is not None or not visible:
+        return visible
+
+    # Older chat uploads shared the same upload endpoint as library uploads.
+    # Recover their conversation association from durable links, never from parse state.
+    refs = select(FileReference.file_id, Message.session_id, Message.created_at).join(
+        Message, Message.id == FileReference.target_id,
+    ).where(
+        FileReference.workspace_id == context.workspace_id,
+        FileReference.target_type == "message",
+        FileReference.relation.in_(("chat_context", "attachment", "chat_attachment", "generated_image")),
+    ).add_columns(FileReference.relation.label("relation"))
+    entries = select(
+        SessionWorkspaceEntry.file_id, SessionWorkspaceEntry.chat_session_id,
+        SessionWorkspaceEntry.created_at, SessionWorkspaceEntry.source,
+    ).where(SessionWorkspaceEntry.workspace_id == context.workspace_id)
+    generations = select(
+        ImageGenerationTask.file_id, ImageGenerationTask.session_id,
+        ImageGenerationTask.created_at, ImageGenerationTask.status,
+    ).where(ImageGenerationTask.workspace_id == context.workspace_id, ImageGenerationTask.status == "completed")
+    links = refs.union_all(entries, generations).subquery()
+    rows = db.execute(
+        select(links.c.file_id, ChatSession.id, ChatSession.title, links.c.relation)
+        .join(ChatSession, ChatSession.id == links.c.session_id)
+        .where(ChatSession.workspace_id == context.workspace_id)
+        .order_by(links.c.created_at, ChatSession.id)
+    ).all()
+    rows = [row for row in rows if row[0] in accessible]
+    readable_sessions = authz.filter_accessible_ids(
+        context.workspace, "session", list(dict.fromkeys(row[1] for row in rows)), "read",
+    ) if rows else set()
+    generated_sources = {"agent", "agent_write", "agent_publish", "generated_image", "completed", "image_generation", "learning_package", "graph_cover"}
+    attachment_sources = {"chat_attachment", "chat_context", "attachment"}
+    session_links: dict[tuple[str, str], tuple[str, str]] = {}
+    for file_id, session_id, title, relation in rows:
+        if session_id not in readable_sessions:
+            continue
+        kind = "generated" if relation in generated_sources else "conversation" if relation in attachment_sources else "other"
+        session_links.setdefault((file_id, kind), (session_id, title))
+    for item in visible:
+        if item.source in generated_sources or (item.id, "generated") in session_links:
+            item.origin = "generated"
+        elif item.source in attachment_sources or (item.source == "upload" and (item.id, "conversation") in session_links):
+            item.origin = "conversation"
+        elif item.source in {"upload", "library_upload"}:
+            item.origin = "learning"
+        else:
+            item.origin = "other"
+        link = session_links.get((item.id, item.origin)) or session_links.get((item.id, "conversation"))
+        if link:
+            item.source_session_id, item.source_session_title = link
+    return visible
 
 
 @router.get("/lookup", response_model=FileView)
@@ -174,8 +227,78 @@ async def upload_file(
     context: CurrentWorkspace,
     settings: AppSettings,
     file: UploadFile = File(...),
+    source: Literal["upload", "library_upload", "chat_attachment"] = "upload",
 ) -> FileView:
-    return FileView.model_validate(await service(db, context, settings).upload(file))
+    return FileView.model_validate(await service(db, context, settings).upload(file, source=source))
+
+
+@router.post("/uploads/init", response_model=ChunkUploadSessionView, status_code=status.HTTP_201_CREATED)
+def init_chunk_upload(
+    payload: ChunkUploadInitRequest,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ChunkUploadSessionView:
+    result = service(db, context, settings).init_chunk_upload(
+        filename=payload.filename,
+        total_size=payload.total_size,
+        chunk_size=payload.chunk_size,
+        content_type=payload.content_type,
+        source=payload.source,
+        sha256=payload.sha256,
+    )
+    if result.get("existing_file") is not None:
+        result["existing_file"] = FileView.model_validate(result["existing_file"])
+    return ChunkUploadSessionView.model_validate(result)
+
+
+@router.get("/uploads/{upload_id}", response_model=ChunkUploadSessionView)
+def get_chunk_upload_status(
+    upload_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ChunkUploadSessionView:
+    return ChunkUploadSessionView.model_validate(
+        service(db, context, settings).get_chunk_upload_status(upload_id)
+    )
+
+
+@router.put("/uploads/{upload_id}/chunks/{chunk_index}", response_model=ChunkUploadPartView)
+async def upload_file_chunk(
+    upload_id: str,
+    chunk_index: int,
+    request: Request,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ChunkUploadPartView:
+    data = await request.body()
+    return ChunkUploadPartView.model_validate(
+        service(db, context, settings).store_upload_chunk(upload_id, chunk_index, data)
+    )
+
+
+@router.post("/uploads/{upload_id}/complete", response_model=FileView, status_code=status.HTTP_201_CREATED)
+async def complete_chunk_upload(
+    upload_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> FileView:
+    record = await service(db, context, settings).complete_chunk_upload(upload_id)
+    return FileView.model_validate(record)
+
+
+@router.delete("/uploads/{upload_id}", response_model=ActionResponse)
+def abort_chunk_upload(
+    upload_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> ActionResponse:
+    service(db, context, settings).abort_chunk_upload(upload_id)
+    return ActionResponse(status="deleted", message="Chunk upload session aborted", resource_id=upload_id)
 
 
 @router.post(
@@ -417,6 +540,10 @@ def create_file_reference(
     settings: AppSettings,
 ) -> FileReferenceView:
     _require_file_access(db, context, file_id, "write")
+    if payload.target_type == "graph" and not AuthorizationService(db, context.principal).can_access_resource(
+        context.workspace, "graph", payload.target_id, "write",
+    ):
+        raise AppError(404, "not_found", "Graph not found or not editable in this workspace")
     return FileReferenceView.model_validate(
         service(db, context, settings).add_reference(file_id, payload)
     )

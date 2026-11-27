@@ -20,6 +20,7 @@ class GraphNodeView(ORMModel):
     external_concept_id: str | None
     mastery_stars: int
     achievement_score: int | None = None
+    execution_state: str | None = None
     retrieval_state: str
     evidence_state: str
     attention_state: str
@@ -162,7 +163,7 @@ class ConversationGraphNodeChange(BaseModel):
     node_id: str | None = Field(default=None, min_length=1, max_length=36)
     label: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=2_000)
-    node_type: Literal["root", "concept", "practice", "assessment"] = "concept"
+    node_type: Literal["root", "concept", "principle", "method", "application", "practice", "lab", "assessment", "open"] = "concept"
     rationale: str = Field(min_length=1, max_length=1_000)
 
     @model_validator(mode="after")

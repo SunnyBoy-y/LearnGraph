@@ -12,8 +12,12 @@ export interface FileRecord {
   parse_status: string
   parser_name: string | null
   parser_version: string | null
-  error_message: string | null
+  error_message?: string | null
   created_at: IsoDateTime
+  source?: string
+  origin?: 'learning' | 'conversation' | 'generated' | 'other' | null
+  source_session_id?: string | null
+  source_session_title?: string | null
 }
 
 export interface FileStorageSummary {

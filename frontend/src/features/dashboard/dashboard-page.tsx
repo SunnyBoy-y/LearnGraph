@@ -1,14 +1,31 @@
+import { useMemo, useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, ArrowRight, ArrowUpRight, ChevronRight, MessageCircle, Network, Plus } from "lucide-react";
+import { Archive, ArrowLeft, ArrowRight, ArrowUpRight, ChevronRight, MessageCircle, Network, Plus, SquareCheck, Trash2 } from "lucide-react";
 import { Link, useParams } from "react-router-dom";
 
-import { getDashboard, listActions, listGraphs, listPracticeSessions, updateAction } from "@/api";
+import {
+  archiveSession,
+  deleteSession,
+  deleteSessionsBatch,
+  getDashboard,
+  getSessionBatchDeleteImpact,
+  getSessionDeleteImpact,
+  listActions,
+  listGraphs,
+  listPracticeSessions,
+  updateAction,
+} from "@/api";
 import { listSessionPage, type SessionSummary } from "@/api/session-browser";
 import { ActivityHeatmap } from "@/components/shared/activity-heatmap";
+import { ClearableSearchInput } from "@/components/shared/clearable-search-input";
+import { DeleteImpactDialog } from "@/components/shared/delete-impact-dialog";
 import { ErrorState, LoadingState, PageFrame } from "@/components/shared/page-elements";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { useListSelection } from "@/lib/list-selection";
 import { toast } from "@/lib/notifications";
 import { workspaceQueryKey } from "@/lib/query-keys";
+import { scheduleSessionRefresh } from "@/lib/session-refresh";
 import type { GraphSummary } from "@/types/graphs";
 import { partitionPlan, planPath, recommend, sessionScope, shortDate } from "./dashboard-model";
 import "./dashboard.css";
@@ -175,15 +192,255 @@ export function DashboardPage() {
 export function LearningSessionsPage() {
   const { workspaceId = "" } = useParams();
   const base = `/w/${workspaceId}`;
+  const client = useQueryClient();
   const sessions = useRecentSessions(workspaceId);
   const graphs = useGraphs(workspaceId);
+  const [search, setSearch] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<
+    | { kind: "single"; session: SessionSummary }
+    | { kind: "batch"; sessions: SessionSummary[] }
+    | null
+  >(null);
+
+  const graphMap = useMemo(
+    () => new Map(graphs.data?.map((graph) => [graph.id, graph])),
+    [graphs.data],
+  );
+  const allItems = useMemo(
+    () => sessions.data?.pages.flatMap((page) => page.items) ?? [],
+    [sessions.data],
+  );
+  const filteredItems = useMemo(() => {
+    const q = search.trim().toLocaleLowerCase();
+    if (!q) return allItems;
+    return allItems.filter((item) => {
+      const title = (item.title || "未命名会话").toLocaleLowerCase();
+      const graphTitle = (item.graph_id ? graphMap.get(item.graph_id)?.title : "")?.toLocaleLowerCase() ?? "";
+      return title.includes(q) || graphTitle.includes(q);
+    });
+  }, [allItems, graphMap, search]);
+
+  const visibleIds = useMemo(() => filteredItems.map((item) => item.id), [filteredItems]);
+  const selection = useListSelection(visibleIds);
+  const selectedSessions = useMemo(
+    () => allItems.filter((item) => selection.selectedIds.has(item.id)),
+    [allItems, selection.selectedIds],
+  );
+
+  const archiveMutation = useMutation({
+    mutationFn: async (targets: SessionSummary[]) => {
+      const results = await Promise.allSettled(targets.map((item) => archiveSession(item.id)));
+      const archivedIds: string[] = [];
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") archivedIds.push(targets[index].id);
+      });
+      return { archivedIds, failed: targets.length - archivedIds.length };
+    },
+    onSuccess: ({ archivedIds, failed }) => {
+      selection.removeIds(archivedIds);
+      void scheduleSessionRefresh(client, workspaceId);
+      void sessions.refetch();
+      if (failed === 0) toast.success(archivedIds.length > 1 ? `已归档 ${archivedIds.length} 个会话` : "会话已归档");
+      else if (archivedIds.length > 0) toast.warning(`已归档 ${archivedIds.length} 个会话，${failed} 个失败`);
+      else toast.error("归档会话失败");
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "归档会话失败"),
+  });
+
+  const deleteImpact = useQuery({
+    queryKey: workspaceQueryKey(
+      workspaceId,
+      "learning-sessions-delete-impact",
+      deleteTarget?.kind === "single"
+        ? deleteTarget.session.id
+        : deleteTarget?.sessions.map((item) => item.id).join(",") ?? "",
+    ),
+    queryFn: () => {
+      if (!deleteTarget) throw new Error("missing target");
+      if (deleteTarget.kind === "single") return getSessionDeleteImpact(deleteTarget.session.id);
+      return getSessionBatchDeleteImpact(deleteTarget.sessions.map((item) => item.id));
+    },
+    enabled: Boolean(deleteTarget),
+  });
+
+  const confirmDelete = useMutation({
+    mutationFn: async (confirmationText: string) => {
+      if (!deleteTarget) return [] as string[];
+      if (deleteTarget.kind === "single") {
+        await deleteSession(deleteTarget.session.id, confirmationText);
+        return [deleteTarget.session.id];
+      }
+      const ids = deleteTarget.sessions.map((item) => item.id);
+      await deleteSessionsBatch(ids, confirmationText);
+      return ids;
+    },
+    onSuccess: (deletedIds) => {
+      selection.removeIds(deletedIds);
+      setDeleteTarget(null);
+      void scheduleSessionRefresh(client, workspaceId);
+      void sessions.refetch();
+      toast.success(deletedIds.length > 1 ? `已删除 ${deletedIds.length} 个会话` : "会话已删除");
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : "删除会话失败"),
+  });
+
+  const busy = archiveMutation.isPending || confirmDelete.isPending;
+  const today = new Date();
+
   return <PageFrame className="study-home">
     <Link className="study-text-link self-start" to={`${base}/home`}><ArrowLeft size={15} />我的学习空间</Link>
-    <h1 data-page-title className="text-2xl font-semibold">全部会话</h1>
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      <h1 data-page-title className="text-2xl font-semibold">全部会话</h1>
+      {allItems.length ? (
+        <Button
+          aria-pressed={selection.multiSelect}
+          onClick={selection.toggleMultiSelect}
+          size="sm"
+          variant={selection.multiSelect ? "secondary" : "outline"}
+        >
+          <SquareCheck className="size-4" />
+          {selection.multiSelect ? "退出多选" : "多选"}
+        </Button>
+      ) : null}
+    </div>
+    {allItems.length ? (
+      <div className="flex flex-wrap items-center gap-2">
+        <ClearableSearchInput
+          aria-label="搜索全部会话"
+          containerClassName="min-w-52 flex-1 sm:max-w-sm"
+          onChange={setSearch}
+          placeholder="搜索会话标题或图谱…"
+          value={search}
+        />
+        {selection.multiSelect ? (
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox
+              aria-label="全选当前列表"
+              checked={selection.visibleCheckboxState}
+              disabled={busy || !filteredItems.length}
+              onCheckedChange={(checked) => selection.toggleVisible(checked === true)}
+            />
+            全选当前列表
+          </label>
+        ) : null}
+      </div>
+    ) : null}
+    {selection.multiSelect && selection.selectedCount > 0 ? (
+      <div
+        aria-label="全部会话批量操作"
+        className="flex flex-wrap items-center gap-2 rounded-xl border bg-muted/30 px-3 py-2 text-sm"
+        role="region"
+      >
+        <span>
+          已选 <strong>{selection.selectedCount}</strong> 个会话
+          {selection.otherSelectedCount > 0 ? `（另有 ${selection.otherSelectedCount} 个不在当前筛选）` : ""}
+        </span>
+        <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          <Button
+            disabled={busy}
+            onClick={() => archiveMutation.mutate(selectedSessions)}
+            size="xs"
+            variant="outline"
+          >
+            <Archive className="size-3.5" />
+            批量归档
+          </Button>
+          <Button
+            disabled={busy}
+            onClick={() => setDeleteTarget({ kind: "batch", sessions: selectedSessions })}
+            size="xs"
+            variant="destructive"
+          >
+            <Trash2 className="size-3.5" />
+            批量删除
+          </Button>
+          <Button disabled={busy} onClick={selection.clear} size="xs" variant="ghost">
+            取消选择
+          </Button>
+        </div>
+      </div>
+    ) : null}
     {sessions.isPending ? <LoadingState label="正在读取会话…" /> : sessions.isError && !sessions.data ?
-      <ErrorState message={sessions.error.message} onRetry={() => void sessions.refetch()} /> : sessions.data?.pages[0]?.items.length ?
-        <div className="study-card study-card--list"><SessionRows items={sessions.data.pages.flatMap((page) => page.items)} graphs={new Map(graphs.data?.map((graph) => [graph.id, graph]))} base={base} today={new Date()} /></div> :
-        <p className="study-empty">还没有会话。</p>}
+      <ErrorState message={sessions.error.message} onRetry={() => void sessions.refetch()} /> : allItems.length ? (
+        filteredItems.length ? (
+          <div className="study-card study-card--list">
+            <ul className="study-list">
+              {filteredItems.map((item, index) => {
+                const graphTitle = item.graph_id ? graphMap.get(item.graph_id)?.title ?? "图谱会话" : "普通会话";
+                const Icon = item.graph_id ? Network : MessageCircle;
+                const title = item.title || "未命名会话";
+                const selected = selection.selectedIds.has(item.id);
+                return (
+                  <li className={`flex items-center gap-2 px-3 py-1.5 ${selected ? "bg-primary/5" : ""}`} key={item.id}>
+                    {selection.multiSelect ? (
+                      <Checkbox
+                        aria-label={`选择会话 ${title}`}
+                        disabled={busy}
+                        {...selection.checkboxProps(item.id)}
+                      />
+                    ) : null}
+                    <Link className="study-row study-row--link min-w-0 flex-1 !px-1" to={`${base}/chat/${encodeURIComponent(item.id)}`}>
+                      <span className="study-icon" data-tone={item.graph_id ? (index % 2 === 0 ? "blue" : "green") : "violet"}><Icon aria-hidden="true" size={17} /></span>
+                      <span className="min-w-0 flex-1">
+                        <span className="study-row__title" title={title}>{title}</span>
+                        <span className="study-row__meta">{[graphTitle, shortDate(item.updated_at, today)].filter(Boolean).join(" · ")}</span>
+                      </span>
+                    </Link>
+                    {!selection.multiSelect ? (
+                      <div className="flex shrink-0 items-center gap-1">
+                        <Button
+                          aria-label={`归档会话 ${title}`}
+                          disabled={busy}
+                          onClick={() => archiveMutation.mutate([item])}
+                          size="icon-xs"
+                          title="归档会话"
+                          variant="ghost"
+                        >
+                          <Archive className="size-3.5" />
+                        </Button>
+                        <Button
+                          aria-label={`删除会话 ${title}`}
+                          disabled={busy}
+                          onClick={() => setDeleteTarget({ kind: "single", session: item })}
+                          size="icon-xs"
+                          title="删除会话"
+                          variant="ghost"
+                        >
+                          <Trash2 className="size-3.5 text-destructive" />
+                        </Button>
+                      </div>
+                    ) : null}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ) : <p className="study-empty">没有匹配「{search.trim()}」的会话。</p>
+      ) : <p className="study-empty">还没有会话。</p>}
     {sessions.hasNextPage && <Button variant="outline" className="self-center" disabled={sessions.isFetchingNextPage} onClick={() => void sessions.fetchNextPage()}>{sessions.isFetchNextPageError ? "重试加载" : sessions.isFetchingNextPage ? "正在加载…" : "加载更多会话"}</Button>}
+    <DeleteImpactDialog
+      confirmLabel="永久删除"
+      error={
+        (deleteImpact.error instanceof Error ? deleteImpact.error.message : undefined) ??
+        (confirmDelete.error instanceof Error ? confirmDelete.error.message : undefined)
+      }
+      impact={deleteImpact.data}
+      isConfirming={confirmDelete.isPending}
+      isLoading={deleteImpact.isPending && Boolean(deleteTarget)}
+      objectLabel={
+        deleteTarget?.kind === "batch"
+          ? `${deleteTarget.sessions.length} 个会话`
+          : deleteTarget?.session.title || "未命名会话"
+      }
+      onConfirm={async () => {
+        if (!deleteImpact.data) return;
+        await confirmDelete.mutateAsync(deleteImpact.data.confirmation_text);
+      }}
+      onOpenChange={(open) => {
+        if (!open && !confirmDelete.isPending) setDeleteTarget(null);
+      }}
+      open={Boolean(deleteTarget)}
+      title={deleteTarget?.kind === "batch" ? `永久删除选中的 ${deleteTarget.sessions.length} 个会话？` : undefined}
+    />
   </PageFrame>;
 }
