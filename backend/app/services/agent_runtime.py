@@ -1469,6 +1469,26 @@ class AgentToolRuntime:
                                 "minimum": 120,
                                 "maximum": 900,
                             },
+                            "max_height": {
+                                "type": "integer",
+                                "minimum": 160,
+                                "maximum": 1600,
+                                "description": "Optional max viewport height in pixels when height_mode is 'bounded'.",
+                            },
+                            "height_mode": {
+                                "type": "string",
+                                "enum": ["auto", "aspect-ratio", "fixed", "bounded"],
+                                "description": (
+                                    "Sizing strategy handled by the runtime: 'auto' (default for interactive HTML, "
+                                    "auto-fits content height bidirectionally), 'aspect-ratio' (proportional scaling), "
+                                    "'bounded' (auto-fits up to max_height with internal scroll), or 'fixed' "
+                                    "(explicit viewport height for 3D/games/full-canvas apps)."
+                                ),
+                            },
+                            "aspect_ratio": {
+                                "type": "string",
+                                "description": "Optional CSS ratio such as '16 / 9' when height_mode is 'aspect-ratio'.",
+                            },
                             "preview_html": {
                                 "type": "string",
                                 "minLength": 1,
@@ -1477,6 +1497,11 @@ class AgentToolRuntime:
                                     "Complete self-contained inline HTML/CSS/JavaScript; "
                                     "all network access is blocked by the host sandbox."
                                 ),
+                            },
+                            "display_mode": {
+                                "type": "string",
+                                "enum": ["inline", "artifact"],
+                                "description": "Optional presentation mode: 'inline' embeds visual content seamlessly into the answer; 'artifact' renders a standalone artifact card.",
                             },
                             "goal_id": {"type": "string"},
                             "node_id": {"type": "string"},
@@ -3655,10 +3680,13 @@ class AgentToolRuntime:
                             return bool((control and control.cancel_requested) or version is None
                                 or version.status in {"cancelled", "failed"})
                         options["cancel_check"] = wait_cancelled
-                    result = self.sandbox.execute_agent_tool(
-                        name, arguments, chat_session_id=chat_session_id,
-                        agent_authorized=self.sandbox_authorized, **options,
-                    )
+                    from app.services.sandbox_checkpoints import checkpoint_turn_context
+
+                    with checkpoint_turn_context(assistant_message_id):
+                        result = self.sandbox.execute_agent_tool(
+                            name, arguments, chat_session_id=chat_session_id,
+                            agent_authorized=self.sandbox_authorized, **options,
+                        )
                 finally:
                     if stream is not None:
                         stream.close()
@@ -7134,8 +7162,20 @@ class AgentToolRuntime:
                 preferred_height=int(arguments["preferred_height"])
                 if isinstance(arguments.get("preferred_height"), int)
                 else None,
+                max_height=int(arguments["max_height"])
+                if isinstance(arguments.get("max_height"), int)
+                else None,
+                height_mode=arguments.get("height_mode")
+                if isinstance(arguments.get("height_mode"), str)
+                else None,
+                aspect_ratio=arguments.get("aspect_ratio")
+                if isinstance(arguments.get("aspect_ratio"), str)
+                else None,
                 preview_html=arguments.get("preview_html")
                 if isinstance(arguments.get("preview_html"), str)
+                else None,
+                display_mode=arguments.get("display_mode")
+                if isinstance(arguments.get("display_mode"), str)
                 else None,
                 scope=scope or None,
             )

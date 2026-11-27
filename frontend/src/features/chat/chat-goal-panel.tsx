@@ -3,6 +3,7 @@ import { LoaderCircle, Pause, Play, Target, X } from 'lucide-react'
 import { controlChatGoal, readChatGoal, type ChatGoal, type ChatGoalAction } from '@/api/chat-goals'
 import { Button } from '@/components/ui/button'
 import { toast } from '@/lib/notifications'
+import { adaptivePollInterval } from '@/lib/network-quality'
 import { workspaceQueryKey } from '@/lib/query-keys'
 
 const labels: Record<ChatGoal['status'], string> = {
@@ -22,7 +23,7 @@ export function useChatGoal(workspaceId: string, sessionId: string) {
     queryKey: chatGoalKey(workspaceId, sessionId),
     queryFn: ({ signal }) => readChatGoal(sessionId, signal),
     enabled: sessionId !== 'new',
-    refetchInterval: (query) => chatGoalIsActive(query.state.data) ? 2000 : false,
+    refetchInterval: (query) => adaptivePollInterval(chatGoalIsActive(query.state.data) ? 2000 : false),
   })
 }
 

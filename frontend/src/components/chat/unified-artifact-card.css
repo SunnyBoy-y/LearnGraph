@@ -1,6 +1,8 @@
 .unified-artifact-card {
   inline-size: 100%;
+  max-inline-size: 100%;
   min-inline-size: 0;
+  box-sizing: border-box;
   margin-block: .65rem;
   border: 1px solid var(--border);
   border-radius: .85rem;
@@ -10,6 +12,18 @@
   font-size: .8125rem;
   line-height: 1.4;
 }
+
+/* Inline mode: native part of the answer rail without file-viewer chrome. */
+.unified-artifact-card.unified-artifact-card--inline {
+  margin-block: 0;
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
+
 .unified-artifact-card__header {
   display: flex;
   align-items: center;
@@ -19,25 +33,139 @@
   padding: .55rem .7rem;
   border-block-end: 1px solid var(--border);
 }
-.unified-artifact-card__identity, .unified-artifact-card__actions {
+
+.unified-artifact-card__identity,
+.unified-artifact-card__actions {
   display: flex;
   align-items: center;
   min-inline-size: 0;
   gap: .4rem;
 }
-.unified-artifact-card__actions { flex-wrap: wrap; }
-.unified-artifact-card__titles { display: grid; min-inline-size: 0; }
-.unified-artifact-card__title { overflow-wrap: anywhere; }
-.unified-artifact-card__meta { overflow-wrap: anywhere; color: var(--muted-foreground); font-size: .75rem; }
-.unified-artifact-card__stage { min-inline-size: 0; }
-.unified-artifact-card__native-svg, .unified-artifact-card__svg-img {
+
+.unified-artifact-card__actions {
+  flex-wrap: wrap;
+}
+
+.unified-artifact-card__titles {
+  display: grid;
+  min-inline-size: 0;
+}
+
+.unified-artifact-card__title {
+  overflow-wrap: anywhere;
+}
+
+.unified-artifact-card__meta {
+  overflow-wrap: anywhere;
+  color: var(--muted-foreground);
+  font-size: .75rem;
+}
+
+.unified-artifact-card__stage {
+  position: relative;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+}
+
+/* Floating hover toolbar: positioned absolutely so showing/hiding causes zero layout shift. */
+.unified-artifact-card__floating-actions,
+.rich-svg-figure__floating-actions {
+  position: absolute;
+  inset-block-start: 8px;
+  inset-inline-end: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid color-mix(in oklab, var(--border) 90%, transparent);
+  border-radius: 9px;
+  background: color-mix(in oklab, var(--popover) 90%, transparent);
+  color: var(--popover-foreground);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 8%);
+  backdrop-filter: blur(8px);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.unified-artifact-card--inline:hover .unified-artifact-card__floating-actions,
+.unified-artifact-card--inline:focus-within .unified-artifact-card__floating-actions,
+.unified-artifact-card--inline[data-source-open="true"] .unified-artifact-card__floating-actions,
+.rich-svg-figure:hover .rich-svg-figure__floating-actions,
+.rich-svg-figure:focus-within .rich-svg-figure__floating-actions,
+.rich-svg-figure[data-source-open="true"] .rich-svg-figure__floating-actions {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.unified-artifact-card__native-svg,
+.unified-artifact-card__svg-img {
   display: block;
   inline-size: 100%;
+  max-inline-size: 100%;
   block-size: auto;
-  max-block-size: min(70dvh, 720px);
+  max-block-size: min(75dvh, 760px);
   object-fit: contain;
+  background: transparent;
 }
-.unified-artifact-card__svg-button { display: block; inline-size: 100%; cursor: zoom-in; }
-.unified-artifact-card__state { display: flex; align-items: center; gap: .45rem; padding: .85rem; color: var(--muted-foreground); }
-.unified-artifact-card__source { margin: 0; padding: .8rem; overflow: auto; max-block-size: 28rem; }
-.unified-artifact-card__frame { display: block; inline-size: 100%; min-block-size: 24rem; border: 0; }
+
+.unified-artifact-card__svg-button {
+  display: block;
+  inline-size: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.unified-artifact-card__state {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  padding: .85rem;
+  color: var(--muted-foreground);
+}
+
+.unified-artifact-card__source {
+  margin: 0;
+  padding: .8rem;
+  overflow: auto;
+  max-block-size: 28rem;
+  font-size: .78rem;
+  line-height: 1.55;
+}
+
+.unified-artifact-card__source--inline {
+  padding-block-start: 2.75rem;
+  border: 1px solid var(--border);
+  border-radius: .65rem;
+  background: color-mix(in oklab, var(--muted) 45%, transparent);
+}
+
+.unified-artifact-card__frame {
+  display: block;
+  inline-size: 100%;
+  min-block-size: 0;
+  border: 0;
+}
+
+@media (hover: none) {
+  .unified-artifact-card__floating-actions,
+  .rich-svg-figure__floating-actions {
+    opacity: .92;
+    pointer-events: auto;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .unified-artifact-card__floating-actions,
+  .rich-svg-figure__floating-actions {
+    transition: none;
+    transform: none;
+  }
+}

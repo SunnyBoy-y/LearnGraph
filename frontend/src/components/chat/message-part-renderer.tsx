@@ -1,3 +1,4 @@
+import { normalizeLiveShellOutput } from "@/features/chat/live-shell-output";
 import { webActivityLabel } from "@/lib/web-activity";
 import { nativeMoney } from "@/lib/money";
 import type { BillingCurrency } from "@/types/usage";
@@ -1170,7 +1171,8 @@ export function TextWithCitations({
             </span>
           );
         }
-        return <img alt={alt} src={src} {...props} />;
+        const imgClassName = typeof props.className === "string" ? props.className : undefined;
+        return <img alt={alt} src={src} {...props} className={cn("max-w-full h-auto", imgClassName)} />;
       },
       pre: (props: MarkdownPreProps) => safeDocument ? <pre className={props.className}>{props.children}</pre> : <PreviewableMarkdownPre {...props} />,
     }),
@@ -1636,7 +1638,21 @@ function toolDisplayTitle(
     const query = typeof input?.query === "string" ? input.query.trim() : "";
     return query ? `搜索 ${query}` : "联网搜索";
   }
-  if (toolName === "sandbox_exec" || toolName === "sandbox_run") {
+  if (toolName === "sandbox_bash" || toolName === "sandbox_exec" || toolName === "sandbox_run") {
+    const input =
+      data?.input && typeof data.input === "object" && !Array.isArray(data.input)
+        ? (data.input as Record<string, unknown>)
+        : null;
+    const rawCommand =
+      typeof input?.command === "string"
+        ? input.command.trim()
+        : Array.isArray(input?.argv)
+          ? input.argv.map(String).join(" ").trim()
+          : "";
+    if (rawCommand) {
+      const compact = rawCommand.replace(/\s+/g, " ");
+      return `沙箱执行 · ${compact.length > 48 ? `${compact.slice(0, 47)}…` : compact}`;
+    }
     return "沙箱执行";
   }
   return toolName ?? "工具调用";
@@ -1719,6 +1735,23 @@ function ToolCallPart({
           ? "input-available"
           : "output-available";
 
+  const rawLiveOutput =
+    typeof part.data?.live_output === "string" ? part.data.live_output : "";
+  const normalizedLiveOutput = rawLiveOutput
+    ? normalizeLiveShellOutput(rawLiveOutput, {
+        alreadyTruncated: part.data?.live_output_truncated === true,
+      })
+    : null;
+  const liveOutputText = normalizedLiveOutput?.text ?? "";
+  const liveOutputRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    const el = liveOutputRef.current;
+    if (el && liveOutputText) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [liveOutputText]);
+
   return (
     <Tool
       className={cn(
@@ -1738,6 +1771,25 @@ function ToolCallPart({
         toolName={title}
         type="dynamic-tool"
       />
+      {isAwaitingResult && liveOutputText ? (
+        <div
+          className="mx-3 mb-2 rounded-lg border border-border/60 bg-muted/50 px-2.5 py-2"
+          data-live-shell-output="true"
+        >
+          <div className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
+            <span>实时输出（尾部）</span>
+            {normalizedLiveOutput?.truncated ? (
+              <span>前面输出已省略</span>
+            ) : null}
+          </div>
+          <pre
+            ref={liveOutputRef}
+            className="max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-4 text-foreground/90"
+          >
+            {liveOutputText}
+          </pre>
+        </div>
+      ) : null}
       <ToolContent>
         {/*
           Only mount I/O bodies while expanded. Collapsed tools used to keep
@@ -1822,7 +1874,7 @@ function WebFetchAuthorizationCard({ data }: { data: FetchAuthorizationData }) {
     return <section className="mt-3 rounded-xl border border-muted p-4 text-sm text-muted-foreground">{state === "approved" ? "网页抓取已获授权。" : "已拒绝本次网页抓取。"}</section>;
   }
   return (
-    <section aria-label="网页抓取授权" className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20">
+    <section aria-label="网页抓取授权" className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/25">
       <div>
         <strong className="text-amber-700 dark:text-amber-400">需要网页抓取授权</strong>
         <p className="mt-1 break-words text-sm text-foreground">{data.message_zh || `我将使用${data.tool_label || "网页抓取工具"}抓取${data.requested_url || "该"}网页，是否批准？`}</p>
@@ -1898,7 +1950,7 @@ function EgressAuthorizationCard({ data }: { data: EgressAuthorizationCardData }
     return <section className="mt-3 rounded-xl border border-muted p-4 text-sm text-muted-foreground">{state === "approved" ? `${capabilityLabel}已获授权。` : `已拒绝${capabilityLabel}。`}</section>;
   }
   return (
-    <section aria-label={isAcquisition ? "外部下载授权" : "沙箱出站授权"} className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:bg-amber-950/20">
+    <section aria-label={isAcquisition ? "外部下载授权" : "沙箱出站授权"} className="mt-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/25">
       <div>
         <strong className="text-amber-700 dark:text-amber-400">需要{capabilityLabel}授权</strong>
         <p className="mt-1 break-words text-sm text-foreground">{data.message_zh || `智能体需要访问主机 ${data.hostname || "该"}主机，是否批准？`}</p>
@@ -2023,6 +2075,7 @@ export function MessagePartRenderer({
   interactive = true,
   onAction,
   part,
+  settled,
   siblingParts,
   streaming = false,
 }: {
@@ -2030,6 +2083,8 @@ export function MessagePartRenderer({
   interactive?: boolean;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
   part: MessagePart;
+  /** True once the owning assistant message has finished streaming. */
+  settled?: boolean;
   /** Sibling parts of the same assistant message (used to resolve inline source groups). */
   siblingParts?: MessagePart[];
   streaming?: boolean;
@@ -2148,7 +2203,7 @@ export function MessagePartRenderer({
         </Suspense>
       );
     case "ui":
-      return <StreamUI data={part.data} partId={part.id} siblingParts={siblingParts} interactive={interactive && !streaming} settled={!streaming} failed={part.status === "failed"} onAction={onAction} />;
+      return <StreamUI data={part.data} partId={part.id} siblingParts={siblingParts} interactive={interactive && !streaming} settled={settled ?? !streaming} failed={part.status === "failed"} onAction={onAction} />;
     case "user_confirmation":
       return <UserConfirmationPart data={part.data} />;
     case "component":
@@ -2165,9 +2220,9 @@ export function MessagePartRenderer({
     case "magic_card": {
       const meta = resolveArtifactMeta(part, siblingParts);
       if (meta.artifactType === "svg") {
-        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} />;
+        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} streaming={streaming} />;
       }
-      return <MagicCardHost data={part.data ?? {}} />;
+      return <MagicCardHost data={part.data ?? {}} streaming={streaming} />;
     }
     case "sandbox": {
       // Published image files render as inline embedded previews (no manual
@@ -2180,7 +2235,7 @@ export function MessagePartRenderer({
         meta.artifactType === "svg" ||
         (meta.artifactType === "html" && (meta.fileId || meta.previewHtml))
       ) {
-        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} />;
+        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} streaming={streaming} />;
       }
       const kind = part.data?.kind;
       if (kind === "file" || typeof part.data?.file_id === "string") {
@@ -2191,12 +2246,12 @@ export function MessagePartRenderer({
         part.data?.runtime === "react-sandbox-v1" ||
         typeof part.data?.card_instance_id === "string"
       ) {
-        return <MagicCardHost data={part.data ?? {}} />;
+        return <MagicCardHost data={part.data ?? {}} streaming={streaming} />;
       }
-      return <SandboxArtifact data={part.data ?? {}} />;
+      return <SandboxArtifact data={part.data ?? {}} streaming={streaming} />;
     }
     case "subapp_artifact":
-      return <SandboxArtifact data={part.data ?? {}} />;
+      return <SandboxArtifact data={part.data ?? {}} streaming={streaming} />;
     case "sandbox_artifact": {
       if (isSandboxImageArtifactPart(part)) {
         return <SandboxImageArtifact part={part} />;
@@ -2206,7 +2261,7 @@ export function MessagePartRenderer({
         meta.artifactType === "svg" ||
         (meta.artifactType === "html" && (meta.fileId || meta.previewHtml))
       ) {
-        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} />;
+        return <UnifiedArtifactCard part={part} meta={meta} siblingParts={siblingParts} streaming={streaming} />;
       }
       return <SandboxFileArtifact data={part.data ?? {}} />;
     }

@@ -2,7 +2,8 @@ import { parseUISnapshot, type DocumentNode, type UISnapshot } from "@/lib/strea
 
 /** Pure view policy. Persisted snapshots, revisions and action targets are untouched. */
 export function presentation(s: UISnapshot) {
-  const chain = s.props.graph_layout === "mindmap" || s.props.interaction === "explore" || (s.component === "graph" && s.state === "streaming") ? null : linearChain(s);
+  const streamingIncomplete = s.component === "graph" && s.state === "streaming" && s.edges.length === 0;
+  const chain = s.props.graph_layout === "mindmap" || s.props.interaction === "explore" || streamingIncomplete ? null : linearChain(s);
   return {
     form: s.component === "graph" && !chain ? "canvas" : s.component === "chart" || (s.component === "table" && s.rows.length > 8) ? "data" : "editorial",
     tableExplore: s.props.interaction === "explore" || (s.props.interaction !== "static" && s.rows.length > 8),

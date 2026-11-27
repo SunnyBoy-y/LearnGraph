@@ -141,4 +141,29 @@ describe("conversation return-to-latest button", () => {
     expect(screen.getByRole("log")).toContainElement(button);
     expect(getComputedStyle(button).bottom).toBe("16px");
   });
+
+  it("mirrors the scroller's symmetric scrollbar gutter onto the parent chat canvas", () => {
+    const view = render(<MainChat />);
+    const canvas = view.container.querySelector<HTMLElement>(".chat-canvas-page")!;
+    const scroller = view.container.querySelector<HTMLElement>("[data-conversation-scroll]")!;
+    Object.defineProperty(scroller, "offsetWidth", { configurable: true, value: 800 });
+    Object.defineProperty(scroller, "clientWidth", { configurable: true, value: 780 });
+    // Trigger ResizeObserver / initial measurement via a fresh mount with known widths.
+    view.unmount();
+    const origOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetWidth");
+    const origClientWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
+    Object.defineProperty(HTMLElement.prototype, "offsetWidth", { configurable: true, get() { return this.hasAttribute("data-conversation-scroll") ? 800 : 0; } });
+    Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get() { return this.hasAttribute("data-conversation-scroll") ? 780 : 0; } });
+    try {
+      const remounted = render(<MainChat />);
+      const remountedCanvas = remounted.container.querySelector<HTMLElement>(".chat-canvas-page")!;
+      expect(remountedCanvas.style.getPropertyValue("--chat-scroll-gutter")).toBe("10px");
+    } finally {
+      if (origOffsetWidth) Object.defineProperty(HTMLElement.prototype, "offsetWidth", origOffsetWidth);
+      else delete (HTMLElement.prototype as { offsetWidth?: number }).offsetWidth;
+      if (origClientWidth) Object.defineProperty(HTMLElement.prototype, "clientWidth", origClientWidth);
+      else delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth;
+    }
+    expect(canvas.style.getPropertyValue("--chat-scroll-gutter")).toBe("0px");
+  });
 });

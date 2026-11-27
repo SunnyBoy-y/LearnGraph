@@ -33,79 +33,117 @@
 }
 .new-chat-suggestions {
   position: absolute;
-  top: calc(100% - 24px);
+  top: calc(100% - 26px);
   right: 0;
   left: 0;
   width: 100%;
-  padding-inline: 12px;
+  padding-inline: 10px;
   color: var(--muted-foreground);
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.45;
+  transition: opacity .16s ease, visibility .16s ease;
+}
+.new-chat-suggestions.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 .new-chat-suggestions__header {
   display: flex;
+  min-height: 26px;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding-inline: 10px;
+  gap: 12px;
+  padding-inline: 8px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.new-chat-suggestions__title {
+  color: inherit;
 }
 .new-chat-suggestions__refresh {
   display: inline-flex;
-  min-height: 36px;
+  min-height: 26px;
   align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  border-radius: 8px;
-  color: inherit;
+  gap: 5px;
+  margin-inline-end: -8px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.4;
   cursor: pointer;
+  transition: color .15s ease, background-color .15s ease;
 }
 .new-chat-suggestions__refresh svg {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
 }
 .new-chat-suggestions__list {
   display: flex;
+  min-height: 106px;
   flex-direction: column;
-  gap: 4px;
-  margin-top: 4px;
+  gap: 2px;
+  margin-top: 6px;
 }
 .new-chat-suggestions__prompt {
   display: flex;
-  min-height: 44px;
+  min-height: 34px;
   width: 100%;
-  align-items: center;
-  gap: 12px;
-  padding: 10px;
-  border-radius: 10px;
-  color: inherit;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: none;
+  color: var(--foreground);
+  font-size: 14px;
+  line-height: 1.45;
   text-align: start;
   cursor: pointer;
   transition: color .15s ease, background-color .15s ease;
 }
 .new-chat-suggestions__prompt > svg {
   flex: none;
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--muted-foreground);
   stroke-width: 1.6;
+  transition: color .15s ease, opacity .15s ease;
 }
 .new-chat-suggestions__prompt > span {
   flex: 1;
   min-width: 0;
+  color: var(--foreground);
   overflow-wrap: anywhere;
 }
 .new-chat-suggestions__prompt .new-chat-suggestions__arrow {
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  color: var(--muted-foreground);
   opacity: 0;
 }
-.new-chat-suggestions__refresh:hover,
-.new-chat-suggestions__prompt:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--foreground) 4%, transparent);
+.new-chat-suggestions__refresh:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--foreground) 4.5%, transparent);
   color: var(--foreground);
 }
-.new-chat-suggestions__prompt:hover .new-chat-suggestions__arrow,
-.new-chat-suggestions__prompt:focus-visible .new-chat-suggestions__arrow {
-  opacity: 1;
+.new-chat-suggestions__prompt:hover:not(:disabled),
+.new-chat-suggestions__prompt:focus-visible:not(:disabled) {
+  background: color-mix(in srgb, var(--foreground) 4.5%, transparent);
+}
+.new-chat-suggestions__prompt:hover:not(:disabled) .new-chat-suggestions__icon,
+.new-chat-suggestions__prompt:focus-visible:not(:disabled) .new-chat-suggestions__icon {
+  color: var(--foreground);
+}
+.new-chat-suggestions__prompt:hover:not(:disabled) .new-chat-suggestions__arrow,
+.new-chat-suggestions__prompt:focus-visible:not(:disabled) .new-chat-suggestions__arrow {
+  opacity: .85;
 }
 .new-chat-suggestions button:focus-visible {
   outline: 2px solid var(--ring);
@@ -118,22 +156,30 @@
 }
 .new-chat-suggestions__loading {
   display: grid;
-  gap: 18px;
-  padding: 16px 10px;
+  gap: 14px;
+  padding: 8px;
 }
 .new-chat-suggestions__skeleton {
-  width: 78%;
-  height: 20px;
+  position: relative;
+  width: 72%;
+  height: 18px;
+  overflow: hidden;
   border-radius: 4px;
-  background: linear-gradient(105deg, color-mix(in srgb, var(--foreground) 5%, transparent) 35%, color-mix(in srgb, var(--foreground) 9%, transparent) 50%, color-mix(in srgb, var(--foreground) 5%, transparent) 65%);
-  background-size: 200% 100%;
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+}
+.new-chat-suggestions__skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 25%, color-mix(in srgb, var(--foreground) 6%, transparent) 50%, transparent 75%);
+  transform: translate3d(-100%, 0, 0);
   animation: new-chat-suggestion-loading 2s ease-in-out infinite;
 }
-.new-chat-suggestions__skeleton:nth-child(2) { width: 92%; }
-.new-chat-suggestions__skeleton:nth-child(3) { width: 66%; }
+.new-chat-suggestions__skeleton:nth-child(2) { width: 84%; }
+.new-chat-suggestions__skeleton:nth-child(3) { width: 62%; }
 @keyframes new-chat-suggestion-loading {
-  from { background-position: 200% 0; }
-  to { background-position: -200% 0; }
+  from { transform: translate3d(-100%, 0, 0); }
+  to { transform: translate3d(100%, 0, 0); }
 }
 .dark .new-chat-heading {
   font-weight: 400;
@@ -165,11 +211,18 @@
     position: static;
     flex: none;
     order: -1;
-    margin: 0 0 24px;
+    margin: 0 0 22px;
     padding-inline: 0;
+  }
+  .new-chat-suggestions__header {
+    padding-inline: 8px;
   }
   .new-chat-suggestions__refresh {
     min-height: 44px;
+    margin-inline-end: 0;
+  }
+  .new-chat-suggestions__prompt {
+    min-height: 36px;
   }
   .new-chat-suggestions__prompt .new-chat-suggestions__arrow {
     opacity: .5;
@@ -179,10 +232,14 @@
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .new-chat-suggestions__prompt {
+  .new-chat-suggestions,
+  .new-chat-suggestions__refresh,
+  .new-chat-suggestions__prompt,
+  .new-chat-suggestions__prompt > svg {
     transition: none;
   }
-  .new-chat-suggestions__skeleton {
+  .new-chat-suggestions__skeleton,
+  .new-chat-suggestions__skeleton::after {
     animation: none;
   }
 }

@@ -17,7 +17,22 @@ export function supportedThinkingStops(modes: readonly string[], thinkingRequire
   return THINKING_STOPS.filter((stop) => stop.thinking === "off" ? !thinkingRequired : modes.includes(stop.thinking));
 }
 
-export function thinkingStopIndex(responseMode: string, thinkingMode: string, stops: readonly ThinkingStop[] = THINKING_STOPS): number {
+export interface EffortStop {
+  label: string;
+  thinking: ThinkingStop["thinking"];
+}
+
+/** Effort-only stops (used when response mode is configured separately). */
+export function thinkingEffortStops(modes: readonly string[], thinkingRequired = false): EffortStop[] {
+  return THINKING_STOPS
+    .filter((stop) => stop.thinking === "off" ? !thinkingRequired : modes.includes(stop.thinking))
+    .map((stop) => ({
+      thinking: stop.thinking,
+      label: stop.thinking === "off" ? "关闭" : stop.label,
+    }));
+}
+
+export function thinkingStopIndex(responseMode: string, thinkingMode: string, stops: readonly { thinking: string }[] = THINKING_STOPS): number {
   const mode = responseMode === "fast" ? "off" : thinkingMode;
   return Math.max(0, stops.findIndex((stop) => stop.thinking === mode));
 }
@@ -26,7 +41,7 @@ export function ThinkingSlider({ value, onChange, disabled, stops = THINKING_STO
   value: number;
   onChange: (index: number) => void;
   disabled?: boolean;
-  stops?: readonly ThinkingStop[];
+  stops?: readonly { label: string; thinking: string }[];
 }) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const lastIndexRef = useRef(value);
@@ -70,7 +85,7 @@ export function ThinkingSlider({ value, onChange, disabled, stops = THINKING_STO
           const next = event.key === "Home" ? 0 : event.key === "End" ? max
             : ["ArrowRight", "ArrowUp"].includes(event.key) ? current + 1
             : ["ArrowLeft", "ArrowDown"].includes(event.key) ? current - 1 : null;
-          if (next !== null) { event.preventDefault(); commit(next); }
+          if (next !== null) { event.preventDefault(); event.stopPropagation(); commit(next); }
         }}
       >
         <div className="thinking-slider__fill" style={{ width: `${pct}%` }} />
@@ -78,7 +93,16 @@ export function ThinkingSlider({ value, onChange, disabled, stops = THINKING_STO
         <div className="thinking-slider__thumb" style={{ left: `${pct}%` }} />
       </div>
       <div className="thinking-slider__labels">{stops.map((stop, index) => (
-        <span className={index === current ? "is-active" : ""} key={stop.thinking}>{stop.label}</span>
+        <button
+          type="button"
+          disabled={inactive}
+          className={`thinking-slider__label ${index === current ? "is-active" : ""}`}
+          key={stop.thinking}
+          onClick={() => commit(index)}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          {stop.label}
+        </button>
       ))}</div>
     </div>
   );

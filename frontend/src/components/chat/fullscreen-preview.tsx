@@ -119,10 +119,19 @@ export function FullscreenPreview({
   children,
   className,
   label,
+  hideExpand = false,
+  hidePause = false,
+  header,
+  onExpandedChange,
 }: {
   children: ReactNode;
   className?: string;
   label: string;
+  hideExpand?: boolean;
+  hidePause?: boolean;
+  /** Optional header slot rendered flush above the frame with runtime controls on the right. */
+  header?: ReactNode;
+  onExpandedChange?: (expanded: boolean) => void;
 }) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -257,6 +266,14 @@ export function FullscreenPreview({
   }
 
   const active = expanded || isFullscreen;
+  const onExpandedChangeRef = useRef(onExpandedChange);
+  useEffect(() => {
+    onExpandedChangeRef.current = onExpandedChange;
+  });
+
+  useEffect(() => {
+    onExpandedChangeRef.current?.(active);
+  }, [active]);
 
   // An expanded preview owns the canvas, so it must survive the card wall's
   // viewport band (the card's own box can scroll away while the top-layer
@@ -274,11 +291,26 @@ export function FullscreenPreview({
   // A preview that unmounts must not leave its group pinned forever.
   useEffect(() => () => pinRef.current?.(false), []);
 
+  const handleTogglePause = () => {
+    if (!paused) {
+      pause();
+      return;
+    }
+    // Play always means "this preview": it also claims playback from a
+    // group that currently holds every other preview paused.
+    activateRef.current?.();
+    resume();
+  };
+
+  const runtimePauseTooltip = paused
+    ? "恢复整个沙箱运行环境（动画、计时器与音频）"
+    : "暂停整个沙箱运行环境（动画、计时器与音频），区别于应用内部控制";
+
   return (
     <>
       <style>{`
-        .fullscreen-preview:fullscreen { display: flex; flex-direction: column; }
-        .fullscreen-preview:fullscreen > iframe { width: 100% !important; height: 100% !important; min-height: 100% !important; flex: 1; border: 0; border-radius: 0; }
+        .fullscreen-preview:fullscreen { display: flex; flex-direction: column; background: var(--background); }
+        .fullscreen-preview:fullscreen > iframe { width: 100% !important; height: auto !important; min-height: 0 !important; flex: 1 1 0; border: 0; border-radius: 0; }
         .fullscreen-preview--expanded {
           position: fixed;
           inset: 0;
@@ -303,11 +335,45 @@ export function FullscreenPreview({
         }
         .fullscreen-preview--expanded > iframe {
           width: 100% !important;
-          height: 100% !important;
+          height: auto !important;
           min-height: 0 !important;
-          flex: 1;
+          flex: 1 1 0;
           border: 0;
           border-radius: 0;
+        }
+        .fullscreen-preview__header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          min-width: 0;
+          flex: 0 0 auto;
+          padding: 7px 10px 7px 12px;
+          border-bottom: 1px solid var(--border);
+          background: var(--card);
+        }
+        .fullscreen-preview__header-lead {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          min-width: 0;
+          flex: 1 1 auto;
+        }
+        .fullscreen-preview__header-controls {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          flex: 0 0 auto;
+        }
+        .fullscreen-preview__runtime-btn {
+          gap: 4px;
+          padding-inline: 7px;
+          color: var(--muted-foreground);
+          font-size: 11px;
+          font-weight: 500;
+        }
+        .fullscreen-preview__runtime-btn[data-paused="true"] {
+          color: var(--foreground);
         }
       `}</style>
       <div
@@ -315,38 +381,67 @@ export function FullscreenPreview({
         popover={expanded ? "manual" : undefined}
         ref={wrapperRef}
       >
+        {header ? (
+          <div className="fullscreen-preview__header" data-preview-header="">
+            <div className="fullscreen-preview__header-lead">{header}</div>
+            <div className="fullscreen-preview__header-controls">
+              {!hidePause && (
+                <Button
+                  aria-label={paused ? `继续播放 ${label}` : `暂停播放 ${label}`}
+                  className="fullscreen-preview__runtime-btn"
+                  data-paused={paused ? "true" : "false"}
+                  data-preview-control=""
+                  onClick={handleTogglePause}
+                  size="xs"
+                  title={runtimePauseTooltip}
+                  type="button"
+                  variant={paused ? "secondary" : "ghost"}
+                >
+                  {paused ? <Play className="size-3.5" /> : <Pause className="size-3.5" />}
+                  <span>{paused ? "恢复运行" : "暂停运行"}</span>
+                </Button>
+              )}
+              {!hideExpand && (
+                <Button
+                  aria-label={active ? `退出 ${label} 放大预览` : `放大预览 ${label}`}
+                  data-preview-control=""
+                  onClick={() => void toggleExpand()}
+                  size="icon-xs"
+                  title={active ? "退出放大预览" : "放大预览"}
+                  type="button"
+                  variant="ghost"
+                >
+                  {active ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+                </Button>
+              )}
+            </div>
+          </div>
+        ) : null}
         {children}
-        <Button
+        {!header && !hideExpand && <Button
           aria-label={active ? `退出 ${label} 放大预览` : `放大预览 ${label}`}
           className="absolute right-2 top-2 z-20"
           data-preview-control=""
           onClick={() => void toggleExpand()}
           size="icon-sm"
+          title={active ? "退出放大预览" : "放大预览"}
           type="button"
           variant="ghost"
         >
           {active ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
-        </Button>
-        <Button
+        </Button>}
+        {!header && !hidePause && <Button
           aria-label={paused ? `继续播放 ${label}` : `暂停播放 ${label}`}
-          className="absolute right-11 top-2 z-20"
+          className={hideExpand ? "absolute right-2 top-2 z-20" : "absolute right-11 top-2 z-20"}
           data-preview-control=""
-          onClick={() => {
-            if (!paused) {
-              pause();
-              return;
-            }
-            // Play always means "this preview": it also claims playback from a
-            // group that currently holds every other preview paused.
-            activateRef.current?.();
-            resume();
-          }}
+          onClick={handleTogglePause}
           size="icon-sm"
+          title={runtimePauseTooltip}
           type="button"
           variant="ghost"
         >
           {paused ? <Play className="size-4" /> : <Pause className="size-4" />}
-        </Button>
+        </Button>}
       </div>
     </>
   );

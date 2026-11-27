@@ -116,6 +116,7 @@ class VoiceContextService:
             agent_id=VOICE_MEMORY_AGENT_ID,
             include_memory=False,
             include_history=False,
+            channel="voice",
         )
         history = [
             {

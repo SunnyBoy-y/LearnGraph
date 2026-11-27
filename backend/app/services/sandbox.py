@@ -2465,6 +2465,31 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             else:
                 return
         if result.get('status') in {'running','cancelling'}:
+            stdout_tail = result.get('stdout_tail') or ''
+            stderr_tail = result.get('stderr_tail') or ''
+            if isinstance(stdout_tail, str) and isinstance(stderr_tail, str) and (stdout_tail or stderr_tail):
+                from app.services.sandbox_live_output import (
+                    combine_live_shell_output,
+                    emit_live_output,
+                )
+
+                redacted_out = _redact_agent_text(stdout_tail, limit=8192)
+                redacted_err = _redact_agent_text(stderr_tail, limit=8192)
+                combined, is_truncated = combine_live_shell_output(
+                    redacted_out,
+                    redacted_err,
+                    truncated=bool(result.get('live_output_truncated')),
+                )
+                if combined:
+                    emit_live_output(
+                        {
+                            'execution_id': meta.get('execution_id'),
+                            'command_id': command.id,
+                            'output': combined,
+                            'truncated': is_truncated,
+                            'latency_ms': int(result.get('latency_ms') or 0),
+                        }
+                    )
             self.db.commit()
             return
         claimed = self.db.execute(update(SandboxAgentCommand).where(
@@ -2674,6 +2699,24 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             self._mark_session_failed(session)
             self.db.commit()
             raise AppError(502, "sandbox_execution_failed", "Sandbox file write failed") from exc
+        # Capture pre-image before mutating workspace_files so turn checkpoints
+        # can safely preview and rewind changes.
+        from app.services.sandbox_checkpoints import (
+            SandboxCheckpointService,
+            current_checkpoint_turn_id,
+        )
+
+        checkpoint_turn_id = current_checkpoint_turn_id()
+        checkpoint_svc = (
+            SandboxCheckpointService(self.db, self.workspace_id, self.actor_id, self.settings)
+            if checkpoint_turn_id
+            else None
+        )
+        existed_before, pre_sha, pre_size = (
+            checkpoint_svc.capture_before_state(payload.chat_session_id, path)
+            if checkpoint_svc is not None
+            else (False, None, 0)
+        )
         # Dual-write into the content-addressed session workspace (two-layer store).
         role = "output" if path.startswith("outputs/") else "work"
         workspace_view = self.workspace_files.put_bytes(
@@ -2685,6 +2728,17 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             source="agent_write",
             publish_file=path.startswith("outputs/"),
         )
+        if checkpoint_svc is not None and checkpoint_turn_id:
+            checkpoint_svc.record_mutation(
+                chat_session_id=payload.chat_session_id,
+                turn_id=checkpoint_turn_id,
+                path=path,
+                existed_before=existed_before,
+                pre_blob_sha256=pre_sha,
+                pre_size_bytes=pre_size,
+                post_blob_sha256=workspace_view.get("blob_sha256"),
+                post_size_bytes=len(data),
+            )
         session.status = "ready"
         self._touch_session(session)
         session.lifecycle_state = "WARM_IDLE"
@@ -3316,11 +3370,38 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
         except (SandboxBackendUnavailable, SandboxBackendError) as exc:
             if was_live:
                 raise AppError(503, "sandbox_backend_unavailable", "Active workspace file could not be deleted") from exc
+        from app.services.sandbox_checkpoints import (
+            SandboxCheckpointService,
+            current_checkpoint_turn_id,
+        )
+
+        checkpoint_turn_id = current_checkpoint_turn_id()
+        checkpoint_svc = (
+            SandboxCheckpointService(self.db, self.workspace_id, self.actor_id, self.settings)
+            if checkpoint_turn_id
+            else None
+        )
+        existed_before, pre_sha, pre_size = (
+            checkpoint_svc.capture_before_state(payload.chat_session_id, path)
+            if checkpoint_svc is not None
+            else (False, None, 0)
+        )
         try:
             self.workspace_files.delete_entry(payload.chat_session_id, path)
         except AppError as exc:
             if exc.code != "session_workspace_entry_not_found":
                 raise
+        if checkpoint_svc is not None and checkpoint_turn_id and existed_before:
+            checkpoint_svc.record_mutation(
+                chat_session_id=payload.chat_session_id,
+                turn_id=checkpoint_turn_id,
+                path=path,
+                existed_before=True,
+                pre_blob_sha256=pre_sha,
+                pre_size_bytes=pre_size,
+                post_blob_sha256=None,
+                post_size_bytes=0,
+            )
         session.status = "ready"
         self._touch_session(session)
         session.lifecycle_state = "WARM_IDLE"
@@ -4175,6 +4256,11 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                                 "description": "Optional inline UTF-8 text. Omit for binary or already-existing files - the backend reads the file from the workspace/container.",
                             },
                             "title": {"type": "string"},
+                            "display_mode": {
+                                "type": "string",
+                                "enum": ["inline", "artifact"],
+                                "description": "Optional presentation mode: 'inline' embeds visual content directly into answer prose; 'artifact' (default) renders a standalone file viewer card.",
+                            },
                             "sandbox_session_id": session_property,
                         },
                         "required": ["path"],
@@ -4791,7 +4877,7 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
             if name == "sandbox_publish_image":
                 return self.publish_image(SandboxAgentImagePublishRequest.model_validate(payload))
             if name == "sandbox_publish_file":
-                return self.publish_workspace_file(
+                published = self.publish_workspace_file(
                     chat_session_id=chat_session_id,
                     path=str(payload.get("path") or ""),
                     content=payload.get("content") if isinstance(payload.get("content"), str) else None,
@@ -4800,6 +4886,14 @@ class SandboxAgentWorkspaceService(SandboxToolkitMixin):
                     if isinstance(payload.get("sandbox_session_id"), str)
                     else None,
                 )
+                raw_display_mode = payload.get("display_mode")
+                if (
+                    isinstance(raw_display_mode, str)
+                    and raw_display_mode.strip().lower() in {"inline", "artifact"}
+                    and isinstance(published, dict)
+                ):
+                    published = {**published, "display_mode": raw_display_mode.strip().lower()}
+                return published
             # ── Sandbox toolkit (bash / todo / patch / git / search / fetch /
             #    subagent / skills / notebook) ──────────────────────────────
             if name == "sandbox_bash":

@@ -58,13 +58,13 @@ const statusLabels: Record<ToolPart["state"], string> = {
 };
 
 const statusIcons: Record<ToolPart["state"], ReactNode> = {
-  "approval-requested": <ClockIcon className="size-3.5 text-yellow-600" />,
-  "approval-responded": <CheckCircleIcon className="size-3.5 text-blue-600" />,
+  "approval-requested": <ClockIcon className="size-3.5 text-amber-600 dark:text-amber-400" />,
+  "approval-responded": <CheckCircleIcon className="size-3.5 text-blue-600 dark:text-blue-400" />,
   "input-available": <ClockIcon className="size-3.5" />,
   "input-streaming": <CircleIcon className="size-3.5" />,
-  "output-available": <CheckCircleIcon className="size-3.5 text-green-600" />,
-  "output-denied": <XCircleIcon className="size-3.5 text-orange-600" />,
-  "output-error": <XCircleIcon className="size-3.5 text-red-600" />,
+  "output-available": <CheckCircleIcon className="size-3.5 text-emerald-600 dark:text-emerald-400" />,
+  "output-denied": <XCircleIcon className="size-3.5 text-orange-600 dark:text-orange-400" />,
+  "output-error": <XCircleIcon className="size-3.5 text-red-600 dark:text-red-400" />,
 };
 
 const getStatusBadge = (status: ToolPart["state"], taskKey: string) => (

@@ -9,7 +9,7 @@
   border-radius: 9999px;
   padding: 2px 7px;
   background: #f3f3f3;
-  color: #737373;
+  color: #595959;
   font-family: inherit;
   font-size: 11px;
   font-weight: 400;
@@ -69,17 +69,17 @@
 }
 a.citation-source-item:hover { background: #f8f8f8; }
 a.citation-source-item:focus-visible { outline: 2px solid #a3a3a3; outline-offset: 1px; }
-.citation-source-header { display: flex; align-items: center; gap: 8px; color: #777; font-size: 13px; font-weight: 400; line-height: 20px; }
+.citation-source-header { display: flex; align-items: center; gap: 8px; color: #5c5c5c; font-size: 13px; font-weight: 400; line-height: 20px; }
 .citation-source-header .citation-favicon { width: 16px; height: 16px; }
 .citation-source-header > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .citation-source-title { display: -webkit-box; overflow: hidden; margin-top: 8px; color: #242424; font-size: 15px; font-weight: 400; line-height: 1.45; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
-.citation-source-meta { display: block; margin-top: 8px; color: #858585; font-size: 13px; line-height: 1.45; }
+.citation-source-meta { display: block; margin-top: 8px; color: #5c5c5c; font-size: 13px; line-height: 1.45; }
 .dark .citation-pill { background: var(--bg-dialog); color: var(--text-secondary); }
 .dark .citation-pill:hover, .dark .citation-pill[data-state="open"] { background: var(--bg-hover); color: var(--text-primary); }
 .dark .citation-pill:focus-visible, .dark a.citation-source-item:focus-visible { outline-color: var(--focus-ring); }
 .dark .citation-hover-card[data-slot="popover-content"] { border-color: var(--border-subtle); background: var(--bg-dialog); color: var(--text-primary); }
 .dark a.citation-source-item:hover { background: var(--bg-hover); }
-.dark .citation-source-item + .citation-source-item::before { background: var(--border-subtle); }
+.dark .citation-source-item + .citation-source-item::before { border-top-color: var(--border-subtle); }
 .dark .citation-source-title { color: var(--text-primary); }
 .dark .citation-source-header, .dark .citation-source-meta { color: var(--text-secondary); }
 @keyframes citation-card-in {

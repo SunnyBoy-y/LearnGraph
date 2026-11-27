@@ -1,4 +1,4 @@
-import { apiClient } from './client'
+import { apiClient, type ApiRequestOptions } from './client'
 import type { ActionItem, CompositeDraft, DeleteImpact, Project, ProjectCreate, Roadmap, RoadmapItemInsertRequest, RoadmapItemRescheduleRequest, RoadmapRejectRequest, RoadmapVersion, SourceLink, SourceRecord, SourceTargetType } from '@/types/workflow'
 import type { ActionResponse } from '@/types/common'
 import type { Session } from '@/types/sessions'
@@ -10,13 +10,13 @@ export const openGraphFolder = (graphId: string) => apiClient.post<Project>(`/gr
 export const updateProject = (id: string, payload: Partial<ProjectCreate & { position: number }>) => apiClient.patch<Project, typeof payload>(`/projects/${encodeURIComponent(id)}`, payload)
 export const archiveProject = (id: string) => apiClient.post<Project>(`/projects/${encodeURIComponent(id)}/archive`)
 export const restoreProject = (id: string) => apiClient.post<Project>(`/projects/${encodeURIComponent(id)}/restore`)
-export const getProjectDeleteImpact = (id: string) => apiClient.get<DeleteImpact>(`/projects/${encodeURIComponent(id)}/delete-impact`)
-export const deleteProject = (id: string, confirmation_text: string) => apiClient.post(`/projects/${encodeURIComponent(id)}/delete`, { confirmation_text })
+export const getProjectDeleteImpact = (id: string, options?: ApiRequestOptions) => apiClient.get<DeleteImpact>(`/projects/${encodeURIComponent(id)}/delete-impact`, options)
+export const deleteProject = (id: string, confirmation_text: string, options?: ApiRequestOptions) => apiClient.post(`/projects/${encodeURIComponent(id)}/delete`, { confirmation_text }, options)
 export const assignSessionProject = (sessionId: string, projectId: string | null) => apiClient.put(`/sessions/${encodeURIComponent(sessionId)}/project`, { project_id: projectId })
 export const archiveSession = (id: string) => apiClient.post<Session>(`/sessions/${encodeURIComponent(id)}/archive`)
 export const restoreSession = (id: string) => apiClient.post<Session>(`/sessions/${encodeURIComponent(id)}/restore`)
-export const getSessionDeleteImpact = (id: string) => apiClient.get<DeleteImpact>(`/sessions/${encodeURIComponent(id)}/delete-impact`)
-export const deleteSession = (id: string, confirmation_text: string) => apiClient.post(`/sessions/${encodeURIComponent(id)}/delete`, { confirmation_text })
+export const getSessionDeleteImpact = (id: string, options?: ApiRequestOptions) => apiClient.get<DeleteImpact>(`/sessions/${encodeURIComponent(id)}/delete-impact`, options)
+export const deleteSession = (id: string, confirmation_text: string, options?: ApiRequestOptions) => apiClient.post(`/sessions/${encodeURIComponent(id)}/delete`, { confirmation_text }, options)
 export const fetchSource = (url: string) => { const host = new URL(url).hostname; return apiClient.post<SourceRecord, { url: string; authorized_domains: string[] }>('/sources/fetch', { url, authorized_domains: [host] }) }
 export const listSourceRecords = () => apiClient.get<SourceRecord[]>('/sources')
 export const getSourceRecord = (sourceId: string) => apiClient.get<SourceRecord>(`/sources/${encodeURIComponent(sourceId)}`)
@@ -25,7 +25,7 @@ export const getSourceDeleteImpact = (sourceId: string) => apiClient.get<DeleteI
 export const deleteSourceConfirmed = (sourceId: string, confirmationText: string) => apiClient.post<ActionResponse, { confirmation_text: string }>(`/sources/${encodeURIComponent(sourceId)}/delete`, { confirmation_text: confirmationText })
 export const createSourceLink = (sourceId: string, target_type: SourceTargetType, target_id: string) => apiClient.post<SourceLink, { target_type: SourceTargetType; target_id: string; relation: string }>(`/sources/${encodeURIComponent(sourceId)}/links`, { target_type, target_id, relation: 'reference' })
 export const listActions = () => apiClient.get<ActionItem[]>('/actions')
-export const createAction = (title: string, graphId?: string) => apiClient.post<ActionItem, { title: string; graph_id?: string }>('/actions', { title, graph_id: graphId })
+export const createAction = (title: string, graphId?: string, dueAt?: string) => apiClient.post<ActionItem, { title: string; graph_id?: string; due_at?: string }>('/actions', { title, graph_id: graphId, due_at: dueAt })
 export const updateAction = (id: string, payload: Partial<Pick<ActionItem, 'title' | 'description' | 'status' | 'due_at' | 'priority' | 'position'>>) => apiClient.patch<ActionItem, typeof payload>(`/actions/${encodeURIComponent(id)}`, payload)
 export const createCompositeDraft = (target_message_id: string, source_version_ids: string[]) => apiClient.post<CompositeDraft, { target_message_id: string; source_version_ids: string[] }>('/message-composites', { target_message_id, source_version_ids })
 export const confirmCompositeDraft = (id: string) => apiClient.post<CompositeDraft>(`/message-composites/${encodeURIComponent(id)}/confirm`)

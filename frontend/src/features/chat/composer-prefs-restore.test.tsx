@@ -110,11 +110,11 @@ describe("composer preference restoration", () => {
     await waitFor(() => expect(apiClient.postSse).toHaveBeenCalledTimes(1));
     expect(vi.mocked(apiClient.postSse).mock.calls[0][1]).toMatchObject({ agent_mode: true, thinking_mode: "high" });
     fireEvent.pointerDown(modeTrigger(), { button: 0, pointerType: "mouse", ctrlKey: false });
-    const slider = await screen.findByRole("slider");
-    vi.spyOn(slider, "getBoundingClientRect").mockReturnValue({ left: 0, width: 400 } as DOMRect);
-    fireEvent.pointerDown(slider, { clientX: 0, pointerId: 1 });
-    fireEvent.pointerUp(slider, { pointerId: 1 });
-    fireEvent.keyDown(slider, { key: "Escape" });
+    const modeRow = await screen.findByRole("menuitem", { name: /^响应模式/ });
+    fireEvent.click(modeRow);
+    const fastOption = await screen.findByRole("menuitemradio", { name: "极速" });
+    fireEvent.click(fastOption);
+    fireEvent.keyDown(fastOption, { key: "Escape" });
     await waitFor(() => expect(modeTrigger()).toHaveTextContent("极速"));
     await act(async () => { view.queryClient.setQueryData(sessionsKey, records.map(record => ({ ...record, title: "刷新" }))); });
     await send("继续刚才的西瓜，画个简单示意图");
@@ -183,11 +183,11 @@ describe("composer preference restoration", () => {
     await waitFor(() => expect(modeTrigger()).toHaveTextContent("极速"));
     await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith("/providers/provider-1/models"));
     fireEvent.pointerDown(modeTrigger(), { button: 0, pointerType: "mouse", ctrlKey: false });
-    const slider = await screen.findByRole("slider");
-    vi.spyOn(slider, "getBoundingClientRect").mockReturnValue({ left: 0, width: 400 } as DOMRect);
-    fireEvent.pointerDown(slider, { clientX: 200, pointerId: 1 });
-    fireEvent.pointerUp(slider, { pointerId: 1 });
-    fireEvent.keyDown(slider, { key: "Escape" });
+    const modeRow = await screen.findByRole("menuitem", { name: /^响应模式/ });
+    fireEvent.click(modeRow);
+    const agentOption = await screen.findByRole("menuitemradio", { name: "智能体" });
+    fireEvent.click(agentOption);
+    fireEvent.keyDown(agentOption, { key: "Escape" });
     await waitFor(() => expect(getSessionComposerPrefs("active")).toMatchObject({ responseMode: "agentic", thinkingMode: "medium" }));
     await act(async () => {
       view.queryClient.setQueryData(sessionsKey, records.map((record) => ({ ...record, title: "刷新后的标题" })));

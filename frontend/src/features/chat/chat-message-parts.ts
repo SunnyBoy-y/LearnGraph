@@ -309,18 +309,35 @@ export function placeRichResponseParts(parts: MessagePart[]): MessagePart[] {
   if (!byBlock.size) return parts;
   const moved = new Set<string>();
   const expanded = parts.flatMap(part => {
-    if (part.type !== "text" || !part.content?.includes("[[artifact:block_id:")) return [{ part, placed: false }];
+    const text = part.content;
+    if (part.type !== "text" || !text || !/\[\[\s*artifact\s*:\s*block_id\s*:/i.test(text)) return [{ part, placed: false }];
     const result: { part: MessagePart; placed: boolean }[] = [];
     let offset = 0;
-    for (const match of part.content.matchAll(/\[\[artifact:block_id:([a-zA-Z0-9_-]+)\]\]/g)) {
+    for (const match of text.matchAll(/\[\[\s*artifact\s*:\s*block_id\s*:\s*([a-zA-Z0-9_-]+)((?:\s*\|\s*[a-z_]+\s*=\s*[a-z0-9_-]+)*)\s*\]\]/gi)) {
       const block = byBlock.get(match[1]);
       if (!block || moved.has(block.id)) continue;
       const start = match.index!;
-      if (start > offset) result.push({ part: { ...part, id: offset ? `${part.id}:rich:${offset}` : part.id, content: part.content.slice(offset, start), content_delta: undefined }, placed: false });
-      result.push({ part: block, placed: true }); moved.add(block.id); offset = start + match[0].length;
+      if (start > offset) result.push({ part: { ...part, id: offset ? `${part.id}:rich:${offset}` : part.id, content: text.slice(offset, start), content_delta: undefined }, placed: false });
+      const rawOpts = match[2] ?? "";
+      let nextBlock = block;
+      if (rawOpts) {
+        const modeMatch = /\|\s*mode\s*=\s*(inline|artifact)/i.exec(rawOpts);
+        const layoutMatch = /\|\s*layout\s*=\s*(inline|block|side)/i.exec(rawOpts);
+        if (modeMatch || layoutMatch) {
+          nextBlock = {
+            ...block,
+            data: {
+              ...(block.data ?? {}),
+              ...(layoutMatch ? { layout: layoutMatch[1].toLowerCase() } : {}),
+              ...(modeMatch ? { display_mode: modeMatch[1].toLowerCase() } : {}),
+            },
+          };
+        }
+      }
+      result.push({ part: nextBlock, placed: true }); moved.add(block.id); offset = start + match[0].length;
     }
     if (!offset) return [{ part, placed: false }];
-    if (offset < part.content.length) result.push({ part: { ...part, id: `${part.id}:rich:${offset}`, content: part.content.slice(offset), content_delta: undefined }, placed: false });
+    if (offset < text.length) result.push({ part: { ...part, id: `${part.id}:rich:${offset}`, content: text.slice(offset), content_delta: undefined }, placed: false });
     return result;
   });
   // Only the inserted occurrences survive, regardless of original ordinals.

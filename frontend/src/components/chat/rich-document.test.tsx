@@ -209,4 +209,42 @@ describe("rich document in the existing message lane", () => {
     expect(appended.map(part => part.id)).toEqual(placed.map(part => part.id));
     expect(appended[0].content).toBe("前文");
   });
+
+  it("composes headings, columns, cards, multiple independent SVGs, captions, and dividers in one Stream UI document", async () => {
+    const svgBefore = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180"><rect x="10" y="10" width="300" height="160" fill="#ffffff" stroke="#d1d5db"/><rect x="90" y="40" width="140" height="80" fill="#dbeafe"/></svg>';
+    const svgAfter = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180"><rect x="10" y="10" width="300" height="160" fill="#ffffff" stroke="#d1d5db"/><rect x="24" y="40" width="272" height="90" fill="#dcfce7"/></svg>';
+    const { container } = render(<StreamUI partId="composable-svg-doc" data={snapshot([
+      { id: "title", type: "heading", level: 2, text: "修改前后的布局对比" },
+      { id: "cols", type: "columns", columns: 2 },
+      { id: "left", parent_id: "cols", type: "card", label: "修改前" },
+      { id: "svg1", parent_id: "left", type: "svg", alt: "修改前示意", svg: svgBefore },
+      { id: "cap1", parent_id: "left", type: "caption", text: "卡片过窄，两侧空间浪费。" },
+      { id: "right", parent_id: "cols", type: "column", label: "修改后" },
+      { id: "svg2", parent_id: "right", type: "svg", alt: "修改后示意", svg: svgAfter },
+      { id: "cap2", parent_id: "right", type: "caption", text: "充分利用宽度，统一表单边界。" },
+      { id: "sep", type: "divider" },
+      { id: "note", type: "caption", text: "上方由标题、双列布局、两个独立 SVG 和说明文字共同组成。" },
+    ], 1)} />);
+
+    expect(await screen.findByRole("heading", { level: 2, name: "修改前后的布局对比" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "修改前示意" })).toHaveAttribute("viewBox", "0 0 320 180");
+    expect(screen.getByRole("img", { name: "修改后示意" })).toHaveAttribute("viewBox", "0 0 320 180");
+    expect(screen.getByText("卡片过窄，两侧空间浪费。")).toBeInTheDocument();
+    expect(screen.getByText("充分利用宽度，统一表单边界。")).toBeInTheDocument();
+    expect(screen.getByText("上方由标题、双列布局、两个独立 SVG 和说明文字共同组成。")).toBeInTheDocument();
+    expect(container.querySelectorAll(".rich-svg-figure[data-display-mode='inline']")).toHaveLength(2);
+    expect(container.querySelector(".rich-doc__card")).toBeInTheDocument();
+    expect(container.querySelector(".rich-doc__column")).toBeInTheDocument();
+    expect(container.querySelector("hr")).toBeInTheDocument();
+
+    // Floating source toggle works independently per SVG inside the same document.
+    await userEvent.click(screen.getByRole("button", { name: "查看源码 修改前示意" }));
+    expect(screen.getByRole("button", { name: "预览 修改前示意" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "修改后示意" })).toBeInTheDocument();
+
+    // Unsafe SVG markup inside a document svg node is rejected by schema validation.
+    expect(parseUISnapshot(snapshot([
+      { id: "unsafe", type: "svg", svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><script>alert(1)</script><rect width="10" height="10"/></svg>' },
+    ]))).toBeNull();
+  });
 });

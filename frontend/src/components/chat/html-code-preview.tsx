@@ -142,8 +142,12 @@ export function HtmlCodePreview({
         >
           {hasCode ? (
             <SandboxedHtmlFrame
+              autoHeight
               className="html-code-preview__iframe"
+              heightMode="bounded"
               html={code}
+              initialHeight={280}
+              maxHeight={640}
               title={title}
             />
           ) : (

@@ -12,13 +12,13 @@ _ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,100}$")
 _RESERVED_IDS = {"__proto__", "prototype", "constructor"}
 
 _LAYOUT_TYPES = {
-    "section", "stack", "row", "columns", "grid", "media_text",
+    "section", "stack", "row", "column", "columns", "grid", "card", "media_text",
     "tabs", "accordion", "figure", "feature_list", "step_list", "status_list",
 }
 _VISUAL_TYPES = {"chart", "table", "graph", "diagram", "timeline", "metric"}
 _CONTENT_TYPES = {
-    "paragraph", "heading", "list", "quote", "code", "math", "divider",
-    "image", "image_group", "gallery", "simulation", "interactive",
+    "paragraph", "heading", "caption", "list", "quote", "code", "math", "divider",
+    "image", "image_group", "gallery", "svg", "simulation", "interactive",
     "rail_item", "icon",
 }
 _ALL_NODE_TYPES = _LAYOUT_TYPES | _VISUAL_TYPES | _CONTENT_TYPES
@@ -31,7 +31,7 @@ _ALLOWED_NODE_ATTRS = {
     "id", "parent", "parent_id", "text", "label", "level", "columns",
     "align", "width", "weight", "image_variant", "fit",
     "language", "query", "query_alternatives", "alt",
-    "caption", "engine", "inline", "values", "icon", "item_status",
+    "caption", "svg", "display_mode", "engine", "inline", "values", "icon", "item_status",
     # Visual props shorthand on chart/table/graph/timeline/metric nodes
     "title", "description", "chart_type", "unit", "source_note",
     "data_kind", "time_range", "interaction", "background", "graph_layout",
@@ -556,6 +556,8 @@ class ExpressUIParser:
                     node.setdefault("text", _unescape_text(content))
             elif node_type in {"image", "image_group", "gallery"}:
                 node.setdefault("query", _unescape_text(content))
+            elif node_type == "svg":
+                node.setdefault("svg", _unescape_text(content))
             elif node_type == "icon":
                 node.setdefault("icon", content)
             else:
@@ -598,6 +600,8 @@ class ExpressUIParser:
         snapshot = compile_command(mount)
         if not any(
             node.text.strip()
+            or (node.type == "caption" and bool(node.caption.strip()))
+            or (node.type == "svg" and bool(node.svg))
             or (node.type in {"image", "image_group", "gallery"} and (node.query or node.fallback_svg))
             or node.type in {"simulation", "interactive", "icon"}
             or (node.visual and any(node.visual.get(key) for key in ("rows", "nodes", "items")))

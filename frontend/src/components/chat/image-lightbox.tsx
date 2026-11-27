@@ -60,10 +60,11 @@ const TAP_SLOP = 24;
 
 type Point = { x: number; y: number };
 
-/** 双指手势起点快照：距离、中点与当时的变换。 */
+/** 双指手势起点快照：距离、中点、未平移舞台中心与当时的变换。 */
 type PinchState = {
   distance: number;
   midpoint: Point;
+  unpannedCenter: Point;
   scale: number;
   offset: Point;
 };
@@ -118,6 +119,8 @@ export function ImageLightbox({
 }) {
   const imageRef = useRef<HTMLImageElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const percentRef = useRef<HTMLSpanElement | null>(null);
+  const stageSizeRef = useRef<{ width: number; height: number } | null>(null);
   // Radix 的 DialogContent 会晚一拍才挂上节点：只用 ref 的话首次 effect 里
   // 还是 null，而依赖不变就不会再跑，滚轮监听会永远绑不上。
   // 用回调 ref 把节点同步进 state，让监听随节点就位。
@@ -145,18 +148,37 @@ export function ImageLightbox({
    * 到边即止，不会把图拖出可视区。
    */
   const offsetBounds = useCallback((nextScale: number): Point => {
-    const stage = stageRef.current;
-    if (!stage) return { x: 0, y: 0 };
-    const width = stage.offsetWidth;
-    const height = stage.offsetHeight;
+    const cached = stageSizeRef.current;
+    let width = cached?.width ?? 0;
+    let height = cached?.height ?? 0;
+    if (!width || !height) {
+      const stage = stageRef.current;
+      if (!stage) return { x: 0, y: 0 };
+      width = stage.offsetWidth;
+      height = stage.offsetHeight;
+    }
     return {
       x: Math.max(0, (width * nextScale - width) / 2),
       y: Math.max(0, (height * nextScale - height) / 2),
     };
   }, []);
 
+  const syncDomTransform = useCallback((nextScale: number, nextOffset: Point) => {
+    const stage = stageRef.current;
+    if (stage) {
+      stage.style.transform = `translate(${nextOffset.x}px, ${nextOffset.y}px) scale(${nextScale})`;
+      stage.classList.toggle("is-zoomed", nextScale > 1);
+    }
+    const percentNode = percentRef.current;
+    if (percentNode) {
+      const pct = Math.round(nextScale * 100);
+      percentNode.textContent = `${pct}%`;
+      percentNode.setAttribute("aria-label", `当前缩放 ${pct}%`);
+    }
+  }, []);
+
   const apply = useCallback(
-    (nextScale: number, nextOffset: Point) => {
+    (nextScale: number, nextOffset: Point, options?: { directOnly?: boolean }) => {
       const bounds = offsetBounds(nextScale);
       const clamped = {
         x: Math.min(bounds.x, Math.max(-bounds.x, nextOffset.x)),
@@ -164,10 +186,14 @@ export function ImageLightbox({
       };
       scaleRef.current = nextScale;
       offsetRef.current = clamped;
+      if (options?.directOnly) {
+        syncDomTransform(nextScale, clamped);
+        return;
+      }
       setScale(nextScale);
       setOffset(clamped);
     },
-    [offsetBounds],
+    [offsetBounds, syncDomTransform],
   );
 
   const reset = useCallback(() => apply(1, { x: 0, y: 0 }), [apply]);
@@ -265,11 +291,27 @@ export function ImageLightbox({
     surface?.setPointerCapture?.(event.pointerId);
     pointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
 
+    const stage = stageRef.current;
+    if (stage && pointersRef.current.size === 1) {
+      stageSizeRef.current = { width: stage.offsetWidth, height: stage.offsetHeight };
+    }
+
     if (pointersRef.current.size === 2) {
       const [first, second] = [...pointersRef.current.values()];
+      const rect = stage?.getBoundingClientRect();
+      const unpannedCenter = rect
+        ? {
+            x: rect.left + rect.width / 2 - offsetRef.current.x,
+            y: rect.top + rect.height / 2 - offsetRef.current.y,
+          }
+        : { x: 0, y: 0 };
+      if (stage) {
+        stageSizeRef.current = { width: stage.offsetWidth, height: stage.offsetHeight };
+      }
       pinchRef.current = {
         distance: distanceBetween(first, second),
         midpoint: midpointOf(first, second),
+        unpannedCenter,
         scale: scaleRef.current,
         offset: offsetRef.current,
       };
@@ -297,22 +339,23 @@ export function ImageLightbox({
       const spread = distanceBetween(first, second);
       const next = clampScale(pinch.scale * (spread / (pinch.distance || 1)));
       const center = midpointOf(first, second);
-      const stage = stageRef.current;
-      if (!stage) return;
-      const rect = stage.getBoundingClientRect();
-      // 与滚轮相同，两个中点都使用未平移中心作为坐标原点。
+      // 与滚轮相同，两个中点都使用未平移中心作为坐标原点（起点已缓存，避免每帧强制回流）。
       const toLocal = (point: Point): Point => ({
-        x: point.x - (rect.left + rect.width / 2) + offsetRef.current.x,
-        y: point.y - (rect.top + rect.height / 2) + offsetRef.current.y,
+        x: point.x - pinch.unpannedCenter.x,
+        y: point.y - pinch.unpannedCenter.y,
       });
       // 双指中点下的像素保持跟随：起始中点 m0 与当前中点 m1 共同决定平移量。
       const m0 = toLocal(pinch.midpoint);
       const m1 = toLocal(center);
       const k = next / pinch.scale;
-      apply(next, {
-        x: m1.x - k * (m0.x - pinch.offset.x),
-        y: m1.y - k * (m0.y - pinch.offset.y),
-      });
+      apply(
+        next,
+        {
+          x: m1.x - k * (m0.x - pinch.offset.x),
+          y: m1.y - k * (m0.y - pinch.offset.y),
+        },
+        { directOnly: true },
+      );
       return;
     }
 
@@ -320,9 +363,16 @@ export function ImageLightbox({
     if (!drag || drag.pointerId !== event.pointerId) return;
     const dx = event.clientX - drag.origin.x;
     const dy = event.clientY - drag.origin.y;
+    const wasMoved = drag.moved > 2;
     drag.moved = Math.max(drag.moved, Math.hypot(dx, dy));
-    if (drag.moved > 2) setDragging(true);
-    apply(scaleRef.current, { x: drag.offset.x + dx, y: drag.offset.y + dy });
+    if (!wasMoved && drag.moved > 2) {
+      stageRef.current?.classList.add("is-dragging");
+    }
+    apply(
+      scaleRef.current,
+      { x: drag.offset.x + dx, y: drag.offset.y + dy },
+      { directOnly: true },
+    );
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -341,7 +391,11 @@ export function ImageLightbox({
         const last = lastTapRef.current;
         if (last && now - last.at <= DOUBLE_TAP_MS && distanceBetween(last.point, point) <= TAP_SLOP) {
           lastTapRef.current = null;
+          stageSizeRef.current = null;
+          stageRef.current?.classList.remove("is-dragging");
+          setDragging(false);
           reset();
+          return;
         } else {
           lastTapRef.current = { at: now, point };
         }
@@ -349,7 +403,13 @@ export function ImageLightbox({
         lastTapRef.current = null;
       }
     }
-    if (pointersRef.current.size === 0) setDragging(false);
+    if (pointersRef.current.size === 0) {
+      stageSizeRef.current = null;
+      stageRef.current?.classList.remove("is-dragging");
+      setDragging(false);
+      setScale(scaleRef.current);
+      setOffset(offsetRef.current);
+    }
   };
 
   const zoomsIn = scale < MAX_SCALE - 1e-6;
@@ -404,6 +464,7 @@ export function ImageLightbox({
             <span
               aria-label={`当前缩放 ${Math.round(scale * 100)}%`}
               className="chat-image-lightbox__percent"
+              ref={percentRef}
             >
               {Math.round(scale * 100)}%
             </span>

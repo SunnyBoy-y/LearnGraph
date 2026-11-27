@@ -7,7 +7,8 @@ import { QuestionSetPager, groupAnswerParts } from "@/components/chat/question-s
 import { SandboxImageStrip } from "@/components/chat/sandbox-image-artifact";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
-import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
+import { MessageReading } from "@/components/chat/message-reading";
+import { StreamStatsAction, StreamStatsBadge } from "@/components/chat/stream-stats-badge";
 import { Button } from "@/components/ui/button";
 import { InputGroup } from "@/components/ui/input-group";
 import { Textarea } from "@/components/ui/textarea";
@@ -44,12 +45,15 @@ function RailMessageContent({
     boundary: message.finalAnswerStarted,
     live: message.status === "streaming",
   });
+  const messageSettled =
+    message.status !== "streaming" && message.status !== "pending";
   const renderPart = (part: MessagePart) => (
     <ChatStreamPartRenderer
-      interactive={message.status !== "streaming"}
+      interactive={messageSettled}
       key={part.id}
       onAction={onAction}
       part={part}
+      settled={messageSettled}
       siblingParts={parts}
       streaming={
         message.status === "streaming" &&
@@ -102,11 +106,11 @@ function RailMessageContent({
       if (group.kind === "side_pair") {
         return (
           <div
-            className="grid gap-3 sm:grid-cols-2 sm:items-start"
+            className="grid min-w-0 gap-3 sm:grid-cols-2 sm:items-start"
             key={`side-pair-${group.artifact.id}`}
           >
-            <div>{renderPart(group.text)}</div>
-            <div>{renderPart(group.artifact)}</div>
+            <div className="min-w-0">{renderPart(group.text)}</div>
+            <div className="min-w-0">{renderPart(group.artifact)}</div>
           </div>
         );
       }
@@ -115,8 +119,7 @@ function RailMessageContent({
 
   return (
     <div className="right-rail-rich-message__content">
-      {displaySegments.map(segment =>
-        segment.kind === "chain" ? (
+      <MessageReading process={displaySegments.filter(segment => segment.kind === "chain").map(segment => (
           <div className="right-rail-rich-message__chain" key={`chain-${message.id}`}>
             <ThinkingChain
               chainParts={segment.parts}
@@ -124,15 +127,7 @@ function RailMessageContent({
               defaultOpen={thinkingChainDefaultOpen}
               finalAnswerStarted={Boolean(message.finalAnswerStarted)}
               messageStatus={message.status}
-              startedAt={
-                typeof message.provider_trace.generation_started_at === "string"
-                  ? message.provider_trace.generation_started_at
-                  : message.created_at
-              }
-              thinkingDurationMs={message.finalAnswerStarted?.thinkingDurationMs}
-              toolCallCount={toolCallCount(parts)}
-            >
-              {segment.parts.map((part) =>
+              renderPart={(part) =>
                 isReasoningTextPart(part) ? (
                   <ReasoningSummaryRow
                     key={part.id}
@@ -141,16 +136,24 @@ function RailMessageContent({
                   />
                 ) : (
                   renderPart(part)
-                ),
-              )}
-            </ThinkingChain>
+                )
+              }
+              startedAt={
+                typeof message.provider_trace.generation_started_at === "string"
+                  ? message.provider_trace.generation_started_at
+                  : message.created_at
+              }
+              thinkingDurationMs={message.finalAnswerStarted?.thinkingDurationMs}
+              toolCallCount={toolCallCount(parts)}
+            />
           </div>
-        ) : (
-          <div className="message-answer-segment" key={`answer-${message.id}`}>
+      ))}>
+        {displaySegments.filter(segment => segment.kind === "parts").map(segment => (
+          <div className="message-answer-segment answer-flow" key={`answer-${message.id}`}>
             {renderAnswerParts(segment.parts)}
           </div>
-        ),
-      )}
+        ))}
+      </MessageReading>
     </div>
   );
 }
@@ -165,7 +168,7 @@ export function RailConversationMessage({ message, onAction, thinkingChainDefaul
   const user = message.role === "user";
   return (
     <AiMessage from={user ? "user" : "assistant"} data-message-id={message.id}>
-      <MessageContent className={user ? undefined : "w-full gap-1"} data-message-content>
+      <MessageContent className={user ? undefined : "message-reading-surface message-reading-surface--compact w-full gap-1 overflow-visible"} data-message-content>
         {user ? <>
           {message.parts.filter((part) => ["attachment", "document_selection", "selection_quote"].includes(part.type)).map((part) => (
             <ChatStreamPartRenderer key={part.id} part={part} siblingParts={message.parts} />
@@ -174,10 +177,11 @@ export function RailConversationMessage({ message, onAction, thinkingChainDefaul
         </> : <RailMessageContent message={message} onAction={onAction} thinkingChainDefaultOpen={thinkingChainDefaultOpen} />}
       </MessageContent>
       {!user ? <>
-        <StreamStatsBadge messageId={message.id} status={message.status} providerTrace={message.provider_trace} />
+        <StreamStatsBadge messageId={message.id} showCompleted={false} status={message.status} providerTrace={message.provider_trace} />
         {message.status !== "streaming" && message.status !== "pending" ? (
-          <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
+          <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100 has-[[data-state=open]]:opacity-100">
             <CopyMessageAction label="复制全文" scope={message.id} text={messageCopyText(message.parts, message.content)} />
+            <StreamStatsAction messageId={message.id} status={message.status} providerTrace={message.provider_trace} />
           </MessageActions>
         ) : null}
       </> : null}

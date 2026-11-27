@@ -19,10 +19,9 @@ export function NativeProcessChain({ parts, siblingParts, providerTrace = {}, st
       startedAt={typeof providerTrace.generation_started_at === 'string' ? providerTrace.generation_started_at : state.startedAt}
       completedDurationSec={thinkingDurationSeconds(providerTrace)}
       finalAnswerStarted={state.finalAnswerStarted} thinkingDurationMs={state.thinkingDurationMs}
-      toolCallCount={toolCallCount(siblingParts)} defaultOpen={state.defaultOpen}>
-      {parts.map(part => isReasoningTextPart(part)
+      toolCallCount={toolCallCount(siblingParts)} defaultOpen={state.defaultOpen}
+      renderPart={part => isReasoningTextPart(part)
         ? <ReasoningSummaryRow key={part.id} part={part} streaming={state.messageStatus === 'streaming'} />
-        : renderPart(part))}
-    </ThinkingChain>
+        : renderPart(part)} />
   </div>
 }

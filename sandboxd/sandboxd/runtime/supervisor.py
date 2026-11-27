@@ -3,12 +3,40 @@
 The watchdog belongs to the container, so API/daemon restarts cannot remove a
 deadline. PID/PGID values are allocated and used in the same PID namespace.
 """
+
+LIVE_TAIL_MAX_BYTES = 8192
+LIVE_TAIL_MAX_LINES = 200
+
+
+def extract_live_tail(
+    raw: bytes | bytearray,
+    *,
+    max_bytes: int = LIVE_TAIL_MAX_BYTES,
+    max_lines: int = LIVE_TAIL_MAX_LINES,
+) -> tuple[str, bool]:
+    """Return a bounded UTF-8 tail snapshot and whether earlier output was omitted."""
+    if not raw:
+        return "", False
+    truncated = len(raw) > max_bytes
+    sliced = bytes(raw[-max_bytes:]) if truncated else bytes(raw)
+    text = sliced.decode("utf-8", "replace")
+    lines = text.splitlines(keepends=True)
+    if len(lines) > max_lines:
+        truncated = True
+        text = "".join(lines[-max_lines:])
+    return text, truncated
+
+
 SUPERVISOR = r'''
 import ctypes, json, os, selectors, signal, sqlite3, subprocess, sys, time
 from pathlib import Path
 spec = json.loads(sys.argv[1])
 root = Path('/tmp/learngraph-exec-' + spec['id'])
 cancel = Path('/tmp/learngraph-cancel-' + spec['id'])
+LIVE_TAIL_MAX_BYTES = 8192
+LIVE_TAIL_MAX_LINES = 200
+LIVE_FLUSH_INTERVAL = 0.35
+LIVE_FLUSH_BYTES = 4096
 try:
     root.mkdir(mode=0o700)
 except FileExistsError:
@@ -30,10 +58,21 @@ def write(value):
     temp = root / 'result.tmp'
     temp.write_text(json.dumps(value))
     temp.replace(root / 'result.json')
+def tail_text(buf):
+    if not buf: return '', False
+    trunc = len(buf) > LIVE_TAIL_MAX_BYTES
+    text = bytes(buf[-LIVE_TAIL_MAX_BYTES:] if trunc else buf).decode('utf-8', 'replace')
+    lines = text.splitlines(keepends=True)
+    if len(lines) > LIVE_TAIL_MAX_LINES:
+        trunc = True
+        text = ''.join(lines[-LIVE_TAIL_MAX_LINES:])
+    return text, trunc
 started = time.monotonic()
 stdout = bytearray(); stderr = bytearray()
 state = 'running'; timed_out = truncated = False
 child = None
+last_live_flush = started
+last_live_bytes = 0
 def descendants():
     parents = {}
     for entry in Path('/proc').iterdir():
@@ -71,7 +110,8 @@ try:
     else:
         child = subprocess.Popen(spec['argv'], cwd=spec['cwd'], start_new_session=True,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        write({'status':'running', 'pid':child.pid})
+        write({'status':'running', 'pid':child.pid, 'stdout_tail':'', 'stderr_tail':'',
+               'live_output_truncated':False, 'latency_ms':0})
         selector = selectors.DefaultSelector()
         selector.register(child.stdout, selectors.EVENT_READ, stdout)
         selector.register(child.stderr, selectors.EVENT_READ, stderr)
@@ -83,8 +123,20 @@ try:
                 block = os.read(key.fd, 65536)
                 if not block: selector.unregister(key.fileobj)
                 else: key.data.extend(block)
-            if len(stdout) + len(stderr) > spec['limit']:
+            total_bytes = len(stdout) + len(stderr)
+            if total_bytes > spec['limit']:
                 truncated = True; state = 'failed'; break
+            now = time.monotonic()
+            if total_bytes > last_live_bytes and (
+                now - last_live_flush >= LIVE_FLUSH_INTERVAL or total_bytes - last_live_bytes >= LIVE_FLUSH_BYTES
+            ):
+                out_tail, out_trunc = tail_text(stdout)
+                err_tail, err_trunc = tail_text(stderr)
+                write({'status':'running', 'pid':child.pid, 'stdout_tail':out_tail, 'stderr_tail':err_tail,
+                       'live_output_truncated':bool(out_trunc or err_trunc),
+                       'latency_ms':int((now - started) * 1000)})
+                last_live_flush = now
+                last_live_bytes = total_bytes
             if child.poll() is not None:
                 for key,_ in selector.select(timeout=0):
                     block=os.read(key.fd,65536)

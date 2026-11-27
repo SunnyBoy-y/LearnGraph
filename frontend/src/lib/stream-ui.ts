@@ -98,9 +98,9 @@ export const documentNodeSchema = z.object({
   id, parent_id: id.nullish(),
   state: z.enum(["pending", "streaming", "completed", "error"]).default("completed"),
   revision: z.number().int().nonnegative().default(0),
-  type: z.enum(["paragraph", "heading", "list", "quote", "code", "math", "table", "divider",
-    "image", "image_group", "gallery", "figure", "chart", "diagram", "graph", "timeline",
-    "metric", "simulation", "interactive", "section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion",
+  type: z.enum(["paragraph", "heading", "caption", "list", "quote", "code", "math", "table", "divider",
+    "image", "image_group", "gallery", "figure", "svg", "chart", "diagram", "graph", "timeline",
+    "metric", "simulation", "interactive", "section", "stack", "row", "column", "columns", "grid", "card", "media_text", "tabs", "accordion",
     "feature_list", "step_list", "status_list", "rail_item", "icon"]),
   text: z.string().max(16000).default(""), label: z.string().max(240).default(""),
   level: z.number().int().min(2).max(6).default(3), columns: z.number().int().min(1).max(3).default(2),
@@ -110,6 +110,8 @@ export const documentNodeSchema = z.object({
   fit: z.enum(["contain", "cover", "scale-down"]).default("contain"),
   language: z.string().max(40).regex(/^[a-zA-Z0-9_+#.-]*$/).default(""),
   query: z.string().max(500).default(""), alt: z.string().max(500).default(""), caption: z.string().max(1000).default(""),
+  svg: z.string().max(24000).default("").refine(value => !value || parseIllustrationSvg(value) !== null, "Unsafe SVG"),
+  display_mode: z.enum(["inline", "artifact"]).default("inline"),
   query_alternatives: z.array(z.string().min(1).max(150)).max(2).default([]),
   fallback_svg: z.string().max(24000).default("").refine(value => !value || parseIllustrationSvg(value) !== null, "Unsafe illustration SVG"),
   engine: z.enum(["chase", "quadratic", "sort_steps"]).default("chase"),
@@ -125,6 +127,8 @@ export const documentNodeSchema = z.object({
 }).strict().superRefine((node, ctx) => {
   if (node.type === "icon" && node.icon == null) ctx.addIssue({code: "custom", message: "Standalone icon nodes require an icon"});
   if (node.type !== "rail_item" && node.item_status != null) ctx.addIssue({code: "custom", message: "item_status belongs to rail items"});
+  if (node.svg && node.type !== "svg") ctx.addIssue({code: "custom", message: "svg belongs to svg nodes"});
+  if (node.display_mode !== "inline" && node.type !== "svg") ctx.addIssue({code: "custom", message: "display_mode belongs to svg nodes"});
   if (node.image_variant !== "default" && !["image", "image_group", "gallery", "figure"].includes(node.type)) {
     ctx.addIssue({code: "custom", message: "image_variant belongs to image or figure nodes"});
   }
@@ -133,7 +137,7 @@ export const documentNodeSchema = z.object({
   }
 });
 export type DocumentNode = z.infer<typeof documentNodeSchema>;
-const layoutTypes = new Set(["section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure", ...railTypes]);
+const layoutTypes = new Set(["section", "stack", "row", "column", "columns", "grid", "card", "media_text", "tabs", "accordion", "figure", ...railTypes]);
 
 const checkRuleSchema = z.object({
   id,
@@ -296,8 +300,8 @@ export type UIActionRequest = {
 function stripComposerMetadata(data: unknown): unknown {
   if (!data || typeof data !== "object" || Array.isArray(data)) return data;
   const record = data as Record<string, unknown>;
-  if (!("artifact_registry" in record) && !("title" in record)) return data;
-  const { artifact_registry: _artifactRegistry, title: _title, ...snapshot } = record;
+  if (!("artifact_registry" in record) && !("title" in record) && !("display_mode" in record)) return data;
+  const { artifact_registry: _artifactRegistry, title: _title, display_mode: _displayMode, ...snapshot } = record;
   return snapshot;
 }
 

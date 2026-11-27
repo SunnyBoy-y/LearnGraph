@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Box, Sparkles } from "lucide-react";
+import { AlertTriangle, Box, LoaderCircle, Sparkles } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
 import { apiClient } from "@/api/client";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import {
+  resolveArtifactFramePolicy,
+  useArtifactFrameHeight,
+} from "@/lib/artifact-frame-size";
 import {
   createSubappChannel,
   subappFailureText,
@@ -29,8 +33,13 @@ type MagicCardData = {
   bundle_id?: string;
   preview_html?: string;
   preferred_height?: number;
+  max_height?: number;
+  height_mode?: string;
+  aspect_ratio?: string | number;
   viewport?: {
     mode?: string;
+    height_mode?: string;
+    aspect_ratio?: string | number;
     preferred_height?: number;
     max_height?: number;
   };
@@ -40,12 +49,6 @@ function asRecord(value: unknown): MagicCardData {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as MagicCardData)
     : {};
-}
-
-function positiveHeight(value: unknown, fallback: number) {
-  return typeof value === "number" && Number.isFinite(value) && value >= 120
-    ? Math.min(900, Math.round(value))
-    : fallback;
 }
 
 /** Reasons persisted by the backend for cards without an executable preview. */
@@ -94,10 +97,16 @@ export function MagicCardHost({
   data,
   hideHeader = false,
   fillContainer = false,
+  fitArtifact = false,
+  expandedArtifact = false,
+  streaming = false,
 }: {
   data: Record<string, unknown>;
   hideHeader?: boolean;
   fillContainer?: boolean;
+  fitArtifact?: boolean;
+  expandedArtifact?: boolean;
+  streaming?: boolean;
 }) {
   const card = useMemo(() => asRecord(data), [data]);
   const title =
@@ -105,10 +114,9 @@ export function MagicCardHost({
     (typeof card.fallback_text === "string" && card.fallback_text) ||
     (typeof card.card_id === "string" && card.card_id) ||
     "交互卡片";
-  const maxHeight = positiveHeight(card.viewport?.max_height, 720);
-  const height = Math.min(
-    maxHeight,
-    positiveHeight(card.preferred_height ?? card.viewport?.preferred_height, 360),
+  const framePolicy = useMemo(
+    () => resolveArtifactFramePolicy(data, { defaultMode: "auto" }),
+    [data],
   );
   const artifactUrl =
     typeof card.artifact_url === "string" ? card.artifact_url : "";
@@ -120,6 +128,7 @@ export function MagicCardHost({
     originVerified && /^https:\/\//i.test(artifactUrl.trim());
   const [failed, setFailed] = useState(false);
   const [failureReason, setFailureReason] = useState("卡片运行时不可用。");
+  const [previewExpanded, setPreviewExpanded] = useState(false);
   const lastHeartbeatRef = useRef(Date.now());
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
@@ -141,11 +150,76 @@ export function MagicCardHost({
     pendingConsentId: string
     triggers: string[]
   } | null>(null);
+  const [consentPending, setConsentPending] = useState(false);
   const [agentStatus, setAgentStatus] = useState<'idle' | 'queued' | 'processing' | 'failed'>('idle');
   const [agentError, setAgentError] = useState<string | null>(null);
   const [bundlePreviewUrl, setBundlePreviewUrl] = useState<string | null>(null);
+  const [bundleLoading, setBundleLoading] = useState(Boolean(bundleId));
   const runtimeIframeRef = useRef<HTMLIFrameElement | null>(null);
   const runtimeBridgeRef = useRef<SandboxRuntimeBridge | null>(null);
+  const isExpanded = expandedArtifact || previewExpanded;
+  const canMeasureSrcDoc =
+    Boolean(previewHtml) &&
+    (Boolean(subappTrigger) || (!canRenderRemote && !bundleId));
+  const autoSizeEnabled =
+    canMeasureSrcDoc &&
+    (!fillContainer || fitArtifact) &&
+    (framePolicy.mode === "auto" || framePolicy.mode === "bounded");
+  const srcDoc = useMemo(
+    () =>
+      previewHtml
+        ? sandboxedHtmlPreviewDocument(previewHtml, {
+            runtimeShim: !subappTrigger,
+            subappClient: Boolean(subappTrigger),
+            measureArtifact: autoSizeEnabled,
+          })
+        : "",
+    [previewHtml, subappTrigger, autoSizeEnabled],
+  );
+  const adaptiveHeight = useArtifactFrameHeight(
+    autoSizeEnabled,
+    isExpanded,
+    subappTrigger ? subappIframeRef : runtimeIframeRef,
+    {
+      mode: framePolicy.mode,
+      minHeight: framePolicy.minHeight,
+      maxHeight: framePolicy.maxHeight,
+      measureKey: streaming ? "streaming" : srcDoc.length,
+    },
+  );
+  const subappFrameSourceKey = subappTrigger
+    ? `${srcDoc || ""}|${!previewHtml ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : "")) : ""}`
+    : "";
+  const prevSubappSourceKeyRef = useRef(subappFrameSourceKey);
+  if (prevSubappSourceKeyRef.current !== subappFrameSourceKey) {
+    prevSubappSourceKeyRef.current = subappFrameSourceKey;
+    subappLoadedRef.current = false;
+  }
+  const sectionClass = fitArtifact
+    ? "magic-card magic-card--fill magic-card--fit"
+    : fillContainer
+      ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col"
+      : "magic-card";
+  const wrapClass = fitArtifact
+    ? "magic-card__frame-wrap magic-card__frame-wrap--fit"
+    : fillContainer
+      ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col"
+      : "magic-card__frame-wrap";
+  const frameClass = fitArtifact
+    ? "magic-card__frame magic-card__frame--fit"
+    : fillContainer
+      ? "magic-card__frame min-h-[420px] flex-1"
+      : "magic-card__frame";
+  const frameStyle =
+    fillContainer && !fitArtifact
+      ? undefined
+      : framePolicy.mode === "aspect-ratio"
+        ? { aspectRatio: framePolicy.aspectRatio, height: "auto" as const }
+        : {
+            height:
+              (autoSizeEnabled ? adaptiveHeight : undefined) ??
+              framePolicy.initialHeight,
+          };
 
   useEffect(() => {
     if (!subappTrigger) return;
@@ -184,10 +258,29 @@ export function MagicCardHost({
     subappChannelRef.current?.handleIframeLoad();
   };
 
+  const handleConsentDecision = async (
+    decision: 'allow_session' | 'allow_app' | 'allow_global' | 'deny',
+  ) => {
+    if (consentPending || !subappChannelRef.current) return;
+    setConsentPending(true);
+    try {
+      const ok = await subappChannelRef.current.decideConsent(decision);
+      if (ok) {
+        setConsentRequest(null);
+      }
+    } finally {
+      setConsentPending(false);
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     setBundlePreviewUrl(null);
-    if (!bundleId) return () => { cancelled = true; };
+    if (!bundleId) {
+      setBundleLoading(false);
+      return () => { cancelled = true; };
+    }
+    setBundleLoading(true);
     void apiClient
       .get<{ url: string }>(`/subapps/bundles/${bundleId}/preview`)
       .then((response) => {
@@ -197,6 +290,9 @@ export function MagicCardHost({
       })
       .catch(() => {
         if (!cancelled) setBundlePreviewUrl(null);
+      })
+      .finally(() => {
+        if (!cancelled) setBundleLoading(false);
       });
     return () => { cancelled = true; };
   }, [bundleId]);
@@ -284,40 +380,51 @@ export function MagicCardHost({
 
   if (subappTrigger) {
     const hasSubappContent = Boolean(previewHtml || bundlePreviewUrl || canRenderRemote);
+    const subappHeader = !hideHeader ? (
+      <div className="magic-card__heading">
+        <Sparkles className="size-4 shrink-0" />
+        <div>
+          <strong>{title}</strong>
+          <span>双向交互子应用</span>
+        </div>
+        <Badge variant="secondary">subapp</Badge>
+      </div>
+    ) : undefined;
     return (
-      <section aria-label={title} className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}>
-        {!hideHeader ? (
-          <div className="magic-card__heading">
-            <Sparkles className="size-4" />
-            <div>
-              <strong>{title}</strong>
-              <span>双向交互子应用</span>
-            </div>
-            <Badge variant="secondary">subapp</Badge>
-          </div>
-        ) : null}
+      <section aria-label={title} className={sectionClass} data-height-mode={framePolicy.mode}>
         {hasSubappContent ? (
           <FullscreenPreview
-            className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+            className={wrapClass}
+            header={subappHeader}
+            hideExpand={fitArtifact}
             label={title}
+            onExpandedChange={setPreviewExpanded}
           >
             <iframe loading="lazy"
             allow=""
-              className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
+              className={frameClass}
               onLoad={handleSubappLoad}
               ref={subappIframeRef}
               referrerPolicy="no-referrer"
               sandbox="allow-scripts"
-              srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml) : undefined}
+              srcDoc={srcDoc || undefined}
               src={
                 !previewHtml
                   ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined))
                   : undefined
               }
-              style={fillContainer ? undefined : { height }}
+              style={frameStyle}
               title={`${title} 子应用`}
             />
           </FullscreenPreview>
+        ) : bundleLoading ? (
+          <>
+            {subappHeader ? <div className="magic-card__header-bar">{subappHeader}</div> : null}
+            <div className="magic-card__loading flex items-center gap-2 p-4 text-sm text-muted-foreground" role="status">
+              <LoaderCircle className="size-4 animate-spin" />
+              <span>正在加载子应用预览…</span>
+            </div>
+          </>
         ) : (
           <MagicCardFallback
             reason="子应用尚未准备好，没有可加载的交互式页面内容。"
@@ -329,34 +436,38 @@ export function MagicCardHost({
             <p>AI建议采用Agent协同模式，是否开启？</p>
             <div className="magic-card__consent-actions">
               <Button
+                disabled={consentPending}
                 size="sm"
                 type="button"
                 variant="default"
-                onClick={() => void subappChannelRef.current?.decideConsent('allow_session')}
+                onClick={() => void handleConsentDecision('allow_session')}
               >
                 允许本次
               </Button>
               <Button
+                disabled={consentPending}
                 size="sm"
                 type="button"
                 variant="secondary"
-                onClick={() => void subappChannelRef.current?.decideConsent('allow_app')}
+                onClick={() => void handleConsentDecision('allow_app')}
               >
                 加入白名单
               </Button>
               <Button
+                disabled={consentPending}
                 size="sm"
                 type="button"
                 variant="secondary"
-                onClick={() => void subappChannelRef.current?.decideConsent('allow_global')}
+                onClick={() => void handleConsentDecision('allow_global')}
               >
                 全局允许
               </Button>
               <Button
+                disabled={consentPending}
                 size="sm"
                 type="button"
                 variant="ghost"
-                onClick={() => void subappChannelRef.current?.decideConsent('deny')}
+                onClick={() => void handleConsentDecision('deny')}
               >
                 暂不开启
               </Button>
@@ -395,36 +506,40 @@ export function MagicCardHost({
   }
 
   if (canRenderRemote) {
+    const remoteHeader = !hideHeader ? (
+      <div className="magic-card__heading">
+        <Sparkles className="size-4 shrink-0" />
+        <div>
+          <strong>{title}</strong>
+          <span>
+            {typeof card.card_id === "string" ? card.card_id : "magic-card"}
+            {card.version != null ? ` · v${card.version}` : ""}
+          </span>
+        </div>
+        <Badge variant="secondary">
+          {typeof card.runtime === "string"
+            ? card.runtime
+            : "react-sandbox-v1"}
+        </Badge>
+      </div>
+    ) : undefined;
     return (
       <section
         aria-label={title}
-        className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}
-        style={fillContainer ? undefined : { maxHeight }}
+        className={sectionClass}
+        data-height-mode={framePolicy.mode}
+        style={fillContainer || framePolicy.mode === "auto" ? undefined : { maxHeight: framePolicy.maxHeight }}
       >
-        {!hideHeader ? (
-          <div className="magic-card__heading">
-            <Sparkles className="size-4" />
-            <div>
-              <strong>{title}</strong>
-              <span>
-                {typeof card.card_id === "string" ? card.card_id : "magic-card"}
-                {card.version != null ? ` · v${card.version}` : ""}
-              </span>
-            </div>
-            <Badge variant="secondary">
-              {typeof card.runtime === "string"
-                ? card.runtime
-                : "react-sandbox-v1"}
-            </Badge>
-          </div>
-        ) : null}
         <FullscreenPreview
-          className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+          className={wrapClass}
+          header={remoteHeader}
+          hideExpand={fitArtifact}
           label={title}
+          onExpandedChange={setPreviewExpanded}
         >
           <iframe loading="lazy"
             allow=""
-            className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
+            className={frameClass}
             onError={() => {
               setFailureReason("卡片 iframe 加载失败。");
               setFailed(true);
@@ -433,7 +548,7 @@ export function MagicCardHost({
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             src={artifactUrl}
-            style={fillContainer ? undefined : { height }}
+            style={frameStyle}
             title={`${title} 隔离运行时`}
           />
         </FullscreenPreview>
@@ -446,28 +561,31 @@ export function MagicCardHost({
     // the capability-gated preview gateway; relative-path resources resolve
     // natively. The gateway injects the runtime shim, and the host bridge
     // relays vfs.read / net.fetch for dynamic access.
+    const bundleHeader = !hideHeader ? (
+      <div className="magic-card__heading">
+        <Box className="size-4 shrink-0" />
+        <div>
+          <strong>{title}</strong>
+        </div>
+      </div>
+    ) : undefined;
     return (
-      <section aria-label={title} className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}>
-        {!hideHeader ? (
-          <div className="magic-card__heading">
-            <Box className="size-4" />
-            <div>
-              <strong>{title}</strong>
-            </div>
-          </div>
-        ) : null}
+      <section aria-label={title} className={sectionClass} data-height-mode={framePolicy.mode}>
         <FullscreenPreview
-          className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+          className={wrapClass}
+          header={bundleHeader}
+          hideExpand={fitArtifact}
           label={title}
+          onExpandedChange={setPreviewExpanded}
         >
           <iframe loading="lazy"
             allow=""
-            className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
+            className={frameClass}
             ref={runtimeIframeRef}
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             src={bundlePreviewUrl}
-            style={fillContainer ? undefined : { height }}
+            style={frameStyle}
             title={`${title} 多文件沙箱`}
           />
         </FullscreenPreview>
@@ -482,32 +600,55 @@ export function MagicCardHost({
     // blocked even if the card ships its own policy. The runtime shim is
     // inlined so sandbox code can still reach multi-file VFS reads and the
     // approval-free network relay through the host bridge.
-    const srcDoc = sandboxedHtmlPreviewDocument(previewHtml, { runtimeShim: true });
+    const dynamicHeader = !hideHeader ? (
+      <div className="magic-card__heading">
+        <Box className="size-4 shrink-0" />
+        <div>
+          <strong>{title}</strong>
+        </div>
+      </div>
+    ) : undefined;
     return (
-      <section aria-label={title} className={fillContainer ? "magic-card magic-card--fill flex h-full min-h-0 flex-1 flex-col" : "magic-card"}>
-        {!hideHeader ? (
-          <div className="magic-card__heading">
-            <Box className="size-4" />
-            <div>
-              <strong>{title}</strong>
-            </div>
-          </div>
-        ) : null}
+      <section aria-label={title} className={sectionClass} data-height-mode={framePolicy.mode}>
         <FullscreenPreview
-          className={fillContainer ? "magic-card__frame-wrap flex min-h-0 flex-1 flex-col" : "magic-card__frame-wrap"}
+          className={wrapClass}
+          header={dynamicHeader}
+          hideExpand={fitArtifact}
           label={title}
+          onExpandedChange={setPreviewExpanded}
         >
           <iframe loading="lazy"
             allow=""
-            className={fillContainer ? "magic-card__frame min-h-[420px] flex-1" : "magic-card__frame"}
+            className={frameClass}
             ref={runtimeIframeRef}
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             srcDoc={srcDoc}
-            style={fillContainer ? undefined : { height }}
+            style={frameStyle}
             title={`${title} 动态预览`}
           />
         </FullscreenPreview>
+      </section>
+    );
+  }
+
+  if (bundleLoading && !previewHtml) {
+    return (
+      <section aria-label={title} className={sectionClass} data-height-mode={framePolicy.mode}>
+        {!hideHeader ? (
+          <div className="magic-card__header-bar">
+            <div className="magic-card__heading">
+              <Box className="size-4 shrink-0" />
+              <div>
+                <strong>{title}</strong>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        <div className="magic-card__loading flex items-center gap-2 p-4 text-sm text-muted-foreground" role="status">
+          <LoaderCircle className="size-4 animate-spin" />
+          <span>正在加载沙箱预览…</span>
+        </div>
       </section>
     );
   }

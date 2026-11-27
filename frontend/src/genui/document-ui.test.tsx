@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { StreamUI } from "@/components/chat/stream-ui";
+import { MessageReading } from "@/components/chat/message-reading";
 import { authStore } from "@/api/auth-store";
 
 vi.mock("@/components/chat/message-part-renderer", () => ({TextWithCitations: ({content}: {content: string}) => <p>{content}</p>}));
@@ -44,6 +45,19 @@ describe("document native UI", () => {
     expect(screen.getByRole("link", {name: "观察"})).not.toHaveAttribute("aria-current");
     expect(screen.getByText("3,180")).toBeInTheDocument();
     expect(screen.getByText(/用户提供/)).toBeInTheDocument();
+  });
+
+  it("moves document headings into the reply outline without duplicating the document TOC", async () => {
+    render(<MessageReading><div className="message-answer-segment answer-flow">
+      <div className="message-text-block"><h2>背景</h2></div>
+      <StreamUI partId="doc-inline-toc" data={{...chart, component: "document", rows: [], props: {title: "报告", density: "editorial", toc: true}, blocks: [
+        {id: "observation", type: "heading", level: 2, text: "观察"},
+        {id: "suggestion", type: "heading", level: 3, text: "建议"},
+      ]}} />
+    </div></MessageReading>);
+    fireEvent.click(await screen.findByRole("button", {name: "目录"}));
+    expect(screen.queryByRole("navigation", {name: "文档目录"})).toBeNull();
+    expect(screen.getAllByRole("listitem").map(item => item.textContent)).toEqual(["背景", "观察", "建议"]);
   });
 
   it("restores validated preferences from disk and sends the current view with an explain action", async () => {

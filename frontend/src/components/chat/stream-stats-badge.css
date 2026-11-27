@@ -1,0 +1,114 @@
+.message-stream-popover {
+  width: 248px;
+  max-width: calc(100vw - 24px);
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 6px 24px color-mix(in srgb, var(--foreground) 7%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.message-stream-popover__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.message-stream-popover__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.message-stream-popover__subtitle {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.message-stream-popover__hero {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.message-stream-popover__metric-label {
+  display: block;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted-foreground);
+}
+
+.message-stream-popover__metric-value {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  margin-top: 2px;
+  line-height: 1.2;
+  color: var(--foreground);
+}
+
+.message-stream-popover__metric-value strong {
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.message-stream-popover__metric-value span {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted-foreground);
+}
+
+.message-stream-popover__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.message-stream-popover__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.message-stream-popover__row-label {
+  color: var(--muted-foreground);
+}
+
+.message-stream-popover__row-value {
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.message-stream-popover__cache {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.message-stream-popover__bar {
+  width: 100%;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--foreground) 10%, transparent);
+}
+
+.message-stream-popover__bar-fill {
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--foreground) 48%, transparent);
+  transform-origin: left center;
+  transition: transform 0.2s ease;
+}

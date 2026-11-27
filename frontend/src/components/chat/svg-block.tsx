@@ -41,15 +41,39 @@ function renderNode(node: CanvasNode): ReactNode {
   return createElement(node.tag, { ...node.attrs, key: node.id, "data-svg-node": node.id }, ...node.text, ...node.children.map(renderNode));
 }
 
+/** Parse "minX minY width height" into a CSS aspect-ratio string. */
+export function parseViewBoxAspectRatio(viewBox: unknown): string | undefined {
+  if (typeof viewBox !== "string") return undefined;
+  const parts = viewBox.trim().split(/[\s,]+/).map(Number);
+  if (parts.length !== 4) return undefined;
+  const [, , w, h] = parts;
+  if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    return `${w} / ${h}`;
+  }
+  return undefined;
+}
+
 /** One stable SVG canvas; keying by protocol IDs preserves existing DOM nodes. */
-export const SVGBlock = memo(function SVGBlock({ viewBox, nodes, label }: { viewBox: unknown; nodes: unknown; label: string }) {
+export const SVGBlock = memo(function SVGBlock({
+  viewBox,
+  nodes,
+  label,
+  className = "unified-artifact-card__native-svg",
+}: {
+  viewBox: unknown;
+  nodes: unknown;
+  label: string;
+  className?: string;
+}) {
   const tree = useMemo(() => typeof viewBox === "string" ? svgTree(viewBox, nodes) : null, [viewBox, nodes]);
+  const aspectRatio = useMemo(() => parseViewBoxAspectRatio(tree?.viewBox), [tree?.viewBox]);
   if (!tree) return null;
   return <svg
     aria-label={label}
-    className="unified-artifact-card__native-svg"
+    className={className}
     preserveAspectRatio="xMidYMid meet"
     role="img"
+    style={aspectRatio ? { aspectRatio } : undefined}
     viewBox={tree.viewBox}
   >{tree.roots.map(renderNode)}</svg>;
 });

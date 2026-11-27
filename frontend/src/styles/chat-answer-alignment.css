@@ -1,42 +1,157 @@
-/* Answer chrome shares the prose column, not the wider composer column.
-   Keep responsive gutters on chat-messages-content so narrow panes do not
-   receive a second inset. */
-.workspace-main--chat .chat-canvas-page {
-  --chat-answer-column-width: var(--reading-max-width);
+/* Unified Chat Content Rail:
+   One shared set of horizontal rail tokens owns max-width, outer gutters, and
+   centering for BOTH the message list (user bubbles, thinking/tool chain,
+   Markdown prose, tables, code blocks, SVG, Stream UI, artifacts, retry/error
+   notices, stats, actions, follow-ups) and the bottom composer dock.
+   Individual renderers must never introduce competing external horizontal
+   margins, paddings, or breakout widths. */
+.chat-canvas-page {
+  --chat-rail-max-width: var(--chat-content-width, 760px);
+  --chat-rail-gutter-start: 24px;
+  --chat-rail-gutter-end: 24px;
+  --chat-scroll-gutter: 0px;
 }
 
-.workspace-main--chat .chat-canvas-page .is-assistant .thinking-chain,
-.workspace-main--chat .chat-canvas-page .is-assistant > .message-stream-details,
-.workspace-main--chat .chat-canvas-page .is-assistant > .message-stream-stats,
-.workspace-main--chat .chat-canvas-page .is-assistant > div:last-child:not([data-message-content]),
-.workspace-main--chat .chat-canvas-page .chat-follow-up-prompts {
-  width: 100%;
-  max-width: var(--chat-answer-column-width);
-  margin-inline: auto;
-}
-
-/* The details wrapper already owns the inset; expanded metrics stay flush. */
-.workspace-main--chat .chat-canvas-page .message-stream-details .message-stream-stats {
-  width: 100%;
-  max-width: none;
-  margin-inline: 0;
-}
-
-/* Preserve the existing full-column answer layout when the desktop rail folds. */
-@media (min-width: 1121px) {
-  .workspace-shell--rail-collapsed .workspace-main--chat .chat-canvas-page {
-    --chat-answer-column-width: 100%;
+@media (max-width: 1024px) {
+  .chat-canvas-page {
+    --chat-rail-gutter-start: 12px;
+    --chat-rail-gutter-end: 12px;
   }
 }
 
-/* The scroll viewport ends above the dock; no composer-height spacer in normal mode. */
+html.is-native-app .chat-canvas-page {
+  --chat-rail-gutter-start: 12px;
+  --chat-rail-gutter-end: 12px;
+}
+
+/* When the message outline lane is active, both the message rail and composer
+   rail reserve the same trailing gutter so the sticky outline stays outside
+   the answer column while messages and composer remain on one vertical rail. */
+.chat-canvas-page:has(.chat-messages-content.chat-outline-lane) {
+  --chat-rail-gutter-start: 12px;
+  --chat-rail-gutter-end: 52px;
+}
+
+/* Message Content Rail (lives inside [data-conversation-scroll], whose box is
+   already inset symmetrically by --chat-scroll-gutter via scrollbar-gutter). */
+.chat-canvas-page .chat-messages-content,
+.chat-canvas-page .chat-messages-content.chat-outline-lane {
+  width: min(
+    var(--chat-rail-max-width),
+    calc(100% - var(--chat-rail-gutter-start) - var(--chat-rail-gutter-end))
+  );
+  max-width: none;
+  margin-inline-start: max(
+    var(--chat-rail-gutter-start),
+    min(
+      calc((100% - var(--chat-rail-max-width)) / 2),
+      calc(100% - var(--chat-rail-max-width) - var(--chat-rail-gutter-end))
+    )
+  );
+  margin-inline-end: auto;
+  padding-inline: 0;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+/* Every top-level row inside the Message Content Rail fills the shared rail
+   without adding a second horizontal inset or competing max-width. */
+.chat-canvas-page .chat-messages-content > .chat-message-mount,
+.chat-canvas-page .chat-messages-content .is-user,
+.chat-canvas-page .chat-messages-content .is-assistant,
+.chat-canvas-page .chat-messages-content .is-assistant > *,
+.chat-canvas-page .chat-messages-content .chat-follow-up-prompts {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  margin-inline: 0;
+  box-sizing: border-box;
+}
+
+/* User message bubbles stay content-sized and right-aligned to the rail edge;
+   only edit mode expands to fill the rail. */
+.chat-canvas-page .chat-messages-content .is-user > [data-message-content] {
+  margin-inline-start: auto;
+  margin-inline-end: 0;
+}
+
+/* Children inside AssistantMessage inherit the Content Rail boundary instead
+   of defining competing max-widths or breaking out via 100cqw. */
+.chat-canvas-page .is-assistant [data-message-content] .message-answer-segment,
+.chat-canvas-page .is-assistant [data-message-content] .thinking-chain {
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  margin-inline: 0;
+  box-sizing: border-box;
+}
+
+/* Composer Content Rail: shares the exact same width and horizontal offset as
+   the Message Content Rail, compensating for [data-conversation-scroll]'s
+   symmetric scrollbar gutter (--chat-scroll-gutter). */
 .chat-canvas-page:not(.is-new-chat-welcome) .chat-composer-dock:not(.is-enlarged) {
   position: relative;
   inset: auto;
   transform: none;
   flex: 0 0 auto;
-  margin-inline: auto;
+  width: min(
+    var(--chat-rail-max-width),
+    calc(
+      100% - 2 * var(--chat-scroll-gutter) - var(--chat-rail-gutter-start) -
+        var(--chat-rail-gutter-end)
+    )
+  );
+  max-width: none;
+  margin-inline-start: calc(
+    var(--chat-scroll-gutter) +
+      max(
+        var(--chat-rail-gutter-start),
+        min(
+          calc(
+            (100% - 2 * var(--chat-scroll-gutter) - var(--chat-rail-max-width)) /
+              2
+          ),
+          calc(
+            100% - 2 * var(--chat-scroll-gutter) - var(--chat-rail-max-width) -
+              var(--chat-rail-gutter-end)
+          )
+        )
+      )
+  );
+  margin-inline-end: auto;
+  padding-inline: 0;
   padding-block-end: max(12px, env(safe-area-inset-bottom, 0px));
+  box-sizing: border-box;
+}
+.chat-canvas-page:not(.is-new-chat-welcome) .chat-composer-dock.is-enlarged {
+  z-index: 30;
+  left: calc(
+    var(--chat-scroll-gutter) +
+      max(
+        var(--chat-rail-gutter-start),
+        min(
+          calc(
+            (100% - 2 * var(--chat-scroll-gutter) - var(--chat-rail-max-width)) /
+              2
+          ),
+          calc(
+            100% - 2 * var(--chat-scroll-gutter) - var(--chat-rail-max-width) -
+              var(--chat-rail-gutter-end)
+          )
+        )
+      )
+  );
+  transform: none;
+  width: min(
+    var(--chat-rail-max-width),
+    calc(
+      100% - 2 * var(--chat-scroll-gutter) - var(--chat-rail-gutter-start) -
+        var(--chat-rail-gutter-end)
+    )
+  );
+}
+.chat-canvas-page .chat-composer-dock .chat-workbench-toolbar {
+  width: 100%;
 }
 .chat-canvas-page .chat-messages-content {
   padding-block-end: calc(20px + var(--conversation-tail-space, 0px));
@@ -45,21 +160,82 @@
   padding-block-end: calc(max(0px, 100cqh - 76px) + var(--conversation-tail-space, 0px));
 }
 .chat-canvas-page:has(.chat-composer-dock.is-enlarged) { container-type: size; }
-.chat-canvas-page .chat-composer-dock.is-enlarged { z-index: 30; }
 .chat-scroll-button-slot { position: relative; inline-size: 100%; block-size: 36px; }
 .chat-scroll-button-slot > .chat-scroll-to-bottom { bottom: 2px; }
-@media (max-width: 1024px) {
-  .chat-canvas-page:not(.is-new-chat-welcome) .chat-composer-dock { width: min(var(--chat-content-width), calc(100% - 24px)); }
+
+/* Shared Assistant Content Rail containment across main chat and side panes:
+   prevent flex/grid intrinsic widths from widening the rail; wide tables and
+   code blocks scroll internally, and images scale proportionally within 100%. */
+.is-assistant [data-message-content] {
+  min-inline-size: 0;
+  box-sizing: border-box;
 }
 
-/* Rich blocks can use the full answer lane without changing the prose column. */
-.workspace-main--chat .chat-canvas-page .is-assistant [data-message-content] {
-  container-type: inline-size;
+:where(
+  .is-assistant [data-message-content] .message-reading,
+  .is-assistant [data-message-content] .message-reading__process,
+  .is-assistant [data-message-content] .message-reading__process > *,
+  .is-assistant [data-message-content] .message-reading__body,
+  .is-assistant [data-message-content] .message-answer-segment,
+  .is-assistant [data-message-content] .message-answer-segment > *,
+  .is-assistant [data-message-content] .message-text-block,
+  .is-assistant [data-message-content] .message-text-block > [data-message-selectable-text],
+  .is-assistant [data-message-content] .answer-markdown-flow,
+  .is-assistant [data-message-content] .answer-markdown-flow > *,
+  .is-assistant [data-message-content] .expandable-content,
+  .is-assistant [data-message-content] .expandable-content__body,
+  .is-assistant [data-message-content] .thinking-chain,
+  .is-assistant [data-message-content] .thinking-chain__content,
+  .is-assistant [data-message-content] .thinking-chain__steps
+) {
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  box-sizing: border-box;
 }
-.chat-canvas-page .message-answer-segment > .unified-artifact-card--wide,
-.chat-canvas-page .message-answer-segment [data-streamdown="table-wrapper"],
-.chat-canvas-page .message-answer-segment [data-streamdown="code-block"] {
-  inline-size: 100cqw;
-  max-inline-size: none;
-  margin-inline-start: calc((100% - 100cqw) / 2);
+
+.is-assistant [data-message-content] :is(
+  [data-streamdown="table-wrapper"],
+  [data-streamdown="code-block"],
+  [data-streamdown="mermaid-block"],
+  pre.incremental-markdown-fence,
+  .html-code-preview,
+  .message-component,
+  .unified-artifact-card,
+  .rich-svg-figure,
+  .rich-doc,
+  .message-chart,
+  .sandbox-artifact,
+  .message-search-results,
+  .graph-proposal,
+  .magic-card,
+  .message-graph-context,
+  .message-quiz,
+  .sandbox-image-strip
+) {
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  margin-inline: 0;
+  box-sizing: border-box;
+}
+
+.is-assistant [data-message-content] [data-streamdown="table-wrapper"] > div:last-child,
+.is-assistant [data-message-content] [data-streamdown="code-block-body"],
+.is-assistant [data-message-content] pre.incremental-markdown-fence {
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  overflow-x: auto;
+  box-sizing: border-box;
+}
+
+.is-assistant [data-message-content] [data-streamdown="image-wrapper"] {
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  box-sizing: border-box;
+}
+
+.is-assistant [data-message-content] .message-text-block img:not(.answer-icon) {
+  max-inline-size: 100%;
+  block-size: auto;
 }

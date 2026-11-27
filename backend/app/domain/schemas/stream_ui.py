@@ -214,10 +214,10 @@ class DocumentNode(StrictModel):
     state: Literal["pending", "streaming", "completed", "error"] = "completed"
     revision: Annotated[int, Field(ge=0)] = 0
     type: Literal[
-        "paragraph", "heading", "list", "quote", "code", "math", "table", "divider",
-        "image", "image_group", "gallery", "figure", "chart", "diagram", "graph",
-        "timeline", "metric", "simulation", "interactive", "section", "stack", "row", "columns",
-        "grid", "media_text", "tabs", "accordion",
+        "paragraph", "heading", "caption", "list", "quote", "code", "math", "table", "divider",
+        "image", "image_group", "gallery", "figure", "svg", "chart", "diagram", "graph",
+        "timeline", "metric", "simulation", "interactive", "section", "stack", "row", "column", "columns",
+        "grid", "card", "media_text", "tabs", "accordion",
         "feature_list", "step_list", "status_list", "rail_item", "icon",
     ]
     text: Annotated[str, Field(max_length=16000)] = ""
@@ -234,6 +234,8 @@ class DocumentNode(StrictModel):
     query_alternatives: Annotated[list[Annotated[str, Field(min_length=1, max_length=150)]], Field(max_length=2)] = Field(default_factory=list)
     alt: Annotated[str, Field(max_length=500)] = ""
     caption: Annotated[str, Field(max_length=1000)] = ""
+    svg: Annotated[str, Field(max_length=24000), AfterValidator(validate_illustration_svg)] = ""
+    display_mode: Literal["inline", "artifact"] = "inline"
     fallback_svg: Annotated[str, Field(max_length=24000), AfterValidator(validate_illustration_svg)] = ""
     # Only registered, bounded local calculations; no expressions or callbacks.
     engine: Literal["chase", "quadratic", "sort_steps"] = "chase"
@@ -259,6 +261,10 @@ class DocumentNode(StrictModel):
             # picture actually returned. Source metadata owns resolved labels.
             self.alt = self.media[0].title or "检索图片"
             self.caption = ""
+        if self.svg and self.type != "svg":
+            raise ValueError("svg belongs to an svg node")
+        if self.display_mode != "inline" and self.type != "svg":
+            raise ValueError("display_mode belongs to an svg node")
         if self.fallback_svg and self.type not in {"image", "image_group", "gallery"}:
             raise ValueError("fallback_svg belongs to an image node")
         if self.image_variant != "default" and self.type not in {"image", "image_group", "gallery", "figure"}:
@@ -282,7 +288,7 @@ class DocumentNode(StrictModel):
 
 
 RAIL_TYPES = {"feature_list", "step_list", "status_list"}
-LAYOUT_TYPES = {"section", "stack", "row", "columns", "grid", "media_text", "tabs", "accordion", "figure"} | RAIL_TYPES
+LAYOUT_TYPES = {"section", "stack", "row", "column", "columns", "grid", "card", "media_text", "tabs", "accordion", "figure"} | RAIL_TYPES
 
 
 def container_child_limit(parent_type: str | None) -> int:

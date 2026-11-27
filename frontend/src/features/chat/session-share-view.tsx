@@ -16,9 +16,14 @@ import {
   PreviewableMarkdownPre,
   type MarkdownPreProps,
 } from "@/components/chat/html-code-preview";
+import { StreamUI } from "@/components/chat/stream-ui";
+import { SVGBlock } from "@/components/chat/svg-block";
 import { ExpandableContent } from "@/components/shared/expandable-content";
 import { fetchSharedSession, type SessionSharePublicView } from "@/api/session-sharing";
+import { documentMarkdown } from "@/genui/document-export";
 import { stripRawWebCitations } from "@/lib/document-citations";
+import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import { committedNumericPreview, parseUISnapshot, visibleStreamUIText } from "@/lib/stream-ui";
 
 type Part = Record<string, unknown>;
 
@@ -42,6 +47,8 @@ function PartRenderer({ part }: { part: Part }) {
   const data = (part.data ?? {}) as Record<string, unknown>;
 
   if (TEXT_KINDS.has(type)) {
+    const cleaned = stripRawWebCitations(visibleStreamUIText(content, false));
+    if (!cleaned.trim()) return null;
     return (
       <div className="share-part share-part--text">
         <ExpandableContent label="正文" lineLimit={32}>
@@ -51,9 +58,36 @@ function PartRenderer({ part }: { part: Part }) {
               pre: (props: MarkdownPreProps) => <PreviewableMarkdownPre {...props} />,
             }}
           >
-            {stripRawWebCitations(content)}
+            {cleaned}
           </LazyStreamdown>
         </ExpandableContent>
+      </div>
+    );
+  }
+
+  if (type === "ui") {
+    const uiPartId =
+      typeof part.id === "string" && part.id
+        ? part.id
+        : `share-ui-${String(data.block_id ?? "block")}`;
+    return (
+      <div className="share-part share-part--ui">
+        <StreamUI
+          data={data}
+          interactive={false}
+          partId={uiPartId}
+          settled
+        />
+      </div>
+    );
+  }
+
+  if (type === "svg") {
+    if (data.state === "removed") return null;
+    const title = typeof data.title === "string" && data.title ? data.title : "SVG 图形";
+    return (
+      <div className="share-part share-part--svg">
+        <SVGBlock label={title} nodes={data.nodes} viewBox={data.view_box} />
       </div>
     );
   }
@@ -99,8 +133,11 @@ function PartRenderer({ part }: { part: Part }) {
       return (
         <div className="share-card">
           <iframe
+            referrerPolicy="no-referrer"
             sandbox="allow-scripts"
-            srcDoc={snapshot.preview_html}
+            srcDoc={sandboxedHtmlPreviewDocument(snapshot.preview_html, {
+              runtimeShim: false,
+            })}
             title="共享组件"
           />
         </div>
@@ -169,18 +206,34 @@ export function SessionShareViewPage() {
     });
   }, []);
 
+  const extractMessageText = useCallback((message: SessionSharePublicView["messages"][number]) => {
+    const partTexts = message.parts
+      .map((part) => {
+        const type = String(part.type ?? "");
+        if (TEXT_KINDS.has(type)) {
+          return visibleStreamUIText(String(part.content ?? ""), false);
+        }
+        if (type === "ui") {
+          const snapshot = parseUISnapshot(part.data);
+          return snapshot && snapshot.state !== "removed"
+            ? documentMarkdown(committedNumericPreview(snapshot)).trim()
+            : "";
+        }
+        return "";
+      })
+      .filter((item) => item.trim());
+    const rawBody = partTexts.length
+      ? partTexts.join("\n\n")
+      : visibleStreamUIText(message.content || "", false);
+    return message.role === "assistant" ? stripRawWebCitations(rawBody) : rawBody;
+  }, []);
+
   const copyAll = useCallback(async () => {
     if (!data) return;
     const text = data.messages
       .map((message) => {
         const role = message.role === "user" ? "我" : "AI";
-        const body =
-          message.content ||
-          (message.parts
-            .filter((part) => TEXT_KINDS.has(String(part.type)))
-            .map((part) => String(part.content ?? ""))
-            .join("\n"));
-        return `【${role}】\n${message.role === "assistant" ? stripRawWebCitations(body) : body}`;
+        return `【${role}】\n${extractMessageText(message)}`;
       })
       .join("\n\n---\n\n");
     try {
@@ -190,21 +243,12 @@ export function SessionShareViewPage() {
     } catch {
       // Clipboard unavailable in this context; ignore.
     }
-  }, [data]);
+  }, [data, extractMessageText]);
 
   const fullText = useMemo(() => {
     if (!data) return "";
-    return data.messages
-      .map(
-        (message) =>
-          message.content ||
-          message.parts
-            .filter((part) => TEXT_KINDS.has(String(part.type)))
-            .map((part) => String(part.content ?? ""))
-            .join("\n"),
-      )
-      .join("\n\n");
-  }, [data]);
+    return data.messages.map(extractMessageText).filter(Boolean).join("\n\n");
+  }, [data, extractMessageText]);
 
   return (
     <div className="share-view">

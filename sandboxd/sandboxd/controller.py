@@ -961,8 +961,22 @@ class SandboxController:
         # The backend can replay admission with the original stable id/payload.
         # An exclusive supervisor mkdir prevents a second native launch. Do not
         # declare an uncertain dispatch stopped merely because a timer elapsed.
-        return {'execution_id':execution_id,'status':record['status'],'sandbox_id':record['sandbox_id'],
-                'launch_pending':native is None and callable(read)}
+        running_view: dict[str, Any] = {
+            'execution_id': execution_id,
+            'status': record['status'],
+            'sandbox_id': record['sandbox_id'],
+            'launch_pending': native is None and callable(read),
+        }
+        if isinstance(native, dict):
+            if isinstance(native.get('stdout_tail'), str):
+                running_view['stdout_tail'] = native['stdout_tail']
+            if isinstance(native.get('stderr_tail'), str):
+                running_view['stderr_tail'] = native['stderr_tail']
+            if 'live_output_truncated' in native:
+                running_view['live_output_truncated'] = bool(native['live_output_truncated'])
+            if isinstance(native.get('latency_ms'), int):
+                running_view['latency_ms'] = native['latency_ms']
+        return running_view
 
     def reconcile_executions(self) -> None:
         for record in self.store.active_executions(self.config.deployment_id):

@@ -22,7 +22,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.database import retry_sqlite_locked
+from app.core.database import retry_sqlite_locked, session_holds_write_gate
 from app.core.errors import AppError
 from app.core.config import Settings, get_settings
 from app.domain.models import (
@@ -62,7 +62,12 @@ from app.domain.settings import (
     CHAT_RESPONSE_STYLE_SETTING_KEY,
     CHAT_SUGGESTED_PROMPTS_SETTING_KEY,
 )
-from app.prompts.compiler import build_style_instructions, normalize_response_style
+from app.prompts.compiler import (
+    PromptChannel,
+    PromptRuntimeState,
+    build_style_instructions,
+    normalize_response_style,
+)
 from app.domain.schemas.chat import (
     BranchRequest,
     ConceptBranchCreateRequest,
@@ -97,7 +102,10 @@ from app.providers.ports.fetch import FetchProviderPort
 from app.providers.ports.search import SearchProviderPort
 from app.providers.storage_factory import object_storage_provider
 from app.providers.model_options import resolve_image_input_mode
-from app.providers.error_policy import provider_stream_retry_category
+from app.providers.error_policy import (
+    classify_provider_error,
+    provider_stream_retry_category,
+)
 from app.providers.remote.fetch import (
     FetchProviderError,
     FetchProviderTimeout,
@@ -583,9 +591,10 @@ def _provider_stream_error_payload(exc: BaseException) -> dict[str, object]:
     Non-AppError failures used to collapse into a generic
     ``provider_stream_failed`` toast that hid HTTP 4xx bodies, transport
     failures, and incomplete-stream details. Surface a safe message while
-    keeping a stable code for clients that branch on it.
+    keeping a stable code and structured ``kind`` for clients that branch on it.
     """
 
+    classification = classify_provider_error(exc)
     if isinstance(exc, AppError):
         error: dict[str, object] = {
             "code": exc.code,
@@ -593,32 +602,63 @@ def _provider_stream_error_payload(exc: BaseException) -> dict[str, object]:
         }
         if exc.details:
             error["details"] = exc.details
-        return error
-    if isinstance(exc, ProviderTimeoutError):
-        return {
+    elif isinstance(exc, ProviderTimeoutError):
+        error = {
             "code": "provider_timeout",
             "message": _safe_provider_error_message(exc) or "The model provider timed out",
         }
-    if isinstance(exc, ProviderResponseError):
-        return {
+    elif isinstance(exc, ProviderResponseError):
+        error = {
             "code": "provider_invalid_response",
             "message": _safe_provider_error_message(exc)
             or "The model provider returned an invalid response",
         }
-    if isinstance(exc, ProviderHTTPError):
-        return {
+    elif isinstance(exc, ProviderHTTPError):
+        error = {
             "code": "provider_http_error",
             "message": _safe_provider_error_message(exc)
             or "The model provider HTTP stream failed",
         }
-    return {
-        "code": "provider_stream_failed",
-        "message": (
-            "The provider stream failed before completion: "
-            f"{_safe_provider_error_message(exc)}"
-        ),
-        "details": {"error_type": type(exc).__name__},
+    else:
+        error = {
+            "code": "provider_stream_failed",
+            "message": (
+                "The provider stream failed before completion: "
+                f"{_safe_provider_error_message(exc)}"
+            ),
+            "details": {"error_type": type(exc).__name__},
+        }
+    error["kind"] = classification["kind"]
+    error["retryable"] = bool(classification["retryable"])
+    if classification.get("status_code") is not None:
+        error["status_code"] = classification["status_code"]
+    return error
+
+
+def _record_retry_attempt_trace(
+    provider_trace: dict[str, Any],
+    *,
+    attempt_no: int,
+    max_retries: int,
+    error_category: str,
+    backoff_ms: int,
+    error_message: str,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "attempt_no": attempt_no,
+        "max_retries": max_retries,
+        "error_category": error_category,
+        "backoff_ms": backoff_ms,
+        "error_message": error_message,
     }
+    history = provider_trace.get("retry_attempts")
+    if not isinstance(history, list):
+        history = []
+    else:
+        history = list(history)
+    history.append(entry)
+    provider_trace["retry_attempts"] = history[-12:]
+    return entry
 
 
 def _jittered_delay(base_seconds: float, ratio: float) -> float:
@@ -1067,9 +1107,11 @@ class ChatService:
                 self._structured_billing_input(messages),
                 "chat_fast_preface",
             )
+            # Release any read/write transaction before waiting on the remote model stream.
+            self.db.commit()
             stream = provider.stream_chat(messages, tools=None)
 
-            for provider_event in stream:
+            for provider_event in self._yield_without_write_lock(stream):
                 if cancelled():
                     raise _GenerationCancellationRequested()
                 if provider_event.type != "text_delta" or not provider_event.content:
@@ -3135,6 +3177,7 @@ class ChatService:
         include_memory: bool = True,
         include_history: bool = True,
         prepared_context: str | None = None,
+        channel: PromptChannel | None = None,
     ) -> tuple[str, ContextSummary | None]:
         history = self._session_timeline(session_id) if include_history else []
         if history_before_message_id is not None:
@@ -3192,7 +3235,7 @@ class ChatService:
         else:
             authorized_context = prepared_context
         style_instructions = (
-            f"{self._style_instructions()}\n\n"
+            f"{self._style_instructions(channel=channel)}\n\n"
             f"{self._mode_tool_policy(agent_mode_enabled=agent_mode, web_search_results_present=web_search_results_present, model_native_search_enabled=getattr(self.model_provider, 'search_route', '') == 'model_native')}"
         )
         if not include_history and not include_memory:
@@ -3950,6 +3993,26 @@ class ChatService:
         )
         return [ProviderChatMessage(role="user", content=compacted)], summary
 
+    def _release_write_lock_before_wait(self) -> None:
+        if session_holds_write_gate(self.db):
+            self._flush_event_buffer()
+
+    def _yield_without_write_lock(self, stream):
+        """Ensure no uncommitted SQLite/PostgreSQL write gate is held while awaiting the next token."""
+        iterator = iter(stream)
+        try:
+            while True:
+                self._release_write_lock_before_wait()
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+                yield item
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+
     def _stream_agent_chat(self, messages, *, tools, session_id):
         from app.services.rich_response import rich_events
         if self.agent_tool_runtime is not None and callable(getattr(self.agent_tool_runtime, "stream_chat", None)):
@@ -4008,13 +4071,17 @@ class ChatService:
                             if any(key[0] in closing for key in jobs.jobs):
                                 time.sleep(.05)
                 yield event
-        yield from rich_events(completion_events(), tool_names={tool.get("function", {}).get("name") for tool in (tools or [])}, allow_tool_calls=bool(tools))
+        yield from self._yield_without_write_lock(
+            rich_events(completion_events(), tool_names={tool.get("function", {}).get("name") for tool in (tools or [])}, allow_tool_calls=bool(tools))
+        )
 
     def _stream_rich_answer(self, prompt):
         from app.providers.ports.model import ProviderStreamEvent
         from app.services.rich_response import CAPABILITY_CATALOG, rich_events
-        yield from rich_events((ProviderStreamEvent("text_delta", content=chunk)
-                                for chunk in self.model_provider.stream_answer(prompt + "\n\n" + CAPABILITY_CATALOG)), allow_tool_calls=False)
+        yield from self._yield_without_write_lock(
+            rich_events((ProviderStreamEvent("text_delta", content=chunk)
+                         for chunk in self.model_provider.stream_answer(prompt + "\n\n" + CAPABILITY_CATALOG)), allow_tool_calls=False)
+        )
 
     def _apply_inline_ui(self, command, *, session_id, message_id, version_id, streamed_parts, ordinal, sequence):
         if "_svg" in command:
@@ -4053,7 +4120,8 @@ class ChatService:
                 workspace_id=self.workspace_id, message_version_id=version_id,
                 ordinal=ordinal, part_type="svg", status="streaming", content=command["title"],
                 data={"block_id": block_id, "view_box": command["view_box"], "title": command["title"],
-                      "nodes": [], "state": "streaming", "layout": "inline"},
+                      "nodes": [], "state": "streaming", "layout": "inline",
+                      "display_mode": command.get("display_mode") or "inline"},
             ))
             streamed_parts.append(part)
         elif part is None or (op == "node" and part.status != "streaming"):
@@ -4518,6 +4586,9 @@ class ChatService:
                 "phase": "publishing",
                 "progress_mode": "indeterminate",
             }
+            raw_display_mode = input_data.get("display_mode")
+            if isinstance(raw_display_mode, str) and raw_display_mode.strip().lower() in {"inline", "artifact"}:
+                data["display_mode"] = raw_display_mode.strip().lower()
         record = self.message_parts.add(
             MessagePartRecord(
                 workspace_id=self.workspace_id,
@@ -4786,7 +4857,7 @@ class ChatService:
         r"!\[([^\]\n]*)\]\(\s*sandbox:([^)\s]+)\s*\)"
         # Bare references (e.g. card_inst_...) are stripped as invalid markers.
         r"|\[\[\s*artifact\s*:\s*(?:([a-z_]+)\s*:\s*)?([^|\]\s]+)"
-        r"(?:\s*\|\s*layout\s*=\s*([a-z_]+))?\s*\]\]",
+        r"((?:\s*\|\s*(?:layout|mode)\s*=\s*[a-z_]+)*)\s*\]\]",
         re.IGNORECASE,
     )
     _ARTIFACT_PART_KINDS = frozenset(
@@ -4868,7 +4939,16 @@ class ChatService:
                 continue
             ref_kind = (match.group(3) or "").casefold()
             ref_value = (match.group(4) or "").strip()
-            layout = (match.group(5) or "").casefold()
+            raw_opts = match.group(5) or ""
+            layout = ""
+            display_mode = ""
+            for opt_key, opt_val in re.findall(r"\|\s*(layout|mode)\s*=\s*([a-z_]+)", raw_opts, re.IGNORECASE):
+                key_lower = opt_key.casefold()
+                val_lower = opt_val.casefold()
+                if key_lower == "layout":
+                    layout = val_lower
+                elif key_lower == "mode" and val_lower in {"inline", "artifact"}:
+                    display_mode = val_lower
             # Always split here so an invalid tag is stripped from the text.
             segments.append(final_text[cursor : match.start()])
             cursor = match.end()
@@ -4888,6 +4968,7 @@ class ChatService:
                     "layout": (
                         layout if layout in {"inline", "block", "side"} else "block"
                     ),
+                    **({"display_mode": display_mode} if display_mode else {}),
                 }
             )
         segments.append(final_text[cursor:])
@@ -5719,6 +5800,138 @@ class ChatService:
             disclosed_tool_names=disclosed_tool_names,
         )
         return future, time.monotonic() + timeout_seconds
+
+    _LIVE_SHELL_TOOLS = frozenset({"sandbox_bash", "sandbox_exec", "sandbox_run"})
+
+    def _encode_ephemeral_tool_live_output(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        message_version_id: str,
+        tool_record: MessagePartRecord,
+        output: str,
+        truncated: bool,
+        latency_ms: int,
+    ) -> str:
+        part_data = dict(tool_record.data or {})
+        part_data["live_output"] = output
+        part_data["live_output_truncated"] = truncated
+        part_data["live_output_elapsed_ms"] = latency_ms
+        payload = {
+            "event_id": f"live-{tool_record.id}-{uuid4().hex[:8]}",
+            "type": "part.delta",
+            "event": "message.part.delta",
+            "workspace_id": self.workspace_id,
+            "session_id": session_id,
+            "message_id": message_id,
+            "message_version_id": message_version_id,
+            "part_id": tool_record.id,
+            "part": self._part_snapshot(
+                tool_record.id,
+                "tool_call",
+                "streaming",
+                tool_record.content or "",
+                part_data,
+            ),
+        }
+        return (
+            f"id: {payload['event_id']}\n"
+            f"event: message.part.delta\n"
+            f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        )
+
+    def _run_live_shell_tool_stream(
+        self,
+        tool_call: dict,
+        allowed_domains: list[str],
+        chat_session_id: str,
+        *,
+        assistant_message_id: str,
+        assistant_version_id: str,
+        source_message_id: str | None,
+        disclosed_tool_names: set[str],
+        tool_record: MessagePartRecord,
+        run_id: str,
+        cancelled: Callable[[], bool] | None = None,
+    ):
+        """Run a shell tool off-thread while streaming bounded live output tails over SSE."""
+        import queue as _queue
+
+        from app.services.sandbox_live_output import live_output_sink
+
+        live_queue: _queue.Queue[dict[str, Any]] = _queue.Queue(maxsize=32)
+
+        def _sink(snapshot: dict[str, Any]) -> None:
+            try:
+                live_queue.put_nowait(snapshot)
+            except _queue.Full:
+                try:
+                    live_queue.get_nowait()
+                except _queue.Empty:
+                    pass
+                try:
+                    live_queue.put_nowait(snapshot)
+                except _queue.Full:
+                    pass
+
+        def _worker() -> tuple[str, dict, list[dict]]:
+            with live_output_sink(_sink):
+                return self._run_agent_tool_isolated(
+                    tool_call,
+                    allowed_domains=allowed_domains,
+                    chat_session_id=chat_session_id,
+                    assistant_message_id=assistant_message_id,
+                    assistant_version_id=assistant_version_id,
+                    source_message_id=source_message_id,
+                    disclosed_tool_names=disclosed_tool_names,
+                )
+
+        executor = _tool_executor_for_call(tool_call)
+        future = executor.submit(_worker)
+        timeout_seconds = self._agent_tool_timeout_seconds(tool_call)
+        deadline = time.monotonic() + timeout_seconds
+        next_heartbeat = time.monotonic() + AGENT_TOOL_HEARTBEAT_SECONDS
+        last_sent_output = ""
+
+        while not future.done():
+            if cancelled is not None and cancelled():
+                future.cancel()
+                raise _GenerationCancellationRequested()
+            if time.monotonic() >= deadline:
+                future.cancel()
+                break
+            latest_snapshot: dict[str, Any] | None = None
+            while True:
+                try:
+                    latest_snapshot = live_queue.get_nowait()
+                except _queue.Empty:
+                    break
+            if latest_snapshot is not None:
+                output = str(latest_snapshot.get("output") or "")
+                if output and output != last_sent_output:
+                    last_sent_output = output
+                    yield self._encode_ephemeral_tool_live_output(
+                        session_id=chat_session_id,
+                        message_id=assistant_message_id,
+                        message_version_id=assistant_version_id,
+                        tool_record=tool_record,
+                        output=output,
+                        truncated=bool(latest_snapshot.get("truncated")),
+                        latency_ms=int(latest_snapshot.get("latency_ms") or 0),
+                    )
+                    next_heartbeat = time.monotonic() + AGENT_TOOL_HEARTBEAT_SECONDS
+            if time.monotonic() >= next_heartbeat:
+                yield ": agent-tool-running\n\n"
+                next_heartbeat = time.monotonic() + AGENT_TOOL_HEARTBEAT_SECONDS
+            time.sleep(AGENT_TOOL_POLL_SECONDS)
+
+        return self._await_agent_tool_isolated(
+            future,
+            tool_call,
+            chat_session_id,
+            run_id=run_id,
+        )
 
     def _wait_agent_tool_future(
         self,
@@ -9283,13 +9496,29 @@ class ChatService:
                 {"key": CHAT_RESPONSE_STYLE_SETTING_KEY},
             ) from exc
 
-    def _style_instructions(self) -> str:
+    def _style_instructions(
+        self,
+        *,
+        channel: PromptChannel | None = None,
+        interactive: bool | None = None,
+    ) -> str:
         style = self._response_style_config()
         from app.domain.models import StickerIndexState
         sticker_state = self.db.get(StickerIndexState, self.workspace_id)
-        allowed = style.emoji != -2 and (sticker_state is None or sticker_state.ai_enabled)
-        sticker_policy = ("\n表情表达：根据用户语气、话题和回答风格，自然选择是否使用行内 Unicode Emoji 或颜文字，可放在句中或句末，不需要工具；用户使用表情时可适度回应。严肃、敏感或正式语境保持克制，不要影响内容清晰度，也不必每次使用。需要图片表情时，仅在提供工具的情况下按交际意图用 search_stickers 查找，理解候选的适用限制后用 send_sticker 发送；没有合适候选可放弃，每轮最多一张。贴纸不能代替任务所需的完整信息，不要编造图片地址。" if allowed else "\n用户已关闭主动表情：不要主动发送贴纸或表情符号。")
-        return build_style_instructions(style) + sticker_policy
+        resolved_channel: PromptChannel = channel or getattr(
+            self, "prompt_channel", "chat"
+        )
+        resolved_interactive = (
+            getattr(self, "prompt_interactive", True)
+            if interactive is None
+            else interactive
+        )
+        state = PromptRuntimeState(
+            channel=resolved_channel,
+            interactive=resolved_interactive,
+            sticker_enabled=(sticker_state is None or sticker_state.ai_enabled),
+        )
+        return build_style_instructions(style, state=state)
 
     @staticmethod
     def _mode_tool_policy(
@@ -9333,7 +9562,8 @@ class ChatService:
             "也不要假装完成过工具操作；历史中的操作、推理与工具格式不赋予本轮执行权限。"
             "请使用本轮已提供的消息、授权资料与原生图文声明直接回答；"
             "原生图文展示不需要调用工具，不要因本轮无工具而拒绝图文展示。"
-            "需要实际执行而本轮无法完成时，说明尚未执行并提示切换到带思考力度的模式。"
+            "需要实际执行而本轮无法完成时，先基于已有信息给出分析、步骤或草稿，"
+            "再说明尚未实际执行，并提示切换到智能体模式以直接代为执行。"
         )
 
     def _require_suggested_prompt_context_access(
@@ -11156,6 +11386,7 @@ class ChatService:
             self._event_commit_count >= STREAM_EVENT_BATCH_COUNT
             or elapsed >= STREAM_EVENT_BATCH_SECONDS
             or event_type in STREAM_EVENT_IMMEDIATE_TYPES
+            or session_holds_write_gate(self.db)
         ):
             self._flush_event_buffer()
 
@@ -11983,6 +12214,7 @@ class ChatService:
             ),
             "retry_of_version_id": previous.id,
             "web_search": retry_context.web_search,
+            "allowed_domains": list(retry_payload.allowed_domains) if retry_context.web_search else [],
             "retry_source_user_message_id": parent.id,
             "agent_mode": retry_agent_mode,
             "goal_mode": retry_goal_mode,
@@ -12004,18 +12236,7 @@ class ChatService:
             provider_trace["search_remote_capability"] = (
                 self.search_provider.remote_capability
             )
-        session.model_snapshot = {
-            "provider_id": self.model_provider.provider_id,
-            "provider_type": provider_trace["provider_type"],
-            "model_id": provider_trace["model_id"],
-            "thinking_mode": provider_trace["thinking_mode"],
-            "actual_reasoning_effort": provider_trace["actual_reasoning_effort"],
-            "agent_mode": bool(provider_trace.get("agent_mode", False)),
-            "search_route": provider_trace.get("search_route", "disabled"),
-            "web_search": bool(provider_trace.get("web_search", False)),
-            "generation_mode": provider_trace.get("generation_mode", "text"),
-        }
-
+        # A retry updates the answer version, not the session's composer defaults.
         version = self.message_versions.add(
             MessageVersion(
                 workspace_id=self.workspace_id,
@@ -12214,7 +12435,7 @@ class ChatService:
                     .where(MessageControl.message_version_id == version.id)
                     .execution_options(populate_existing=True)
                 )
-                return bool(control and control.cancel_requested)
+                return control is None or bool(control.cancel_requested)
 
             def record_active_usage():
                 nonlocal active_usage_recorded
@@ -12980,6 +13201,27 @@ class ChatService:
                                             ),
                                         )
                                     )
+                                elif (
+                                    tool_name in self._LIVE_SHELL_TOOLS
+                                    and self.tool_worker_factory is not None
+                                ):
+                                    result_content, result_meta, result_sources = yield from self._run_live_shell_tool_stream(
+                                        tool_call,
+                                        retry_context.allowed_domains,
+                                        session_id,
+                                        assistant_message_id=message.id,
+                                        assistant_version_id=version.id,
+                                        source_message_id=parent.id,
+                                        disclosed_tool_names={
+                                            str(item.get("function", {}).get("name") or "")
+                                            for item in retry_tool_definitions
+                                        },
+                                        tool_record=tool_record,
+                                        run_id=(
+                                            f"run_{message.id or parent.id or str(tool_call.get('id') or uuid4())}"
+                                        ),
+                                        cancelled=cancelled,
+                                    )
                                 else:
                                     result_content, result_meta, result_sources = (
                                         self._execute_agent_tool(
@@ -13587,6 +13829,15 @@ class ChatService:
                             )
                             sequence += 1
                             yield self._encode_event(replaced)
+                        retry_error_message = _safe_provider_error_message(exc, limit=180)
+                        _record_retry_attempt_trace(
+                            provider_trace,
+                            attempt_no=attempt_no + 1,
+                            max_retries=len(self.retry_delays),
+                            error_category=error_category,
+                            backoff_ms=int(delay * 1000),
+                            error_message=retry_error_message,
+                        )
                         scheduled = self._append_event(
                             session_id=session_id,
                             message_id=message.id,
@@ -13600,6 +13851,7 @@ class ChatService:
                                 "max_attempts": max_attempts,
                                 "error_category": error_category,
                                 "backoff_ms": int(delay * 1000),
+                                "error_message": retry_error_message,
                             },
                         )
                         sequence += 1
@@ -13762,6 +14014,12 @@ class ChatService:
                 for moved_event in moved_events:
                     yield moved_event
                 yield self._encode_event(completed)
+                try:
+                    from app.services.queued_turns import schedule_queued_turn_drain
+
+                    schedule_queued_turn_drain(self.db, self.workspace_id, session_id)
+                except Exception:
+                    logger.debug("Queued turn drain scheduling skipped", exc_info=True)
             except _GenerationCancellationRequested:
                 record_active_usage()
                 discard_response_state()
@@ -13897,6 +14155,7 @@ class ChatService:
                 text_record.status = "failed"
                 text_record.content = final_text
                 version.status = "failed"
+                provider_trace["last_error"] = error
                 version.provider_trace = dict(provider_trace)
                 message.status = "failed"
                 message.content = final_text
@@ -15786,7 +16045,7 @@ class ChatService:
                     .where(MessageControl.message_version_id == assistant_version.id)
                     .execution_options(populate_existing=True)
                 )
-                return bool(control and control.cancel_requested)
+                return control is None or bool(control.cancel_requested)
 
             graph_proposal_applied = False
 
@@ -16679,6 +16938,27 @@ class ChatService:
                                             f"run_{assistant_message.id or user_message.id or str(tool_call.get('id') or uuid4())}"
                                         ),
                                     )
+                                elif (
+                                    tool_name in self._LIVE_SHELL_TOOLS
+                                    and self.tool_worker_factory is not None
+                                ):
+                                    result_content, result_meta, result_sources = yield from self._run_live_shell_tool_stream(
+                                        tool_call,
+                                        payload.allowed_domains,
+                                        session_id,
+                                        assistant_message_id=assistant_message.id,
+                                        assistant_version_id=assistant_version.id,
+                                        source_message_id=user_message.id,
+                                        disclosed_tool_names={
+                                            str(item.get("function", {}).get("name") or "")
+                                            for item in tool_definitions
+                                        },
+                                        tool_record=tool_record,
+                                        run_id=(
+                                            f"run_{assistant_message.id or user_message.id or str(tool_call.get('id') or uuid4())}"
+                                        ),
+                                        cancelled=cancelled,
+                                    )
                                 else:
                                     result_content, result_meta, result_sources = self._execute_agent_tool(
                                         tool_call,
@@ -17359,7 +17639,16 @@ class ChatService:
                             )
                             sequence += 1
                             yield self._encode_event(replaced)
-                        scheduled = self._append_event(session_id=session_id, message_id=assistant_message.id, message_version_id=assistant_version.id, part_id=None, sequence=sequence, event_type="provider.retry.scheduled", payload={"attempt_no": attempt_no + 1, "max_retries": len(self.retry_delays), "max_attempts": max_attempts, "error_category": error_category, "backoff_ms": int(delay * 1000)})
+                        retry_error_message = _safe_provider_error_message(exc, limit=180)
+                        _record_retry_attempt_trace(
+                            provider_trace,
+                            attempt_no=attempt_no + 1,
+                            max_retries=len(self.retry_delays),
+                            error_category=error_category,
+                            backoff_ms=int(delay * 1000),
+                            error_message=retry_error_message,
+                        )
+                        scheduled = self._append_event(session_id=session_id, message_id=assistant_message.id, message_version_id=assistant_version.id, part_id=None, sequence=sequence, event_type="provider.retry.scheduled", payload={"attempt_no": attempt_no + 1, "max_retries": len(self.retry_delays), "max_attempts": max_attempts, "error_category": error_category, "backoff_ms": int(delay * 1000), "error_message": retry_error_message})
                         sequence += 1
                         yield self._encode_event(scheduled)
                         self.db.commit()
@@ -17540,6 +17829,12 @@ class ChatService:
                 for moved_event in moved_events:
                     yield moved_event
                 yield self._encode_event(completed_event)
+                try:
+                    from app.services.queued_turns import schedule_queued_turn_drain
+
+                    schedule_queued_turn_drain(self.db, self.workspace_id, session_id)
+                except Exception:
+                    logger.debug("Queued turn drain scheduling skipped", exc_info=True)
             except _GenerationCancellationRequested:
                 discard_provider_response_state()
                 if attempt is not None and attempt.status == "running":
@@ -17706,6 +18001,9 @@ class ChatService:
                 sequence += 1
                 assistant_message.status = "failed"
                 assistant_version.status = "failed"
+                provider_trace["last_error"] = error
+                assistant_version.provider_trace = dict(provider_trace)
+                assistant_message.provider_trace = dict(provider_trace)
                 if submission is not None:
                     submission.status = "failed"
                 self.audit.record(

@@ -32,7 +32,7 @@ from app.domain.schemas.stream_ui import (
 MAX_UI_BYTES = 192_000
 MAX_UI_BLOCKS = 20
 IMAGE_NODE_TYPES = {"image", "image_group", "gallery"}
-ENVELOPE_METADATA_KEYS = ("artifact_registry", "title")
+ENVELOPE_METADATA_KEYS = ("artifact_registry", "title", "display_mode")
 
 
 def strip_part_envelope(data: dict) -> dict:
@@ -615,8 +615,9 @@ def tool_definitions() -> list[dict]:
         "name": "ui_stream", "description": (
             "Stream native interactive chart/graph/timeline/table/metric or composable document blocks among your text. "
             "For document, upsert.blocks is a flat tree with stable id, optional parent_id and type. "
-            "Types: paragraph,heading,list,quote,code,math,divider,icon; image,image_group,gallery,figure; "
-            "chart,table,graph,diagram,timeline,metric,simulation,interactive; section,stack,row,columns,grid,media_text,tabs,accordion. "
+            "Types: paragraph,heading,caption,list,quote,code,math,divider,icon; image,image_group,gallery,figure,svg; "
+            "chart,table,graph,diagram,timeline,metric,simulation,interactive; section,stack,row,column,columns,grid,card,media_text,tabs,accordion. "
+            "Multiple independent type=svg nodes (with safe static svg markup, alt, caption) can be composed freely alongside native headings, text, captions, charts, images, dividers, columns, grids and cards inside one document instead of drawing layout text into one giant SVG. "
             "Editorial list parents: feature_list,step_list,status_list; children must be rail_item linked by parent_id, maximum12. "
             "Rail items use label=title,text=Markdown explanation,caption=detail,item_status=pending|active|completed|error (rail_item only). "
             "Icons are optional, not required in every answer. Use icon=fluent:<slug>, e.g. fluent:rocket, fluent:light-bulb, fluent:brain; "

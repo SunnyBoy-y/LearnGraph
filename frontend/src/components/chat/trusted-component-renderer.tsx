@@ -596,6 +596,7 @@ export function TrustedComponentRenderer({
         {multiline ? (
           <Textarea
             aria-label={component.props.title}
+            disabled={!interactive}
             onChange={(event) => handleTextChange(event.currentTarget.value)}
             placeholder={component.props.placeholder ?? undefined}
             value={textValue}
@@ -603,6 +604,7 @@ export function TrustedComponentRenderer({
         ) : (
           <Input
             aria-label={component.props.title}
+            disabled={!interactive}
             onChange={(event) => handleTextChange(event.currentTarget.value)}
             placeholder={component.props.placeholder ?? undefined}
             value={textValue}
@@ -610,7 +612,7 @@ export function TrustedComponentRenderer({
         )}
         <div className="message-component__actions">
           <Button
-            disabled={!textValue.trim() || !component.allowed_events.includes("submit")}
+            disabled={!interactive || !textValue.trim() || !component.allowed_events.includes("submit")}
             onClick={() => emit("submit", { value: textValue.trim() })}
             size="sm"
           >
@@ -692,7 +694,7 @@ export function TrustedComponentRenderer({
               const eventName = action.event ?? action.id;
               return (
                 <Button
-                  disabled={!component.allowed_events.includes(eventName)}
+                  disabled={!interactive || !component.allowed_events.includes(eventName)}
                   key={action.id}
                   onClick={() =>
                     emit(eventName, {
@@ -753,7 +755,7 @@ export function TrustedComponentRenderer({
               const eventName = action.event ?? action.id;
               return (
                 <Button
-                  disabled={!component.allowed_events.includes(eventName)}
+                  disabled={!interactive || !component.allowed_events.includes(eventName)}
                   key={action.id}
                   onClick={() =>
                     emit(eventName, {
@@ -1346,7 +1348,12 @@ export function TrustedComponentRenderer({
   }
 
   // create 模式：与极速模式「审核初始图谱」1:1 复刻，确认即通过审核并发布。
-  const nodeById = new Map(proposal.nodes.map((node) => [node.id, node]));
+  const nodeByRef = new Map<string, (typeof proposal.nodes)[number]>();
+  for (const node of proposal.nodes) {
+    nodeByRef.set(node.ref, node);
+    nodeByRef.set(node.id, node);
+    if (node.node_id) nodeByRef.set(node.node_id, node);
+  }
   return (
     <section
       className="goal-flow-graph-review topic-preview-panel graph-proposal is-create-panel"
@@ -1407,11 +1414,11 @@ export function TrustedComponentRenderer({
                 key={`${edge.source_ref}-${edge.target_ref}-${index}`}
               >
                 <span>
-                  {nodeById.get(edge.source_ref)?.label ?? edge.source_ref}
+                  {nodeByRef.get(edge.source_ref)?.label ?? edge.source_ref}
                 </span>
                 <ArrowRight aria-hidden="true" className="size-3.5" />
                 <span>
-                  {nodeById.get(edge.target_ref)?.label ?? edge.target_ref}
+                  {nodeByRef.get(edge.target_ref)?.label ?? edge.target_ref}
                 </span>
                 <Badge variant="outline">{edge.relation}</Badge>
               </li>

@@ -33,19 +33,23 @@ export function createPlainCodeHighlighter() {
     type: "code-highlighter" as const,
     supportsLanguage: () => true,
     getSupportedLanguages: () => [],
-    getThemes: () => ["github-light"],
+    getThemes: () => ["github-light", "github-dark"] as const,
     highlight: () => null,
   };
 }
 
-function loadStreamdown(_mode: CodeHighlightMode): Promise<StreamdownModule> {
+export function resolveStreamdownPlugins(mode: CodeHighlightMode): Record<string, unknown> {
+  return {
+    cjk,
+    code: mode === "plain" ? createPlainCodeHighlighter() : code,
+    math: createMathPlugin({ singleDollarTextMath: true }),
+  };
+}
+
+function loadStreamdown(mode: CodeHighlightMode): Promise<StreamdownModule> {
   return Promise.resolve({
     Streamdown,
-    plugins: {
-      cjk,
-      code,
-      math: createMathPlugin({ singleDollarTextMath: true }),
-    },
+    plugins: resolveStreamdownPlugins(mode),
   });
 }
 
@@ -124,7 +128,7 @@ export function LazyStreamdown({
 
   const { Streamdown, plugins } = module;
   return (
-    <Streamdown {...props} components={renderComponents} rehypePlugins={rehypePlugins} plugins={diagramPlugin ? { ...plugins, mermaid: diagramPlugin } : plugins}>
+    <Streamdown {...props} className={`answer-markdown-flow ${String(props.className ?? "")}`} components={renderComponents} rehypePlugins={rehypePlugins} plugins={diagramPlugin ? { ...plugins, mermaid: diagramPlugin } : plugins}>
       {typeof children === "string" ? children : ""}
     </Streamdown>
   );

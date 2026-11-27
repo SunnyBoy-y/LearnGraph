@@ -1,0 +1,74 @@
+.generation-config-menu[data-slot="dropdown-menu-content"],
+.generation-config-menu[data-slot="dropdown-menu-sub-content"] {
+  border-radius: 12px !important;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.09) !important;
+}
+
+.generation-config-menu [data-highlighted],
+.generation-config-menu [data-slot="dropdown-menu-sub-trigger"][data-state="open"] {
+  background: var(--muted);
+  color: var(--popover-foreground);
+}
+
+.generation-config-menu [data-slot="dropdown-menu-radio-item"][data-state="checked"] {
+  background: color-mix(in srgb, var(--muted) 72%, transparent);
+}
+
+.generation-config-menu [data-slot="dropdown-menu-radio-item"][data-state="checked"][data-highlighted] {
+  background: var(--muted);
+}
+
+/* Clickable stop labels under the thinking slider */
+.thinking-slider__label {
+  background: transparent;
+  border: 0;
+  padding: 2px 2px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.12s ease;
+}
+
+.thinking-slider__label:hover:not(:disabled) {
+  color: var(--foreground);
+}
+
+.thinking-slider__label:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* Lightweight CSS hover tooltip for capability icons inside menu items */
+.model-capability-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: color-mix(in srgb, var(--muted-foreground) 72%, transparent);
+}
+
+.model-capability-badge::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 60;
+  white-space: nowrap;
+  border-radius: 6px;
+  background: var(--foreground);
+  color: var(--background);
+  padding: 3px 7px;
+  font-size: 11px;
+  line-height: 1.3;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.model-capability-badge:hover::after,
+.model-capability-badge:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
+}

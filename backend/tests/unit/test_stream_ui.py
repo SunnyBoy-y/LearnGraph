@@ -341,3 +341,116 @@ def test_stream_ui_tolerates_composer_envelope_metadata():
             {**base, "unexpected_key": True},
         )
 
+
+def test_stream_ui_composable_multi_svg_document_and_security():
+    from app.services.genui_express import ExpressUIParser
+    from app.services.rich_response import InlineUIParser
+    from app.services.streamed_ui import UIArgumentStream
+
+    svg_before = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 200"><rect x="10" y="10" width="300" height="180" rx="8" fill="#ffffff" stroke="#d1d5db"/><rect x="90" y="50" width="140" height="80" rx="6" fill="#dbeafe"/></svg>'
+    svg_after = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 200"><rect x="10" y="10" width="300" height="180" rx="8" fill="#ffffff" stroke="#d1d5db"/><rect x="24" y="40" width="272" height="110" rx="6" fill="#dcfce7"/></svg>'
+    snapshot = compile_command(mount(component="document", upsert={"blocks": [
+        {"id": "h1", "type": "heading", "level": 2, "text": "修改前后的布局对比"},
+        {"id": "cols", "type": "columns", "columns": 2},
+        {"id": "left", "parent_id": "cols", "type": "card", "label": "修改前"},
+        {"id": "svg_left", "parent_id": "left", "type": "svg", "svg": svg_before, "alt": "修改前布局"},
+        {"id": "cap_left", "parent_id": "left", "type": "caption", "text": "卡片过窄，两侧空间浪费。"},
+        {"id": "right", "parent_id": "cols", "type": "column", "label": "修改后"},
+        {"id": "svg_right", "parent_id": "right", "type": "svg", "svg": svg_after, "alt": "修改后布局", "display_mode": "artifact"},
+        {"id": "cap_right", "parent_id": "right", "type": "caption", "text": "充分利用宽度，统一表单边界。"},
+        {"id": "div", "type": "divider"},
+        {"id": "summary", "type": "caption", "text": "上方由标题、双列布局、两个独立 SVG 和说明文字共同组成。"},
+    ]}))
+    assert [node.type for node in snapshot.blocks] == [
+        "heading", "columns", "card", "svg", "caption", "column", "svg", "caption", "divider", "caption",
+    ]
+    assert snapshot.blocks[3].display_mode == "inline"
+    assert snapshot.blocks[6].display_mode == "artifact"
+
+    # Security: unsafe SVG and misplaced fields are rejected.
+    with pytest.raises(AppError):
+        compile_command(mount(component="document", upsert={"blocks": [
+            {"id": "bad", "type": "svg", "svg": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><script>alert(1)</script><rect width="10" height="10"/></svg>'},
+        ]}))
+    with pytest.raises(AppError):
+        compile_command(mount(component="document", upsert={"blocks": [
+            {"id": "bad", "type": "paragraph", "text": "x", "svg": svg_before},
+        ]}))
+    with pytest.raises(AppError):
+        compile_command(mount(component="document", upsert={"blocks": [
+            {"id": "bad", "type": "paragraph", "text": "x", "display_mode": "artifact"},
+        ]}))
+
+    # Inline :::ui parser accepts documents whose content is native SVG + caption (including svg_markup alias).
+    parser = InlineUIParser()
+    events = list(parser.feed(
+        ':::ui compare\n'
+        '{"props":{"title":"布局对比"},"upsert":{"blocks":['
+        '{"id":"s1","type":"svg","svg_markup":' + __import__("json").dumps(svg_before) + ',"alt":"示意"}'
+        ']}}\n'
+        ':::\n'
+    ))
+    events.extend(parser.finish())
+    assert not parser.failed_declaration
+    assert any(getattr(e, "type", None) == "ui_command" and e.command.get("op") == "complete" for e in events)
+
+    # Express DSL supports card/column/svg/caption.
+    express = ExpressUIParser("exp1")
+    for line in [
+        "@title 对比",
+        "columns#c columns=2",
+        "  card#l: 修改前",
+        f"    svg#s1: {svg_before}",
+        "    caption#cap1: 说明文字",
+    ]:
+        express.feed_line(line + "\n")
+    finished = express.finish()
+    assert finished[-1]["op"] == "complete"
+
+    # Streaming argument preview creates a stable pending slot for incomplete svg nodes.
+    stream = UIArgumentStream()
+    partial = stream.feed(
+        '{"op":"mount","block_id":"d","component":"document","props":{"title":"图"},'
+        '"upsert":{"blocks":[{"id":"s1","type":"svg","label":"架构图","svg":"<svg viewBox='
+    )
+    assert partial is not None
+    assert partial["upsert"]["blocks"] == [{"id": "s1", "type": "svg", "label": "架构图", "state": "pending"}]
+
+
+def test_response_composer_and_stream_svg_display_modes():
+    from types import SimpleNamespace
+    from app.services.response_composer import ArtifactRegistry
+    from app.services.stream_svg import SvgDeclaration
+
+    svg_markup = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180"><rect width="80" height="40" fill="#dbeafe"/></svg>'
+
+    # :::svg defaults to inline and supports explicit display_mode=artifact.
+    decl_default = SvgDeclaration("s_inline")
+    start_default = decl_default.feed_line('{"viewBox":[0,0,320,180],"title":"架构示意"}')
+    assert start_default[0]["display_mode"] == "inline"
+
+    decl_artifact = SvgDeclaration("s_art")
+    start_artifact = decl_artifact.feed_line('{"viewBox":[0,0,320,180],"title":"可交付架构图","display_mode":"artifact"}')
+    assert start_artifact[0]["display_mode"] == "artifact"
+
+    decl_invalid = SvgDeclaration("s_bad")
+    assert decl_invalid.feed_line('{"viewBox":[0,0,320,180],"title":"x","display_mode":"popup"}') == []
+
+    # Same SVG format can be either inline or artifact based on purpose or explicit mode.
+    native_svg = SimpleNamespace(id="p1", part_type="svg", status="completed", content="图", data={"block_id": "s1", "view_box": "0 0 320 180", "svg_markup": svg_markup})
+    native_svg_as_artifact = SimpleNamespace(id="p2", part_type="svg", status="completed", content="图", data={"block_id": "s2", "view_box": "0 0 320 180", "svg_markup": svg_markup, "display_mode": "artifact"})
+    file_svg = SimpleNamespace(id="p3", part_type="sandbox_artifact", status="completed", content="diagram.svg", data={"file_id": "f1", "path": "outputs/diagram.svg", "mime_type": "image/svg+xml"})
+    file_svg_inline = SimpleNamespace(id="p4", part_type="sandbox_artifact", status="completed", content="diagram-inline.svg", data={"file_id": "f2", "path": "outputs/inline.svg", "mime_type": "image/svg+xml", "display_mode": "inline"})
+    static_svg_card_markup = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180"><circle cx="160" cy="90" r="40" fill="#dcfce7"/></svg>'
+    static_svg_card = SimpleNamespace(id="p5", part_type="magic_card", status="completed", content="卡片图", data={"card_id": "c1", "preview_html": f"<main>{static_svg_card_markup}</main>"})
+    interactive_html = SimpleNamespace(id="p6", part_type="magic_card", status="completed", content="交互应用", data={"card_id": "c2", "preview_html": "<button onclick='x()'>Go</button>"})
+
+    ArtifactRegistry().reconcile([native_svg, native_svg_as_artifact, file_svg, file_svg_inline, static_svg_card, interactive_html])
+    assert native_svg.data["artifact_registry"]["display_mode"] == "inline"
+    assert native_svg_as_artifact.data["artifact_registry"]["display_mode"] == "artifact"
+    assert file_svg.data["artifact_registry"]["display_mode"] == "artifact"
+    assert file_svg_inline.data["artifact_registry"]["display_mode"] == "inline"
+    assert static_svg_card.data["artifact_registry"]["display_mode"] == "inline"
+    assert interactive_html.data["artifact_registry"]["display_mode"] == "artifact"
+
+

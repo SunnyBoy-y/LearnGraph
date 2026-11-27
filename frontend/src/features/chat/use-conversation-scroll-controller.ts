@@ -8,11 +8,15 @@ import {
   type TouchEvent as ReactTouchEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
+import {
+  DEFAULT_NEAR_BOTTOM_THRESHOLD_PX,
+  evaluateScrollEvent,
+  isNearBottom,
+  isPointerOnVerticalScrollbarTrack,
+  type ScrollFollowMode,
+} from "@/features/chat/scroll-follow-core";
 
-export type ConversationScrollMode =
-  | "FOLLOW_ACTIVITY"
-  | "ANSWER_ANCHORED"
-  | "MANUAL_READING";
+export type ConversationScrollMode = ScrollFollowMode;
 
 export type ConversationScrollReason =
   | "activity-follow"
@@ -72,7 +76,7 @@ export interface ConversationScrollController {
   tailSpace: number;
 }
 
-const NEAR_BOTTOM_THRESHOLD = 96;
+const NEAR_BOTTOM_THRESHOLD = DEFAULT_NEAR_BOTTOM_THRESHOLD_PX;
 /**
  * Extra tail space kept beyond the strictly required amount, so the anchored
  * turn always sits clear of the "near bottom" band. Without it the anchor would
@@ -202,7 +206,18 @@ export function useConversationScrollController(): ConversationScrollController 
     const element = scrollElementRef.current;
     if (!element) return;
     const threshold = modeRef.current === "ANSWER_ANCHORED" ? 2 : NEAR_BOTTOM_THRESHOLD;
-    setIsAtBottom(maxScrollTop(element) - element.scrollTop <= threshold);
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    setIsAtBottom(
+      isNearBottom(
+        {
+          scrollTop: element.scrollTop,
+          scrollHeight: element.scrollHeight,
+          clientHeight: element.clientHeight,
+        },
+        threshold,
+        dpr,
+      ),
+    );
   }, [setIsAtBottom]);
 
   /**
@@ -504,39 +519,40 @@ export function useConversationScrollController(): ConversationScrollController 
     if (!element) return;
     const nextTop = element.scrollTop;
     const previousTop = lastScrollTopRef.current;
-    const distance = element.scrollHeight - nextTop - element.clientHeight;
-    const nearBottom = distance <= NEAR_BOTTOM_THRESHOLD;
-    const isProgrammatic =
-      performance.now() < ignoreManualUntilRef.current &&
-      expectedProgrammaticTopRef.current !== null &&
-      Math.abs(nextTop - expectedProgrammaticTopRef.current) <= 2;
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const decision = evaluateScrollEvent({
+      mode: modeRef.current,
+      previousScrollTop: previousTop,
+      metrics: {
+        scrollTop: nextTop,
+        scrollHeight: element.scrollHeight,
+        clientHeight: element.clientHeight,
+      },
+      nowMs: performance.now(),
+      ignoreManualUntilMs: ignoreManualUntilRef.current,
+      expectedProgrammaticTop: expectedProgrammaticTopRef.current,
+      nearBottomThresholdPx: NEAR_BOTTOM_THRESHOLD,
+      devicePixelRatio: dpr,
+    });
 
-    // The scroller is not only moved by this controller: the wheel, a touch
-    // drag, the keyboard, and the browser's own clamping all move it too. That
-    // displacement is not a layout change, so it has to be folded into the
-    // anchor's baseline here and now. A layout decision frame that was already
-    // scheduled for this same frame (streaming content resizes nearly every
-    // frame) runs *after* this and would otherwise read the pre-scroll baseline,
-    // mistake the learner's own scroll for content growth above the anchor, and
-    // scroll the viewport straight back — the reason the reply could not be
-    // scrolled by hand while it was streaming.
-    const scrollDelta = nextTop - previousTop;
-    if (scrollDelta !== 0 && activeAnchorRef.current) {
-      activeAnchorRef.current.viewportTop -= scrollDelta;
+    // Fold user/browser scroll displacement into the anchor baseline so an
+    // already-scheduled layout frame never mistakes user scroll for growth above.
+    if (decision.scrollDelta !== 0 && activeAnchorRef.current) {
+      activeAnchorRef.current.viewportTop -= decision.scrollDelta;
     }
     lastScrollTopRef.current = nextTop;
-    setIsAtBottom(nearBottom);
-    if (isProgrammatic) {
+    setIsAtBottom(decision.nearBottom);
+    if (decision.clearExpectedProgrammaticTop) {
       expectedProgrammaticTopRef.current = null;
+    }
+    if (decision.isProgrammatic) {
       return;
     }
-    expectedProgrammaticTopRef.current = null;
-
-    if (nextTop < previousTop - 1 && !nearBottom) {
+    if (decision.nextMode === "MANUAL_READING" && modeRef.current !== "MANUAL_READING") {
       enterManualReading();
       return;
     }
-    if (modeRef.current === "MANUAL_READING") {
+    if (decision.adoptManualAnchor) {
       window.requestAnimationFrame(adoptManualAnchor);
     }
   }, [adoptManualAnchor, enterManualReading, setIsAtBottom]);
@@ -576,7 +592,23 @@ export function useConversationScrollController(): ConversationScrollController 
       const element = scrollElementRef.current;
       if (!element) return;
       const rect = element.getBoundingClientRect();
-      if (event.clientX >= rect.right - 18) enterManualReading();
+      const direction =
+        typeof window !== "undefined" &&
+        window.getComputedStyle(element).direction === "rtl"
+          ? "rtl"
+          : "ltr";
+      if (
+        isPointerOnVerticalScrollbarTrack({
+          clientX: event.clientX,
+          rectLeft: rect.left,
+          rectRight: rect.right,
+          offsetWidth: element.offsetWidth,
+          clientWidth: element.clientWidth,
+          direction,
+        })
+      ) {
+        enterManualReading();
+      }
       if (event.pointerType === "touch") {
         touchStartYRef.current = event.clientY;
       }

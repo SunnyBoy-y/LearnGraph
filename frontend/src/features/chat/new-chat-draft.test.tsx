@@ -80,6 +80,75 @@ describe("unused chat drafts", () => {
   );
 });
 
+describe("home goal mode", () => {
+  it("keeps the home composer and bookshelf until a valid goal is submitted", async () => {
+    const workspace = `goal-home-${crypto.randomUUID()}`;
+    const clarification = deferred<never>();
+    vi.spyOn(apiClient, "get").mockImplementation(async (path) => {
+      if (path === "/providers") return [{
+        id: "goal-test-provider", provider_type: "openai_compatible_chat", display_name: "测试模型",
+        enabled: true, remote_capability: true, capabilities: { default_model: "test-model" },
+      }];
+      if (path === "/providers/goal-test-provider/models") return {
+        models: [{ id: "test-model", roles: ["llm"], enabled: true, remote: true, streaming: true }],
+      };
+      if (path === "/settings") return [{ key: "chat.default_response_mode", value: { response_mode: "fast" } }];
+      return [];
+    });
+    const post = vi.spyOn(apiClient, "post").mockImplementation((path, body) => {
+      if (path === "/sessions/opening-prompts") return Promise.resolve({
+        prompts: (body as { mode?: string }).mode === "goal"
+          ? [{ id: "goal", content: "学会独立画出操作系统的进程状态图。" }]
+          : [{ id: "question", content: "什么是进程？" }],
+      });
+      if (path === "/goals/clarify") return clarification.promise;
+      return Promise.reject(new Error(`Unexpected write: ${path}`));
+    });
+    const view = renderWithProviders(<TooltipProvider><Routes>
+      <Route path="/w/:workspaceId" element={<WorkspaceShell />}>
+        <Route path="chat/:sessionId" element={<ChatCanvasPage />} />
+      </Route>
+    </Routes></TooltipProvider>, { initialEntries: [`/w/${workspace}/chat/new`] });
+    const bookshelf = await screen.findByRole("region", { name: "图谱书架" });
+    await screen.findByRole("button", { name: "什么是进程？" });
+    const composer = screen.getByPlaceholderText("询问 LearnGraph");
+    const page = composer.closest(".chat-canvas-page");
+    const goal = screen.getByRole("button", { name: "目标", exact: true });
+    fireEvent.change(composer, { target: { value: "学会 @操作系统  " } });
+
+    fireEvent.click(goal);
+    expect(goal).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("heading", { name: "你想学会什么？" })).toBeVisible();
+    expect(screen.getByPlaceholderText("描述你想达成的学习目标...")).toBe(composer);
+    expect(composer).toHaveValue("学会 @操作系统  ");
+    expect(page).toHaveClass("is-new-chat-welcome");
+    expect(screen.getByRole("region", { name: "图谱书架" })).toBe(bookshelf);
+    expect(screen.queryByText("目标图谱预览")).not.toBeInTheDocument();
+
+    fireEvent.click(goal);
+    expect(goal).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByPlaceholderText("询问 LearnGraph")).toBe(composer);
+    expect(composer).toHaveValue("学会 @操作系统  ");
+    fireEvent.click(goal);
+    fireEvent.change(composer, { target: { value: "学" } });
+    fireEvent.submit(composer.closest("form")!);
+    const suggestion = await screen.findByRole("button", { name: "学会独立画出操作系统的进程状态图。" });
+    fireEvent.click(suggestion);
+    expect(composer).toHaveValue("学会独立画出操作系统的进程状态图。");
+    expect(post.mock.calls.every(([path]) => path === "/sessions/opening-prompts")).toBe(true);
+    expect(screen.getByRole("region", { name: "图谱书架" })).toBe(bookshelf);
+
+    fireEvent.submit(composer.closest("form")!);
+    await screen.findByText("正在澄清学习目标");
+    expect(post).toHaveBeenCalledWith("/goals/clarify", expect.objectContaining({ prompt: "学会独立画出操作系统的进程状态图。" }));
+    expect(page).not.toHaveClass("is-new-chat-welcome");
+    expect(screen.queryByText("目标设定")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "图谱书架" })).not.toBeInTheDocument();
+    expect(screen.queryByText("尚未描述学习目标")).not.toBeInTheDocument();
+    view.unmount();
+  });
+});
+
 describe("first message draft promotion", () => {
   it("isolates a promoted fourth conversation while three background answers keep streaming", async () => {
     const labels = ["A", "B", "C", "D"];

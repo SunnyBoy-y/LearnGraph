@@ -30,6 +30,7 @@ def utc_now() -> datetime:
 
 
 CHAT_GOAL_JOB_KIND = "chat.goal_round"
+QUEUED_CHAT_TURN_JOB_KIND = "queued_chat_turn.dispatch"
 
 
 class DurableQueue:
@@ -383,6 +384,19 @@ def _execute_claimed_job(queue, job, settings, on_heartbeat):
             if job.kind in {"learning.package.build", "learning.package.grade"}:
                 # Retired feature: drain old work without provider calls or deleting history.
                 queue.cancel_claimed(job)
+            elif job.kind == "learning.node_activity.build":
+                from app.services.learning_packages import run_build_stage
+
+                done = run_build_stage(job.id, job.lease_token, str(job.payload["build_id"]))
+                if done:
+                    queue.complete(job)
+                else:
+                    queue.rearm(job)
+            elif job.kind == "learning.node_activity.grade":
+                from app.services.learning_packages import grade_attempt
+
+                grade_attempt(job.id, job.lease_token, str(job.payload["attempt_id"]))
+                queue.complete(job)
             elif job.kind == "graph.cover.ai":
                 from app.services.graph_cover_ai import run_cover_ai_job
 
@@ -409,6 +423,10 @@ def _execute_claimed_job(queue, job, settings, on_heartbeat):
                 from app.services.chat_goals import run_goal_round
 
                 run_goal_round(job, queue.worker_id)
+            elif job.kind == QUEUED_CHAT_TURN_JOB_KIND:
+                from app.services.queued_turns import run_queued_turn_dispatch
+
+                run_queued_turn_dispatch(job, queue.worker_id)
             elif job.kind == "chat.continue_stream":
                 from app.services.chat_durable import run_chat_continue_once
 

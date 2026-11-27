@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Smile, Search } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { getStickerPipeline, searchStickers, type Sticker } from '@/api/stickers';
+import { adaptivePollInterval } from '@/lib/network-quality';
 import { useAuth } from '@/features/auth/auth-context-value';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -33,7 +34,7 @@ export function StickerPicker({ onSelect, onInsertText, disabled = false }: { on
   const [query, setQuery] = useState('');
   const [analyzing, setAnalyzing] = useState<Sticker | null>(null);
   const result = useQuery({ queryKey: ['stickers', auth.workspaceId, auth.userId, 'search', query], queryFn: () => searchStickers(query), enabled: open && tab === 'stickers', staleTime: 5000 });
-  const pipeline = useQuery({ queryKey: ['stickers', auth.workspaceId, auth.userId, 'pipeline'], queryFn: getStickerPipeline, enabled: open && tab === 'stickers', refetchInterval: open && tab === 'stickers' ? 3000 : false });
+  const pipeline = useQuery({ queryKey: ['stickers', auth.workspaceId, auth.userId, 'pipeline'], queryFn: getStickerPipeline, enabled: open && tab === 'stickers', refetchInterval: () => adaptivePollInterval(open && tab === 'stickers' ? 3000 : false) });
   const items = tab === 'emoji' ? emoji : kaomoji;
   return <><Popover open={open} onOpenChange={setOpen}>
     <PopoverTrigger asChild><Button ref={triggerRef} aria-label="选择表情包" className="size-8 shrink-0" disabled={disabled} size="icon" type="button" variant="ghost"><Smile className="size-[18px]" /></Button></PopoverTrigger>

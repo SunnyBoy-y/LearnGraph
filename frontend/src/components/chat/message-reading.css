@@ -1,0 +1,164 @@
+/* Conversation flow owns the distance between blocks, not their card chrome. */
+:root {
+  --chat-space-tight: 4px;
+  --chat-space-related: 8px;
+  --chat-space-flow: 12px;
+  --chat-space-feature: 16px;
+  --chat-space-section: 24px;
+  --chat-space-module: 32px;
+}
+.message-reading {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--chat-space-flow);
+  inline-size: 100%;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  box-sizing: border-box;
+}
+.message-reading__process { min-inline-size: 0; max-inline-size: 100%; }
+.message-reading__body { display: flex; flex-direction: column; gap: var(--chat-space-flow); min-inline-size: 0; max-inline-size: 100%; }
+.message-reading__process .thinking-chain { margin-block: 0; }
+.message-reading__process:empty, .message-reading__body:empty { display: none; }
+
+.message-answer-segment.answer-flow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--chat-space-flow);
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+.is-assistant .message-answer-segment.answer-flow > * { margin-block: 0; }
+.message-answer-segment.answer-flow > :is(.message-text-block, .stream-ui) + :is(.message-component:not(.stream-ui--document), .unified-artifact-card),
+.message-answer-segment.answer-flow > :is(.message-component:not(.stream-ui--document), .unified-artifact-card) + .message-text-block {
+  margin-block-start: calc(var(--chat-space-feature) - var(--chat-space-flow));
+}
+.is-assistant [data-message-content] .answer-flow :is(.message-text-block > [data-message-selectable-text], .answer-markdown-flow, .rich-doc__flow, .rich-doc__stack, .rich-doc__section) {
+  row-gap: var(--chat-space-flow);
+}
+.is-assistant [data-message-content] .answer-flow :is(.message-text-block > [data-message-selectable-text], .answer-markdown-flow) {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+.is-assistant [data-message-content] .answer-flow :is(.message-text-block > [data-message-selectable-text], .answer-markdown-flow) > *,
+.is-assistant [data-message-content] .answer-flow .rich-doc__node > :is(p, blockquote, hr, h1, h2, h3, h4, h5, h6),
+.is-assistant [data-message-content] .answer-flow .rich-doc__layout > .rich-doc__section-title {
+  margin-block: 0;
+}
+.is-assistant [data-message-content] .answer-flow :is(
+  .answer-markdown-flow > :is(h1,h2,h3,h4):not(:first-child),
+  [data-message-selectable-text] > .answer-markdown-flow:has(> :is(h1,h2,h3,h4):first-child):not(:first-child),
+  .rich-doc__node:has(> :is(h1,h2,h3,h4)):not(:first-child)
+) { margin-block-start: calc(var(--chat-space-section) - var(--chat-space-flow)); }
+
+/* Keep the outline outside the answer lane at every width, without conditional
+   space or a new row. The scroll pane and composer share these rail gutters so
+   messages and input stay aligned on one horizontal Content Rail. */
+.chat-canvas-page:has(.chat-messages-content.chat-outline-lane) {
+  --chat-rail-gutter-start: 12px;
+  --chat-rail-gutter-end: 52px;
+}
+.chat-canvas-page .chat-messages-content.chat-outline-lane {
+  --outline-gutter: var(--chat-rail-gutter-end, 52px);
+  --outline-leading-gutter: var(--chat-rail-gutter-start, 12px);
+  width: min(
+    var(--chat-rail-max-width, var(--chat-content-width)),
+    calc(100% - var(--outline-leading-gutter) - var(--outline-gutter))
+  );
+  margin-inline-start: max(
+    var(--outline-leading-gutter),
+    min(
+      calc((100% - var(--chat-rail-max-width, var(--chat-content-width))) / 2),
+      calc(100% - var(--chat-rail-max-width, var(--chat-content-width)) - var(--outline-gutter))
+    )
+  );
+  margin-inline-end: auto;
+}
+.message-reading-surface { overflow: visible; }
+/* Compact companion panes have less space. Leave a gutter on the reading
+   container only; user messages and the composer keep their original layout. */
+.message-reading-surface--compact { padding-inline-end: 44px; }
+.message-outline-track {
+  position: absolute;
+  z-index: 18;
+  inset: 0;
+  pointer-events: none;
+}
+.message-outline {
+  position: sticky;
+  inset-block-start: 12px;
+  display: flex;
+  justify-content: flex-end;
+  inline-size: min(240px, calc(100% + 44px));
+  margin-inline-start: auto;
+  margin-inline-end: -44px;
+  block-size: 32px;
+}
+.message-outline__trigger {
+  display: inline-flex;
+  align-items: center;
+  align-self: start;
+  gap: var(--chat-space-tight);
+  min-block-size: 32px;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  font-weight: 400;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.message-outline__trigger:hover, .message-outline__trigger[aria-expanded="true"] { color: var(--foreground); }
+.message-outline__trigger svg { transition: transform 140ms ease; }
+.message-outline__trigger[aria-expanded="true"] svg { transform: rotate(180deg); }
+.message-outline__panel {
+  position: absolute;
+  inset-block-start: calc(100% + 4px);
+  inset-inline-end: 0;
+  inline-size: min(240px, 100%);
+  max-block-size: min(288px, 45dvh, var(--outline-panel-room, 288px));
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--popover);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 8%);
+  pointer-events: auto;
+}
+.message-outline[data-side="top"] .message-outline__panel { inset-block: auto calc(100% + 4px); }
+.message-outline__panel button {
+  position: relative;
+  inline-size: 100%;
+  min-block-size: 30px;
+  padding: 5px 8px;
+  padding-inline-start: calc(10px + 12px * var(--outline-depth, 0));
+  border-radius: 5px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: start;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.message-outline__panel button:is(:hover, [aria-current]) { background: var(--muted); color: var(--foreground); }
+.message-outline__panel button[aria-current] { font-weight: 600; }
+.message-outline__panel button[aria-current]::before {
+  position: absolute;
+  inset-block: 7px;
+  inset-inline-start: 2px;
+  inline-size: 2px;
+  border-radius: 2px;
+  background: currentColor;
+  content: "";
+}
+.message-outline :focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+@media (prefers-reduced-motion: reduce) { .message-outline__trigger svg { transition: none; } }
+@media print { .message-outline-track { display: none; } }

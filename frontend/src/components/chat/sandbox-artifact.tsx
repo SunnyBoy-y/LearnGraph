@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { BarChart3, Box, FileCode2, ShieldAlert, ShieldCheck } from "lucide-react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
+import { QueryClientContext } from "@tanstack/react-query";
+import { BarChart3, Box, FileCode2, LoaderCircle, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { BundledLanguage } from "shiki";
 
 import {
@@ -12,6 +13,10 @@ import { Button } from "@/components/ui/button";
 import { FullscreenPreview } from "@/components/chat/fullscreen-preview";
 import { ExpandableContent } from "@/components/shared/expandable-content";
 import { sandboxedHtmlPreviewDocument } from "@/lib/sandboxed-html-preview";
+import {
+  resolveArtifactFramePolicy,
+  useArtifactFrameHeight,
+} from "@/lib/artifact-frame-size";
 import { apiClient } from "@/api/client";
 import { streamSessionMessage } from "@/api/sessions";
 import {
@@ -45,7 +50,13 @@ function codeLanguage(value: unknown): BundledLanguage {
     : "tsx";
 }
 
-export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
+export function SandboxArtifact({
+  data,
+  streaming = false,
+}: {
+  data: Record<string, unknown>;
+  streaming?: boolean;
+}) {
   const title = typeof data.title === "string" ? data.title : "生成式组件产物";
   const status = typeof data.status === "string" ? data.status : "preview";
   const sourceCode = typeof data.source_code === "string" ? data.source_code : "";
@@ -53,6 +64,8 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const artifactUrl = typeof data.artifact_url === "string" ? data.artifact_url : "";
   const bundleId = typeof data.bundle_id === "string" ? data.bundle_id : "";
   const [bundlePreviewUrl, setBundlePreviewUrl] = useState<string | null>(null);
+  const [bundleLoading, setBundleLoading] = useState(Boolean(bundleId));
+  const queryClient = useContext(QueryClientContext);
   const originVerified = data.origin_verified === true;
   const canRenderRemote = originVerified && /^https:\/\//i.test(artifactUrl);
   // P2-A trusted renderer decision is server-side only. The host surfaces it
@@ -81,9 +94,69 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
     pendingConsentId: string
     triggers: string[]
   } | null>(null);
+  const [consentPending, setConsentPending] = useState(false);
   const [agentStatus, setAgentStatus] = useState<'idle' | 'queued' | 'processing' | 'failed'>('idle');
   const [agentError, setAgentError] = useState<string | null>(null);
   const [analysisSending, setAnalysisSending] = useState(false);
+  const [previewExpanded, setPreviewExpanded] = useState(false);
+
+  const framePolicy = useMemo(
+    () => resolveArtifactFramePolicy(data, { defaultMode: "auto" }),
+    [data],
+  );
+  const autoSizeEnabled =
+    Boolean(previewHtml) &&
+    (Boolean(subappTrigger) || !bundlePreviewUrl) &&
+    (framePolicy.mode === "auto" || framePolicy.mode === "bounded");
+
+  const subappSrcDoc = useMemo(
+    () =>
+      previewHtml
+        ? sandboxedHtmlPreviewDocument(previewHtml, {
+            subappClient: true,
+            measureArtifact: autoSizeEnabled,
+          })
+        : undefined,
+    [previewHtml, autoSizeEnabled],
+  );
+  const staticSrcDoc = useMemo(
+    () =>
+      previewHtml
+        ? sandboxedHtmlPreviewDocument(previewHtml, {
+            runtimeShim: true,
+            measureArtifact: autoSizeEnabled,
+          })
+        : undefined,
+    [previewHtml, autoSizeEnabled],
+  );
+  const activeSrcDoc = subappTrigger ? subappSrcDoc : staticSrcDoc;
+  const adaptiveHeight = useArtifactFrameHeight(
+    autoSizeEnabled,
+    previewExpanded,
+    subappTrigger ? iframeRef : runtimeIframeRef,
+    {
+      mode: framePolicy.mode,
+      minHeight: framePolicy.minHeight,
+      maxHeight: framePolicy.maxHeight,
+      measureKey: streaming ? "streaming" : activeSrcDoc?.length ?? 0,
+    },
+  );
+  const previewFrameStyle =
+    framePolicy.mode === "aspect-ratio"
+      ? { aspectRatio: framePolicy.aspectRatio, height: "auto" as const }
+      : {
+          height:
+            (autoSizeEnabled ? adaptiveHeight : undefined) ??
+            framePolicy.initialHeight,
+        };
+  const subappFrameSourceKey = subappTrigger
+    ? `${subappSrcDoc ?? ""}|${!previewHtml ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : "")) : ""}`
+    : "";
+  const prevSubappSourceKeyRef = useRef(subappFrameSourceKey);
+  if (prevSubappSourceKeyRef.current !== subappFrameSourceKey) {
+    prevSubappSourceKeyRef.current = subappFrameSourceKey;
+    subappLoadedRef.current = false;
+  }
 
   /** Built-in data-analysis entry: send a structured message to the Agent. */
   const sendAnalysisRequest = async () => {
@@ -99,12 +172,33 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
         message_kind: 'normal',
         search_route: 'disabled',
       })) {
-        // 消费 SSE 流；消息与结果由后端持久化并展示在聊天中。
+        // 消费 SSE 流；消息与结果由后端持久化。
+      }
+      if (queryClient) {
+        await queryClient.invalidateQueries({
+          predicate: (query) =>
+            query.queryKey[2] === "messages" && query.queryKey[3] === chatSessionId,
+        });
       }
     } catch {
       // 发送失败由聊天流 UI 呈现；这里不阻断 artifact 渲染。
     } finally {
       setAnalysisSending(false)
+    }
+  };
+
+  const handleConsentDecision = async (
+    decision: 'allow_session' | 'allow_app' | 'allow_global' | 'deny',
+  ) => {
+    if (consentPending || !subappChannelRef.current) return;
+    setConsentPending(true);
+    try {
+      const ok = await subappChannelRef.current.decideConsent(decision);
+      if (ok) {
+        setConsentRequest(null);
+      }
+    } finally {
+      setConsentPending(false);
     }
   };
 
@@ -148,7 +242,11 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   useEffect(() => {
     let cancelled = false;
     setBundlePreviewUrl(null);
-    if (!bundleId) return () => { cancelled = true; };
+    if (!bundleId) {
+      setBundleLoading(false);
+      return () => { cancelled = true; };
+    }
+    setBundleLoading(true);
     void apiClient
       .get<{ url: string }>(`/subapps/bundles/${bundleId}/preview`)
       .then((response) => {
@@ -156,6 +254,9 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
       })
       .catch(() => {
         if (!cancelled) setBundlePreviewUrl(null);
+      })
+      .finally(() => {
+        if (!cancelled) setBundleLoading(false);
       });
     return () => { cancelled = true; };
   }, [bundleId]);
@@ -180,7 +281,7 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
   const hasSubappContent = Boolean(previewHtml || bundlePreviewUrl || canRenderRemote);
 
   return (
-    <section className="sandbox-artifact" aria-label={title}>
+    <section className="sandbox-artifact" aria-label={title} data-height-mode={framePolicy.mode}>
       <div className="sandbox-artifact__heading">
         <FileCode2 className="size-4" />
         <div>
@@ -197,7 +298,11 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
 
       {subappTrigger ? (
         hasSubappContent ? (
-          <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+          <FullscreenPreview
+            className="sandbox-artifact__preview-wrap"
+            label={title}
+            onExpandedChange={setPreviewExpanded}
+          >
             <iframe loading="lazy"
             allow=""
               className="sandbox-artifact__preview"
@@ -205,11 +310,19 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
               ref={iframeRef}
               referrerPolicy="no-referrer"
               sandbox="allow-scripts"
-              srcDoc={previewHtml ? sandboxedHtmlPreviewDocument(previewHtml, { subappClient: true }) : undefined}
+              srcDoc={subappSrcDoc}
               src={!previewHtml ? (bundlePreviewUrl || (canRenderRemote ? artifactUrl : undefined)) : undefined}
+              style={previewFrameStyle}
               title={`${title}子应用`}
             />
           </FullscreenPreview>
+        ) : bundleLoading ? (
+          <div className="sandbox-artifact__empty" role="status">
+            <LoaderCircle className="size-5 animate-spin" />
+            <div>
+              <strong>正在加载子应用预览…</strong>
+            </div>
+          </div>
         ) : (
           <div className="sandbox-artifact__empty">
             <Box className="size-6" />
@@ -220,7 +333,11 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           </div>
         )
       ) : bundlePreviewUrl ? (
-        <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+        <FullscreenPreview
+          className="sandbox-artifact__preview-wrap"
+          label={title}
+          onExpandedChange={setPreviewExpanded}
+        >
           <iframe loading="lazy"
             allow=""
             className="sandbox-artifact__preview"
@@ -228,11 +345,16 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             src={bundlePreviewUrl}
+            style={previewFrameStyle}
             title={`${title}多文件沙箱预览`}
           />
         </FullscreenPreview>
       ) : previewHtml ? (
-        <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+        <FullscreenPreview
+          className="sandbox-artifact__preview-wrap"
+          label={title}
+          onExpandedChange={setPreviewExpanded}
+        >
           <iframe loading="lazy"
             allow=""
             className="sandbox-artifact__preview"
@@ -240,21 +362,34 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
             ref={runtimeIframeRef}
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
-            srcDoc={sandboxedHtmlPreviewDocument(previewHtml, { runtimeShim: true })}
+            srcDoc={staticSrcDoc}
+            style={previewFrameStyle}
             title={`${title}动态沙箱预览`}
           />
         </FullscreenPreview>
       ) : canRenderRemote ? (
-        <FullscreenPreview className="sandbox-artifact__preview-wrap" label={title}>
+        <FullscreenPreview
+          className="sandbox-artifact__preview-wrap"
+          label={title}
+          onExpandedChange={setPreviewExpanded}
+        >
           <iframe loading="lazy"
             allow=""
             className="sandbox-artifact__preview"
             referrerPolicy="no-referrer"
             sandbox="allow-scripts"
             src={artifactUrl}
+            style={previewFrameStyle}
             title={`${title}隔离运行预览`}
           />
         </FullscreenPreview>
+      ) : bundleLoading ? (
+        <div className="sandbox-artifact__empty" role="status">
+          <LoaderCircle className="size-5 animate-spin" />
+          <div>
+            <strong>正在加载沙箱预览…</strong>
+          </div>
+        </div>
       ) : (
         <div className="sandbox-artifact__empty">
           <Box className="size-6" />
@@ -277,34 +412,38 @@ export function SandboxArtifact({ data }: { data: Record<string, unknown> }) {
           <p>AI建议采用Agent协同模式，是否开启？</p>
           <div className="sandbox-artifact__consent-actions">
             <Button
+              disabled={consentPending}
               size="sm"
               type="button"
               variant="default"
-              onClick={() => void subappChannelRef.current?.decideConsent('allow_session')}
+              onClick={() => void handleConsentDecision('allow_session')}
             >
               允许本次
             </Button>
             <Button
+              disabled={consentPending}
               size="sm"
               type="button"
               variant="secondary"
-              onClick={() => void subappChannelRef.current?.decideConsent('allow_app')}
+              onClick={() => void handleConsentDecision('allow_app')}
             >
               加入白名单
             </Button>
             <Button
+              disabled={consentPending}
               size="sm"
               type="button"
               variant="secondary"
-              onClick={() => void subappChannelRef.current?.decideConsent('allow_global')}
+              onClick={() => void handleConsentDecision('allow_global')}
             >
               全局允许
             </Button>
             <Button
+              disabled={consentPending}
               size="sm"
               type="button"
               variant="ghost"
-              onClick={() => void subappChannelRef.current?.decideConsent('deny')}
+              onClick={() => void handleConsentDecision('deny')}
             >
               暂不开启
             </Button>

@@ -18,6 +18,7 @@ class SvgDeclaration:
         self.block_id = block_id
         self.view_box = ""
         self.title = ""
+        self.display_mode = "inline"
         self.nodes: dict[str, tuple[str, int, ET.Element]] = {}
         self.bytes = 256
         self.text_size = 0
@@ -37,14 +38,18 @@ class SvgDeclaration:
             if not self.attempted_header:
                 self.attempted_header = True
                 box, title = value.get("viewBox"), value.get("title")
-                if (set(value) != {"viewBox", "title"} or not isinstance(box, list)
+                display_mode = value.get("display_mode", "inline")
+                if (set(value) - {"viewBox", "title", "display_mode"} or "viewBox" not in value or "title" not in value
+                    or not isinstance(box, list)
                     or len(box) != 4 or any(type(n) not in {int, float} or not -10000 <= n <= 10000 for n in box)
-                    or not isinstance(title, str) or not title.strip() or len(title) > 240):
+                    or not isinstance(title, str) or not title.strip() or len(title) > 240
+                    or display_mode not in {"inline", "artifact"}):
                     raise ValueError("Invalid SVG header")
                 view_box = " ".join(str(n) for n in box)
                 validate_illustration_svg(f'<svg viewBox="{view_box}"><rect/></svg>')
-                self.view_box, self.title = view_box, title.strip()
-                return [{"op": "start", "block_id": self.block_id, "view_box": self.view_box, "title": self.title}]
+                self.view_box, self.title, self.display_mode = view_box, title.strip(), display_mode
+                return [{"op": "start", "block_id": self.block_id, "view_box": self.view_box,
+                         "title": self.title, "display_mode": self.display_mode}]
             if not self.view_box:
                 return []
             node = self._node(value)

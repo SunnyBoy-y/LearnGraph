@@ -60,4 +60,36 @@ describe("new chat suggestions", () => {
     const { container } = render(<NewChatSuggestions prompts={[]} disabled={false} pending onSelect={vi.fn()} />);
     expect(container).toBeEmptyDOMElement();
   });
+
+  it("renders concise display_text while sending the full prompt content on click", () => {
+    const onSelect = vi.fn();
+    const separated = [
+      {
+        id: "sep-1",
+        display_text: "HashMap 在什么情况下会从红黑树退化为链表？",
+        content: "针对 HashMap 树化后节点减少的退化阈值，带我做一组删除操作的推演练习，理清树化与退化的边界条件。",
+      },
+      { id: "sep-2", content: "画图解释 HashMap 的哈希冲突" },
+    ];
+    render(<NewChatSuggestions prompts={separated} disabled={false} onSelect={onSelect} />);
+
+    const first = screen.getByRole("button", { name: "HashMap 在什么情况下会从红黑树退化为链表？" });
+    fireEvent.click(first);
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith(separated[0].content);
+
+    const second = screen.getByRole("button", { name: "画图解释 HashMap 的哈希冲突" });
+    expect(second).toBeEnabled();
+  });
+
+  it("hides without unmounting or shifting layout when hidden is true", () => {
+    const { container } = render(
+      <NewChatSuggestions prompts={prompts} disabled={false} hidden onRefresh={vi.fn()} onSelect={vi.fn()} />,
+    );
+    const section = container.querySelector(".new-chat-suggestions");
+    expect(section).toHaveClass("is-hidden");
+    expect(section).toHaveAttribute("aria-hidden", "true");
+    for (const button of container.querySelectorAll("button")) {
+      expect(button).toHaveAttribute("tabindex", "-1");
+    }
+  });
 });

@@ -186,18 +186,18 @@ class UIArgumentStream:
                     node = {key: item for key, item in value.items() if path + (key,) in self.complete}
                     self._apply_progressive_keys(node, path, PROGRESSIVE_BLOCK_KEYS)
                     node_type = node.get("type")
-                    if ("id" in node and node_type in {"paragraph", "heading", "list", "quote", "code", "math", "rail_item"}
+                    if ("id" in node and node_type in {"paragraph", "heading", "caption", "list", "quote", "code", "math", "rail_item"}
                             and (node_type != "rail_item" or (node.get("parent_id") and str(node.get("label", "")).strip()))):
                         node["state"] = "streaming"
                         entries.append(node)
-                    elif ("id" in node and node_type in {"section", "stack", "row", "columns", "grid", "media_text",
+                    elif ("id" in node and node_type in {"section", "stack", "row", "column", "columns", "grid", "card", "media_text",
                                                         "tabs", "accordion", "figure", "feature_list", "step_list", "status_list"}
                             and any(str(node.get(key, "")).strip() for key in ("label", "caption", "text"))):
                         node["state"] = "streaming"
                         entries.append(node)
-                    elif "id" in node and node_type in {"chart", "metric", "table", "graph", "diagram", "timeline"}:
-                        # Establish a stable slot before the data object closes.
-                        entries.append({key: node[key] for key in ("id", "parent_id", "type", "label") if key in node} | {"state": "pending"})
+                    elif "id" in node and node_type in {"svg", "chart", "metric", "table", "graph", "diagram", "timeline"}:
+                        # Establish a stable slot before the data or SVG object closes.
+                        entries.append({key: node[key] for key in ("id", "parent_id", "type", "label", "alt") if key in node} | {"state": "pending"})
                 elif collection == "items" and isinstance(value, dict) and raw.get("component") != "metric":
                     item = {key: entry for key, entry in value.items() if path + (key,) in self.complete}
                     self._apply_progressive_keys(item, path, PROGRESSIVE_ITEM_KEYS)

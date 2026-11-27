@@ -32,16 +32,16 @@ _PRESENTATION_POLICY = presentation_catalog_prompt() + """回答可以自然混�
 检索意图不是照片观察。真实图片返回后，系统以实际来源标题作为图注；alt/caption只填对象名称或“对象示例”，不要预写动作、姿态、场景、颜色、数量或视角。相邻正文也不要用“左图/右图/图中”等表述断言未观察的图片细节，更不能把检索词或SVG设计当作实图事实。可以独立介绍对象的一般特征，明确这是一般知识，不以检索图片作已核验的证据。
 """
 
-_DOCUMENT_CATALOG = """document 的 blocks 为稳定 id、可选 parent_id、type 的平面树（先父后子）。内容类型 paragraph/heading/list/quote/code/math/divider 使用 text；code 可设 language。
+_DOCUMENT_CATALOG = """document 的 blocks 为稳定 id、可选 parent_id、type 的平面树（先父后子）。内容类型 paragraph/heading/caption/list/quote/code/math/divider 使用 text；code 可设 language；svg 节点使用 svg（合法静态 SVG 字符串）、可选 alt/caption/label，可在同一 document 内与文字、标题、columns/row/column/grid/card、chart、image 和 divider 自由混排，避免为了双列对比等排版把文字和容器全部画进一张大 SVG。
 可选图标示例：{"id":"intro","type":"heading","text":"概览","icon":"fluent:light-bulb"}；section、rail_item与其他普通节点也支持icon。独立图标用{"id":"launch","type":"icon","icon":"fluent:rocket"}，必须有icon且不能包含子节点。props.icon装饰组件标题，metric/timeline的items[].icon装饰条目，不需要每次使用。
-布局 section/stack/row/columns/grid/media_text/tabs/accordion/figure，可设 label、columns=1..3、align=start|center|end、width=reading|full；最大深度6、160节点、同级40。
+布局 section/stack/row/column/columns/grid/card/media_text/tabs/accordion/figure，可设 label、columns=1..3、align=start|center|end、width=reading|full；最大深度6、160节点、同级40。
 media_text 只是布局；图片必须是另一个 image 子节点，使用 parent_id 关联布局。不要把 query 写在 media_text 等布局节点上，否则校验会提示修正。
 你负责根据内容明确决定布局：section/stack 及文档根节点始终按顺序纵排，前端不会因控件大小或相邻而自动配对。需要比较的简洁图表、彼此关联的要点，可由你放入同一个 row/columns/grid，设 columns=2 或 3；讲解需要连续展开或细节较多时选纵排，复杂图表、多列表格或关系图可独占一行，分栏中的节点设 width=full 可跨整行。图与对应解释可用 media_text。分栏是你给出的内容分组和最大列数意图，前端只按实际可用宽度换行、拉伸填满余下行，并去掉空列；不改变分组、顺序或因图表数据量另选布局。不留空白占位，不为凑列添加无关内容，不必把所有控件都并排。
 图片 image/image_group/gallery 使用 query、query_alternatives（最多2个保持同一主体与阶段的简短备用词）、alt、caption、fallback_svg，不得提供 URL；query 和备用表达使用1至4个英文词，主体名称放首位，只有避免类别歧义或保留关键阶段时才加限定，不为凑词添加构图修饰。构图、视角、尺寸词不能替代对象名称或必要的领域限定；至少一个备用表达应简化非必要构图词，保持同一对象和阶段。同名可指不同类别时必须保留领域限定；用于辨认普通对象时优先常见原型，不以特殊改装款代表典型外形。后端会核对结果标题与查询的相关性，首选失败时尝试备用查询。仅开启联网且已配置图片搜索时异步检索，绝不虚构检索结果或猜测权限问题。配图是有来源的示例，不能把检索命中说成已经视觉核验。
 图片先提交 query，不要预先绘制备用 SVG。检索失败且示意图有助于理解时，再通过 patch 按需补充同主题 fallback_svg；无失败时不生成备用图。已有 SVG 会在同一查询的后续更新中保留，切换查询不沿用旧图。示意图不是真实照片，不能当作观察证据。
 fallback_svg 是 SVG 字符串：根节点 svg 带 xmlns="http://www.w3.org/2000/svg" 和 viewBox；宽80..1600、高80..1200、宽高比0.4..4，UTF-8不超过24KB、96元素、深度8。尽量用少量形状和清晰中文标签，优先 viewBox="0 0 640 400"。仅允许 svg/g/path/rect/circle/ellipse/line/polyline/polygon/text/tspan/title/desc 和直接的坐标、纯颜色、文字属性；字体可用 sans-serif。不允许 style/CSS/script、image/use、外链、href、url()、defs/渐变/滤镜/动画。path 坐标绝对值<=10000、最多256个数值。示例：<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 400"><circle cx="320" cy="170" r="80" fill="#ddd"/><text x="320" y="300" text-anchor="middle" font-size="24">请绘制本题的具体主体</text></svg>。示例仅演示语法，不要照抄其内容。
 chart/table/graph/diagram/timeline/metric 必须把组件参数嵌入 visual，不能把 props、rows、nodes、edges 或 items 直接放在文档节点上。
-chart/table/graph/diagram/timeline 使用 visual={"props":{"title":"标题","columns":[{"key":"v","label":"数值"}]},"rows":[{"id":"a","label":"A","values":{"v":1}}]}。
+chart/table 使用 visual={"props":{"title":"标题","columns":[{"key":"v","label":"数值"}]},"rows":[{"id":"a","label":"A","values":{"v":1}}]}；graph/diagram 使用 visual={"props":{"title":"关系图"},"nodes":[{"id":"a","label":"节点A"},{"id":"b","label":"节点B"}],"edges":[{"id":"e1","source":"a","target":"b","label":"关联"}]}；timeline 使用 visual={"props":{"title":"时间线"},"items":[{"id":"t1","label":"阶段一","date":"2026-01","description":"说明"}]}（不要给 graph/diagram/timeline 写 rows）。
 metric 用 visual={"props":{"title":"关键指标","data_kind":"example"},"items":[{"id":"latest","label":"最新用户数","value":12,"description":"示意值"}]}，不是 columns/rows。columns 的每项只有 key 和 label，单位写在 props.unit；没有 x_label/y_label 或每列 unit 字段。
 有目录的报告在文档 props 中写 toc=true，并使用 heading(level=2) 组织章节。最小有效结构示例（只演示嵌套语法，不得复用这些示意数字）：
 {"props":{"title":"分析报告","toc":true},"upsert":{"blocks":[{"id":"summary","type":"heading","level":2,"text":"结论"},{"id":"text","type":"paragraph","text":"解释结论。"},{"id":"metric","type":"metric","visual":{"props":{"title":"关键指标","data_kind":"example"},"items":[{"id":"count","label":"示意指标","value":12}]}},{"id":"trend","type":"heading","level":2,"text":"趋势"},{"id":"chart","type":"chart","visual":{"props":{"title":"变化趋势","data_kind":"example","columns":[{"key":"v","label":"数值"}]},"rows":[{"id":"a","label":"A","values":{"v":1}},{"id":"b","label":"B","values":{"v":2}}]}}]}}
@@ -152,6 +152,8 @@ class InlineUIParser:
             snapshot = compile_command(mount)
             if not any(
                 node.text.strip()
+                or (node.type == "caption" and bool(node.caption.strip()))
+                or (node.type == "svg" and bool(node.svg))
                 or (node.type in {"image", "image_group", "gallery"} and (node.query or node.fallback_svg))
                 or node.type in {"simulation", "interactive", "icon"}
                 or (node.visual and any(node.visual.get(key) for key in ("rows", "nodes", "items")))

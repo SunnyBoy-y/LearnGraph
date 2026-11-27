@@ -3,21 +3,23 @@
 
 @layer genui.tokens {
   :where(.stream-ui) {
-    --genui-accent: light-dark(#6366d9, #a3a5ff);
     --genui-surface-subtle: light-dark(
       color-mix(in oklab, var(--muted) 60%, transparent),
       color-mix(in oklab, var(--muted) 45%, transparent)
     );
-    --genui-check-warn-bg: color-mix(in oklab, #d97706 10%, transparent);
-    --genui-check-warn-fg: light-dark(#92400e, #fcd34d);
-    --genui-check-err-bg: color-mix(in oklab, var(--destructive) 10%, transparent);
+    --genui-check-warn-bg: var(--warning-soft);
+    --genui-check-warn-fg: var(--warning-foreground);
+    --genui-check-err-bg: var(--danger-soft);
   }
 }
 
 /* Override unlayered .message-component card shell from index.css */
 .message-component.stream-ui {
   display: block;
+  inline-size: 100%;
+  max-inline-size: 100%;
   min-width: 0;
+  box-sizing: border-box;
   padding: 0;
   color: var(--foreground);
   font-size: 15px;
@@ -133,8 +135,8 @@
   .stream-ui__graph[data-direction="TB"] .stream-ui__graph-scroll { height: 440px; }
   .stream-ui__graph[data-layout="mindmap"] .stream-ui__edge path { stroke-width: 2.5; }
   .stream-ui__graph[data-layout="mindmap"] .stream-ui__edge[data-cross-link="true"] path { stroke-dasharray: 5 4; stroke-width: 1.5; }
-  .stream-ui__graph[data-layout="mindmap"] .stream-ui__node[data-root="true"] rect { fill: #4338ca; stroke: #4338ca; }
-  .stream-ui__graph[data-layout="mindmap"] .stream-ui__node[data-root="true"] text { fill: #fff; font-weight: 650; }
+  .stream-ui__graph[data-layout="mindmap"] .stream-ui__node[data-root="true"] rect { fill: var(--primary); stroke: var(--primary); }
+  .stream-ui__graph[data-layout="mindmap"] .stream-ui__node[data-root="true"] text { fill: var(--primary-foreground); font-weight: 650; }
   .stream-ui__graph .stream-ui__toolbar select { max-width: 110px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); color: var(--foreground); padding: 3px 6px; }
   .stream-ui__graph .stream-ui__toolbar output { min-width: 3em; font-variant-numeric: tabular-nums; }
   .stream-ui__node { cursor: grab; touch-action: none; }
@@ -155,7 +157,7 @@
   .stream-ui__flow-arrow { color: var(--muted-foreground); margin-left: 8px; }
   .stream-ui__linear small { color: var(--muted-foreground); font-size: 12px; }
   .stream-ui__flow-detail { margin-top: 12px; padding: 8px 0 0; border-top: 1px solid var(--border); font-size: 14px; }
-  .stream-ui__table-scroll { overflow-x: auto; max-height: 420px; margin: 0; }
+  .stream-ui__table-scroll { inline-size: 100%; max-inline-size: 100%; min-inline-size: 0; overflow-x: auto; max-height: 420px; margin: 0; }
   .stream-ui table { border-collapse: collapse; width: 100%; font-size: 14px; line-height: 1.65; }
   .stream-ui th, .stream-ui td { text-align: left; border-bottom: 1px solid var(--border); padding: 10px 12px; white-space: normal; min-width: 90px; vertical-align: top; }
   .stream-ui :where(th, td):first-child { padding-left: 0; }
@@ -189,8 +191,8 @@
 
   /* Outrank prose list rules without changing ordinary Markdown or MetricCard. */
   .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics { padding: 0; margin: 0; }
-  .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics > li { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 52px auto; align-items: start; gap: 4px; padding: 0; margin: 0; border: 0; }
-  .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics .metric-card__value { grid-column: 1; grid-row: 2; height: 52px; align-self: end; align-items: baseline; line-height: 52px; padding: 0; margin: 0; text-align: left; }
+  .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics > li { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(52px, auto) auto; align-items: start; gap: 4px; padding: 0; margin: 0; border: 0; }
+  .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics .metric-card__value { grid-column: 1; grid-row: 2; min-height: 52px; height: auto; align-self: end; align-items: baseline; flex-wrap: wrap; line-height: 1.25; padding: 0; margin: 0; text-align: left; overflow-wrap: anywhere; }
   .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics .metric-card__hint { grid-column: 1; grid-row: 3; }
   .message-component.stream-ui[data-ui-component] .stream-ui__linear ol, .message-component.stream-ui[data-ui-component] .stream-ui__events { padding: 0; margin: 0; }
   .message-component.stream-ui[data-ui-component] .stream-ui__linear li, .message-component.stream-ui[data-ui-component] .stream-ui__events li { margin: 0; }
@@ -201,8 +203,8 @@
     .stream-ui__metrics .metric-card__value { font-size: 28px; }
     .stream-ui__metrics [data-emphasis="primary"] .metric-card__value { font-size: 34px; }
     .stream-ui__metrics [data-emphasis="context"] .metric-card__value { font-size: 22px; }
-    .stream-ui__chart text { font-size: 22px; }
-    .stream-ui__chart .stream-ui__endpoint { font-size: 25px; }
+    .stream-ui__chart text { font-size: 16px; }
+    .stream-ui__chart .stream-ui__endpoint { font-size: 18px; }
     .stream-ui__linear ol { display: grid; }
     .stream-ui__linear li { flex-wrap: nowrap; }
     .stream-ui__linear li:first-child { padding-left: 28px; }
@@ -210,8 +212,8 @@
     .stream-ui__footer { align-items: flex-start; flex-wrap: wrap; }
     .stream-ui__events li { gap: 12px; }
     .stream-ui__events time { flex-basis: 4rem; }
-    .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics > li { grid-template-rows: auto 44px auto; }
-    .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics .metric-card__value { height: 44px; line-height: 44px; }
+    .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics > li { grid-template-rows: auto minmax(44px, auto) auto; }
+    .message-component.stream-ui[data-ui-component="metric"] .stream-ui__metrics .metric-card__value { min-height: 44px; height: auto; line-height: 1.25; }
     .message-component.stream-ui :where(th, td) { min-width: 68px; padding-inline: 8px; }
     .message-component.stream-ui :where(th, td):first-child { padding-left: 0; }
     .message-component.stream-ui :where(th, td):last-child { padding-right: 0; }

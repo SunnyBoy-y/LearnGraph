@@ -49,6 +49,77 @@ _SVG_SHAPE_TAG_RE = re.compile(
     r"<(rect|circle|ellipse|line|polygon|polyline|path|text)\b", re.IGNORECASE
 )
 _WS_RE = re.compile(r"\s+")
+DISPLAY_MODES = frozenset({"inline", "artifact"})
+HEIGHT_MODES = frozenset({"auto", "aspect-ratio", "fixed", "bounded"})
+
+
+def normalize_height_mode(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in HEIGHT_MODES else None
+
+
+def resolve_height_mode(data: dict[str, Any], *, artifact_type: str) -> str:
+    """Resolve sizing strategy ('auto' | 'aspect-ratio' | 'fixed' | 'bounded')."""
+    reg = data.get("artifact_registry")
+    viewport = data.get("viewport")
+    explicit = (
+        normalize_height_mode(data.get("height_mode"))
+        or (
+            normalize_height_mode(viewport.get("height_mode"))
+            or normalize_height_mode(viewport.get("mode"))
+            if isinstance(viewport, dict)
+            else None
+        )
+        or (
+            normalize_height_mode(reg.get("height_mode"))
+            if isinstance(reg, dict)
+            else None
+        )
+    )
+    if explicit is not None:
+        return explicit
+    if artifact_type == "svg":
+        return "aspect-ratio"
+    return "auto"
+
+
+def normalize_display_mode(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in DISPLAY_MODES else None
+
+
+def resolve_display_mode(
+    part_type: str,
+    data: dict[str, Any],
+    *,
+    artifact_type: str,
+    is_static_svg_card: bool,
+) -> tuple[str, bool]:
+    """Resolve explicit or purpose-based display mode ('inline' | 'artifact')."""
+    reg = data.get("artifact_registry")
+    explicit = (
+        normalize_display_mode(data.get("display_mode"))
+        or normalize_display_mode(data.get("presentation_mode"))
+        or normalize_display_mode(data.get("render_mode"))
+        or (
+            normalize_display_mode(reg.get("display_mode"))
+            if isinstance(reg, dict)
+            else None
+        )
+    )
+    if explicit is not None:
+        return explicit, True
+    if part_type == "svg":
+        return "inline", False
+    if part_type == "magic_card" and is_static_svg_card:
+        return "inline", False
+    if part_type == "ui" or artifact_type == "ui":
+        return "inline", False
+    return "artifact", False
 
 
 def extract_svg_markup(source: str | None) -> str | None:
@@ -171,6 +242,9 @@ class ArtifactEntry:
     svg_markup: str | None = None
     content_fingerprint: str | None = None
     is_static_svg_card: bool = False
+    display_mode: str = "artifact"
+    explicit_display_mode: bool = False
+    height_mode: str = "auto"
     primary_deliverable: bool = True
     capabilities: dict[str, bool] = field(default_factory=dict)
     merged_from_ids: list[str] = field(default_factory=list)
@@ -303,6 +377,13 @@ class ArtifactRegistry:
             "fullscreen": artifact_type in {"svg", "image", "magic_card", "html", "subapp_artifact"},
             "wide_layout": artifact_type in {"svg", "magic_card", "html", "chart", "subapp_artifact"},
         }
+        display_mode, explicit_display_mode = resolve_display_mode(
+            part_type,
+            data,
+            artifact_type=artifact_type,
+            is_static_svg_card=is_static_svg_card,
+        )
+        height_mode = resolve_height_mode(data, artifact_type=artifact_type)
 
         return ArtifactEntry(
             part=part,
@@ -322,6 +403,9 @@ class ArtifactRegistry:
             svg_markup=svg_markup,
             content_fingerprint=fingerprint,
             is_static_svg_card=is_static_svg_card,
+            display_mode=display_mode,
+            explicit_display_mode=explicit_display_mode,
+            height_mode=height_mode,
             primary_deliverable=primary_deliverable,
             capabilities=capabilities,
         )
@@ -378,12 +462,16 @@ class ArtifactRegistry:
             data["artifact_registry"] = {
                 "canonical_id": entry.canonical_id,
                 "artifact_type": entry.artifact_type,
+                "display_mode": entry.display_mode,
+                "height_mode": entry.height_mode,
                 "title": entry.title,
                 "capabilities": entry.capabilities,
                 "merged_from_ids": entry.merged_from_ids,
                 "primary_deliverable": entry.primary_deliverable,
                 "layout": "wide" if entry.capabilities.get("wide_layout") else data.get("layout", "block"),
             }
+            if entry.explicit_display_mode and not normalize_display_mode(data.get("display_mode")):
+                data["display_mode"] = entry.display_mode
             if entry.file_id and not data.get("file_id"):
                 data["file_id"] = entry.file_id
             if entry.path and not data.get("path"):
@@ -464,6 +552,9 @@ class ArtifactRegistry:
         for key, enabled in loser.capabilities.items():
             if enabled:
                 winner.capabilities[key] = True
+        if not winner.explicit_display_mode and loser.explicit_display_mode:
+            winner.display_mode = loser.display_mode
+            winner.explicit_display_mode = True
         winner.primary_deliverable = winner.primary_deliverable or loser.primary_deliverable
 
 
@@ -556,8 +647,17 @@ class ResponseComposer:
             referenced_ids.add(part_id)
             referenced_parts.append(part)
             layout = marker.get("layout")
-            if layout:
-                part.data = {**(getattr(part, "data", None) or {}), "layout": layout}
+            display_mode = normalize_display_mode(marker.get("display_mode"))
+            if layout or display_mode:
+                updated = dict(getattr(part, "data", None) or {})
+                if layout:
+                    updated["layout"] = layout
+                if display_mode:
+                    updated["display_mode"] = display_mode
+                    reg = dict(updated.get("artifact_registry") or {})
+                    reg["display_mode"] = display_mode
+                    updated["artifact_registry"] = reg
+                part.data = updated
             self._stamp_placement(part, "referenced")
 
         surviving_artifacts = [

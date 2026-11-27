@@ -32,6 +32,11 @@
 @layer genui.components {
   .rich-doc__flow, .rich-doc__section, .rich-doc__stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.1rem 1.25rem; align-items: start; }
   .rich-doc__flow > *, .rich-doc__section > *, .rich-doc__stack > * { grid-column: 1 / -1; min-width: 0; }
+  .rich-doc__column { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; align-items: start; align-content: start; }
+  .rich-doc__column > * { grid-column: 1 / -1; min-width: 0; }
+  .rich-doc__card { display: grid; grid-template-columns: minmax(0, 1fr); gap: .75rem; align-items: start; align-content: start; padding: .9rem 1rem; border: 1px solid var(--border); border-radius: .75rem; background: transparent; box-sizing: border-box; }
+  .rich-doc__card > * { grid-column: 1 / -1; min-width: 0; }
+  .rich-doc__section-title { margin: 0; font-size: .95rem; font-weight: 600; line-height: 1.45; display: flex; align-items: center; gap: .4em; }
   .rich-doc__node { min-width: 0; max-width: 100%; }
   .rich-doc__node > * { width: 100%; min-width: 0; margin-block: 0; }
   .rich-doc__icon-copy { display: flex; align-items: baseline; gap: .45em; }
@@ -41,6 +46,7 @@
   .rich-doc__standalone-icon[data-align="center"] { justify-content: center; }
   .rich-doc__standalone-icon[data-align="end"] { justify-content: flex-end; }
   .rich-doc figcaption, .rich-doc__caption { font-size: .8rem; color: var(--muted-foreground); line-height: 1.6; margin-top: .5rem; }
+  .rich-doc__node > .rich-doc__caption { margin-top: 0; }
   .rich-doc__layout { min-width: 0; gap: 1.25rem; align-items: start; }
   .rich-doc__layout > * { min-width: 0; max-width: 100%; }
   .rich-doc__row, .rich-doc__columns, .rich-doc__grid, .rich-doc__media_text { display: flex; flex-wrap: wrap; --rich-gap: 1.25rem; gap: var(--rich-gap); }
@@ -49,7 +55,7 @@
   .rich-doc__grid > .rich-doc__node,
   .rich-doc__media_text > .rich-doc__node {
     flex: var(--rich-weight, 1) 1 calc((100% - (var(--rich-columns, 2) - 1) * var(--rich-gap)) / var(--rich-columns, 2));
-    min-width: min(100%, 18rem);
+    min-width: min(100%, 16rem);
   }
   .rich-doc__layout > .rich-doc__section-title,
   .rich-doc__layout > .message-text-block,
@@ -73,8 +79,10 @@
   .rich-doc__resource[aria-busy="false"] { min-height: 0; gap: .5rem; }
   .rich-doc__resource[aria-busy="false"] .rich-doc__fallback { min-height: 0; margin: 0; }
   .rich-doc__image > .rich-doc__fallback { min-height: 0; padding: 1rem; border-radius: .5rem; background: var(--muted); }
-  .rich-doc__illustration { min-width: 0; max-width: 100%; }
-  .rich-doc__illustration > svg { display: block; width: 100%; height: auto; max-height: 420px; border-radius: .5rem; background: var(--rich-illustration-bg); color: var(--rich-illustration-fg); overflow: hidden; }
+  .rich-doc__illustration { min-width: 0; max-width: 100%; background: transparent; border: 0; padding: 0; }
+  .rich-doc__illustration-stage { position: relative; inline-size: 100%; max-inline-size: 100%; min-inline-size: 0; }
+  .rich-doc__illustration > svg,
+  .rich-doc__illustration-stage > svg { display: block; inline-size: 100%; max-inline-size: 100%; block-size: auto; max-block-size: min(70dvh, 640px); background: transparent; color: var(--foreground); }
   .rich-doc__simulation { padding-block: 1rem; border-block: 1px solid var(--border); }
   .rich-doc__simulation svg { width: 100%; max-height: 260px; }
   .rich-doc__controls { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .75rem; }
@@ -90,6 +98,12 @@
   .rich-doc .message-text-block { min-width: 0; max-width: 100%; }
   .rich-doc .katex-display { display: block; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding-block: .25rem; }
   .message-component.stream-ui--document { font-size: var(--reading-font-size, 16px); }
-  @container (max-width: 560px) { .rich-doc__gallery > figure { flex-basis: 92%; } }
+  @container (max-width: 560px) {
+    .rich-doc__gallery > figure { flex-basis: 92%; }
+    .rich-doc__row > .rich-doc__node,
+    .rich-doc__columns > .rich-doc__node,
+    .rich-doc__grid > .rich-doc__node,
+    .rich-doc__media_text > .rich-doc__node { flex-basis: 100%; min-width: 0; }
+  }
   @media (prefers-reduced-motion: reduce) { .rich-doc * { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }
 }

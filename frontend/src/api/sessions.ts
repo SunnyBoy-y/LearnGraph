@@ -129,16 +129,19 @@ export function updateSession(
 
 export function getSessionBatchDeleteImpact(
   sessionIds: string[],
+  options: ApiRequestOptions = {},
 ): Promise<SessionBatchDeleteImpact> {
   return apiClient.post<SessionBatchDeleteImpact, { session_ids: string[] }>(
     '/sessions/batch-delete-impact',
     { session_ids: sessionIds },
+    options,
   )
 }
 
 export function deleteSessionsBatch(
   sessionIds: string[],
   confirmationText: string,
+  options: ApiRequestOptions = {},
 ): Promise<SessionBatchDeleteResult> {
   return apiClient.post<
     SessionBatchDeleteResult,
@@ -146,7 +149,7 @@ export function deleteSessionsBatch(
   >('/sessions/batch-delete', {
     session_ids: sessionIds,
     confirmation_text: confirmationText,
-  })
+  }, options)
 }
 
 export type ListSessionMessagesOptions = {

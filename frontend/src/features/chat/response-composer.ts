@@ -1,4 +1,5 @@
 import type { MessagePart } from "@/types/sessions";
+import { normalizeHeightMode, type HeightMode } from "@/lib/artifact-frame-size";
 
 export type ArtifactKind =
   | "svg"
@@ -11,6 +12,8 @@ export type ArtifactKind =
   | "component"
   | "file";
 
+export type RichContentDisplayMode = "inline" | "artifact";
+
 export interface ArtifactCapabilities {
   inlinePreview: boolean;
   download: boolean;
@@ -21,6 +24,9 @@ export interface ArtifactCapabilities {
 export interface UnifiedArtifactMeta {
   canonicalId: string;
   artifactType: ArtifactKind;
+  displayMode: RichContentDisplayMode;
+  explicitDisplayMode: boolean;
+  heightMode: HeightMode;
   title: string;
   fileId?: string;
   path?: string;
@@ -182,6 +188,49 @@ function stringField(data: Record<string, unknown>, key: string): string | undef
   return typeof value === "string" && value ? value : undefined;
 }
 
+export function normalizeDisplayMode(
+  value: unknown,
+): RichContentDisplayMode | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "inline" || normalized === "artifact") {
+    return normalized;
+  }
+  return undefined;
+}
+
+export function resolveArtifactDisplayMode(
+  part: MessagePart,
+  artifactType: ArtifactKind,
+  isStaticSvgCard: boolean,
+): { displayMode: RichContentDisplayMode; explicit: boolean } {
+  const data = (part.data ?? {}) as Record<string, unknown>;
+  const reg =
+    data.artifact_registry &&
+    typeof data.artifact_registry === "object" &&
+    !Array.isArray(data.artifact_registry)
+      ? (data.artifact_registry as Record<string, unknown>)
+      : undefined;
+  const explicit =
+    normalizeDisplayMode(data.display_mode) ??
+    normalizeDisplayMode(data.presentation_mode) ??
+    normalizeDisplayMode(data.render_mode) ??
+    normalizeDisplayMode(reg?.display_mode);
+  if (explicit) {
+    return { displayMode: explicit, explicit: true };
+  }
+  if (part.type === "svg") {
+    return { displayMode: "inline", explicit: false };
+  }
+  if (part.type === "magic_card" && isStaticSvgCard) {
+    return { displayMode: "inline", explicit: false };
+  }
+  if (part.type === "ui" || artifactType === "ui") {
+    return { displayMode: "inline", explicit: false };
+  }
+  return { displayMode: "artifact", explicit: false };
+}
+
 function isBackendSuppressedPart(part: MessagePart): boolean {
   const reg = part.data?.artifact_registry;
   return Boolean(
@@ -305,12 +354,32 @@ function buildEntry(
         )
       : [];
 
+  const { displayMode, explicit: explicitDisplayMode } =
+    resolveArtifactDisplayMode(part, artifactType, isStaticSvgCard);
+  const viewport =
+    data.viewport && typeof data.viewport === "object" && !Array.isArray(data.viewport)
+      ? (data.viewport as Record<string, unknown>)
+      : undefined;
+  const regRecord =
+    reg && typeof reg === "object" && !Array.isArray(reg)
+      ? (reg as Record<string, unknown>)
+      : undefined;
+  const heightMode: HeightMode =
+    normalizeHeightMode(data.height_mode) ??
+    normalizeHeightMode(viewport?.height_mode) ??
+    normalizeHeightMode(viewport?.mode) ??
+    normalizeHeightMode(regRecord?.height_mode) ??
+    (artifactType === "svg" ? "aspect-ratio" : "auto");
+
   return {
     part,
     suppressed: isBackendSuppressedPart(part),
     meta: {
       canonicalId,
       artifactType,
+      displayMode,
+      explicitDisplayMode,
+      heightMode,
       title,
       fileId,
       path,
@@ -399,6 +468,10 @@ function mergeEntries(winner: ArtifactEntry, loser: ArtifactEntry): void {
   };
   winner.meta.primaryDeliverable =
     winner.meta.primaryDeliverable || loser.meta.primaryDeliverable;
+  if (!winner.meta.explicitDisplayMode && loser.meta.explicitDisplayMode) {
+    winner.meta.displayMode = loser.meta.displayMode;
+    winner.meta.explicitDisplayMode = true;
+  }
   if (!winner.meta.layout && loser.meta.layout) {
     winner.meta.layout = loser.meta.layout;
   }
@@ -432,10 +505,15 @@ function applyMetaToPart(entry: ArtifactEntry): MessagePart {
     (!existingData.title || fileExtension(existingData.title) === "svg")
       ? { title: meta.title }
       : {}),
+    ...(meta.explicitDisplayMode && !normalizeDisplayMode(existingData.display_mode)
+      ? { display_mode: meta.displayMode }
+      : {}),
     artifact_registry: {
       ...existingReg,
       canonical_id: meta.canonicalId,
       artifact_type: meta.artifactType,
+      display_mode: meta.displayMode,
+      height_mode: meta.heightMode,
       title: meta.title,
       capabilities: {
         inline_preview: meta.capabilities.inlinePreview,
@@ -541,12 +619,14 @@ export function composeAnswerOrdering(
   if (answerParts.length <= 1) return answerParts;
 
   const isPrimary = (part: MessagePart): boolean => {
-    if (part.type === "svg" || part.data?.state === "removed") return false;
+    if (part.type === "svg" || part.type === "ui" || part.data?.state === "removed") return false;
     const registry = part.data?.artifact_registry as { placement?: string } | undefined;
     if (registry?.placement === "referenced") return false;
     const layout = typeof part.data?.layout === "string" ? part.data.layout : "";
     if (layout === "side" || layout === "inline") return false;
     const entry = entriesByPartId?.get(part.id);
+    if (entry?.meta.displayMode === "inline") return false;
+    if (normalizeDisplayMode(part.data?.display_mode) === "inline") return false;
     if (entry) return entry.meta.primaryDeliverable && !entry.suppressed;
     if (part.type === "component") {
       const ct = typeof part.data?.component_type === "string" ? part.data.component_type : "";
@@ -557,7 +637,6 @@ export function composeAnswerOrdering(
       part.type === "magic_card" ||
       part.type === "chart" ||
       part.type === "subapp_artifact" ||
-      part.type === "ui" ||
       ((part.type === "sandbox_artifact" || part.type === "sandbox") &&
         (isSvgFileData(part.data) ||
           isImageFileData(part.data) ||

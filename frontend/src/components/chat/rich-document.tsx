@@ -12,6 +12,7 @@ import { StreamUIStateScope, useStreamUIState } from "@/lib/stream-ui-local-stat
 import { useBoundText } from "@/lib/data-model-store";
 import { simplifyDocument } from "@/genui/presentation-simplifier";
 import { DocumentTOC } from "@/genui/document-toc";
+import { MessageReadingContext } from "./message-reading";
 import { RailList } from "@/genui/rail-list";
 import { AnswerIcon } from "./answer-icon";
 import "./rich-document.css";
@@ -147,10 +148,13 @@ function Simulation({ node }: { node: DocumentNode }) {
       <p aria-live="polite">时间 {time.toFixed(1)} · {parameter > 1 ? `相遇时间 ${(10 / (parameter - 1)).toFixed(2)}` : "当前速度无法追上"}</p>
     </>}
     <div className="rich-doc__controls">
-      {!sorting && <label>{node.engine === "quadratic" ? "系数 a" : "追赶速度"}
-        <input type="range" min={node.engine === "quadratic" ? -3 : 1} max={node.engine === "quadratic" ? 3 : 5} step="0.1" value={parameter}
-          onChange={event => setParameter(Number(event.target.value))} />
-      </label>}
+      {!sorting && <>
+        <label>{node.engine === "quadratic" ? "系数 a" : "追赶速度"}
+          <input type="range" min={node.engine === "quadratic" ? -3 : 1} max={node.engine === "quadratic" ? 3 : 5} step="0.1" value={parameter}
+            onChange={event => setParameter(Number(event.target.value))} />
+        </label>
+        <output className="rich-doc__caption">{parameter.toFixed(1)}</output>
+      </>}
       {node.engine !== "quadratic" && <>
         <Button type="button" variant="outline" size="sm" onClick={() => setPlaying(value => !value)}>{playing ? "暂停" : "播放"}</Button>
         <Button type="button" variant="ghost" size="sm" disabled={currentStep >= maxStep} onClick={() => setStep(value => Math.min(maxStep, value + 1))}>下一步</Button>
@@ -183,10 +187,57 @@ function Tabs({ node, nodes, render }: { node: DocumentNode; nodes: DocumentNode
   </div>{nodes.map(child => <div key={child.id} role="tabpanel" id={`${domId}-${child.id}-panel`} aria-labelledby={`${domId}-${child.id}-tab`} hidden={active !== child.id}>{render(child)}</div>)}</div>;
 }
 
+const EmbeddedVisualNode = memo(function EmbeddedVisualNode({
+  node,
+  scope,
+}: {
+  node: DocumentNode;
+  scope: string;
+}) {
+  const onBlockExplain = useContext(BlockActionContext);
+  const embeddedData = useMemo(
+    () =>
+      node.visual
+        ? {
+            ...node.visual,
+            protocol: "suip/0.1",
+            component: node.type === "diagram" ? "graph" : node.type,
+            block_id: node.id,
+            revision: 0,
+            state: "completed",
+          }
+        : null,
+    [node.visual, node.type, node.id],
+  );
+  if (!embeddedData) return <p role="status">{node.label || "等待数据填充…"}</p>;
+  return (
+    <StreamUI
+      embedded
+      partId={`${scope}:${node.id}`}
+      onAction={onBlockExplain ? (action) => onBlockExplain(node.id, action.payload) : undefined}
+      data={embeddedData}
+    />
+  );
+});
+
+const LEAF_NODE_TYPES = new Set([
+  "paragraph", "heading", "list", "quote", "code", "math", "divider", "caption",
+  "icon", "svg", "image", "image_group", "gallery", "simulation", "interactive",
+  "chart", "table", "graph", "diagram", "timeline", "metric", "rail_item",
+]);
+
+function sameChildrenList(a: DocumentNode[] | undefined, b: DocumentNode[] | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 const NodeContent = memo(function NodeContent({ node, childrenByParent, scope }: {
   node: DocumentNode; childrenByParent: Map<string | null, DocumentNode[]>; scope: string;
 }) {
-  const onBlockExplain = useContext(BlockActionContext);
   const interrupted = useContext(InterruptedContext);
   const boundText = useBoundText(node.type === "code" ? "" : node.text);
   const nodeText = node.type === "code" ? node.text : boundText;
@@ -206,7 +257,8 @@ const NodeContent = memo(function NodeContent({ node, childrenByParent, scope }:
     case "feature_list": case "step_list": case "status_list":
       return <RailList node={node} items={children} interrupted={interrupted} renderText={text => <Markdown text={text} />} />;
     case "icon": return <div className="rich-doc__standalone-icon" data-align={node.align}><AnswerIcon name={node.icon} size="large" label={nodeAlt || nodeLabel} /></div>;
-    case "heading": return createElement(`h${node.level}`, {id: `${scope}-${node.id}`, tabIndex: -1}, node.icon && <AnswerIcon name={node.icon} />, nodeText || nodeLabel);
+    case "heading": return createElement(`h${node.level}`, {id: `${scope}-${node.id}`, tabIndex: -1, "data-outline-heading": true}, node.icon && <AnswerIcon name={node.icon} />, nodeText || nodeLabel);
+    case "caption": return <p className="rich-doc__caption">{nodeText || nodeCaption || nodeLabel}</p>;
     case "paragraph": case "list": return node.icon ? <div className="rich-doc__icon-copy"><AnswerIcon name={node.icon} /><div><Markdown text={nodeText} /></div></div> : <Markdown text={nodeText} />;
     case "quote": return <blockquote><Markdown text={nodeText} /></blockquote>;
     case "code": {
@@ -215,10 +267,13 @@ const NodeContent = memo(function NodeContent({ node, childrenByParent, scope }:
     }
     case "math": return <Markdown text={mathMarkdown(nodeText, node.inline)} />;
     case "divider": return <hr />;
+    case "svg":
+      return node.svg ? <SvgIllustration alt={nodeAlt || nodeLabel || "SVG 图形"} caption={nodeCaption} displayMode={node.display_mode} label={nodeLabel} svg={node.svg} variant="node" />
+        : <p className="rich-doc__resource rich-doc__resource--svg" role="status">{nodeLabel || nodeAlt || "正在准备图形…"}</p>;
     case "image": case "image_group": case "gallery": return <Images node={node} />;
     case "simulation": case "interactive": return <Simulation node={node} />;
     case "chart": case "table": case "graph": case "diagram": case "timeline": case "metric":
-      return node.visual ? <StreamUI embedded partId={`${scope}:${node.id}`} onAction={onBlockExplain ? action => onBlockExplain(node.id, action.payload) : undefined} data={{...node.visual, protocol: "suip/0.1", component: node.type === "diagram" ? "graph" : node.type, block_id: node.id, revision: 0, state: "completed"}} /> : <p role="status">{nodeLabel || "等待数据填充…"}</p>;
+      return <EmbeddedVisualNode node={node} scope={scope} />;
     case "tabs": return <Tabs node={node} nodes={children} render={render} />;
     case "accordion": return <div className="rich-doc__stack">{children.map(child => <AccordionItem key={child.id} node={child}>{render(child)}</AccordionItem>)}</div>;
     case "figure": {
@@ -236,15 +291,24 @@ const NodeContent = memo(function NodeContent({ node, childrenByParent, scope }:
 
 // Keep every node's explicit icon visible, including content without a title slot.
 // Stable node keys and the shared state scope preserve controls across patches.
-const fallbackIconTypes = new Set(["quote", "code", "math", "divider", "image", "image_group", "gallery", "simulation", "interactive", "chart", "table", "graph", "diagram", "timeline", "metric", "tabs", "accordion", "figure"]);
+const fallbackIconTypes = new Set(["caption", "quote", "code", "math", "divider", "svg", "image", "image_group", "gallery", "simulation", "interactive", "chart", "table", "graph", "diagram", "timeline", "metric", "tabs", "accordion", "figure"]);
 const NodeView = memo(function NodeView(props: {node: DocumentNode; childrenByParent: Map<string | null, DocumentNode[]>; scope: string}) {
   const content = <NodeContent {...props} />;
   return <>{props.node.icon && fallbackIconTypes.has(props.node.type) &&
     <div className="rich-doc__node-icon"><AnswerIcon name={props.node.icon} /></div>}{content}</>;
+}, (prev, next) => {
+  if (prev.node !== next.node || prev.scope !== next.scope) return false;
+  if (LEAF_NODE_TYPES.has(prev.node.type)) return true;
+  return sameChildrenList(prev.childrenByParent.get(prev.node.id), next.childrenByParent.get(next.node.id));
 });
 
 export default function RichDocument({ snapshot, siblingParts, failed = false, settled = false, onBlockExplain }: { snapshot: UISnapshot; siblingParts?: MessagePart[]; failed?: boolean; settled?: boolean; onBlockExplain?: (blockId: string, payload: Record<string, unknown>) => void }) {
   const scope = useContext(StreamUIStateScope);
+  const messageOwnsOutline = useContext(MessageReadingContext);
+  const sourceSiblingParts = useMemo(() => {
+    const sources = siblingParts?.filter((part) => part.type === "source_list");
+    return sources && sources.length > 0 ? sources : undefined;
+  }, [siblingParts]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const blocks = useMemo(() => snapshot.blocks?.some(node => node.icon) ? snapshot.blocks : simplifyDocument(snapshot), [snapshot.blocks, snapshot.state, snapshot.preview]);
   const headings = blocks.filter(node => node.type === "heading" && node.state !== "pending");
@@ -258,9 +322,9 @@ export default function RichDocument({ snapshot, siblingParts, failed = false, s
     return result;
   }, [blocks]);
   const roots = childrenByParent.get(null) ?? [];
-  return <BlockActionContext.Provider value={onBlockExplain}><SiblingPartsContext.Provider value={siblingParts}><InterruptedContext.Provider value={failed || settled}><div className="rich-doc rich-doc__flow">
+  return <BlockActionContext.Provider value={onBlockExplain}><SiblingPartsContext.Provider value={sourceSiblingParts}><InterruptedContext.Provider value={failed || settled}><div className="rich-doc rich-doc__flow">
     {snapshot.props.icon && <AnswerIcon name={snapshot.props.icon} size="small" label={snapshot.props.title} />}
-    {(snapshot.props.toc || snapshot.props.density === "editorial") && <DocumentTOC headings={headings} scope={scope} />}
+    {!messageOwnsOutline && headings.length >= 2 && (snapshot.props.toc || snapshot.props.density === "editorial") && <DocumentTOC headings={headings} scope={scope} />}
     {snapshot.props.description && <p>{snapshot.props.description}</p>}
     {roots.length ? roots.map(node => <div key={node.id} className="rich-doc__node" data-width={node.width}
       data-weight={node.weight > 1 ? node.weight : undefined}

@@ -14,9 +14,10 @@ export const StreamUIStateScope = createContext("");
 // Keep choices by workspace + durable Part ID, including browser reloads.
 // Only bounded UI preferences are saved; answer/source data stays on the server.
 const blocks = new Map<string, Map<string, unknown>>();
+const pendingSaves = new Map<string, number>();
 const MAX_BLOCKS = 128;
 const STORAGE_KEY = "learngraph.genui.preferences.v1";
-const persistentKeys = new Set(["mode", "hidden", "limit", "query", "sort", "selected", "zoom"]);
+const persistentKeys = new Set(["mode", "hidden", "limit", "query", "sort", "zoom"]);
 
 function namespace(scope: string) {
   return `${authStore.getSession()?.userId ?? "guest"}:${authStore.getWorkspaceId() ?? "local"}:${scope}`;
@@ -24,7 +25,7 @@ function namespace(scope: string) {
 function validPreference(key: string, value: unknown): boolean {
   if (key === "mode") return value === null || value === "line" || value === "bar";
   if (key === "limit") return [3, 5, 10, 500].includes(value as number);
-  if (key === "query" || key === "selected" || key.endsWith(":tab")) return typeof value === "string" && value.length <= 500;
+  if (key === "query" || key.endsWith(":tab")) return typeof value === "string" && value.length <= 500;
   if (key === "hidden") return Array.isArray(value) && value.length <= 12 && value.every(item => typeof item === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(item));
   if (key === "sort") return value === null || (typeof value === "object" && value !== null && "key" in value && typeof value.key === "string" && value.key.length <= 100 && "descending" in value && typeof value.descending === "boolean");
   if (key === "zoom") return typeof value === "number" && value >= .2 && value <= 4;
@@ -35,6 +36,9 @@ function validPreference(key: string, value: unknown): boolean {
   if (key.endsWith(":open")) return typeof value === "boolean";
   return false;
 }
+function shouldDebounceSave(key: string): boolean {
+  return key.endsWith(":step") || key.endsWith(":parameter");
+}
 function readSaved(): Record<string, Record<string, unknown>> {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -43,7 +47,12 @@ function readSaved(): Record<string, Record<string, unknown>> {
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, Record<string, unknown>> : {};
   } catch { return {}; }
 }
-function save(scope: string, state: Map<string, unknown>) {
+function saveNow(scope: string, state: Map<string, unknown>) {
+  const existing = pendingSaves.get(scope);
+  if (existing !== undefined) {
+    window.clearTimeout(existing);
+    pendingSaves.delete(scope);
+  }
   try {
     const saved = readSaved();
     delete saved[scope];
@@ -52,6 +61,21 @@ function save(scope: string, state: Map<string, unknown>) {
     const serialized = JSON.stringify(Object.fromEntries(entries));
     if (serialized.length <= 256_000) localStorage.setItem(STORAGE_KEY, serialized);
   } catch { /* Private browsing/quota failure must never break an answer. */ }
+}
+function scheduleSave(scope: string, state: Map<string, unknown>, debounce: boolean) {
+  if (!debounce || typeof window === "undefined") {
+    saveNow(scope, state);
+    return;
+  }
+  const existing = pendingSaves.get(scope);
+  if (existing !== undefined) window.clearTimeout(existing);
+  pendingSaves.set(
+    scope,
+    window.setTimeout(() => {
+      pendingSaves.delete(scope);
+      saveNow(scope, state);
+    }, 250),
+  );
 }
 
 export function streamUIViewState(scope: string): Record<string, unknown> {
@@ -90,7 +114,7 @@ export function useStreamUIState<T>(
           ? (action as (value: T) => T)(previous)
           : action;
       state.set(key, next);
-      if (validPreference(key, next)) save(namespace(scope), state);
+      if (validPreference(key, next)) scheduleSave(namespace(scope), state, shouldDebounceSave(key));
       setValue(next);
     },
     [scope, key],

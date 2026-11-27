@@ -11,7 +11,9 @@ import {
   createContext,
   useCallback,
   useContext,
+  useLayoutEffect,
   useMemo,
+  useRef,
   type CSSProperties,
   type ReactNode,
 } from "react";
@@ -78,6 +80,39 @@ export const ConversationContent = ({
   ...props
 }: ConversationContentProps) => {
   const { controller } = useConversationScrollContext();
+  const scrollNodeRef = useRef<HTMLDivElement | null>(null);
+
+  const assignScrollRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      scrollNodeRef.current = node;
+      controller.scrollRef(node);
+    },
+    [controller],
+  );
+
+  // Mirror the scroller's symmetric scrollbar gutter onto the parent canvas so
+  // sibling Content Rail containers (such as the composer dock) align to the
+  // exact same left/right baseline on both classic and overlay scrollbars.
+  useLayoutEffect(() => {
+    const scroller = scrollNodeRef.current;
+    const canvas = scroller?.closest<HTMLElement>(".chat-canvas-page");
+    if (!scroller || !canvas) return;
+    let lastValue = "";
+    const sync = () => {
+      const gutter = Math.max(0, (scroller.offsetWidth - scroller.clientWidth) / 2);
+      const next = `${gutter}px`;
+      if (next !== lastValue) {
+        lastValue = next;
+        canvas.style.setProperty("--chat-scroll-gutter", next);
+      }
+    };
+    sync();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(sync);
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, []);
+
   return (
     <div
       className={scrollClassName}
@@ -91,7 +126,7 @@ export const ConversationContent = ({
       onTouchEnd={controller.handleTouchEnd}
       onTouchStart={controller.handleTouchStart}
       onWheel={controller.handleWheel}
-      ref={controller.scrollRef}
+      ref={assignScrollRef}
       style={{
         height: "100%",
         overflow: "auto",

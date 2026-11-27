@@ -30,8 +30,8 @@ export function AnswerParts({ parts, siblingParts = parts, interactive = true, o
           labels: submission.results.flatMap(item => item.labels), graded_count: submission.gradedCount, correct_count: submission.correctCount },
       })} />;
     if (group.kind === "image_strip") return <SandboxImageStrip key={`image-strip-${group.parts[0]?.id ?? "empty"}`} parts={group.parts} />;
-    if (group.kind === "side_pair") return <div className="grid gap-3 sm:grid-cols-2 sm:items-start" key={`side-pair-${group.artifact.id}`}>
-      <div>{render(group.text)}</div><div>{render(group.artifact)}</div>
+    if (group.kind === "side_pair") return <div className="grid min-w-0 gap-3 sm:grid-cols-2 sm:items-start" key={`side-pair-${group.artifact.id}`}>
+      <div className="min-w-0">{render(group.text)}</div><div className="min-w-0">{render(group.artifact)}</div>
     </div>;
     return render(group.part);
   })}</>;

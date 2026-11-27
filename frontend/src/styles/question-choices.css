@@ -8,10 +8,10 @@
   --diamond-control-hover: var(--background, #fff);
   --diamond-selected-bg: color-mix(in srgb, var(--primary, #18181b) 7%, var(--card, #fff));
   --diamond-selected-border: var(--primary, #18181b);
-  --diamond-success: #1f7a4d;
-  --diamond-success-bg: color-mix(in srgb, #1f7a4d 8%, var(--card, #fff));
-  --diamond-danger: #b42318;
-  --diamond-danger-bg: color-mix(in srgb, #b42318 7%, var(--card, #fff));
+  --diamond-success: var(--success-foreground, #086b54);
+  --diamond-success-bg: var(--success-soft, #e7f6f0);
+  --diamond-danger: var(--danger-foreground, #a82424);
+  --diamond-danger-bg: var(--danger-soft, #fdecec);
 }
 
 .option-group {
@@ -122,11 +122,11 @@
 }
 
 .option-group__status-icon.is-correct {
-  color: #1f7a4d;
+  color: var(--diamond-success);
 }
 
 .option-group__status-icon.is-wrong {
-  color: #b42318;
+  color: var(--diamond-danger);
 }
 
 .option-group__choice > span {
@@ -561,33 +561,33 @@
 
 .dark .option-group__choice.is-correct,
 .dark .message-quiz__option.is-correct {
-  border-color: rgba(74, 222, 128, .42);
-  background: rgba(31, 122, 77, .22);
+  border-color: var(--success-border);
+  background: var(--success-soft);
   box-shadow: none;
 }
 
 .dark .option-group__choice.is-wrong,
 .dark .message-quiz__option.is-wrong {
-  border-color: rgba(248, 113, 113, .42);
-  background: rgba(180, 35, 24, .22);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
   box-shadow: none;
 }
 
 .dark .option-group__status-icon.is-correct,
 .dark .question-set-pager__verdict-icon.is-correct,
 .dark .question-set-pager__verdict-icon.is-submitted {
-  color: #4ade80;
+  color: var(--success-foreground);
 }
 
 .dark .option-group__status-icon.is-wrong,
 .dark .question-set-pager__verdict-icon.is-wrong {
-  color: #f87171;
+  color: var(--danger-foreground);
 }
 
 .dark .option-group__submitted-note {
-  border-color: rgba(74, 222, 128, .28);
-  background: rgba(31, 122, 77, .18);
-  color: #86efac;
+  border-color: var(--success-border);
+  background: var(--success-soft);
+  color: var(--success-foreground);
 }
 
 .dark .question-set-pager__verdict-banner {
@@ -597,13 +597,13 @@
 
 .dark .question-set-pager__verdict-banner.is-correct,
 .dark .question-set-pager__verdict-banner.is-submitted {
-  border-color: rgba(74, 222, 128, .3);
-  background: rgba(31, 122, 77, .18);
+  border-color: var(--success-border);
+  background: var(--success-soft);
 }
 
 .dark .question-set-pager__verdict-banner.is-wrong {
-  border-color: rgba(248, 113, 113, .3);
-  background: rgba(180, 35, 24, .18);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
 }
 
 .dark .question-set-pager__verdict-banner.is-pending {

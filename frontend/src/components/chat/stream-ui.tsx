@@ -112,17 +112,31 @@ function ChartView({ snapshot: s }: ViewProps) {
         : [],
     ),
   );
-  const min = Math.min(0, ...values),
-    max = Math.max(1, ...values);
+  const min = Math.min(0, ...values);
+  const rawMax = Math.max(0, ...values);
+  const max = rawMax > min ? rawMax : min + 1;
   const x = (index: number) =>
-    52 + ((index + 0.5) / Math.max(1, rows.length)) * 620;
+    64 + ((index + 0.5) / Math.max(1, rows.length)) * 608;
   const y = (value: number) => 236 - ((value - min) / (max - min)) * 202;
+  const formatTick = (value: number) => {
+    const span = Math.abs(max - min);
+    if (span < 10 && value !== 0) {
+      return Intl.NumberFormat("zh", { maximumFractionDigits: 3 }).format(value);
+    }
+    return Intl.NumberFormat("zh", { notation: "compact" }).format(value);
+  };
   const active = rows.find((row) => row.id === (focused ?? hovered));
   const chartType = staticChart ? s.props.chart_type : mode ?? s.props.chart_type;
   const first = rows[0], last = rows.at(-1), single = columns.length === 1 ? columns[0] : null;
   const start = single && first?.values[single.key], end = single && last?.values[single.key];
   const change = typeof start === "number" && typeof end === "number" && start > 0 ? (end - start) / start * 100 : null;
-  const insight = single && typeof end === "number" ? `${last!.label} · ${single.label} ${format(end)}${s.props.unit}${change != null && rows.length > 1 ? `，较${first.label}${change >= 0 ? "增加" : "减少"} ${format(Math.abs(end - (start as number)))}${s.props.unit}` : ""}` : "";
+  const deltaText =
+    change != null && rows.length > 1
+      ? end === start
+        ? `，与${first.label}持平`
+        : `，较${first.label}${change > 0 ? "增加" : "减少"} ${format(Math.abs((end as number) - (start as number)))}${s.props.unit}`
+      : "";
+  const insight = single && typeof end === "number" ? `${last!.label} · ${single.label} ${format(end)}${s.props.unit}${deltaText}` : "";
   return (
     <>
       <div className="stream-ui__chart-context">
@@ -202,16 +216,14 @@ function ChartView({ snapshot: s }: ViewProps) {
               return (
                 <g key={tick}>
                   <line
-                    x1={52}
+                    x1={64}
                     x2={680}
                     y1={y(value)}
                     y2={y(value)}
                     className="stream-ui__grid"
                   />
-                  <text x={48} y={y(value) + 4} textAnchor="end">
-                    {Intl.NumberFormat("zh", { notation: "compact" }).format(
-                      value,
-                    )}
+                  <text x={58} y={y(value) + 4} textAnchor="end">
+                    {formatTick(value)}
                   </text>
                 </g>
               );
@@ -253,12 +265,22 @@ function ChartView({ snapshot: s }: ViewProps) {
                       36,
                       480 / rows.length / Math.max(1, columns.length),
                     );
+                    const isolated =
+                      typeof rows[index - 1]?.values[column.key] !== "number" &&
+                      typeof rows[index + 1]?.values[column.key] !== "number";
                     return chartType === "line" ? (
                       <circle
                         key={row.id}
                         cx={x(index)}
                         cy={y(value)}
-                        r={index === rows.length - 1 || row.id === (focused ?? hovered) ? 5 : 0}
+                        r={
+                          index === rows.length - 1 ||
+                          row.id === (focused ?? hovered)
+                            ? 5
+                            : isolated
+                              ? 4
+                              : 0
+                        }
                         fill="currentColor"
                         stroke="var(--background)"
                         strokeWidth={2}
@@ -302,9 +324,9 @@ function ChartView({ snapshot: s }: ViewProps) {
                 aria-label={`${row.label}: ${columns.map((c) => `${c.label} ${format(row.values[c.key])}`).join(", ")}`}
               >
                 <rect
-                  x={52 + (index / rows.length) * 620}
+                  x={64 + (index / rows.length) * 608}
                   y={28}
-                  width={620 / rows.length}
+                  width={608 / rows.length}
                   height={212}
                   fill="transparent"
                 />
@@ -362,12 +384,18 @@ function GraphView({ snapshot: rawSnapshot, onExplain }: ViewProps) {
     "selected",
     null,
   );
+  const [canvasCustomized] = useStreamUIState<boolean>(
+    "canvas_customized",
+    false,
+  );
   const selectedNode = s.nodes.find((node) => node.id === selected);
-  const chain = presentation(s).chain;
+  const chain = canvasCustomized ? null : presentation(s).chain;
+  const toggleSelected = (nodeId: string) =>
+    setSelected((current) => (current === nodeId ? null : nodeId));
   if (chain) return <div className="stream-ui__linear" data-presentation="linear">
     <ol aria-label={s.props.title}>{chain.map((node, i) => <li key={node.id}>
       {i > 0 && <span className="stream-ui__flow-arrow" aria-hidden="true">→</span>}
-      <button type="button" aria-pressed={selected === node.id} onClick={() => setSelected(node.id)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") {event.preventDefault(); setSelected(node.id);} }}>{node.label}</button>
+      <button type="button" aria-pressed={selected === node.id} onClick={() => toggleSelected(node.id)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") {event.preventDefault(); toggleSelected(node.id);} else if (event.key === "Escape") {setSelected(null);} }}>{node.label}</button>
       {i > 0 && s.edges.find(e => e.target === node.id)?.label && <small>{s.edges.find(e => e.target === node.id)?.label}</small>}
     </li>)}</ol>
     {selectedNode && <div className="stream-ui__flow-detail"><strong>{selectedNode.label}</strong><p>{selectedNode.description || selectedNode.group}</p>{onExplain && <Button size="sm" variant="ghost" onClick={() => onExplain(selectedNode.id)}>让 AI 解释此节点</Button>}</div>}
@@ -525,7 +553,15 @@ function TableView({ snapshot: s }: ViewProps) {
           </tbody>
         </table>
       </div>
-      {!rows.length && <Empty settled={s.state === "completed"} />}
+      {!rows.length && (
+        explore && query.trim() && s.rows.length > 0 ? (
+          <div className="stream-ui__empty" role="status">
+            未找到匹配「{query.trim()}」的数据
+          </div>
+        ) : (
+          <Empty settled={s.state === "completed"} />
+        )
+      )}
     </>
   );
 }
@@ -704,11 +740,15 @@ function ValidatedUI({
     setError("");
     try {
       const targetNode = nodeId ? snapshot.nodes.find((item) => item.id === nodeId) : undefined;
+      const resolvedTitle = boundTitle || snapshot.props.title;
+      const resolvedNodeLabel = targetNode
+        ? (store ? store.resolveText(targetNode.label) : targetNode.label) || nodeId
+        : nodeId;
       const userMessage =
         embeddedUserMessage ||
         (nodeId
-          ? `请解释图表「${snapshot.props.title}」中的节点「${targetNode?.label ?? nodeId}」及其关联。`
-          : `请解释图表「${snapshot.props.title}」，分析其中的主要信息。`);
+          ? `请解释图表「${resolvedTitle}」中的节点「${resolvedNodeLabel}」及其关联。`
+          : `请解释图表「${resolvedTitle}」，分析其中的主要信息。`);
       await onAction?.({
         componentId: partId,
         componentType: "stream_ui",

@@ -126,7 +126,11 @@ function isRailMessagePart(value: unknown): value is MessagePart {
   );
 }
 
-function appendRailPart(parts: MessagePart[], incoming: MessagePart): MessagePart[] {
+function appendRailPart(
+  parts: MessagePart[],
+  incoming: MessagePart,
+  replaceData = false,
+): MessagePart[] {
   const index = parts.findIndex((part) => part.id === incoming.id);
   if (index < 0) {
     return [
@@ -139,6 +143,10 @@ function appendRailPart(parts: MessagePart[], incoming: MessagePart): MessagePar
       ? {
           ...part,
           ...incoming,
+          data:
+            replaceData && incoming.data !== undefined
+              ? { ...incoming.data }
+              : { ...(part.data ?? {}), ...(incoming.data ?? {}) },
           content:
             incoming.content ??
             `${part.content ?? ""}${incoming.content_delta ?? ""}`,
@@ -398,7 +406,14 @@ export function SideConversationRail({
   }, [sessions.data, creationParentSessionId, parentSessionId, currentSession?.project_id, persistComposerPrefs, queryClient, workspaceId, messageKey]);
 
   const send = useCallback(
-    async (event?: FormEvent, contentOverride?: string) => {
+    async (
+      event?: FormEvent,
+      contentOverride?: string,
+      options?: {
+        uiAction?: MessageCreateRequest["ui_action"];
+        analysisOnly?: boolean;
+      },
+    ) => {
       event?.preventDefault();
       const content = (contentOverride ?? draft).trim();
       if (!content || !canSend || selectedSession?.status === "closed") return;
@@ -480,6 +495,8 @@ export function SideConversationRail({
         search_route: searchRoute,
         web_search: searchRoute !== "disabled",
         graph_action: "none",
+        ...(options?.uiAction ? { ui_action: options.uiAction } : {}),
+        ...(options?.analysisOnly ? { analysis_only: true } : {}),
       };
       const controller = new AbortController();
       const handle: RailStreamHandle = {
@@ -563,13 +580,17 @@ export function SideConversationRail({
                 }));
               } else if (isRailMessagePart(data.part)) {
                 const part = data.part;
-                patchAssistant((message) => ({
-                  ...message,
-                  parts: appendRailPart(message.parts, part),
-                  content: appendRailPart(message.parts, part)
-                    .filter((item) => item.type === "text")
-                    .map((item) => item.content ?? "").join("\n"),
-                }));
+                const replaceData = type === "part.replaced";
+                patchAssistant((message) => {
+                  const nextParts = appendRailPart(message.parts, part, replaceData);
+                  return {
+                    ...message,
+                    parts: nextParts,
+                    content: nextParts
+                      .filter((item) => item.type === "text")
+                      .map((item) => item.content ?? "").join("\n"),
+                  };
+                });
               }
             }
           } catch (error) {
@@ -681,6 +702,42 @@ export function SideConversationRail({
 
   const handleRailAction = useCallback(
     (action: TrustedComponentAction) => {
+      if (action.componentType === "code_trainer") {
+        if (
+          action.event !== "submit" ||
+          typeof action.payload.prompt !== "string" ||
+          action.payload.prompt.length > 50000
+        ) {
+          return;
+        }
+        return send(undefined, action.payload.prompt, { analysisOnly: true });
+      }
+      if (action.componentType === "stream_ui") {
+        if (
+          action.event !== "explain" &&
+          action.event !== "graph.node.explain" &&
+          action.event !== "document.block.explain"
+        ) {
+          return;
+        }
+        const uiAction = {
+          part_id: action.componentId,
+          revision: Number(action.payload.revision),
+          action: action.event,
+          ...(typeof action.payload.node_id === "string" ? { node_id: action.payload.node_id } : {}),
+          ...(typeof action.payload.block_id === "string" ? { block_id: action.payload.block_id } : {}),
+          ...(action.payload.view_state && typeof action.payload.view_state === "object"
+            ? { view_state: action.payload.view_state as Record<string, unknown> }
+            : {}),
+        } satisfies NonNullable<MessageCreateRequest["ui_action"]>;
+        const userMessage =
+          typeof action.payload.userMessage === "string" && action.payload.userMessage.trim()
+            ? action.payload.userMessage.trim()
+            : uiAction.node_id
+              ? `请解释图谱节点「${uiAction.node_id}」及其关联。`
+              : "请解释当前图表，分析其中的主要信息。";
+        return send(undefined, userMessage, { uiAction });
+      }
       if (action.componentType === "graph_update_proposal") {
         toast.message("图谱变更请在主画布中审核");
         return;

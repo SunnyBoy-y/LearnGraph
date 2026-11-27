@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider, type InfiniteData } from '@tanstack/r
 import { describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import { listSessionPage, type SessionPage } from '@/api/session-browser'
-import { cacheCreatedSession, sessionBrowserKey, summaryOf, updateSessionCaches, useSessionPicker } from './session-queries'
+import { cacheCreatedSession, removeSessionsFromCaches, sessionBrowserKey, sessionDetailKey, summaryOf, updateSessionCaches, useSessionPicker } from './session-queries'
 import { workspaceQueryKey } from './query-keys'
 import type { Session } from '@/types/sessions'
 
@@ -37,5 +37,24 @@ describe('session cache representations', () => {
     await act(async () => resolve(page('existing')))
     await waitFor(() => expect(hook.result.current.data.map(item => item.id)).toEqual(['created', 'existing']))
     hook.unmount(); client.clear()
+  })
+  it('removes deleted sessions immediately from browser, list, recent-created, and detail caches', () => {
+    const client = new QueryClient()
+    const browserKey = [...sessionBrowserKey('w'), { ungrouped: true }]
+    const keep = summaryOf(session('keep'))
+    client.setQueryData(browserKey, { pages: [{ ...page('del'), items: [summaryOf(session('del')), keep] }], pageParams: [{}] })
+    client.setQueryData(workspaceQueryKey('w', 'sessions'), [session('del'), session('keep')])
+    client.setQueryData(workspaceQueryKey('w', 'sessions', 'recent-created'), [summaryOf(session('del')), keep])
+    client.setQueryData(sessionDetailKey('w', 'del'), session('del'))
+    client.setQueryData(sessionDetailKey('w', 'keep'), session('keep'))
+
+    removeSessionsFromCaches(client, 'w', ['del'])
+
+    expect(client.getQueryData<InfiniteData<SessionPage>>(browserKey)?.pages[0].items.map(i => i.id)).toEqual(['keep'])
+    expect(client.getQueryData<Session[]>(workspaceQueryKey('w', 'sessions'))?.map(i => i.id)).toEqual(['keep'])
+    expect(client.getQueryData(workspaceQueryKey('w', 'sessions', 'recent-created'))).toEqual([keep])
+    expect(client.getQueryData(sessionDetailKey('w', 'del'))).toBeUndefined()
+    expect(client.getQueryData(sessionDetailKey('w', 'keep'))).toBeDefined()
+    client.clear()
   })
 })

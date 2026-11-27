@@ -1,22 +1,37 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
-import { ChevronDown, Search } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { ChevronDown } from "lucide-react";
 import { discoverProviderModels, listProviders } from "@/api/providers";
-import { migrateThinkingPreference } from "@/lib/thinking-effort-migration";
-import { ThinkingSlider, supportedThinkingStops, thinkingStopIndex } from "@/components/chat/thinking-slider";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
+import { GenerationConfigMenu } from "@/components/chat/generation-config";
+import { buildModelSelectorGroups } from "@/lib/generation-config";
+import {
+  capabilityThinkingModes,
+  modelSupportsAgent,
+  providerModelOptions,
+  thinkingLabels,
+} from "@/lib/model-choices";
 import { workspaceQueryKey } from "@/lib/query-keys";
-import { capabilityThinkingModes, fuzzyModelMatch, modelChoiceValue, modelProtocolLabel, parseModelChoiceValue, providerModelOptions, modelSupportsAgent, thinkingLabels } from "@/lib/model-choices";
-import { getSessionComposerPrefs, prefsFromModelSnapshot, setSessionComposerPrefs, type ResponseMode, type ThinkingMode } from "@/lib/session-composer-prefs";
+import {
+  getSessionComposerPrefs,
+  prefsFromModelSnapshot,
+  setSessionComposerPrefs,
+  type ResponseMode,
+  type ThinkingMode,
+} from "@/lib/session-composer-prefs";
+import { migrateThinkingPreference } from "@/lib/thinking-effort-migration";
 import { isDeepSeekProvider, isModelProvider } from "@/types/providers";
 
 /** One set of model / thinking controls for every conversation in the side rail. */
-export function useRailConversationModel(workspaceId: string, prefsSessionId: string, sessionId?: string, snapshot?: Record<string, unknown>) {
+export function useRailConversationModel(
+  workspaceId: string,
+  prefsSessionId: string,
+  sessionId?: string,
+  snapshot?: Record<string, unknown>,
+) {
+  const navigate = useNavigate();
   const snapshotPrefs = prefsFromModelSnapshot(snapshot ?? {});
-  const initialPrefs = getSessionComposerPrefs(
-    prefsSessionId,
-  );
+  const initialPrefs = getSessionComposerPrefs(prefsSessionId);
   const [selectedProviderId, setSelectedProviderId] = useState(
     () => initialPrefs.providerId ?? snapshotPrefs.providerId ?? "",
   );
@@ -30,10 +45,12 @@ export function useRailConversationModel(workspaceId: string, prefsSessionId: st
     () => initialPrefs.thinkingMode,
   );
   const [modelSearch, setModelSearch] = useState("");
-  /** 响应与模型菜单是否展开：展开时胶囊显示「思考强度」，收起时显示当前档位。 */
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
 
-  const providers = useQuery({ queryKey: workspaceQueryKey(workspaceId, "providers"), queryFn: listProviders });
+  const providers = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "providers"),
+    queryFn: listProviders,
+  });
   const modelProviders = useMemo(
     () =>
       (providers.data ?? []).filter(
@@ -66,27 +83,12 @@ export function useRailConversationModel(workspaceId: string, prefsSessionId: st
     [activeProvider, discoveredModels?.data?.models],
   );
   const selectedModel =
-    modelOptions.find((model) => model.id === selectedModelId) ?? modelOptions[0];
+    modelOptions.find((model) => model.id === selectedModelId) ??
+    modelOptions[0];
   const supportsAgentMode = modelSupportsAgent(activeProvider, selectedModel);
-  const availableModelChoices = useMemo(
-    () =>
-      modelProviders.flatMap((provider, index) =>
-        providerModelOptions(
-          provider,
-          providerModelQueries[index]?.data?.models,
-        ).map((model) => ({ provider, model })),
-      ),
+  const modelGroups = useMemo(
+    () => buildModelSelectorGroups(modelProviders, providerModelQueries),
     [modelProviders, providerModelQueries],
-  );
-  const filteredModelChoices = useMemo(
-    () =>
-      availableModelChoices.filter(({ provider, model }) =>
-        fuzzyModelMatch(
-          `${model.id} ${provider.display_name} ${modelProtocolLabel(provider.provider_type)}`,
-          modelSearch,
-        ),
-      ),
-    [availableModelChoices, modelSearch],
   );
   const thinkingModes = useMemo(
     () =>
@@ -107,6 +109,7 @@ export function useRailConversationModel(workspaceId: string, prefsSessionId: st
       : thinkingModes.includes(thinkingMode)
         ? thinkingMode
         : (thinkingModes[0] ?? "off");
+
   useEffect(() => {
     const prefs = getSessionComposerPrefs(prefsSessionId);
     setSelectedProviderId(prefs.providerId ?? snapshotPrefs.providerId ?? "");
@@ -135,8 +138,17 @@ export function useRailConversationModel(workspaceId: string, prefsSessionId: st
 
   useEffect(() => {
     if (providers.isPending || discoveredModels?.isPending) return;
-    const migrated = migrateThinkingPreference(prefsSessionId, activeProvider?.id, selectedModel?.id, selectedModel?.capabilities, thinkingMode);
-    if (migrated !== thinkingMode) { setThinkingMode(migrated); return; }
+    const migrated = migrateThinkingPreference(
+      prefsSessionId,
+      activeProvider?.id,
+      selectedModel?.id,
+      selectedModel?.capabilities,
+      thinkingMode,
+    );
+    if (migrated !== thinkingMode) {
+      setThinkingMode(migrated);
+      return;
+    }
     setThinkingMode((current) => {
       if (responseMode === "fast" && !thinkingRequired) return "off";
       if (!thinkingModes.length) return current === "off" ? "off" : current;
@@ -147,32 +159,49 @@ export function useRailConversationModel(workspaceId: string, prefsSessionId: st
         ? current
         : (thinkingModes[0] ?? "off");
     });
-  }, [responseMode, thinkingModes, thinkingRequired, providers.isPending, discoveredModels?.isPending, prefsSessionId, activeProvider?.id, selectedModel?.id, selectedModel?.capabilities, thinkingMode]);
+  }, [
+    responseMode,
+    thinkingModes,
+    thinkingRequired,
+    providers.isPending,
+    discoveredModels?.isPending,
+    prefsSessionId,
+    activeProvider?.id,
+    selectedModel?.id,
+    selectedModel?.capabilities,
+    thinkingMode,
+  ]);
 
-  const persistComposerPrefs = useCallback((
-    targetSessionId: string,
-    overrides: {
-      providerId?: string;
-      modelId?: string;
-      responseMode?: ResponseMode;
-      thinkingMode?: ThinkingMode;
-    } = {},
-  ) => {
-    if (!targetSessionId) return;
-    setSessionComposerPrefs(targetSessionId, {
-      providerId: overrides.providerId ?? activeProvider?.id,
-      modelId: overrides.modelId ?? selectedModel?.id,
-      responseMode: overrides.responseMode ?? responseMode,
-      thinkingMode: overrides.thinkingMode ?? thinkingMode,
-    });
-  }, [activeProvider?.id, selectedModel?.id, responseMode, thinkingMode]);
-  /** 极速：清空思考力度；智能体：力度缺失时补一个可用档位。 */
+  const persistComposerPrefs = useCallback(
+    (
+      targetSessionId: string,
+      overrides: {
+        providerId?: string;
+        modelId?: string;
+        responseMode?: ResponseMode;
+        thinkingMode?: ThinkingMode;
+      } = {},
+    ) => {
+      if (!targetSessionId) return;
+      setSessionComposerPrefs(targetSessionId, {
+        providerId: overrides.providerId ?? activeProvider?.id,
+        modelId: overrides.modelId ?? selectedModel?.id,
+        responseMode: overrides.responseMode ?? responseMode,
+        thinkingMode: overrides.thinkingMode ?? thinkingMode,
+      });
+    },
+    [activeProvider?.id, selectedModel?.id, responseMode, thinkingMode],
+  );
+
   function setMode(mode: ResponseMode) {
     setResponseMode(mode);
     if (mode === "fast") {
       setThinkingMode("off");
       if (sessionId) {
-        persistComposerPrefs(sessionId, { responseMode: "fast", thinkingMode: "off" });
+        persistComposerPrefs(sessionId, {
+          responseMode: "fast",
+          thinkingMode: "off",
+        });
       }
       return;
     }
@@ -185,38 +214,34 @@ export function useRailConversationModel(workspaceId: string, prefsSessionId: st
     setThinkingMode(nextThinking);
     if (sessionId) {
       persistComposerPrefs(sessionId, {
-        responseMode: "agentic",
+        responseMode: mode,
         thinkingMode: nextThinking,
       });
     }
   }
 
-  /** 「响应与思考力度」滑块：档位 0 = 极速，其后每档 = 智能体 + 一个思考力度。 */
-  const thinkingStops = useMemo(() => supportedThinkingStops(thinkingModes, thinkingRequired), [thinkingModes, thinkingRequired]);
-  function handleThinkingSliderChange(index: number) {
-    const stop = thinkingStops[index];
-    if (!stop) return;
-    if (stop.responseMode === "fast") {
-      setMode("fast");
-      return;
-    }
-    const nextThinking = stop.thinking as ThinkingMode;
-    setResponseMode("agentic");
+  function handleThinkingChange(nextThinking: ThinkingMode) {
     setThinkingMode(nextThinking);
     if (sessionId) {
-      persistComposerPrefs(sessionId, {
-        responseMode: "agentic",
-        thinkingMode: nextThinking,
-      });
+      persistComposerPrefs(sessionId, { thinkingMode: nextThinking });
     }
   }
 
-  const requestPreferences = useMemo(() => ({
-    provider_id: activeProvider?.id,
-    model_id: selectedModel?.id,
-    thinking_mode: effectiveThinkingMode,
-    agent_mode: responseMode === "agentic" && supportsAgentMode,
-  }), [activeProvider?.id, selectedModel?.id, effectiveThinkingMode, responseMode, supportsAgentMode]);
+  const requestPreferences = useMemo(
+    () => ({
+      provider_id: activeProvider?.id,
+      model_id: selectedModel?.id,
+      thinking_mode: effectiveThinkingMode,
+      agent_mode: responseMode === "agentic" && supportsAgentMode,
+    }),
+    [
+      activeProvider?.id,
+      selectedModel?.id,
+      effectiveThinkingMode,
+      responseMode,
+      supportsAgentMode,
+    ],
+  );
 
   return {
     canSend: Boolean(activeProvider && selectedModel?.id),
@@ -224,105 +249,56 @@ export function useRailConversationModel(workspaceId: string, prefsSessionId: st
     persistComposerPrefs,
     requestPreferences,
     control: (
-        <DropdownMenu
-          open={modeMenuOpen}
-          onOpenChange={(open) => {
-            setModeMenuOpen(open);
-            if (!open) setModelSearch("");
-          }}
-        >
-          <DropdownMenuTrigger asChild>
-            <button
-              aria-label="选择响应模式、思考力度和模型"
-              className="chat-mode-chip"
-              // 回复途中同样允许切换：本次回答沿用发送时锁定的模型，改动只对
-              // 下一条消息生效。
-              disabled={!modelProviders.length}
-              title="响应模式与模型"
-              type="button"
-            >
-              <span>
-                {modeMenuOpen
-                  ? "思考强度"
-                  : responseMode === "fast"
-                    ? "极速"
-                    : thinkingLabels[thinkingMode]}
-              </span>
-              <ChevronDown aria-hidden="true" className="size-3.5" />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-64" collisionPadding={12}>
-            <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
-            <div className="px-2 py-1">
-              <ThinkingSlider
-                onChange={handleThinkingSliderChange}
-                stops={thinkingStops}
-                value={thinkingStopIndex(responseMode, effectiveThinkingMode, thinkingStops)}
-              />
-            </div>
-            {!thinkingModes.length ? (
-              <p className="px-2 pb-1 text-[10px] text-muted-foreground">
-                当前模型未声明推理能力，按服务商默认执行。
-              </p>
-            ) : null}
-            <DropdownMenuSeparator />
-            <DropdownMenuLabel>模型</DropdownMenuLabel>
-            <div className="relative px-1 pb-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                aria-label="搜索模型"
-                className="h-8 pl-8 font-mono text-xs"
-                onChange={(event) => setModelSearch(event.target.value)}
-                onKeyDown={(event) => event.stopPropagation()}
-                onPointerDown={(event) => event.stopPropagation()}
-                placeholder="搜索模型名称或 Provider…"
-                value={modelSearch}
-              />
-            </div>
-            <div className="max-h-[min(50vh,20rem)] overflow-y-auto">
-              {filteredModelChoices.length ? (
-                <DropdownMenuRadioGroup
-                  onValueChange={(value) => {
-                    const choice = parseModelChoiceValue(value);
-                    if (!choice) return;
-                    setSelectedProviderId(choice.providerId);
-                    setSelectedModelId(choice.modelId);
-                    if (sessionId) {
-                      persistComposerPrefs(sessionId, {
-                        providerId: choice.providerId,
-                        modelId: choice.modelId,
-                      });
-                    }
-                  }}
-                  value={
-                    activeProvider && selectedModel
-                      ? modelChoiceValue(activeProvider.id, selectedModel.id)
-                      : ""
-                  }
-                >
-                  {filteredModelChoices.map(({ provider, model }) => (
-                    <DropdownMenuRadioItem
-                      key={`${provider.id}:${model.id}`}
-                      value={modelChoiceValue(provider.id, model.id)}
-                    >
-                      <span className="flex min-w-0 flex-col">
-                        <span className="truncate font-mono">{model.id}</span>
-                        <span className="text-[10px] text-muted-foreground">
-                          {provider.display_name} ·{" "}
-                          {modelProtocolLabel(provider.provider_type)}
-                        </span>
-                      </span>
-                    </DropdownMenuRadioItem>
-                  ))}
-                </DropdownMenuRadioGroup>
-              ) : (
-                <DropdownMenuItem disabled>
-                  {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
-                </DropdownMenuItem>
-              )}
-            </div>
-          </DropdownMenuContent>
-        </DropdownMenu>
+      <GenerationConfigMenu
+        open={modeMenuOpen}
+        onOpenChange={setModeMenuOpen}
+        align="start"
+        side="top"
+        layout="inline"
+        groups={modelGroups}
+        providerId={activeProvider?.id ?? ""}
+        modelId={selectedModel?.id ?? ""}
+        responseMode={responseMode}
+        thinkingMode={effectiveThinkingMode}
+        thinkingModes={thinkingModes}
+        supportsAgent={supportsAgentMode}
+        thinkingRequired={thinkingRequired}
+        modelError={Boolean(discoveredModels?.isError)}
+        onModelChange={(providerId, modelId) => {
+          setSelectedProviderId(providerId);
+          setSelectedModelId(modelId);
+          if (sessionId) {
+            persistComposerPrefs(sessionId, { providerId, modelId });
+          }
+        }}
+        onModeChange={setMode}
+        onThinkingChange={handleThinkingChange}
+        onManageModels={() => {
+          setModeMenuOpen(false);
+          navigate(`/w/${workspaceId}/settings/providers`);
+        }}
+        onRefreshModels={() => void discoveredModels?.refetch()}
+        modelSearch={modelSearch}
+        onModelSearchChange={setModelSearch}
+        trigger={
+          <button
+            aria-label="选择响应模式、思考力度和模型"
+            className="chat-mode-chip"
+            disabled={!modelProviders.length}
+            title="生成配置"
+            type="button"
+          >
+            <span>
+              {modeMenuOpen
+                ? "生成配置"
+                : responseMode === "fast"
+                  ? "极速"
+                  : thinkingLabels[effectiveThinkingMode]}
+            </span>
+            <ChevronDown aria-hidden="true" className="size-3.5" />
+          </button>
+        }
+      />
     ),
   };
 }

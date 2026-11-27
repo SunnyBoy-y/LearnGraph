@@ -72,7 +72,24 @@ from app.domain.schemas.chat import (
 )
 from app.domain.schemas.common import ActionResponse
 from app.domain.schemas.chat_goals import ChatGoalControl, ChatGoalStart, ChatGoalView
+from app.domain.schemas.queued_turns import (
+    QueuedTurnCompleteRequest,
+    QueuedTurnCreateRequest,
+    QueuedTurnListResponse,
+    QueuedTurnPromoteRequest,
+    QueuedTurnPromoteResponse,
+    QueuedTurnUpdateRequest,
+    QueuedTurnView,
+)
+from app.domain.schemas.sandbox_checkpoints import (
+    CheckpointRewindPreviewView,
+    CheckpointRewindRequest,
+    CheckpointRewindResultView,
+    CheckpointTurnListResponse,
+)
 from app.services import chat_goals
+from app.services.queued_turns import QueuedTurnService
+from app.services.sandbox_checkpoints import SandboxCheckpointService
 from app.domain.schemas.opening_prompts import OpeningPromptRequest, OpeningPromptResponse
 from app.domain.schemas.stream_ui import UIAction
 from app.domain.schemas.graphs import GraphChangeSetView, RejectGraphChangeSetRequest
@@ -162,6 +179,8 @@ class _DetachedStreamFailure:
 
 
 _DETACHED_STREAM_END = object()
+SSE_KEEPALIVE_INTERVAL_SECONDS = 12.0
+SSE_KEEPALIVE_COMMENT = ": keepalive\n\n"
 
 
 def _detached_sse_transport(
@@ -171,6 +190,7 @@ def _detached_sse_transport(
     thread_name: str,
     on_disconnect: Callable[[], None] | None = None,
     lease: AdmissionTicket | None = None,
+    keepalive_interval_seconds: float | None = None,
 ):
     output: queue.Queue[str | object | _DetachedStreamFailure] = queue.Queue(
         maxsize=256
@@ -230,12 +250,24 @@ def _detached_sse_transport(
 
     def events():
         worker_started = False
+        heartbeat_interval = (
+            SSE_KEEPALIVE_INTERVAL_SECONDS
+            if keepalive_interval_seconds is None
+            else keepalive_interval_seconds
+        )
         try:
             worker.start()
             worker_started = True
             yield SSE_TRANSPORT_READY_COMMENT
             while True:
-                item = output.get()
+                try:
+                    if heartbeat_interval > 0:
+                        item = output.get(timeout=heartbeat_interval)
+                    else:
+                        item = output.get()
+                except queue.Empty:
+                    yield SSE_KEEPALIVE_COMMENT
+                    continue
                 if item is _DETACHED_STREAM_END:
                     return
                 if isinstance(item, _DetachedStreamFailure):
@@ -1721,6 +1753,208 @@ def promote_concept_branch(
 def cancel_message(session_id: str, message_id: str, db: DB, context: CurrentWorkspace, settings: AppSettings) -> ActionResponse:
     version_id = service(db, context, settings).cancel_message(session_id, message_id)
     return ActionResponse(status="cancelled", message="The message was cancelled", resource_id=version_id)
+
+
+@router.get("/{session_id}/queued-turns", response_model=QueuedTurnListResponse)
+def list_queued_turns(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> QueuedTurnListResponse:
+    require_session_access(session_id, "read", db, context)
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    return QueuedTurnListResponse(
+        items=[QueuedTurnView.model_validate(item) for item in svc.list_turns(session_id)]
+    )
+
+
+@router.post("/{session_id}/queued-turns", response_model=QueuedTurnView, status_code=status.HTTP_201_CREATED)
+def enqueue_queued_turn(
+    session_id: str,
+    payload: QueuedTurnCreateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> QueuedTurnView:
+    require_session_access(session_id, "write", db, context)
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    turn = svc.enqueue_turn(
+        session_id,
+        client_request_id=payload.client_request_id,
+        content=payload.content,
+        payload=payload.payload,
+        mode=payload.mode,
+    )
+    return QueuedTurnView.model_validate(turn)
+
+
+@router.patch("/{session_id}/queued-turns/{turn_id}", response_model=QueuedTurnView)
+def update_queued_turn(
+    session_id: str,
+    turn_id: str,
+    payload: QueuedTurnUpdateRequest,
+    db: DB,
+    context: CurrentWorkspace,
+) -> QueuedTurnView:
+    require_session_access(session_id, "write", db, context)
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    turn = svc.update_turn(
+        session_id,
+        turn_id,
+        content=payload.content,
+        payload=payload.payload,
+    )
+    return QueuedTurnView.model_validate(turn)
+
+
+@router.delete("/{session_id}/queued-turns/{turn_id}", response_model=QueuedTurnView)
+def cancel_queued_turn(
+    session_id: str,
+    turn_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> QueuedTurnView:
+    require_session_access(session_id, "write", db, context)
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    return QueuedTurnView.model_validate(svc.cancel_turn(session_id, turn_id))
+
+
+@router.post("/{session_id}/queued-turns/{turn_id}/promote", response_model=QueuedTurnPromoteResponse)
+def promote_queued_turn(
+    session_id: str,
+    turn_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    payload: QueuedTurnPromoteRequest | None = None,
+) -> QueuedTurnPromoteResponse:
+    require_session_access(session_id, "write", db, context)
+    req = payload or QueuedTurnPromoteRequest()
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    cancel_fn = (
+        (lambda sid, mid: service(db, context, settings).cancel_message(sid, mid))
+        if req.cancel_active
+        else None
+    )
+    turn, cancelled_id = svc.promote_turn(session_id, turn_id, cancel_active_fn=cancel_fn)
+    return QueuedTurnPromoteResponse(
+        turn=QueuedTurnView.model_validate(turn),
+        cancelled_message_id=cancelled_id,
+    )
+
+
+@router.post("/{session_id}/queued-turns/{turn_id}/claim", response_model=QueuedTurnView)
+def claim_queued_turn(
+    session_id: str,
+    turn_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> QueuedTurnView:
+    require_session_access(session_id, "write", db, context)
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    claimed = svc.claim_turn(session_id, turn_id)
+    if claimed is None:
+        raise AppError(409, "queued_turn_already_claimed", "该待发消息已被其他端或后台任务接管。")
+    return QueuedTurnView.model_validate(claimed)
+
+
+@router.post("/{session_id}/queued-turns/{turn_id}/complete", response_model=QueuedTurnView)
+def complete_queued_turn(
+    session_id: str,
+    turn_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    payload: QueuedTurnCompleteRequest | None = None,
+) -> QueuedTurnView:
+    require_session_access(session_id, "write", db, context)
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    turn = svc.mark_dispatched(
+        session_id,
+        turn_id,
+        dispatched_message_id=payload.dispatched_message_id if payload else None,
+    )
+    return QueuedTurnView.model_validate(turn)
+
+
+@router.post("/{session_id}/queued-turns/{turn_id}/requeue", response_model=QueuedTurnView)
+def requeue_queued_turn(
+    session_id: str,
+    turn_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+) -> QueuedTurnView:
+    require_session_access(session_id, "write", db, context)
+    svc = QueuedTurnService(db, context.workspace_id, context.principal.user_id)
+    return QueuedTurnView.model_validate(svc.requeue_turn(session_id, turn_id))
+
+
+@router.get("/{session_id}/checkpoints", response_model=CheckpointTurnListResponse)
+def list_session_checkpoints(
+    session_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+) -> CheckpointTurnListResponse:
+    require_session_access(session_id, "read", db, context)
+    svc = SandboxCheckpointService(db, context.workspace_id, context.principal.user_id, settings)
+    return CheckpointTurnListResponse(items=svc.list_turns(session_id))
+
+
+@router.get(
+    "/{session_id}/checkpoints/{turn_id}/preview",
+    response_model=CheckpointRewindPreviewView,
+)
+def preview_turn_checkpoint_rewind(
+    session_id: str,
+    turn_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    include_subsequent_turns: bool = Query(default=True),
+) -> CheckpointRewindPreviewView:
+    require_session_access(session_id, "read", db, context)
+    svc = SandboxCheckpointService(db, context.workspace_id, context.principal.user_id, settings)
+    return CheckpointRewindPreviewView.model_validate(
+        svc.preview_rewind(
+            session_id,
+            turn_id,
+            include_subsequent_turns=include_subsequent_turns,
+        )
+    )
+
+
+@router.post(
+    "/{session_id}/checkpoints/{turn_id}/rewind",
+    response_model=CheckpointRewindResultView,
+)
+def execute_turn_checkpoint_rewind(
+    session_id: str,
+    turn_id: str,
+    db: DB,
+    context: CurrentWorkspace,
+    settings: AppSettings,
+    payload: CheckpointRewindRequest | None = None,
+) -> CheckpointRewindResultView:
+    require_session_access(session_id, "write", db, context)
+    req = payload or CheckpointRewindRequest()
+    svc = SandboxCheckpointService(db, context.workspace_id, context.principal.user_id, settings)
+    sandbox_svc = None
+    try:
+        from app.services.sandbox import SandboxAgentWorkspaceService
+
+        sandbox_svc = SandboxAgentWorkspaceService(
+            db, context.workspace_id, context.principal.user_id, settings
+        )
+    except Exception:
+        sandbox_svc = None
+    return CheckpointRewindResultView.model_validate(
+        svc.execute_rewind(
+            session_id,
+            turn_id,
+            expected_current_hashes=req.expected_current_hashes,
+            include_subsequent_turns=req.include_subsequent_turns,
+            sandbox_service=sandbox_svc,
+        )
+    )
 
 
 @router.post("/{session_id}/messages/{message_id}/retry")

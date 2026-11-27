@@ -176,6 +176,7 @@ export interface SessionBatchDeleteResult {
 export interface SuggestedPrompt {
   id: string
   content: string
+  display_text?: string | null
 }
 
 export interface SuggestedPromptRequest {

@@ -10,6 +10,7 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
+from app.core.database import retry_sqlite_locked
 from app.core.errors import AppError
 from app.core.security import Principal
 from app.domain.models import (
@@ -203,56 +204,85 @@ class WorkflowService:
         return DeleteImpact(resource_type="project", resource_id=item.id, title=item.title, confirmation_text=item.title, impacts=[ImpactItem(resource_type="session", count=sessions, action="delete"), ImpactItem(resource_type="graph_change_set", count=proposals, action="delete"), ImpactItem(resource_type="action_item", count=actions, action="delete"), ImpactItem(resource_type="source_link", count=links, action="delete"), ImpactItem(resource_type="file_reference", count=file_references, action="delete"), *self._session_memory_impacts(list(self.db.scalars(session_ids)))])
 
     def delete_project(self, project_id: str, confirmation: str) -> None:
-        impact = self.project_impact(project_id)
-        if confirmation != impact.confirmation_text:
+        item = self._project(project_id)
+        if confirmation != item.title:
             raise AppError(409, "confirmation_mismatch", "Confirmation text does not match the project title")
-        session_ids = list(self.db.scalars(select(ChatSession.id).where(ChatSession.workspace_id == self.workspace_id, ChatSession.project_id == project_id)))
-        if session_ids:
-            self._session_memory_deletion().delete(session_ids)
-        message_ids = list(self.db.scalars(select(Message.id).where(Message.workspace_id == self.workspace_id, Message.session_id.in_(session_ids)))) if session_ids else []
-        source_link_ids = list(self.db.scalars(select(SourceLink.id).where(SourceLink.workspace_id == self.workspace_id, SourceLink.target_type == "project", SourceLink.target_id == project_id)))
-        version_ids = list(self.db.scalars(select(MessageVersion.id).where(MessageVersion.workspace_id == self.workspace_id, MessageVersion.message_id.in_(message_ids)))) if message_ids else []
-        reference_conditions = [
-            and_(FileReference.target_type == "project", FileReference.target_id == project_id),
-        ]
-        if session_ids:
-            reference_conditions.append(and_(FileReference.target_type == "session", FileReference.target_id.in_(session_ids)))
-        if message_ids:
-            reference_conditions.append(and_(FileReference.target_type == "message", FileReference.target_id.in_(message_ids)))
-        if source_link_ids:
-            reference_conditions.append(and_(FileReference.target_type == "source_link", FileReference.target_id.in_(source_link_ids)))
-        self.db.execute(
-            delete(FileReference).where(
-                FileReference.workspace_id == self.workspace_id,
-                or_(*reference_conditions),
+
+        def _execute() -> None:
+            self._project(project_id)
+            session_ids = list(self.db.scalars(select(ChatSession.id).where(ChatSession.workspace_id == self.workspace_id, ChatSession.project_id == project_id)))
+            message_ids = list(self.db.scalars(select(Message.id).where(Message.workspace_id == self.workspace_id, Message.session_id.in_(session_ids)))) if session_ids else []
+            source_link_ids = list(self.db.scalars(select(SourceLink.id).where(SourceLink.workspace_id == self.workspace_id, SourceLink.target_type == "project", SourceLink.target_id == project_id)))
+            version_ids = list(self.db.scalars(select(MessageVersion.id).where(MessageVersion.workspace_id == self.workspace_id, MessageVersion.message_id.in_(message_ids)))) if message_ids else []
+            memory_targets = (
+                self._session_memory_deletion().delete(session_ids, message_ids=set(message_ids))
+                if session_ids
+                else None
             )
-        )
-        if session_ids:
-            self.db.execute(delete(GraphChangeSet).where(GraphChangeSet.workspace_id == self.workspace_id, GraphChangeSet.session_id.in_(session_ids)))
-        if version_ids:
-            for model in (
-                MessageControl,
-                ImageGenerationTask,
-                MessageStreamEvent,
-                MessagePartRecord,
-                ProviderAttempt,
-                ProviderResponseState,
-            ):
-                column = MessageControl.message_version_id if model is MessageControl else model.message_version_id
-                self.db.execute(delete(model).where(column.in_(version_ids)))
-        if session_ids:
-            self.db.execute(delete(MessageSubmission).where(MessageSubmission.workspace_id == self.workspace_id, MessageSubmission.session_id.in_(session_ids)))
-            self.db.execute(delete(ContextSummary).where(ContextSummary.workspace_id == self.workspace_id, ContextSummary.session_id.in_(session_ids)))
-        if message_ids: self.db.execute(delete(MessageVersion).where(MessageVersion.workspace_id == self.workspace_id, MessageVersion.message_id.in_(message_ids)))
-        if session_ids:
-            if message_ids: self.db.execute(delete(CompositeDraft).where(CompositeDraft.workspace_id == self.workspace_id, CompositeDraft.target_message_id.in_(message_ids)))
-            self.db.execute(delete(Message).where(Message.workspace_id == self.workspace_id, Message.session_id.in_(session_ids)))
-            self.db.execute(delete(ChatSession).where(ChatSession.workspace_id == self.workspace_id, ChatSession.id.in_(session_ids)))
-        self.db.execute(delete(ActionItem).where(ActionItem.workspace_id == self.workspace_id, ActionItem.project_id == project_id))
-        self.db.execute(delete(SourceLink).where(SourceLink.workspace_id == self.workspace_id, SourceLink.target_type == "project", SourceLink.target_id == project_id))
-        self.db.execute(delete(Project).where(Project.workspace_id == self.workspace_id, Project.id == project_id))
-        self.audit.record(actor_id=self.actor_id, action="project.delete", resource_type="project", resource_id=project_id, details={"impacts": [i.model_dump() for i in impact.impacts]})
-        self.db.commit()
+            reference_conditions = [
+                and_(FileReference.target_type == "project", FileReference.target_id == project_id),
+            ]
+            if session_ids:
+                reference_conditions.append(and_(FileReference.target_type == "session", FileReference.target_id.in_(session_ids)))
+            if message_ids:
+                reference_conditions.append(and_(FileReference.target_type == "message", FileReference.target_id.in_(message_ids)))
+            if source_link_ids:
+                reference_conditions.append(and_(FileReference.target_type == "source_link", FileReference.target_id.in_(source_link_ids)))
+            file_references = (
+                self.db.execute(
+                    delete(FileReference).where(
+                        FileReference.workspace_id == self.workspace_id,
+                        or_(*reference_conditions),
+                    )
+                ).rowcount or 0
+            )
+            proposals = 0
+            if session_ids:
+                proposals = (
+                    self.db.execute(delete(GraphChangeSet).where(GraphChangeSet.workspace_id == self.workspace_id, GraphChangeSet.session_id.in_(session_ids))).rowcount or 0
+                )
+            if version_ids:
+                for model in (
+                    MessageControl,
+                    ImageGenerationTask,
+                    MessageStreamEvent,
+                    MessagePartRecord,
+                    ProviderAttempt,
+                    ProviderResponseState,
+                ):
+                    column = MessageControl.message_version_id if model is MessageControl else model.message_version_id
+                    self.db.execute(delete(model).where(column.in_(version_ids)))
+            if session_ids:
+                self.db.execute(delete(MessageSubmission).where(MessageSubmission.workspace_id == self.workspace_id, MessageSubmission.session_id.in_(session_ids)))
+                self.db.execute(delete(ContextSummary).where(ContextSummary.workspace_id == self.workspace_id, ContextSummary.session_id.in_(session_ids)))
+            if message_ids:
+                self.db.execute(delete(MessageVersion).where(MessageVersion.workspace_id == self.workspace_id, MessageVersion.message_id.in_(message_ids)))
+            if session_ids:
+                if message_ids:
+                    self.db.execute(delete(CompositeDraft).where(CompositeDraft.workspace_id == self.workspace_id, CompositeDraft.target_message_id.in_(message_ids)))
+                self.db.execute(delete(Message).where(Message.workspace_id == self.workspace_id, Message.session_id.in_(session_ids)))
+                self.db.execute(delete(ChatSession).where(ChatSession.workspace_id == self.workspace_id, ChatSession.id.in_(session_ids)))
+            actions = (
+                self.db.execute(delete(ActionItem).where(ActionItem.workspace_id == self.workspace_id, ActionItem.project_id == project_id)).rowcount or 0
+            )
+            links = (
+                self.db.execute(delete(SourceLink).where(SourceLink.workspace_id == self.workspace_id, SourceLink.target_type == "project", SourceLink.target_id == project_id)).rowcount or 0
+            )
+            self.db.execute(delete(Project).where(Project.workspace_id == self.workspace_id, Project.id == project_id))
+            impacts = [
+                ImpactItem(resource_type="session", count=len(session_ids), action="delete"),
+                ImpactItem(resource_type="graph_change_set", count=proposals, action="delete"),
+                ImpactItem(resource_type="action_item", count=actions, action="delete"),
+                ImpactItem(resource_type="source_link", count=links, action="delete"),
+                ImpactItem(resource_type="file_reference", count=file_references, action="delete"),
+                ImpactItem(resource_type="memory", count=len(memory_targets.memory_ids) if memory_targets else 0, action="delete"),
+                ImpactItem(resource_type="memory_draft", count=len(memory_targets.draft_ids) if memory_targets else 0, action="delete"),
+                ImpactItem(resource_type="conversation_episode", count=len(memory_targets.episode_ids) if memory_targets else 0, action="delete"),
+            ]
+            self.audit.record(actor_id=self.actor_id, action="project.delete", resource_type="project", resource_id=project_id, details={"impacts": [i.model_dump() for i in impacts]})
+            self.db.commit()
+
+        retry_sqlite_locked(self.db, _execute)
 
     def assign_session(self, session_id: str, project_id: str | None) -> ChatSession:
         session = self.db.scalar(select(ChatSession).where(ChatSession.workspace_id == self.workspace_id, ChatSession.id == session_id))
@@ -506,6 +536,8 @@ class WorkflowService:
         message_ids: list[str] | None = None,
         version_ids: list[str] | None = None,
     ) -> list[str]:
+        if not session_ids:
+            return []
         selected_session_ids = set(session_ids)
         if message_ids is None:
             message_ids = list(
@@ -516,40 +548,52 @@ class WorkflowService:
                     )
                 )
             )
-        if version_ids is None:
-            version_ids = (
-                list(
-                    self.db.scalars(
-                        select(MessageVersion.id).where(
-                            MessageVersion.workspace_id == self.workspace_id,
-                            MessageVersion.message_id.in_(message_ids),
-                        )
+        if not message_ids:
+            # With no messages, only batches directly bound to the session can match.
+            return list(
+                self.db.scalars(
+                    select(SuggestedPromptBatch.id).where(
+                        SuggestedPromptBatch.workspace_id == self.workspace_id,
+                        SuggestedPromptBatch.session_id.in_(session_ids),
                     )
                 )
-                if message_ids
-                else []
+            )
+        if version_ids is None:
+            version_ids = list(
+                self.db.scalars(
+                    select(MessageVersion.id).where(
+                        MessageVersion.workspace_id == self.workspace_id,
+                        MessageVersion.message_id.in_(message_ids),
+                    )
+                )
             )
         deleted_message_ids = set(message_ids)
         deleted_version_ids = set(version_ids)
         affected: list[str] = []
-        batches = self.db.scalars(
-            select(SuggestedPromptBatch).where(
+        rows = self.db.execute(
+            select(
+                SuggestedPromptBatch.id,
+                SuggestedPromptBatch.session_id,
+                SuggestedPromptBatch.anchor_message_id,
+                SuggestedPromptBatch.anchor_message_version_id,
+                SuggestedPromptBatch.source_message_ids,
+            ).where(
                 SuggestedPromptBatch.workspace_id == self.workspace_id
             )
         ).all()
-        for batch in batches:
+        for batch_id, batch_session_id, anchor_message_id, anchor_version_id, raw_sources in rows:
             source_message_ids = (
-                set(batch.source_message_ids)
-                if isinstance(batch.source_message_ids, list)
+                set(raw_sources)
+                if isinstance(raw_sources, list)
                 else set()
             )
             if (
-                batch.session_id in selected_session_ids
-                or batch.anchor_message_id in deleted_message_ids
-                or batch.anchor_message_version_id in deleted_version_ids
+                batch_session_id in selected_session_ids
+                or anchor_message_id in deleted_message_ids
+                or anchor_version_id in deleted_version_ids
                 or bool(source_message_ids & deleted_message_ids)
             ):
-                affected.append(batch.id)
+                affected.append(batch_id)
         return affected
 
     def _session_memory_deletion(self):
@@ -691,8 +735,7 @@ class WorkflowService:
             ],
         )
 
-    def _delete_session_records(self, session_ids: list[str]) -> None:
-        self._session_memory_deletion().delete(session_ids)
+    def _delete_session_records(self, session_ids: list[str]) -> list[ImpactItem]:
         message_ids = list(
             self.db.scalars(
                 select(Message.id).where(
@@ -720,6 +763,12 @@ class WorkflowService:
                 version_ids=version_ids,
             )
         )
+        # Run read-heavy collection above BEFORE taking the SQLite/PostgreSQL
+        # write lock inside SessionMemoryDeletionService.delete().
+        memory_targets = self._session_memory_deletion().delete(
+            session_ids,
+            message_ids=set(message_ids),
+        )
 
         reference_conditions = [
             and_(FileReference.target_type == "session", FileReference.target_id.in_(session_ids)),
@@ -728,18 +777,22 @@ class WorkflowService:
             reference_conditions.append(
                 and_(FileReference.target_type == "message", FileReference.target_id.in_(message_ids))
             )
-        self.db.execute(
-            delete(FileReference).where(
-                FileReference.workspace_id == self.workspace_id,
-                or_(*reference_conditions),
-            )
+        file_reference_count = (
+            self.db.execute(
+                delete(FileReference).where(
+                    FileReference.workspace_id == self.workspace_id,
+                    or_(*reference_conditions),
+                )
+            ).rowcount or 0
         )
 
-        self.db.execute(
-            delete(GraphChangeSet).where(
-                GraphChangeSet.workspace_id == self.workspace_id,
-                GraphChangeSet.session_id.in_(session_ids),
-            )
+        change_set_count = (
+            self.db.execute(
+                delete(GraphChangeSet).where(
+                    GraphChangeSet.workspace_id == self.workspace_id,
+                    GraphChangeSet.session_id.in_(session_ids),
+                )
+            ).rowcount or 0
         )
         self.db.execute(
             delete(FetchAuthorizationRequest).where(
@@ -808,14 +861,16 @@ class WorkflowService:
 
         # Branches included in the batch are deleted. Only surviving branches
         # are detached, matching the single-session deletion rule.
-        self.db.execute(
-            ChatSession.__table__.update()
-            .where(
-                ChatSession.workspace_id == self.workspace_id,
-                ChatSession.parent_session_id.in_(session_ids),
-                ChatSession.id.notin_(session_ids),
-            )
-            .values(parent_session_id=None)
+        detached_child_count = (
+            self.db.execute(
+                ChatSession.__table__.update()
+                .where(
+                    ChatSession.workspace_id == self.workspace_id,
+                    ChatSession.parent_session_id.in_(session_ids),
+                    ChatSession.id.notin_(session_ids),
+                )
+                .values(parent_session_id=None)
+            ).rowcount or 0
         )
         self.db.execute(
             delete(ChatSession).where(
@@ -823,13 +878,35 @@ class WorkflowService:
                 ChatSession.id.in_(session_ids),
             )
         )
+        return [
+            ImpactItem(resource_type="message", count=len(message_ids), action="delete"),
+            ImpactItem(resource_type="graph_change_set", count=change_set_count, action="delete"),
+            ImpactItem(resource_type="suggested_prompt_batch", count=len(suggested_prompt_batch_ids), action="delete"),
+            ImpactItem(resource_type="child_session", count=detached_child_count, action="detach"),
+            ImpactItem(resource_type="file_reference", count=file_reference_count, action="delete"),
+            ImpactItem(resource_type="memory", count=len(memory_targets.memory_ids), action="delete"),
+            ImpactItem(resource_type="memory_draft", count=len(memory_targets.draft_ids), action="delete"),
+            ImpactItem(resource_type="conversation_episode", count=len(memory_targets.episode_ids), action="delete"),
+        ]
 
     def delete_session(self, session_id: str, confirmation: str) -> None:
-        impact = self.session_impact(session_id)
-        if confirmation != impact.confirmation_text: raise AppError(409, "confirmation_mismatch", "Confirmation text does not match the session title")
-        self._delete_session_records([session_id])
-        self.audit.record(actor_id=self.actor_id, action="session.delete", resource_type="session", resource_id=session_id, details={"impacts": [i.model_dump() for i in impact.impacts]})
-        self.db.commit()
+        item = self._session(session_id)
+        if confirmation != item.title:
+            raise AppError(409, "confirmation_mismatch", "Confirmation text does not match the session title")
+
+        def _execute() -> None:
+            self._session(session_id)
+            impacts = self._delete_session_records([session_id])
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="session.delete",
+                resource_type="session",
+                resource_id=session_id,
+                details={"impacts": [i.model_dump() for i in impacts]},
+            )
+            self.db.commit()
+
+        retry_sqlite_locked(self.db, _execute)
 
     def delete_sessions(
         self,
@@ -837,7 +914,7 @@ class WorkflowService:
         confirmation: str,
     ) -> SessionBatchDeleteResponse:
         try:
-            impact = self.session_batch_impact(session_ids)
+            self._sessions(session_ids)
         except AppError as error:
             if error.code != "session_not_found":
                 raise
@@ -845,29 +922,35 @@ class WorkflowService:
             if replay is not None:
                 return replay
             raise
-        if confirmation != impact.confirmation_text:
+        if confirmation != self._session_batch_confirmation(session_ids):
             raise AppError(
                 409,
                 "confirmation_mismatch",
                 "Confirmation token does not match the selected sessions",
             )
-        self._delete_session_records(session_ids)
-        self.audit.record(
-            actor_id=self.actor_id,
-            action="session.batch_delete",
-            resource_type="session_batch",
-            resource_id=impact.resource_id,
-            details={
-                "session_ids": session_ids,
-                "impacts": [item.model_dump() for item in impact.impacts],
-            },
-        )
-        self.db.commit()
-        return SessionBatchDeleteResponse(
-            deleted_session_ids=session_ids,
-            deleted_count=len(session_ids),
-            impacts=impact.impacts,
-        )
+        resource_id = f"batch-{self._session_batch_digest(session_ids)}"
+
+        def _execute() -> SessionBatchDeleteResponse:
+            self._sessions(session_ids)
+            impacts = self._delete_session_records(session_ids)
+            self.audit.record(
+                actor_id=self.actor_id,
+                action="session.batch_delete",
+                resource_type="session_batch",
+                resource_id=resource_id,
+                details={
+                    "session_ids": session_ids,
+                    "impacts": [item.model_dump() for item in impacts],
+                },
+            )
+            self.db.commit()
+            return SessionBatchDeleteResponse(
+                deleted_session_ids=session_ids,
+                deleted_count=len(session_ids),
+                impacts=impacts,
+            )
+
+        return retry_sqlite_locked(self.db, _execute)
 
     def _deleted_session_batch(
         self,
@@ -1117,7 +1200,7 @@ class WorkflowService:
 
     @staticmethod
     def _action_type_for_node(node: GraphNode) -> str:
-        if node.node_type == "practice":
+        if node.node_type in {"practice", "lab", "method", "application", "open"}:
             return "practice"
         if node.node_type == "assessment":
             return "assessment"
@@ -1128,6 +1211,16 @@ class WorkflowService:
     @staticmethod
     def _acceptance_criteria(node: GraphNode, action_type: str) -> list[str]:
         label = node.label.strip() or "当前节点"
+        if action_type != "review":
+            criteria = {
+                "principle": [f"解释“{label}”的因果链，并能预测条件改变后的结果", "保留可追溯的推导或反例解释"],
+                "method": [f"不依赖提示独立执行“{label}”的关键步骤", "保留操作步骤与可检查的结果"],
+                "application": [f"在新场景中用“{label}”解决实际问题", "提交方案、选择依据和结果验证"],
+                "lab": [f"操作“{label}”实验的变量并观察结果", "保留服务端记录的操作与实验结果"],
+                "open": [f"提交“{label}”要求的可检查成果", "对照明确的验收标准检查交付物，而不是只检查任务计划"],
+            }.get(node.node_type)
+            if criteria is not None:
+                return criteria
         if action_type == "practice":
             return [
                 f"完成一项与“{label}”直接相关的练习",

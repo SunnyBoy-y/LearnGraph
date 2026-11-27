@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { Sparkles } from 'lucide-react';
 import { analyzeSticker, getSticker, getStickerPipeline, updateSticker, type Sticker } from '@/api/stickers';
+import { adaptivePollInterval } from '@/lib/network-quality';
 import { useAuth } from '@/features/auth/auth-context-value';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -16,8 +17,8 @@ export function StickerAnalysisDialog({ sticker, onClose, onSelect }: { sticker:
   const [manual, setManual] = useState(false);
   const [description, setDescription] = useState('');
   useEffect(() => { setManual(false); setDescription(''); }, [sticker?.id]);
-  const current = useQuery({ queryKey: [...prefix, 'detail', sticker?.id], queryFn: () => getSticker(sticker!.id), enabled: Boolean(sticker), refetchInterval: sticker ? 1500 : false });
-  const pipeline = useQuery({ queryKey: [...prefix, 'pipeline'], queryFn: getStickerPipeline, enabled: Boolean(sticker), refetchInterval: sticker ? 1500 : false });
+  const current = useQuery({ queryKey: [...prefix, 'detail', sticker?.id], queryFn: () => getSticker(sticker!.id), enabled: Boolean(sticker), refetchInterval: () => adaptivePollInterval(sticker ? 1500 : false) });
+  const pipeline = useQuery({ queryKey: [...prefix, 'pipeline'], queryFn: getStickerPipeline, enabled: Boolean(sticker), refetchInterval: () => adaptivePollInterval(sticker ? 1500 : false) });
   const value = current.data ?? sticker;
   const job = pipeline.data?.assets?.find(entry => entry.sticker_id === sticker?.id);
   const busy = job?.status === 'queued' || job?.status === 'leased';

@@ -44,6 +44,7 @@ import {
   FileText,
   GitBranch,
   GitCompareArrows,
+  History,
   LayoutDashboard,
   ImageIcon,
   LoaderCircle,
@@ -68,13 +69,51 @@ import {
   X,
 } from "lucide-react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { SandboxAuthDialog, type SandboxAuthRequest } from "@/components/chat/sandbox-auth-dialog";
+import { type SandboxAuthRequest } from "@/components/chat/sandbox-auth-dialog";
+import { ToolApprovalBar } from "@/components/chat/tool-approval-bar";
+import { CheckpointRewindDialog } from "@/components/chat/checkpoint-rewind-dialog";
 import { SandboxBuildProgress } from "@/components/shared/sandbox-build-progress";
-import { StreamStatsBadge } from "@/components/chat/stream-stats-badge";
+import { StreamStatsAction, StreamStatsBadge } from "@/components/chat/stream-stats-badge";
 import { RetryAnswerMenu, RetryMenuSettings } from "@/components/chat/retry-answer-menu";
+import {
+  FloatingMenuContent,
+  GenerationConfigMenu,
+  ModelSelector,
+} from "@/components/chat/generation-config";
+import {
+  buildModelSelectorGroups,
+  resolveHistoricalGenerationConfig,
+  type GenerationConfig,
+} from "@/lib/generation-config";
+import { RetryDetailsBlock } from "@/components/chat/retry-details-block";
+import { TurnErrorNotice } from "@/components/chat/turn-error-notice";
 import { FollowUpPrompts } from "@/components/chat/suggested-prompts";
 import { MemoryOpeningSuggestions } from "./memory-opening-suggestions";
 import { ComposerActionMenu } from "./composer-action-menu";
+import { collectPendingApprovals } from "@/features/chat/pending-approvals";
+import { mergeServerQueuedTurns } from "@/features/chat/queued-turn-sync";
+import { useEscapeStopRun } from "@/features/chat/escape-stop-run";
+import { listSessionCheckpoints } from "@/api/checkpoints";
+import { listEgressApprovals } from "@/api/egress";
+import { listFetchAuthorizations } from "@/api/fetch-authorizations";
+import {
+  cancelQueuedTurn,
+  claimQueuedTurn,
+  completeQueuedTurn,
+  enqueueQueuedTurn,
+  listQueuedTurns,
+  promoteQueuedTurn,
+  requeueQueuedTurn,
+  updateQueuedTurn,
+} from "@/api/queued-turns";
+import {
+  extractRetryAttemptsFromTrace,
+  mergeRetryEventIntoTrace,
+} from "@/features/chat/retry-attempts";
+import {
+  extractLastErrorFromTrace,
+  extractStructuredErrorFromEvent,
+} from "@/features/chat/turn-error";
 import {
   beginStreamStats,
   deltaTextOf,
@@ -82,6 +121,7 @@ import {
 } from "@/features/chat/stream-stats";
 
 import { toast } from '@/lib/notifications';
+import { adaptivePollInterval, useNetworkQuality } from '@/lib/network-quality';
 import { ComposerFeedback, useComposerFeedback } from '@/components/chat/composer-feedback';
 import { CopyMessageAction, useCopyFeedback } from '@/components/shared/copy-feedback';
 import { createStreamRenderQueue } from "@/features/chat/stream-render-queue";
@@ -94,6 +134,7 @@ import {
   cancelSessionMessage,
   cleanupDictation,
   closeSession,
+  compactSessionContext,
   confirmCompositeDraft,
   confirmGraphChangeSet,
   createSession,
@@ -147,7 +188,6 @@ import type { VoiceRenderUpdate } from "@/features/voice/voice-session-controlle
 import { hashFileSha256 } from "@/lib/file-hash";
 import { PREFILL_COMPOSER_EVENT } from "@/features/mobile/PendingShareConsumer";
 import { migrateThinkingPreference } from "@/lib/thinking-effort-migration";
-import { ThinkingSlider, supportedThinkingStops, thinkingStopIndex } from "@/components/chat/thinking-slider";
 import { DictationBar } from "@/components/chat/dictation-bar";
 import {
   startDictationOrchestrator,
@@ -188,12 +228,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -289,7 +324,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { InputGroupAddon } from "@/components/ui/input-group";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -334,10 +368,8 @@ import {
 } from "@/lib/session-composer-prefs";
 import {
   capabilityThinkingModes,
-  fuzzyModelMatch,
   isRealtimeTranscriptionModel,
   modelChoiceValue,
-  modelProtocolLabel,
   parseModelChoiceValue,
   providerAsrModelId,
   providerCapabilityString,
@@ -389,6 +421,7 @@ import {
 } from "@/features/chat/chat-message-parts";
 import { messageCopyText } from "@/features/chat/message-copy";
 import { ThinkingChain } from "@/components/chat/thinking-chain";
+import { MessageReading } from "@/components/chat/message-reading";
 import { ReasoningSummaryRow } from "@/components/chat/reasoning-summary-row";
 import {
   GoalSetupConversation,
@@ -417,6 +450,7 @@ type ImageSize = NonNullable<MessageCreateRequest["image_size"]>;
  */
 type PendingSendItem = {
   id: string;
+  serverTurnId?: string;
   workspaceId: string;
   sessionId: string;
   text: string;
@@ -652,7 +686,7 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
     queryKey: workspaceQueryKey(workspaceId, "agent-sandbox-readiness"),
     queryFn: getAgentSandboxReadiness,
     refetchInterval: (query) =>
-      query.state.data?.available === false ? 5_000 : false,
+      adaptivePollInterval(query.state.data?.available === false ? 5_000 : false),
   });
   const bootstrap = useQuery({
     queryKey: workspaceQueryKey(workspaceId, "sandbox-bootstrap-status"),
@@ -663,7 +697,7 @@ function SandboxReadinessNotice({ workspaceId }: { workspaceId: string }) {
       readiness.data?.code === "sandbox_backend_unavailable" ||
       readiness.data?.available === true,
     refetchInterval: (query) =>
-      query.state.data?.active_job ? 1_500 : false,
+      adaptivePollInterval(query.state.data?.active_job ? 1_500 : false),
   });
   const initialize = useMutation({
     mutationFn: startSandboxBootstrap,
@@ -1142,6 +1176,7 @@ function clearLearningNodeContext() {
 function appendPart(
   parts: MessagePart[],
   incoming: MessagePart,
+  replaceData = false,
 ): MessagePart[] {
   const visibleParts =
     incoming.type === "image"
@@ -1172,7 +1207,10 @@ function appendPart(
           const next = {
           ...part,
           ...incoming,
-          data: { ...(part.data ?? {}), ...(incoming.data ?? {}) },
+          data:
+            replaceData && incoming.data !== undefined
+              ? { ...incoming.data }
+              : { ...(part.data ?? {}), ...(incoming.data ?? {}) },
           content: nextContent,
           sequence:
             typeof incoming.sequence === "number"
@@ -1290,10 +1328,11 @@ async function waitForStreamReconnect(
   signal: AbortSignal,
 ): Promise<void> {
   if (signal.aborted) throw signal.reason;
-  const delay =
+  const baseDelay =
     STREAM_RECONNECT_DELAYS_MS[
       Math.min(reconnectAttempt, STREAM_RECONNECT_DELAYS_MS.length - 1)
     ];
+  const delay = Math.round(baseDelay * (0.5 + Math.random() * 0.5));
   await new Promise<void>((resolve, reject) => {
     let timer: number | undefined;
     const cleanup = () => {
@@ -1320,27 +1359,32 @@ async function waitForStreamReconnect(
 
 function StreamConnectionFeedback({
   notice,
+  onOpenProviderSettings,
 }: {
   notice: StreamConnectionNotice;
+  onOpenProviderSettings?: () => void;
 }) {
   const reconnecting = notice.phase === "reconnecting";
+  if (!reconnecting) {
+    return (
+      <TurnErrorNotice
+        error={notice.detail}
+        onOpenProviderSettings={onOpenProviderSettings}
+      />
+    );
+  }
   return (
     <div
-      aria-live={reconnecting ? "polite" : "assertive"}
+      aria-live="polite"
       className={`chat-stream-connection chat-stream-connection--${notice.phase}`}
-      role={reconnecting ? "status" : "alert"}
+      role="status"
     >
-      <LoaderCircle
-        aria-hidden="true"
-        className={reconnecting ? "animate-spin" : undefined}
-      />
+      <LoaderCircle aria-hidden="true" className="animate-spin" />
       <div>
         <strong>
-          {reconnecting
-            ? notice.attempt > 0
-              ? `连接中断，正在重连（${notice.attempt}/${notice.maxAttempts}）`
-              : "正在续接生成任务"
-            : "连接或模型服务异常"}
+          {notice.attempt > 0
+            ? `连接中断，正在重连（${notice.attempt}/${notice.maxAttempts}）`
+            : "正在续接生成任务"}
         </strong>
         <span>{notice.detail}</span>
       </div>
@@ -1365,22 +1409,63 @@ function applyStreamUpdates(
 ): Message {
   return updates.reduce<Message>((current, data) => {
     const eventType = streamEventType(data);
-    if (eventType === "message.completed")
+    if (
+      eventType === "provider.retry.scheduled" ||
+      eventType === "provider.retry.started" ||
+      eventType === "provider.retry.exhausted"
+    ) {
+      return {
+        ...current,
+        provider_trace: mergeRetryEventIntoTrace(
+          current.provider_trace,
+          eventType,
+          data,
+        ),
+      };
+    }
+    if (eventType === "message.completed") {
+      const nextTrace = (data.provider_trace ?? {}) as Record<string, unknown>;
+      const mergedTrace =
+        !nextTrace.retry_attempts && current.provider_trace?.retry_attempts
+          ? { ...nextTrace, retry_attempts: current.provider_trace.retry_attempts }
+          : nextTrace;
       return {
         ...current,
         status: "completed",
-        provider_trace: (data.provider_trace ?? {}) as Record<string, unknown>,
+        provider_trace: mergedTrace,
       };
-    if (eventType === "message.failed" || eventType === "message.cancelled")
+    }
+    if (eventType === "message.failed" || eventType === "message.cancelled") {
+      const structuredError =
+        eventType === "message.failed"
+          ? extractStructuredErrorFromEvent(data)
+          : null;
       return {
         ...current,
         status: eventType === "message.cancelled" ? "cancelled" : "failed",
+        provider_trace: structuredError
+          ? {
+              ...(current.provider_trace ?? {}),
+              last_error: {
+                ...(structuredError.kind ? { kind: structuredError.kind } : {}),
+                ...(structuredError.code ? { code: structuredError.code } : {}),
+                ...(structuredError.message ? { message: structuredError.message } : {}),
+                ...(structuredError.statusCode !== null && structuredError.statusCode !== undefined
+                  ? { status_code: structuredError.statusCode }
+                  : {}),
+                ...(structuredError.retryable !== null && structuredError.retryable !== undefined
+                  ? { retryable: structuredError.retryable }
+                  : {}),
+              },
+            }
+          : current.provider_trace,
         parts: current.parts.map((part) =>
           part.data?.optimistic === true
             ? { ...part, status: "failed" as const }
             : part,
         ),
       };
+    }
     if (eventType === "answer.started") {
       // 后端 SSE envelope 把 final_part_id / boundary_sequence /
       // thinking_duration_ms 放在 payload 里（顶层只提升 part/status/
@@ -1416,7 +1501,7 @@ function applyStreamUpdates(
     if (isMessagePart(data.part))
       return {
         ...current,
-        parts: appendPart(current.parts, data.part),
+        parts: appendPart(current.parts, data.part, eventType === "part.replaced"),
       };
     return current;
   }, message);
@@ -1908,6 +1993,11 @@ function AssistantMessageInner({
   retryMenuOpen = false,
   retryPending = false,
   onBranch,
+  onRewindCheckpoint,
+  checkpointFileCount = 0,
+  onOpenProviderSettings,
+  onCompactAndRetry,
+  compactPending = false,
   onComponentAction,
   selectionMarks = [],
   onOpenSelectionExplanation,
@@ -1921,12 +2011,17 @@ function AssistantMessageInner({
   message: Message;
   sessionId: string;
   workspaceId: string;
-  onRetry: () => void;
+  onRetry: (shown?: Message) => void;
   onRetryClose: () => void;
   retryMenuContent?: ((shown: Message) => ReactNode) | null;
   retryMenuOpen?: boolean;
   retryPending?: boolean;
   onBranch: () => void;
+  onRewindCheckpoint?: () => void;
+  checkpointFileCount?: number;
+  onOpenProviderSettings?: () => void;
+  onCompactAndRetry?: () => void;
+  compactPending?: boolean;
   onComponentAction: (action: TrustedComponentAction) => void | Promise<void>;
   selectionMarks?: SelectionExplanationRecord[];
   onOpenSelectionExplanation?: (recordId: string) => void;
@@ -1978,7 +2073,14 @@ function AssistantMessageInner({
     imageInputTrace.model_id.trim()
       ? imageInputTrace.model_id.trim()
       : null;
-  const orderedParts = orderedMessageParts(shown.parts);
+  const orderedParts = useMemo(
+    () => orderedMessageParts(shown.parts),
+    [shown.parts],
+  );
+  const messageSettled =
+    shown.status !== "streaming" && shown.status !== "pending";
+  const isCurrentVersion = !selectedVersionId || shown.version === message.version;
+  const effectiveInteractive = componentsInteractive && isCurrentVersion;
   const finalAnswerStarted =
     shown.finalAnswerStarted ?? message.finalAnswerStarted;
   // Thinking chain (reasoning + tools) is always rendered above the final body.
@@ -1994,10 +2096,11 @@ function AssistantMessageInner({
     const renderPart = (part: MessagePart) => {
     const rendered = (
     <ChatStreamPartRenderer
-      interactive={componentsInteractive}
+      interactive={effectiveInteractive}
       key={part.id}
       onAction={onComponentAction}
       part={part}
+      settled={messageSettled}
       siblingParts={orderedParts}
       streaming={
         shown.status === "streaming" &&
@@ -2020,7 +2123,7 @@ function AssistantMessageInner({
   };
   const renderAnswerParts = (parts: MessagePart[]) => (
     <AnswerParts
-      interactive={componentsInteractive}
+      interactive={effectiveInteractive}
       onAction={onComponentAction}
       parts={parts}
       renderPart={renderPart}
@@ -2120,16 +2223,17 @@ function AssistantMessageInner({
           ))}
         </div>
       ) : null}
-      <MessageContent className="w-full gap-1" data-message-content>
+      <MessageContent className="message-reading-surface w-full gap-1 overflow-visible" data-message-content>
         {visionModelId ? (
           <p className="text-xs text-muted-foreground">
             图像由 {visionModelId} 模型提供
           </p>
         ) : null}
-        <div ref={messageContentRef} className="contents">
-        {displaySegments.map(segment =>
-          segment.kind === "chain" ? (
-            <div className="space-y-2" key={`chain-wrap-${message.id}`}>
+        <MessageReading
+          answerRef={messageContentRef}
+          key={shown.version}
+          process={displaySegments.filter(segment => segment.kind === "chain").map(segment => (
+            <div key={`chain-wrap-${message.id}`}>
               <ThinkingChain
                 chainParts={segment.parts}
                 completedDurationSec={thinkingDurationSeconds(
@@ -2138,15 +2242,7 @@ function AssistantMessageInner({
                 defaultOpen={thinkingChainDefaultOpen}
                 finalAnswerStarted={Boolean(finalAnswerStarted)}
                 messageStatus={shown.status}
-                startedAt={
-                  typeof shown.provider_trace.generation_started_at === "string"
-                    ? shown.provider_trace.generation_started_at
-                    : shown.created_at
-                }
-                thinkingDurationMs={finalAnswerStarted?.thinkingDurationMs}
-                toolCallCount={toolCallCount(orderedParts)}
-              >
-                {segment.parts.map((part) =>
+                renderPart={(part) =>
                   isReasoningTextPart(part) ? (
                     <ReasoningSummaryRow
                       key={part.id}
@@ -2155,21 +2251,56 @@ function AssistantMessageInner({
                     />
                   ) : (
                     renderPart(part)
-                  ),
-                )}
-              </ThinkingChain>
+                  )
+                }
+                startedAt={
+                  typeof shown.provider_trace.generation_started_at === "string"
+                    ? shown.provider_trace.generation_started_at
+                    : shown.created_at
+                }
+                thinkingDurationMs={finalAnswerStarted?.thinkingDurationMs}
+                toolCallCount={toolCallCount(orderedParts)}
+              />
             </div>
-          ) : (
-            <div
-              className="message-answer-segment"
-              key={`parts-${message.id}`}
-            >
+          ))}
+        >
+          {displaySegments.filter(segment => segment.kind !== "chain").map(segment => (
+            <div className="message-answer-segment answer-flow" key={`parts-${message.id}`}>
               {renderAnswerParts(segment.parts)}
             </div>
-          ),
-        )}
-        </div>
+          ))}
+        </MessageReading>
       </MessageContent>
+      {(() => {
+        const retryAttempts = extractRetryAttemptsFromTrace(shown.provider_trace);
+        const isInFlight = IN_FLIGHT_MESSAGE_STATUSES.includes(
+          shown.status as (typeof IN_FLIGHT_MESSAGE_STATUSES)[number],
+        );
+        const lastError =
+          shown.status === "failed"
+            ? extractLastErrorFromTrace(shown.provider_trace) ?? {
+                message: "本次回答生成失败，请重试或查看服务端日志。",
+              }
+            : null;
+        return (
+          <>
+            {retryAttempts.length > 0 ? (
+              <RetryDetailsBlock attempts={retryAttempts} isActive={isInFlight} />
+            ) : null}
+            {lastError ? (
+              <TurnErrorNotice
+                error={lastError}
+                onRetry={persisted ? onRetry : undefined}
+                onOpenProviderSettings={onOpenProviderSettings}
+                onCompactAndRetry={persisted ? onCompactAndRetry : undefined}
+                busy={retryPending}
+                retryDisabled={retryDisabled}
+                compactPending={compactPending}
+              />
+            ) : null}
+          </>
+        );
+      })()}
       {
         // A voice answer is not a token stream, so this badge has nothing to
         // measure: while the answer was being read aloud it sat underneath it
@@ -2177,24 +2308,32 @@ function AssistantMessageInner({
         isVoiceTrace(shown.provider_trace) ? null : (
           <StreamStatsBadge
             messageId={message.id}
+            showCompleted={false}
             status={shown.status}
             providerTrace={shown.provider_trace}
           />
         )
       }
       {!voiceActionsVisible(shown) ? null : (
-        <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100">
+        <MessageActions className="opacity-60 transition-opacity focus-within:opacity-100 hover:opacity-100 has-[[data-state=open]]:opacity-100">
           <CopyMessageAction label="复制全文" text={fullText} scope={shown.id + ':' + shown.version} />
         {retryMenuContent === undefined ? (
-          <MessageAction disabled={retryDisabled} label="重试并保留版本" onClick={onRetry} tooltip={retryDisabledReason ?? "重试并保留版本"}>
+          <MessageAction disabled={retryDisabled} label="重试并保留版本" onClick={() => onRetry(shown)} tooltip={retryDisabledReason ?? "重试并保留版本"}>
             <RefreshCcw className="size-3.5" />
           </MessageAction>
         ) : (
-          <RetryAnswerMenu open={retryMenuOpen} onOpenChange={(open) => open ? onRetry() : onRetryClose()} content={retryMenuContent?.(shown)}>
-            <MessageAction disabled={retryDisabled} label={retryPending ? "正在生成新版本" : "重试并保留版本"} title={retryDisabledReason ?? "重新生成回答"} className="data-[state=open]:bg-muted data-[state=open]:text-foreground">
+          <RetryAnswerMenu open={retryMenuOpen} onOpenChange={(open) => open ? onRetry(shown) : onRetryClose()} content={retryMenuContent?.(shown)}>
+            <MessageAction disabled={retryDisabled} label={retryPending ? "正在生成新版本" : "重试并保留版本"} title={retryDisabledReason ?? "重新生成"} className="data-[state=open]:bg-muted data-[state=open]:text-foreground">
               {retryPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <RefreshCcw className="size-3.5" />}
             </MessageAction>
           </RetryAnswerMenu>
+        )}
+        {isVoiceTrace(shown.provider_trace) ? null : (
+          <StreamStatsAction
+            messageId={shown.id}
+            status={shown.status}
+            providerTrace={shown.provider_trace}
+          />
         )}
         {/* 低频动作（创建分支 / 复制消息 ID）收进「更多」二级菜单，操作行只留高频按钮。 */}
         <DropdownMenu>
@@ -2224,6 +2363,16 @@ function AssistantMessageInner({
                 </span>
               ) : null}
             </DropdownMenuItem>
+            {onRewindCheckpoint && checkpointFileCount > 0 ? (
+              <DropdownMenuItem
+                disabled={branchDisabled}
+                onSelect={onRewindCheckpoint}
+                title="预览并安全回退本轮修改的沙箱工作区文件"
+              >
+                <History className="size-3.5" />
+                回退沙箱文件（{checkpointFileCount}）
+              </DropdownMenuItem>
+            ) : null}
             {sessionId ? (
               <DropdownMenuItem
                 onSelect={() => void copyMessageId()}
@@ -2280,7 +2429,10 @@ const areEqualAssistantMessage = (
   prev.componentsInteractive === next.componentsInteractive &&
   prev.selectionMarks === next.selectionMarks &&
   prev.onOpenSelectionExplanation === next.onOpenSelectionExplanation &&
-  prev.thinkingChainDefaultOpen === next.thinkingChainDefaultOpen;
+  prev.thinkingChainDefaultOpen === next.thinkingChainDefaultOpen &&
+  prev.checkpointFileCount === next.checkpointFileCount &&
+  Boolean(prev.onRewindCheckpoint) === Boolean(next.onRewindCheckpoint) &&
+  prev.compactPending === next.compactPending;
 
 type AssistantMessageMemoProps = Parameters<typeof AssistantMessageInner>[0];
 
@@ -2368,7 +2520,7 @@ function ConversationQuickActions({
       : []),
     {
       key: "goal",
-      label: goalActive ? "目标中" : "目标",
+      label: "目标",
       icon: <Target aria-hidden="true" />,
       title: goalActive ? "退出目标设定" : "在当前对话中设定学习目标",
       onClick: onGoal,
@@ -2487,11 +2639,16 @@ export function ChatCanvasPage() {
     restoreScrollSnapshot,
     scrollMessageIntoView,
   } = conversationScroll;
-  const goalMode = new URLSearchParams(location.search).get("mode") === "goal";
+  const persistedGoalMode = new URLSearchParams(location.search).get("mode") === "goal";
   const draftProjectId = sessionId === "new"
     ? new URLSearchParams(location.search).get("project")
     : null;
   const conversationResetKey = `${workspaceId}:${sessionId}${sessionId === "new" ? `:${draftProjectId ?? "root"}` : ""}`;
+  const [goalInputScope, setGoalInputScope] = useState<string | null>(null);
+  const goalMode = persistedGoalMode || goalInputScope === conversationResetKey;
+  useEffect(() => {
+    setGoalInputScope((scope) => scope === conversationResetKey ? scope : null);
+  }, [conversationResetKey]);
   const { notice: composerNotice, show: showComposerNotice, clear: clearComposerNotice } = useComposerFeedback(conversationResetKey);
   const configureModels = useCallback(() => navigate(`/w/${workspaceId}/settings/models`), [navigate, workspaceId]);
   const selectionCopy = useCopyFeedback(conversationResetKey + ':selection');
@@ -2622,6 +2779,7 @@ export function ChatCanvasPage() {
     setStreamConnectionNotice(null);
     resetConversation();
   }, [conversationResetKey, resetConversation, sessionId]);
+  const { online: networkOnline } = useNetworkQuality();
   const [modelSearch, setModelSearch] = useState("");
   // Collapsed = icon + chevron, open = current mode word + chevron, matching
   // the ChatGPT composer trigger. Drives the chip content and Ctrl+Shift+M.
@@ -2837,6 +2995,8 @@ export function ChatCanvasPage() {
     messageId: string;
     sourceSessionId: string;
   } | null>(null);
+  const [retryHistoricalConfig, setRetryHistoricalConfig] =
+    useState<GenerationConfig | null>(null);
   const [retryProviderId, setRetryProviderId] = useState("");
   const [retryModelId, setRetryModelId] = useState("");
   const [retryResponseMode, setRetryResponseMode] =
@@ -2853,6 +3013,86 @@ export function ChatCanvasPage() {
   } | null>(null);
   const [imageRetryChoice, setImageRetryChoice] = useState("");
   const [sandboxAuthRequest, setSandboxAuthRequest] = useState<SandboxAuthRequest | null>(null);
+  const [rewindTurnId, setRewindTurnId] = useState<string | null>(null);
+  const [resolvedApprovalIds, setResolvedApprovalIds] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    setResolvedApprovalIds(new Set());
+    setRewindTurnId(null);
+  }, [sessionId]);
+  const sessionCheckpointsQuery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "session-checkpoints", sessionId),
+    queryFn: () => listSessionCheckpoints(sessionId),
+    enabled: Boolean(sessionId && sessionId !== "new"),
+    staleTime: 10_000,
+    retry: false,
+  });
+  const checkpointCountByTurn = useMemo(() => {
+    const map = new Map<string, number>();
+    const items = Array.isArray(sessionCheckpointsQuery.data?.items)
+      ? sessionCheckpointsQuery.data.items
+      : [];
+    for (const item of items) {
+      map.set(item.turn_id, item.file_count);
+    }
+    return map;
+  }, [sessionCheckpointsQuery.data?.items]);
+  const pendingEgressApprovalsQuery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "pending-egress-approvals", sessionId),
+    queryFn: () => listEgressApprovals({ status: "pending", limit: 20 }),
+    enabled: Boolean(sessionId && sessionId !== "new"),
+    staleTime: 10_000,
+    retry: false,
+  });
+  const pendingFetchApprovalsQuery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "pending-fetch-approvals", sessionId),
+    queryFn: () => listFetchAuthorizations({ status: "pending", limit: 20 }),
+    enabled: Boolean(sessionId && sessionId !== "new"),
+    staleTime: 10_000,
+    retry: false,
+  });
+  const serverQueuedTurnsQuery = useQuery({
+    queryKey: workspaceQueryKey(workspaceId, "queued-turns", sessionId),
+    queryFn: () => listQueuedTurns(sessionId),
+    enabled: Boolean(sessionId && sessionId !== "new"),
+    staleTime: 5_000,
+    retry: false,
+  });
+  useEffect(() => {
+    if (
+      !sessionId ||
+      sessionId === "new" ||
+      !serverQueuedTurnsQuery.isSuccess ||
+      !Array.isArray(serverQueuedTurnsQuery.data?.items)
+    ) {
+      return;
+    }
+    const serverItems = serverQueuedTurnsQuery.data.items;
+    setPendingSendQueue((current) => {
+      const next = mergeServerQueuedTurns(current, serverItems, {
+        workspaceId,
+        sessionId,
+        defaultImageSize: IMAGE_SIZE_OPTIONS[0].value,
+      });
+      if (
+        next.length === current.length &&
+        next.every(
+          (entry, idx) =>
+            entry.id === current[idx]?.id &&
+            entry.serverTurnId === current[idx]?.serverTurnId &&
+            entry.text === current[idx]?.text,
+        )
+      ) {
+        return current;
+      }
+      return next;
+    });
+  }, [
+    serverQueuedTurnsQuery.data,
+    serverQueuedTurnsQuery.isSuccess,
+    sessionId,
+    setPendingSendQueue,
+    workspaceId,
+  ]);
   const initialLearningNode = useRef<LearningNodeContext | undefined>(
     readLearningNodeContext(sessionId),
   );
@@ -2965,6 +3205,24 @@ export function ChatCanvasPage() {
     openFileDialogRef.current = openFileDialog;
   }, []);
 
+  const syncComposerHeight = useCallback(() => {
+    const el = composerTextareaRef.current;
+    if (!el) return;
+    // 高度预算来自 CSS token，窄屏由堆叠式布局收紧，避免这里写死像素。
+    const composerStyles = window.getComputedStyle(el);
+    const maxHeight =
+      Number.parseFloat(composerStyles.getPropertyValue("--composer-textarea-max")) || 210;
+    const minHeight =
+      Number.parseFloat(composerStyles.getPropertyValue("--composer-textarea-min")) || 52;
+    // Collapse first so scrollHeight reflects full content, including soft wraps.
+    el.style.height = "0px";
+    const contentHeight = el.scrollHeight;
+    const next = Math.min(maxHeight, Math.max(minHeight, contentHeight));
+    el.style.height = `${next}px`;
+    el.style.overflowY = contentHeight > maxHeight + 1 ? "auto" : "hidden";
+    setComposerExpanded(contentHeight > minHeight + 1);
+  }, []);
+
   // Grow the composer with soft wraps (not only hard newlines), ChatGPT-style.
   // Cap height; once capped, allow overflow so the caret stays reachable.
   // Width is fixed: the pill spans the shared content column
@@ -2982,36 +3240,42 @@ export function ChatCanvasPage() {
     }
     if (!composerText) setComposerEnlarged(false);
 
-    const syncHeight = () => {
-      // 高度预算来自 CSS token，窄屏由堆叠式布局收紧，避免这里写死像素。
-      const composerStyles = window.getComputedStyle(el);
-      const maxHeight =
-        Number.parseFloat(composerStyles.getPropertyValue("--composer-textarea-max")) || 210;
-      const minHeight =
-        Number.parseFloat(composerStyles.getPropertyValue("--composer-textarea-min")) || 52;
-      // Collapse first so scrollHeight reflects full content, including soft wraps.
-      el.style.height = "0px";
-      const contentHeight = el.scrollHeight;
-      const next = Math.min(maxHeight, Math.max(minHeight, contentHeight));
-      el.style.height = `${next}px`;
-      el.style.overflowY = contentHeight > maxHeight + 1 ? "auto" : "hidden";
-      setComposerExpanded(contentHeight > minHeight + 1);
-    };
+    syncComposerHeight();
+  }, [composerText, composerInstanceKey, composerEnlarged, syncComposerHeight]);
 
-    syncHeight();
-    window.addEventListener("resize", syncHeight);
-    // Re-sync when the pill chrome changes (model chip, mode switches…).
+  // Keep resize observation stable across keystrokes and only re-measure when
+  // width changes (self-induced height changes must not retrigger a reflow).
+  useEffect(() => {
+    const el = composerTextareaRef.current;
+    if (!el || composerEnlarged) return;
+    let frame = 0;
+    const scheduleSync = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        syncComposerHeight();
+      });
+    };
+    window.addEventListener("resize", scheduleSync);
+    // Re-sync when the pill chrome width changes (model chip, mode switches…).
     const group = el.closest("[data-slot='input-group']");
+    let lastWidth = group ? group.getBoundingClientRect().width : -1;
     let observer: ResizeObserver | undefined;
     if (group && typeof ResizeObserver !== "undefined") {
-      observer = new ResizeObserver(syncHeight);
+      observer = new ResizeObserver(([entry]) => {
+        const nextWidth = entry?.contentRect.width ?? group.getBoundingClientRect().width;
+        if (Math.abs(nextWidth - lastWidth) <= 0.5) return;
+        lastWidth = nextWidth;
+        scheduleSync();
+      });
       observer.observe(group);
     }
     return () => {
-      window.removeEventListener("resize", syncHeight);
+      window.removeEventListener("resize", scheduleSync);
       observer?.disconnect();
+      if (frame) window.cancelAnimationFrame(frame);
     };
-  }, [composerText, composerInstanceKey, composerEnlarged]);
+  }, [composerInstanceKey, composerEnlarged, syncComposerHeight]);
 
   useEffect(() => {
     if (!selectionMenu) return;
@@ -3040,13 +3304,13 @@ export function ChatCanvasPage() {
   // switches navigate without the ?mode=goal query, so this flag is the only
   // record that the session was in goal mode.
   useEffect(() => {
-    if (goalMode) setSessionGoalMode(workspaceId, sessionId, true);
-  }, [goalMode, sessionId, workspaceId]);
+    if (persistedGoalMode && sessionId !== "new") setSessionGoalMode(workspaceId, sessionId, true);
+  }, [persistedGoalMode, sessionId, workspaceId]);
 
   // Returning to a session that was in goal mode re-applies the mode, unless
   // the user explicitly exited it (leaveGoalMode clears the stored flag).
   useEffect(() => {
-    if (goalMode || !hasSessionGoalMode(workspaceId, sessionId)) return;
+    if (sessionId === "new" || goalMode || !hasSessionGoalMode(workspaceId, sessionId)) return;
     const params = new URLSearchParams(location.search);
     params.set("mode", "goal");
     navigate(`${location.pathname}?${params.toString()}`, { replace: true });
@@ -3112,9 +3376,12 @@ export function ChatCanvasPage() {
     refetchOnMount: true,
     // No session-wide push channel exists. Check only the visible idle window;
     // discovered remote streams use the existing cursor-based event replay.
-    refetchInterval: () => longGoalActive && !isSessionStreaming(sessionId)
-      ? 2_000
-      : timelinePollInterval(sessionId, isSessionStreaming(sessionId), status),
+    refetchInterval: () =>
+      adaptivePollInterval(
+        longGoalActive && !isSessionStreaming(sessionId)
+          ? 2_000
+          : timelinePollInterval(sessionId, isSessionStreaming(sessionId), status),
+      ),
     refetchIntervalInBackground: false,
     // Evict inactive session histories quickly; active eviction below is the
     // primary bound, this is the safety net for unobserved caches.
@@ -3512,15 +3779,12 @@ export function ChatCanvasPage() {
       ),
     [imageProviderModelQueries, imageProviders],
   );
-  const filteredAvailableImageModelChoices = useMemo(
+  const imageModelGroups = useMemo(
     () =>
-      availableImageModelChoices.filter(({ provider, model }) =>
-        fuzzyModelMatch(
-          `${model.id} ${provider.display_name} ${modelProtocolLabel(provider.provider_type)}`,
-          modelSearch,
-        ),
-      ),
-    [availableImageModelChoices, modelSearch],
+      buildModelSelectorGroups(imageProviders, imageProviderModelQueries, {
+        defaultModelCapability: "default_image_generation_model_id",
+      }),
+    [imageProviderModelQueries, imageProviders],
   );
   const selectedImageModel =
     imageModelOptions.find((model) => model.id === selectedImageModelId) ??
@@ -3580,27 +3844,12 @@ export function ChatCanvasPage() {
       ).filter((model) => isTextChatModel(model)),
     [activeModelProvider, discoveredModels?.data?.models],
   );
-  const availableModelChoices = useMemo(
+  const textModelGroups = useMemo(
     () =>
-      modelProviders
-        .flatMap((provider, index) =>
-          providerModelOptions(
-            provider,
-            providerModelQueries[index]?.data?.models,
-          ).map((model) => ({ provider, model })),
-        )
-        .filter(({ model }) => isTextChatModel(model)),
+      buildModelSelectorGroups(modelProviders, providerModelQueries, {
+        filterModel: isTextChatModel,
+      }),
     [modelProviders, providerModelQueries],
-  );
-  const filteredAvailableModelChoices = useMemo(
-    () =>
-      availableModelChoices.filter(({ provider, model }) =>
-        fuzzyModelMatch(
-          `${model.id} ${provider.display_name} ${modelProtocolLabel(provider.provider_type)}`,
-          modelSearch,
-        ),
-      ),
-    [availableModelChoices, modelSearch],
   );
   const selectedModel = modelOptions.find(
     (model) => model.id === selectedModelId,
@@ -4127,6 +4376,52 @@ export function ChatCanvasPage() {
     }
   }, [messages, sessionId]);
 
+  const pendingApprovals = useMemo(
+    () =>
+      collectPendingApprovals({
+        sessionId,
+        messages,
+        sandboxAuthRequest,
+        backendEgress: Array.isArray(pendingEgressApprovalsQuery.data?.items)
+          ? pendingEgressApprovalsQuery.data.items
+          : undefined,
+        backendFetch: Array.isArray(pendingFetchApprovalsQuery.data?.items)
+          ? pendingFetchApprovalsQuery.data.items
+          : undefined,
+        resolvedIds: resolvedApprovalIds,
+      }),
+    [
+      messages,
+      pendingEgressApprovalsQuery.data?.items,
+      pendingFetchApprovalsQuery.data?.items,
+      resolvedApprovalIds,
+      sandboxAuthRequest,
+      sessionId,
+    ],
+  );
+  const handleApprovalResolved = useCallback(
+    (approvalId: string) => {
+      setResolvedApprovalIds((current) => {
+        const next = new Set(current);
+        next.add(approvalId);
+        return next;
+      });
+      if (approvalId.startsWith("delete:")) {
+        setSandboxAuthRequest(null);
+      }
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "pending-egress-approvals", sessionId),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceQueryKey(workspaceId, "pending-fetch-approvals", sessionId),
+      });
+    },
+    [queryClient, sessionId, workspaceId],
+  );
+
   // A reload can race the producer's first database commit: the first history
   // hydrate may see neither the just-submitted user turn nor its assistant row.
   // Recheck a few times after mount so the normal in-flight replay effect below
@@ -4364,12 +4659,12 @@ export function ChatCanvasPage() {
           markSessionRunning(streamSessionId, false);
           if (isViewing()) {
             setStatus("error");
-            setStreamConnectionNotice({
+            setStreamConnectionNotice(terminalFailure === "生成已取消。" ? {
               phase: "failed",
               attempt: 0,
               maxAttempts: DEFAULT_STREAM_RECONNECTS,
               detail: terminalFailure,
-            });
+            } : null);
           } else {
             markSessionGenerationFinished(streamSessionId, { viewing: false });
           }
@@ -5289,27 +5584,18 @@ export function ChatCanvasPage() {
     // 会话切换保留向导进度；手动点「目标」退出则丢弃进度，下次重新开始。
     preserveOnDisable: !goalModeExitedManuallyRef.current,
   });
-  useEffect(() => {
-    if (!goalMode) return;
-    window.dispatchEvent(
-      new CustomEvent("learngraph:goal-graph-preview", {
-        detail: { composerText },
-      }),
-    );
-  }, [composerText, goalMode]);
-
   // Keep the capture-stage composer text in the per-session goal state so a
   // session switch away and back restores exactly what the user was typing.
   useEffect(() => {
     if (
-      !goalMode ||
+      !persistedGoalMode ||
       goalFlow.stage !== "capture" ||
       !composerText.trim()
     ) {
       return;
     }
     setSessionGoalDraft(workspaceId, sessionId, composerText);
-  }, [composerText, goalFlow.stage, goalMode, sessionId, workspaceId]);
+  }, [composerText, goalFlow.stage, persistedGoalMode, sessionId, workspaceId]);
 
   // Once the capture is submitted (or the wizard advances), the draft lives in
   // the flow state — no longer needed as a standalone capture draft.
@@ -5323,18 +5609,18 @@ export function ChatCanvasPage() {
   // (e.g. session switch back). Guarded by the latch ref so deleting the text
   // within the same session does not resurrect it.
   useEffect(() => {
-    if (!goalMode || goalFlow.stage !== "capture" || composerText) return;
+    if (!persistedGoalMode || goalFlow.stage !== "capture" || composerText) return;
     const scope = `${workspaceId}:${sessionId}`;
     if (goalDraftRestoredScopeRef.current === scope) return;
     goalDraftRestoredScopeRef.current = scope;
     const draft = getSessionGoalDraft(workspaceId, sessionId);
     if (draft) setComposerText(draft);
-  }, [composerText, goalFlow.stage, goalMode, sessionId, workspaceId, setComposerText]);
+  }, [composerText, goalFlow.stage, persistedGoalMode, sessionId, workspaceId, setComposerText]);
 
   // 智能体模式：把会话消息里的 create 图谱提案实时同步到右侧「目标图谱预览」，
   // 提案待审核 → reviewing；确认后（状态为 confirmed）→ approved（通过审核）。
   useEffect(() => {
-    if (!goalMode || !effectiveAgentMode) return;
+    if (!persistedGoalMode || !effectiveAgentMode) return;
     const proposalParts = messages.flatMap((message) =>
       (message.parts ?? []).map((part) => ({ part, message })),
     );
@@ -5365,7 +5651,16 @@ export function ChatCanvasPage() {
           }>;
         }
       | undefined;
-    if (!props || props.mode !== "create") return;
+    if (!props || props.mode !== "create") {
+      if (messages.some((message) => message.role === "assistant" && (
+        message.content.trim() || message.parts.some((part) => part.type === "component" || (part.type === "text" && part.content?.trim()))
+      ))) {
+        window.dispatchEvent(new CustomEvent("learngraph:goal-graph-preview", {
+          detail: { scopeKey: conversationResetKey, phase: "clarifying", graphNodes: [], graphEdges: [] },
+        }));
+      }
+      return;
+    }
     const refToId = new Map(
       (props.nodes ?? []).map((node) => [
         node.ref,
@@ -5375,6 +5670,7 @@ export function ChatCanvasPage() {
     window.dispatchEvent(
       new CustomEvent("learngraph:goal-graph-preview", {
         detail: {
+          scopeKey: conversationResetKey,
           submittedPrompt: "",
           title: props.title,
           answers: [],
@@ -5402,7 +5698,7 @@ export function ChatCanvasPage() {
         },
       }),
     );
-  }, [goalMode, messages, effectiveAgentMode]);
+  }, [conversationResetKey, persistedGoalMode, messages, effectiveAgentMode]);
   const closeSessionMutation = useMutation({
     mutationFn: () => {
       if (!currentSession || sessionId === "new") {
@@ -6010,6 +6306,7 @@ export function ChatCanvasPage() {
             (message) => message.id !== user.id && message.id !== assistant.id,
           ),
         );
+        return persistedAssistant;
       };
       const retryPersistedReconciliation = () => {
         void (async () => {
@@ -6296,13 +6593,13 @@ export function ChatCanvasPage() {
           await frameQueue.drain();
           if (persistedAssistantId) {
             try {
-              await reconcilePersisted(TERMINAL_MESSAGE_STATUSES);
+              const reconciled = await reconcilePersisted(TERMINAL_MESSAGE_STATUSES);
               markSessionGenerationFinished(targetSessionId, {
                 viewing: isViewingStream(),
               });
               if (isViewingStream()) {
                 setStatus("ready");
-                setStreamConnectionNotice({
+                setStreamConnectionNotice(reconciled.status === "failed" ? null : {
                   phase: "failed",
                   attempt: DEFAULT_STREAM_RECONNECTS,
                   maxAttempts: DEFAULT_STREAM_RECONNECTS,
@@ -6508,7 +6805,7 @@ export function ChatCanvasPage() {
           // Lookup and browser-digest failures fall back to normal upload.
         }
       }
-      if (!stored) stored = await uploadFile(file);
+      if (!stored) stored = await uploadFile(file, { source: "chat_attachment" });
       await queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "files") });
       return prepareStoredFile(stored, agentMode);
     },
@@ -6701,7 +6998,8 @@ export function ChatCanvasPage() {
         showComposerNotice("语音模式下附件与快捷操作暂不可用，请退出语音模式后再使用。");
         return false;
       }
-      if (generatingNow && (trimmedText || effectiveStickers.length || effectiveFiles.length || effectivePendingFiles.length || effectiveLongPaste !== null)) {
+      const offlineQueueable = !networkOnline && sessionId !== "new";
+      if ((generatingNow || offlineQueueable) && (trimmedText || effectiveStickers.length || effectiveFiles.length || effectivePendingFiles.length || effectiveLongPaste !== null)) {
         const queued: PendingSendItem = {
           id: `pending-send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           workspaceId,
@@ -6717,6 +7015,45 @@ export function ChatCanvasPage() {
         };
         autoDispatchBlockedRef.current = false;
         setPendingSendQueue((current) => [...current, queued]);
+        if (offlineQueueable) {
+          toast.info("当前离线，消息已加入待发队列，恢复网络后将自动发送。");
+        }
+        if (networkOnline && sessionId && sessionId !== "new" && effectiveFiles.length === 0 && effectiveLongPaste === null) {
+          void enqueueQueuedTurn(sessionId, {
+            client_request_id: queued.id,
+            content: message.text,
+            mode: "append",
+            payload: {
+              provider_id: activeModelProvider?.id,
+              model_id: selectedModel?.id,
+              thinking_mode: effectiveThinkingMode,
+              agent_mode: effectiveAgentMode,
+              search_route: searchRoute,
+              web_search: searchRoute !== "disabled",
+              file_ids: effectivePendingFiles.map((file) => file.id),
+              sticker_ids: effectiveStickers.map((sticker) => sticker.id),
+              pending_files: effectivePendingFiles,
+              stickers: effectiveStickers,
+              generation_mode: effectiveGenerationMode,
+              image_size: effectiveImageSize,
+            },
+          })
+            .then((saved) => {
+              setPendingSendQueue((current) =>
+                current.map((entry) =>
+                  entry.id === queued.id
+                    ? { ...entry, serverTurnId: saved.id }
+                    : entry,
+                ),
+              );
+              void queryClient.invalidateQueries({
+                queryKey: workspaceQueryKey(workspaceId, "queued-turns", sessionId),
+              });
+            })
+            .catch(() => {
+              // Keep the local queue item usable if offline or transient error occurs.
+            });
+        }
         // The visible queue itself is the confirmation; do not duplicate it globally.
         // 与正常发送一致地清空草稿（文本与附件已移入队列条目）。
         clearSubmittedDraft();
@@ -6817,11 +7154,12 @@ export function ChatCanvasPage() {
           requestedGenerationMode === "image"
             ? message.text.replace(/^\s*@绘图(?=\s|$)/u, "").trim()
             : message.text.trim();
-        if (goalMode && requestedGenerationMode === "text" && !contentText) {
-          toast.message(
-            "请先补充目标描述。附件可以关联到 Goal，但当前澄清不会读取附件正文。",
-          );
-          return false;
+        if (goalMode && requestedGenerationMode === "text") {
+          const capturingGoal = !effectiveAgentMode || isEmptySession;
+          if (!contentText || (capturingGoal && contentText.length < 3)) {
+            showComposerNotice(capturingGoal ? "请至少输入 3 个字符描述学习目标。" : "请输入澄清回复。");
+            return false;
+          }
         }
         if (
           requestedGenerationMode === "image" &&
@@ -6911,6 +7249,17 @@ export function ChatCanvasPage() {
           return false;
         }
         if (goalMode && requestedGenerationMode === "text") {
+          if (!effectiveAgentMode && (goalFlow.stage !== "capture" || goalFlow.busy)) {
+            showComposerNotice("请先完成上方的目标审核。");
+            return false;
+          }
+          // A real session only persists goal mode after an explicit submission.
+          // Agent sends from /chat/new already carry the mode at draft promotion.
+          if (sessionId !== "new" && !persistedGoalMode) {
+            const params = new URLSearchParams(location.search);
+            params.set("mode", "goal");
+            navigate(`${location.pathname}?${params.toString()}`, { replace: true });
+          }
           if (effectiveAgentMode) {
             // 智能体目标模式走统一聊天流：Agent 通过工具从会话上下文中
             // 挖掘学习需求与方向，创建/确认 Goal，再生成待审核的图谱提案，
@@ -6925,10 +7274,6 @@ export function ChatCanvasPage() {
             clearSubmittedDraft();
             void sending.catch(() => undefined);
             return true;
-          }
-          if (goalFlow.stage !== "capture" || goalFlow.busy) {
-            showComposerNotice("请先完成上方的目标审核。");
-            return false;
           }
           if (fileIds.length) {
             toast.message(
@@ -6983,6 +7328,10 @@ export function ChatCanvasPage() {
       generationMode,
       goalFlow,
       goalMode,
+      persistedGoalMode,
+      location.pathname,
+      location.search,
+      isEmptySession,
       imageSize,
       longPaste,
       pendingFiles,
@@ -7072,6 +7421,24 @@ export function ChatCanvasPage() {
         setPendingSendQueue(current => current.some(entry => entry.id === item.id) ? current : [item, ...current]);
         return false;
       }
+      let claimedOnServer = false;
+      if (item.serverTurnId && sessionId && sessionId !== "new") {
+        try {
+          await claimQueuedTurn(sessionId, item.serverTurnId);
+          claimedOnServer = true;
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 409) {
+            // Another tab or background worker already claimed this turn.
+            void queryClient.invalidateQueries({
+              queryKey: workspaceQueryKey(workspaceId, "queued-turns", sessionId),
+            });
+            void queryClient.invalidateQueries({
+              queryKey: workspaceQueryKey(workspaceId, "messages", sessionId),
+            });
+            return true;
+          }
+        }
+      }
       try {
         const ok = await submitPrompt(
           { text: item.text, files: item.files },
@@ -7085,21 +7452,36 @@ export function ChatCanvasPage() {
           },
         );
         if (!ok) {
+          if (claimedOnServer && item.serverTurnId) {
+            void requeueQueuedTurn(sessionId, item.serverTurnId).catch(() => undefined);
+          }
           // Validation failed (e.g. sandbox not ready): put the item back at
           // the front and stop auto-dispatching so the user can decide.
           setPendingSendQueue((current) => [item, ...current]);
           autoDispatchBlockedRef.current = true;
         } else {
+          if (claimedOnServer && item.serverTurnId) {
+            void completeQueuedTurn(sessionId, item.serverTurnId)
+              .then(() =>
+                queryClient.invalidateQueries({
+                  queryKey: workspaceQueryKey(workspaceId, "queued-turns", sessionId),
+                }),
+              )
+              .catch(() => undefined);
+          }
           autoDispatchBlockedRef.current = false;
         }
         return ok;
       } catch {
+        if (claimedOnServer && item.serverTurnId) {
+          void requeueQueuedTurn(sessionId, item.serverTurnId).catch(() => undefined);
+        }
         setPendingSendQueue((current) => [item, ...current]);
         autoDispatchBlockedRef.current = true;
         return false;
       }
     },
-    [submitPrompt, workspaceId, sessionId, setPendingSendQueue, autoDispatchBlockedRef],
+    [submitPrompt, workspaceId, sessionId, setPendingSendQueue, autoDispatchBlockedRef, queryClient],
   );
 
   /** 打断当前回复并立即发送该队列条目。 */
@@ -7114,6 +7496,11 @@ export function ChatCanvasPage() {
         current.filter((entry) => entry.id !== item.id),
       );
       try {
+        if (item.serverTurnId && sessionId && sessionId !== "new") {
+          void promoteQueuedTurn(sessionId, item.serverTurnId, { cancelActive: false }).catch(
+            () => undefined,
+          );
+        }
         const streamSessionId = activeStreamSessionId.current;
         if (streamSessionId === sessionId || isSessionStreaming(sessionId)) {
           if (!(await stopCurrentGeneration())) {
@@ -7141,18 +7528,29 @@ export function ChatCanvasPage() {
 
   /** 取消发送：把队列条目丢弃。 */
   const handleCancelQueued = useCallback((id: string) => {
+    const target = pendingSendQueueRef.current.find((entry) => entry.id === id);
+    if (target?.serverTurnId && sessionId && sessionId !== "new") {
+      void cancelQueuedTurn(sessionId, target.serverTurnId)
+        .then(() =>
+          queryClient.invalidateQueries({
+            queryKey: workspaceQueryKey(workspaceId, "queued-turns", sessionId),
+          }),
+        )
+        .catch(() => undefined);
+    }
     setPendingSendQueue((current) =>
       current.filter((entry) => entry.id !== id),
     );
-  }, [ setPendingSendQueue]);
+  }, [queryClient, sessionId, setPendingSendQueue, workspaceId]);
 
   // Keep a ref in sync so async dispatch paths read the freshest queue.
   useEffect(() => {
     pendingSendQueueRef.current = pendingSendQueue;
   }, [pendingSendQueue]);
 
-  // 当前会话空闲时自动发送队列中的下一条消息。
+  // 当前会话空闲且在线时自动发送队列中的下一条消息。
   useEffect(() => {
+    if (!networkOnline) return;
     if (longGoalActive || dispatchInFlightRef.current) return;
     if (autoDispatchBlockedRef.current || stopState.phase !== "idle" || queueEditItem?.sessionId === sessionId) return;
     if (!pendingSendQueue.length) return;
@@ -7173,6 +7571,7 @@ export function ChatCanvasPage() {
       }
     })();
   }, [
+    networkOnline,
     closeSessionMutation.isPending,
     longGoalActive,
     dispatchQueuedSend,
@@ -7277,7 +7676,7 @@ export function ChatCanvasPage() {
       ]);
       // 确认 create 提案视作通过审核：拉取已发布的真实图谱并广播到右侧预览。
       if (
-        changeSet.status === "confirmed" &&
+        goalMode && changeSet.status === "confirmed" &&
         changeSet.mode === "create" &&
         changeSet.graph_id
       ) {
@@ -7286,6 +7685,7 @@ export function ChatCanvasPage() {
           window.dispatchEvent(
             new CustomEvent("learngraph:goal-graph-preview", {
               detail: {
+                scopeKey: conversationResetKey,
                 submittedPrompt: "",
                 title: publishedGraph.title,
                 answers: [],
@@ -8353,7 +8753,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   const handleComposerPointerDown = (event: ReactPointerEvent<HTMLTextAreaElement>) => {
     if (composerHasDraft || voiceBarActive || isListening || holdFinalizing || dictationFinalizing || voiceBlocksComposer || sessionIsClosed || goalFlow.busy) return;
     if (holdRef.current.timer != null) return;
-    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if (event.pointerType !== "mouse" || event.button !== 0) return;
     const hold = holdRef.current;
     hold.startY = event.clientY;
     try {
@@ -8771,36 +9171,28 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   const voiceDialBlocked = streamOrSubmitted || goalFlow.busy || longGoalActive || stopState.phase !== "idle";
   const composerShowsInterrupt =
     !voiceModeOpen && !composerHasDraft && streamOrSubmitted && !goalFlow.busy;
-  const goalStageLabel =
-    goalFlow.stage === "capture"
-      ? "描述目标"
-      : goalFlow.stage === "clarifying"
-        ? "关键澄清"
-        : goalFlow.stage === "goal_review" || goalFlow.stage === "graph_building"
-          ? "确认 Goal"
-          : goalFlow.stage === "graph_review"
-            ? "审核图谱"
-            : "已完成";
-
   const enterGoalMode = useCallback(() => {
     goalModeExitedManuallyRef.current = false;
-    setComposerText((current) =>
-      current.replace(/(^|\s)@[^\s@]*$/u, "$1").trimEnd(),
-    );
-    setDismissedMention("");
+    setDismissedMention(composerText);
     setGraphAction("none");
     setSearchRoute("disabled");
     setGenerationMode("text");
-    const params = new URLSearchParams(location.search);
-    params.set("mode", "goal");
-    navigate(`${location.pathname}?${params.toString()}`);
-    window.requestAnimationFrame(() => composerTextareaRef.current?.focus());
-  }, [location.pathname, location.search, navigate, setComposerText, setGenerationMode]);
+    setGoalInputScope(conversationResetKey);
+    window.requestAnimationFrame(() => composerTextareaRef.current?.focus({ preventScroll: true }));
+  }, [composerText, conversationResetKey, setGenerationMode]);
 
   const leaveGoalMode = useCallback(() => {
     // Manual exit is the only way to cancel a session's goal state: forget the
     // stored flag, the capture draft and any saved wizard progress.
     goalModeExitedManuallyRef.current = true;
+    setGoalInputScope(null);
+    window.dispatchEvent(new CustomEvent("learngraph:goal-graph-preview", {
+      detail: { scopeKey: conversationResetKey, phase: "draft", graphNodes: [], graphEdges: [] },
+    }));
+    if (!persistedGoalMode) {
+      goalFlow.clearProgress();
+      return;
+    }
     clearSessionGoalMode(workspaceId, sessionId);
     clearSessionGoalDraft(workspaceId, sessionId);
     goalFlow.clearProgress();
@@ -8811,10 +9203,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       replace: true,
     });
   }, [
+    conversationResetKey,
     goalFlow,
     location.pathname,
     location.search,
     navigate,
+    persistedGoalMode,
     sessionId,
     workspaceId,
   ]);
@@ -9080,6 +9474,25 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       !sessionIsClosed &&
       mentionEntries.length,
   );
+  useEscapeStopRun(
+    {
+      isRunning:
+        status === "streaming" ||
+        status === "submitted" ||
+        isSessionStreaming(sessionId),
+      hasPendingApproval: pendingApprovals.length > 0,
+      hasLocalOverlay:
+        showMentionMenu ||
+        composerEnlarged ||
+        Boolean(selectionMenu) ||
+        Boolean(queueEditItem),
+      isComposerElement: (el) =>
+        Boolean(el?.closest(".chat-composer-anchor")),
+    },
+    () => {
+      void stopCurrentGeneration();
+    },
+  );
   const mentionCandidateSignature = mentionEntries
     .map((item) =>
       item.kind === "command"
@@ -9284,7 +9697,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       }
       try {
         const file = dataUrlToFile(dataUrl, `photo-${Date.now()}.jpg`);
-        const record = await uploadFile(file);
+        const record = await uploadFile(file, { source: "chat_attachment" });
         setPendingFiles((current) =>
           current.some((item) => item.id === record.id)
             ? current
@@ -9330,33 +9743,116 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   );
 
   // Message rows are memoized while composer preferences change; read the
-  // latest saved settings when opening a retry menu rather than an old closure.
-  const retryDefaultsRef = useRef({ providerId: "", modelId: "", responseMode, thinkingMode: effectiveThinkingMode, webSearch: false });
+  // latest session fallback and model catalog when opening a retry menu.
+  const retryDefaultsRef = useRef<{
+    sessionFallback: GenerationConfig;
+    groups: typeof textModelGroups;
+    providers: typeof modelProviders;
+  }>({
+    sessionFallback: {
+      providerId: "",
+      modelId: "",
+      responseMode,
+      thinkingMode: effectiveThinkingMode,
+      webSearch: false,
+      allowedDomains: "",
+    },
+    groups: textModelGroups,
+    providers: modelProviders,
+  });
   retryDefaultsRef.current = {
-    providerId: activeModelProvider?.id ?? modelProviders[0]?.id ?? "",
-    modelId: selectedModelId,
-    responseMode,
-    thinkingMode: effectiveThinkingMode,
-    webSearch: searchRoute !== "disabled",
+    sessionFallback: {
+      providerId: activeModelProvider?.id ?? modelProviders[0]?.id ?? "",
+      modelId: selectedModelId,
+      responseMode,
+      thinkingMode: effectiveThinkingMode,
+      webSearch: searchRoute !== "disabled",
+      allowedDomains: "",
+    },
+    groups: textModelGroups,
+    providers: modelProviders,
   };
-  const submitRetry = () => {
-    if (stopState.phase !== "idle" || retry.isPending || !retryTarget || !retryProvider || !retrySelectedModel?.remote) return;
-    const useWebSearch = retryWebSearch && retryCanUseNetworkSearch;
-    const allowedDomains = [...new Set(retryAllowedDomains.split(/[\s,，]+/u).map((domain) => domain.trim()).filter(Boolean))];
+  const openRetryMenu = (message: Message, shown?: Message) => {
+    const activeShown = shown ?? message;
+    const {
+      sessionFallback,
+      groups,
+      providers: activeProviders,
+    } = retryDefaultsRef.current;
+    const recordedProvider = activeShown.provider_trace?.provider_id;
+    if (groups.some((group) => group.loading && (!recordedProvider || group.id === recordedProvider))) {
+      toast.message("正在载入模型，请稍后重试。");
+      return;
+    }
+    const resolved = resolveHistoricalGenerationConfig({
+      trace: activeShown.provider_trace,
+      groups,
+      providers: activeProviders,
+      sessionFallback,
+    });
+    setRetryHistoricalConfig(resolved.historicalConfig);
+    setRetryProviderId(resolved.draftInitialConfig.providerId);
+    setRetryModelId(resolved.draftInitialConfig.modelId);
+    setRetryResponseMode(resolved.draftInitialConfig.responseMode);
+    setRetryThinkingMode(resolved.draftInitialConfig.thinkingMode);
+    setRetryWebSearch(resolved.draftInitialConfig.webSearch);
+    setRetryAllowedDomains(resolved.draftInitialConfig.allowedDomains);
+    setRetryTarget({
+      messageId: message.id,
+      sourceSessionId: message.session_id,
+    });
+  };
+  const submitRetryWithConfig = (config: GenerationConfig) => {
+    if (stopState.phase !== "idle" || retry.isPending || !retryTarget) return;
+    const targetProvider = modelProviders.find(
+      (provider) => provider.id === config.providerId,
+    );
+    const targetProviderIndex = modelProviders.findIndex(
+      (provider) => provider.id === config.providerId,
+    );
+    const targetOptions =
+      targetProvider && targetProvider.id === retryProviderId
+        ? retryModelOptions
+        : providerModelOptions(
+            targetProvider,
+            targetProviderIndex >= 0
+              ? providerModelQueries[targetProviderIndex]?.data?.models
+              : undefined,
+          ).filter(isTextChatModel);
+    const targetModel = targetOptions.find((model) => model.id === config.modelId);
+    if (!targetProvider || !targetModel?.remote) return;
+    const targetSupportsAgent = modelSupportsAgent(targetProvider, targetModel);
+    const targetCanSearch = Boolean(
+      hasAuthorizedAgentSearchProvider ||
+        hasQwenCompanionSearchProvider ||
+        targetModel.capabilities?.hosted_web_search ||
+        targetProvider.capabilities.hosted_web_search,
+    );
+    const useWebSearch = config.webSearch && targetCanSearch;
+    const allowedDomains = [
+      ...new Set(
+        config.allowedDomains
+          .split(/[\s,，]+/u)
+          .map((domain) => domain.trim())
+          .filter(Boolean),
+      ),
+    ];
     const variables = {
       messageId: retryTarget.messageId,
       sourceSessionId: retryTarget.sourceSessionId,
       payload: {
-        provider_id: retryProvider.id,
-        model_id: retrySelectedModel.id,
+        provider_id: targetProvider.id,
+        model_id: targetModel.id,
         thinking_mode:
-          retryResponseMode === "fast" ? "off" : retryThinkingMode,
-        agent_mode: retryResponseMode === "agentic" && retrySupportsAgentMode,
+          config.responseMode === "fast" ? "off" : config.thinkingMode,
+        agent_mode: config.responseMode === "agentic" && targetSupportsAgent,
         search_route: useWebSearch
           ? resolveNetworkSearchRoute(
-              "auto",
-              Boolean(retrySelectedModel.capabilities?.hosted_web_search ??
-                retryProvider.capabilities.hosted_web_search),
+              config.searchRoute ?? "auto",
+              Boolean(
+                targetModel.capabilities?.hosted_web_search ??
+                  targetProvider.capabilities.hosted_web_search,
+              ),
               hasAuthorizedAgentSearchProvider,
             )
           : "disabled",
@@ -9369,7 +9865,22 @@ ${detail.text!.trim()}` : detail.text!.trim(),
       payload: MessageRetryRequest;
     };
     setRetryTarget(null);
+    setRetryHistoricalConfig(null);
     retry.mutate(variables);
+  };
+  const submitDirectRetry = () => {
+    if (!retryHistoricalConfig) return;
+    submitRetryWithConfig(retryHistoricalConfig);
+  };
+  const submitRetry = () => {
+    submitRetryWithConfig({
+      providerId: retryProviderId,
+      modelId: retryModelId,
+      responseMode: retryResponseMode,
+      thinkingMode: retryThinkingMode,
+      webSearch: retryWebSearch,
+      allowedDomains: retryAllowedDomains,
+    });
   };
 
   const submitImageRetry = () => {
@@ -9412,7 +9923,8 @@ ${detail.text!.trim()}` : detail.text!.trim(),
   );
   };
 
-  const showNewChatWelcome = isEmptySession && !roundTasks.length && !goalMode && !longGoal.data && !voiceModeOpen;
+  const goalSetupStarted = goalMode && Boolean(goalFlow.submittedPrompt || goalFlow.stage !== "capture");
+  const showNewChatWelcome = isEmptySession && !roundTasks.length && !longGoal.data && !voiceModeOpen && !goalSetupStarted;
 
   return (
     <div className={cn("chat-canvas-page relative flex h-full min-h-0 flex-col bg-background", showNewChatWelcome && "is-new-chat-welcome")} data-session-id={sessionId}>
@@ -9443,7 +9955,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           workspaceId={workspaceId}
         >
         <ConversationContent
-          className="chat-messages-content mx-auto w-full max-w-4xl gap-7 px-4 py-6 sm:px-7 sm:py-7"
+          className="chat-messages-content chat-outline-lane gap-7 px-0 py-6 sm:py-7"
           onMouseUp={() => {
             const selected = readTextSelection();
             if (!selected) {
@@ -9656,24 +10168,24 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                         if (persisted && message.session_id === sessionId)
                           branch.mutate(message.id);
                       }}
+                      checkpointFileCount={checkpointCountByTurn.get(message.id) ?? 0}
+                      onRewindCheckpoint={
+                        persisted && message.session_id === sessionId && (checkpointCountByTurn.get(message.id) ?? 0) > 0
+                          ? () => setRewindTurnId(message.id)
+                          : undefined
+                      }
                       onOpenSelectionExplanation={handleOpenSelectionExplanation}
                       selectionMarks={selectionExplanationMarks}
-                      onRetryClose={() => setRetryTarget(null)}
+                      onRetryClose={() => { setRetryTarget(null); setRetryHistoricalConfig(null); }}
                       retryMenuOpen={retryTarget?.messageId === message.id && retryTarget.sourceSessionId === message.session_id}
                       retryPending={retry.isPending && retry.variables?.messageId === message.id && retry.variables.sourceSessionId === message.session_id}
                       retryMenuContent={imageAnswer ? undefined : retryTarget?.messageId === message.id && retryTarget.sourceSessionId === message.session_id ? (shown) => (
                         <RetryMenuSettings
                           previousAnswerTrace={shown.provider_trace}
-                          groups={modelProviders.map((provider, index) => ({
-                            id: provider.id,
-                            label: provider.display_name,
-                            models: providerModelOptions(provider, providerModelQueries[index]?.data?.models).filter(isTextChatModel),
-                            loading: providerModelQueries[index]?.isPending,
-                            failed: providerModelQueries[index]?.isError,
-                          }))}
+                          groups={textModelGroups}
                           providerId={retryProviderId} modelId={retryModelId}
                           responseMode={retryResponseMode} thinkingMode={retryThinkingMode}
-                          thinkingModes={!retryThinkingModes.length ? [] : retrySelectedModel?.capabilities?.thinking_required ? retryThinkingModes.filter((mode) => mode !== "off") : [...new Set<ThinkingMode>(["off", ...retryThinkingModes])]}
+                          thinkingModes={retryThinkingModes}
                           supportsAgent={retrySupportsAgentMode}
                           thinkingRequired={retrySelectedModel?.capabilities?.thinking_required === true}
                           webSearch={retryWebSearch} canSearch={retryCanUseNetworkSearch}
@@ -9686,11 +10198,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                           }}
                           onThinkingChange={setRetryThinkingMode} onSearchChange={setRetryWebSearch}
                           allowedDomains={retryAllowedDomains} onDomainsChange={setRetryAllowedDomains}
+                          onDirectRetry={submitDirectRetry}
                           onRetry={submitRetry} onRefreshModels={() => void retryDiscoveredModels.refetch()}
-                          onConfigure={() => { setRetryTarget(null); navigate(`/w/${workspaceId}/settings/providers`); }}
+                          onConfigure={() => { setRetryTarget(null); setRetryHistoricalConfig(null); navigate(`/w/${workspaceId}/settings/providers`); }}
                         />
                       ) : null}
-                      onRetry={() => {
+                      onRetry={(shown) => {
                         if (!persisted) return;
                         if (imageAnswer) {
                           const prompt =
@@ -9719,17 +10232,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                           });
                           return;
                         }
-                        const defaults = retryDefaultsRef.current;
-                        setRetryProviderId(defaults.providerId);
-                        setRetryModelId(defaults.modelId);
-                        setRetryResponseMode(defaults.responseMode);
-                        setRetryThinkingMode(defaults.thinkingMode);
-                        setRetryWebSearch(defaults.webSearch);
-                        setRetryAllowedDomains("");
-                        setRetryTarget({
-                          messageId: message.id,
-                          sourceSessionId: message.session_id,
-                        });
+                        openRetryMenu(message, shown);
                       }}
                       retryDisabled={
                         !persisted ||
@@ -9755,6 +10258,32 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                                     ? "重试绘图（可切换绘图模型）"
                                     : undefined
                       }
+                      onOpenProviderSettings={() =>
+                        navigate(`/w/${workspaceId}/settings/providers`)
+                      }
+                      onCompactAndRetry={
+                        persisted && message.session_id === sessionId
+                          ? () => {
+                              void (async () => {
+                                try {
+                                  await compactSessionContext(sessionId, {
+                                    provider_id: activeModelProvider?.id,
+                                    model_id: selectedModel?.id,
+                                    agent_mode: effectiveAgentMode,
+                                  });
+                                  toast.success("已压缩上下文，请确认重试配置或直接重试");
+                                  openRetryMenu(message);
+                                } catch (compactError) {
+                                  toast.error(
+                                    compactError instanceof Error
+                                      ? compactError.message
+                                      : "上下文压缩失败",
+                                  );
+                                }
+                              })();
+                            }
+                          : undefined
+                      }
                       sessionId={message.session_id}
                       workspaceId={workspaceId}
                     />
@@ -9766,7 +10295,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                   );
                 })()}
               {streamConnectionNotice ? (
-                <StreamConnectionFeedback notice={streamConnectionNotice} />
+                <StreamConnectionFeedback
+                  notice={streamConnectionNotice}
+                  onOpenProviderSettings={() =>
+                    navigate(`/w/${workspaceId}/settings/providers`)
+                  }
+                />
               ) : null}
               {goalMode && !effectiveAgentMode ? (
                 <GoalSetupConversation
@@ -9898,7 +10432,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         className={cn("chat-composer-dock", composerEnlarged && "is-enlarged")}
       >
         {!showNewChatWelcome && !composerEnlarged ? <div className="chat-scroll-button-slot" ref={setScrollButtonHost} /> : null}
-        {showNewChatWelcome ? <h2 className="new-chat-heading">从一个问题开始</h2> : null}
+        {showNewChatWelcome ? <h2 className="new-chat-heading">{goalMode ? "你想学会什么？" : "从一个问题开始"}</h2> : null}
         {effectiveAgentMode ? (
           <SandboxReadinessNotice workspaceId={workspaceId} />
         ) : null}
@@ -9975,25 +10509,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
         ) : null}
         {longGoal.data ? (
           <ChatGoalPanel key={longGoal.data.id} workspaceId={workspaceId} sessionId={sessionId} goal={longGoal.data} readOnly={sessionIsClosed} />
-        ) : null}
-        {goalMode ? (
-          <div className="chat-goal-mode" role="status">
-            <Target className="size-3.5" />
-            <span>
-              <strong>目标设定</strong>
-              {goalStageLabel}
-            </span>
-            <Button
-              aria-label="退出目标设定模式"
-              disabled={goalFlow.busy}
-              onClick={leaveGoalMode}
-              size="icon-xs"
-              title="退出目标设定"
-              variant="ghost"
-            >
-              <X className="size-3" />
-            </Button>
-          </div>
         ) : null}
         {!goalMode && generationMode === "image" ? (
           <div className="chat-image-controls" role="group" aria-label="绘图设置">
@@ -10295,15 +10810,13 @@ ${detail.text!.trim()}` : detail.text!.trim(),
             !canUseNetworkSearch
           }
         />
-        <SandboxAuthDialog
-          onClose={() => setSandboxAuthRequest(null)}
-          onGranted={() => {
-            void queryClient.invalidateQueries({ queryKey: workspaceQueryKey(workspaceId, "messages", sessionId) });
-          }}
-          request={sandboxAuthRequest}
-        />
-
         <div className={cn("chat-composer-anchor", (voiceBarActive || isListening || dictationFinalizing === "transcribing") && "is-dictating")}>
+        {pendingApprovals.length > 0 ? (
+          <ToolApprovalBar
+            items={pendingApprovals}
+            onResolved={handleApprovalResolved}
+          />
+        ) : null}
         {voiceBarActive || isListening || dictationFinalizing === "transcribing" ? <DictationBar
           holdToTalk={voiceBarActive}
           level={voiceLevel}
@@ -10612,7 +11125,9 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                 }
               }}
               placeholder={
-                goalMode
+                showNewChatWelcome && goalMode
+                  ? "描述你想达成的学习目标..."
+                  : goalMode
                   ? searchRoute !== "disabled"
                     ? "搜索待确认的信息…"
                     : goalComposerLocked
@@ -10631,7 +11146,6 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               onPointerDown={handleComposerPointerDown}
               onPointerMove={handleComposerPointerMove}
               onPointerUp={handleComposerPointerUp}
-              style={{ touchAction: composerHasDraft ? undefined : "none" }}
               role="combobox"
               value={composerText}
             />
@@ -10652,7 +11166,7 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                      ? "极速"
                      : thinkingLabels[thinkingMode];
                const modelTriggerOpenLabel =
-                 generationMode === "image" ? "绘图模型" : "思考强度";
+                 generationMode === "image" ? "绘图模型" : "生成配置";
                // Phone top bar is tight: show only the two-character mode word
                // (极速/思考/智能, or 绘图 for image mode) instead of the full
                // label + arrow.
@@ -10664,219 +11178,141 @@ ${detail.text!.trim()}` : detail.text!.trim(),
                      : effectiveAgentMode
                        ? "智能"
                        : thinkingLabels[thinkingMode] || "思考";
-               const thinkingStops = supportedThinkingStops(thinkingModes, thinkingRequired);
-               const thinkingSliderValue = thinkingStopIndex(responseMode, thinkingMode, thinkingStops);
-               const handleThinkingSliderChange = (index: number) => {
-                 const stop = thinkingStops[index];
-                 if (!stop) return;
+               const handleComposerModeChange = (mode: ResponseMode) => {
                  setGenerationMode("text");
-                 if (stop.responseMode === "fast") {
-                   setResponseMode("fast");
+                 setResponseMode(mode);
+                 if (mode === "fast") {
                    setThinkingMode("off");
                  } else {
-                   setResponseMode("agentic");
-                   setThinkingMode(stop.thinking as ThinkingMode);
+                   setThinkingMode((current) =>
+                     current !== "off" && thinkingModes.includes(current)
+                       ? current
+                       : thinkingModes.includes("medium")
+                         ? "medium"
+                         : thinkingModes[0] ?? "off",
+                   );
                    if (hasAuthorizedAgentSearchProvider) {
                      setSearchRoute((current) => (current === "disabled" ? "auto" : current));
                    }
                  }
                };
-               const modelChoices = (
-                 <>
-                   <div className="relative px-1 pb-1">
-                     <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                     <Input
-                       aria-label="搜索模型"
-                       className="h-8 pl-8 font-mono text-xs"
-                       onChange={(event) => setModelSearch(event.target.value)}
-                       onKeyDown={(event) => event.stopPropagation()}
-                       onPointerDown={(event) => event.stopPropagation()}
-                       placeholder="搜索模型名称或 Provider…"
-                       value={modelSearch}
-                     />
-                   </div>
-                   {filteredAvailableModelChoices.length ? (
-                     <DropdownMenuRadioGroup
-                       onValueChange={(value) => {
-                         const choice = parseModelChoiceValue(value);
-                         if (!choice) return;
-                         setSelectedProviderId(choice.providerId);
-                         setSelectedModelId(choice.modelId);
-                       }}
-                       value={
-                         activeModelProvider && selectedModelId
-                           ? modelChoiceValue(
-                               activeModelProvider.id,
-                               selectedModelId,
-                             )
-                           : ""
-                       }
-                     >
-                       {filteredAvailableModelChoices.map(({ provider, model }) => (
-                         <DropdownMenuRadioItem
-                           key={`${provider.id}:${model.id}`}
-                           value={modelChoiceValue(provider.id, model.id)}
-                         >
-                           <span className="flex min-w-0 flex-col">
-                             <span className="truncate font-mono">{model.id}</span>
-                             <span className="text-xs text-muted-foreground">
-                               {provider.display_name} ·{" "}
-                               {modelProtocolLabel(provider.provider_type)}
-                             </span>
-                           </span>
-                           {model.capabilities?.supports_image_input
-                             ? " · 图片"
-                             : ""}
-                         </DropdownMenuRadioItem>
-                       ))}
-                     </DropdownMenuRadioGroup>
-                   ) : (
-                     <DropdownMenuItem disabled>
-                       {discoveredModels?.isPending ? "正在载入模型…" : "暂无可用模型"}
-                     </DropdownMenuItem>
-                   )}
-                 </>
+               const modelTriggerButton = isPhoneLayout ? (
+                 <Button
+                   aria-label={modelTriggerAriaLabel}
+                   className="topbar-model-trigger"
+                   disabled={modelTriggerDisabled}
+                   size="xs"
+                   type="button"
+                   variant="outline"
+                 >
+                   <span>{phoneModelTriggerLabel}</span>
+                 </Button>
+               ) : (
+                 <PromptInputButton
+                   aria-label={modelTriggerAriaLabel}
+                   className="chat-composer__mode"
+                   disabled={modelTriggerDisabled}
+                   tooltip={
+                     generationMode === "image"
+                       ? "绘图模型"
+                       : {
+                           content: "生成配置",
+                           shortcut: "Ctrl + Shift + M",
+                           side: "top",
+                         }
+                   }
+                 >
+                   <span>
+                     {modelMenuOpen ? modelTriggerOpenLabel : modelTriggerChipLabel}
+                   </span>
+                   <ChevronDown aria-hidden="true" className="size-4" />
+                 </PromptInputButton>
                );
-               const modelMenu = (
-             <DropdownMenu
-               open={modelMenuOpen}
-               onOpenChange={(open) => {
-                 setModelMenuOpen(open);
-                 if (!open) setModelSearch("");
-               }}
-             >
-              <DropdownMenuTrigger asChild>
-                {isPhoneLayout ? (
-                  <Button
-                    aria-label={modelTriggerAriaLabel}
-                    className="topbar-model-trigger"
-                    disabled={modelTriggerDisabled}
-                    size="xs"
-                    type="button"
-                    variant="outline"
-                  >
-                    <span>{phoneModelTriggerLabel}</span>
-                  </Button>
-                ) : (
-                  <PromptInputButton
-                    aria-label={modelTriggerAriaLabel}
-                    className="chat-composer__mode"
-                    disabled={modelTriggerDisabled}
-                    tooltip={
-                      generationMode === "image"
-                        ? "绘图模型"
-                        : {
-                            content: "响应模式与模型",
-                            shortcut: "Ctrl + Shift + M",
-                            side: "top",
-                          }
-                    }
-                  >
-                    <span>
-                      {modelMenuOpen ? modelTriggerOpenLabel : modelTriggerChipLabel}
-                    </span>
-                    <ChevronDown aria-hidden="true" className="size-4" />
-                  </PromptInputButton>
-                )}
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="end"
-                className="chat-model-menu w-60"
-                collisionPadding={12}
-                side={isPhoneLayout ? "bottom" : "top"}
-              >
-                {generationMode === "image" ? (
-                  <>
-                    <DropdownMenuLabel>绘图模型</DropdownMenuLabel>
-                    <div className="relative px-1 pb-1">
-                      <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                      <Input
-                        aria-label="搜索绘图模型"
-                        className="h-8 pl-8 font-mono text-xs"
-                        onChange={(event) => setModelSearch(event.target.value)}
-                        onKeyDown={(event) => event.stopPropagation()}
-                        onPointerDown={(event) => event.stopPropagation()}
-                        placeholder="搜索绘图模型或 Provider…"
-                        value={modelSearch}
-                      />
-                    </div>
-                    {filteredAvailableImageModelChoices.length ? (
-                      <DropdownMenuRadioGroup
-                        onValueChange={(value) => {
-                          const choice = parseModelChoiceValue(value);
-                          if (!choice) return;
-                          setSelectedImageProviderId(choice.providerId);
-                          setSelectedImageModelId(choice.modelId);
-                        }}
-                        value={
-                          activeImageProvider && selectedImageModel
-                            ? modelChoiceValue(
-                                activeImageProvider.id,
-                                selectedImageModel.id,
-                              )
-                            : ""
-                        }
-                      >
-                        {filteredAvailableImageModelChoices.map(
-                          ({ provider, model }) => (
-                            <DropdownMenuRadioItem
-                              key={`${provider.id}:${model.id}`}
-                              value={modelChoiceValue(provider.id, model.id)}
-                            >
-                              <span className="flex min-w-0 flex-col">
-                                <span className="truncate font-mono">{model.id}</span>
-                                <span className="text-xs text-muted-foreground">
-                                  {provider.display_name} · 绘图
-                                </span>
-                              </span>
-                            </DropdownMenuRadioItem>
-                          ),
-                        )}
-                      </DropdownMenuRadioGroup>
-                    ) : (
-                      <DropdownMenuItem disabled>
-                        {discoveredImageModels?.isPending
-                          ? "正在载入绘图模型…"
-                          : "暂无已配置的绘图模型"}
-                      </DropdownMenuItem>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <DropdownMenuLabel>响应与思考力度</DropdownMenuLabel>
-                    <div className="px-2 py-1">
-                      <ThinkingSlider
-                        stops={thinkingStops}
-                        value={thinkingSliderValue}
-                        onChange={handleThinkingSliderChange}
-                      />
-                    </div>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuLabel>模型</DropdownMenuLabel>
-                    {isPhoneLayout ? (
-                      modelChoices
-                    ) : (
-                      <DropdownMenuSub>
-                        <DropdownMenuSubTrigger>选择模型</DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent className="max-h-[min(60vh,32rem)] overflow-y-auto">
-                          {modelChoices}
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
-                    )}
-                    {voiceModeOpen ? (
-                      <>
-                        <DropdownMenuSeparator />
-                        <VoiceLowLatencyToggle
-                          enabled={Boolean(voiceSnapshotForGating.lowLatencyMode)}
-                          pending={voiceSnapshotForGating.lowLatencySaving}
-                          onCheckedChange={(enabled) => void voiceSessionController.setLowLatencyMode(enabled)}
-                        />
-                      </>
-                    ) : null}
-                  </>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+               const modelMenu = generationMode === "image" ? (
+                 <DropdownMenu
+                   open={modelMenuOpen}
+                   onOpenChange={(open) => {
+                     setModelMenuOpen(open);
+                     if (!open) setModelSearch("");
+                   }}
+                 >
+                   <DropdownMenuTrigger asChild>
+                     {modelTriggerButton}
+                   </DropdownMenuTrigger>
+                   <FloatingMenuContent
+                     align="end"
+                     className="chat-model-menu flex max-h-[min(68dvh,480px)] w-72 flex-col overflow-hidden"
+                     side={isPhoneLayout ? "bottom" : "top"}
+                   >
+                     <DropdownMenuLabel className="px-2.5 pb-1.5 pt-2 text-[13px] font-semibold text-foreground">
+                       绘图模型
+                     </DropdownMenuLabel>
+                     <ModelSelector
+                       groups={imageModelGroups}
+                       providerId={activeImageProvider?.id ?? ""}
+                       modelId={selectedImageModel?.id ?? ""}
+                       onSelect={(providerId, modelId) => {
+                         setSelectedImageProviderId(providerId);
+                         setSelectedImageModelId(modelId);
+                       }}
+                       onManageModels={() => {
+                         setModelMenuOpen(false);
+                         navigate(`/w/${workspaceId}/settings/providers`);
+                       }}
+                       searchLabel="搜索绘图模型"
+                       searchPlaceholder="搜索绘图模型"
+                       emptyText="暂无已配置的绘图模型"
+                       search={modelSearch}
+                       onSearchChange={setModelSearch}
+                     />
+                   </FloatingMenuContent>
+                 </DropdownMenu>
+               ) : (
+                 <GenerationConfigMenu
+                   open={modelMenuOpen}
+                   onOpenChange={setModelMenuOpen}
+                   trigger={modelTriggerButton}
+                   align="end"
+                   side={isPhoneLayout ? "bottom" : "top"}
+                   layout={isPhoneLayout ? "inline" : "submenu"}
+                   contentClassName="chat-model-menu"
+                   groups={textModelGroups}
+                   providerId={activeModelProvider?.id ?? ""}
+                   modelId={selectedModelId}
+                   responseMode={responseMode}
+                   thinkingMode={effectiveThinkingMode}
+                   thinkingModes={thinkingModes}
+                   supportsAgent={supportsAgentMode}
+                   thinkingRequired={thinkingRequired}
+                   modelError={Boolean(discoveredModels?.isError)}
+                   onModelChange={(providerId, modelId) => {
+                     setSelectedProviderId(providerId);
+                     setSelectedModelId(modelId);
+                   }}
+                   onModeChange={handleComposerModeChange}
+                   onThinkingChange={(mode) => {
+                     setGenerationMode("text");
+                     setThinkingMode(mode);
+                   }}
+                   onManageModels={() => {
+                     setModelMenuOpen(false);
+                     navigate(`/w/${workspaceId}/settings/providers`);
+                   }}
+                   onRefreshModels={() => void discoveredModels?.refetch()}
+                   modelSearch={modelSearch}
+                   onModelSearchChange={setModelSearch}
+                   extraContent={
+                     voiceModeOpen ? (
+                       <VoiceLowLatencyToggle
+                         enabled={Boolean(voiceSnapshotForGating.lowLatencyMode)}
+                         pending={voiceSnapshotForGating.lowLatencySaving}
+                         onCheckedChange={(enabled) =>
+                           void voiceSessionController.setLowLatencyMode(enabled)
+                         }
+                       />
+                     ) : undefined
+                   }
+                 />
                );
                // Portal keeps composer state/context while the trigger lives
                // in the top bar on phone widths.
@@ -11007,7 +11443,12 @@ ${detail.text!.trim()}` : detail.text!.trim(),
               (suggestedPromptsModel.provider_id && suggestedPromptsModel.model_id) || remoteSuggestionProviderAvailable
             )}
             disabled={(sessionId !== "new" && history.isPending) || status !== "ready" || sessionIsClosed}
-            onSelect={(content) => void send(content)}
+            hidden={!goalMode && composerHasText}
+            mode={goalMode ? "goal" : "question"}
+            onSelect={goalMode ? (content) => {
+              setComposerText(content);
+              focusComposer();
+            } : (content) => void send(content)}
           />
         ) : null}
       </div>
@@ -11018,10 +11459,26 @@ ${detail.text!.trim()}` : detail.text!.trim(),
           {queueEditItem ? <p className="text-xs text-muted-foreground">{queueEditItem.files.length + queueEditItem.pendingFiles.length} 个附件，{queueEditItem.stickers.length} 张表情</p> : null}
           <DialogFooter>
             <Button variant="outline" onClick={() => { setQueueEditItem(null); autoDispatchBlockedRef.current = false; }}>取消</Button>
-            <Button onClick={() => { const item = queueEditItem; if (!item || item.sessionId !== sessionId) return; setPendingSendQueue(current => current.map(entry => entry.id === item.id ? { ...entry, text: queueEditText } : entry)); setQueueEditItem(null); autoDispatchBlockedRef.current = false; }}>保存</Button>
+            <Button onClick={() => { const item = queueEditItem; if (!item || item.sessionId !== sessionId) return; setPendingSendQueue(current => current.map(entry => entry.id === item.id ? { ...entry, text: queueEditText } : entry)); if (item.serverTurnId && sessionId !== "new") { void updateQueuedTurn(sessionId, item.serverTurnId, { content: queueEditText }).catch(() => undefined); } setQueueEditItem(null); autoDispatchBlockedRef.current = false; }}>保存</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <CheckpointRewindDialog
+        open={Boolean(rewindTurnId && sessionId && sessionId !== "new")}
+        sessionId={sessionId}
+        turnId={rewindTurnId}
+        onOpenChange={(open) => {
+          if (!open) setRewindTurnId(null);
+        }}
+        onRewound={() => {
+          void queryClient.invalidateQueries({
+            queryKey: workspaceQueryKey(workspaceId, "session-checkpoints", sessionId),
+          });
+          void queryClient.invalidateQueries({
+            queryKey: workspaceQueryKey(workspaceId, "session-files", sessionId),
+          });
+        }}
+      />
       <Dialog
         onOpenChange={(open) => {
           if (!open) setImageRetryTarget(null);

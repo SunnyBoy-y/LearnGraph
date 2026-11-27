@@ -96,7 +96,21 @@ function ImageParticleField({ active }: { active: boolean }) {
       return t * t * (3 - 2 * t);
     };
 
+    let inViewport = true;
+    const shouldAnimate = () => !disposed && !reducedMotion && inViewport && !document.hidden;
+    const scheduleNext = () => {
+      if (!shouldAnimate() || raf) return;
+      raf = window.requestAnimationFrame(draw);
+    };
+    const pauseLoop = () => {
+      if (raf) {
+        window.cancelAnimationFrame(raf);
+        raf = 0;
+      }
+    };
+
     const draw = (timeMs: number) => {
+      raf = 0;
       if (disposed) return;
       const t = timeMs * 0.001;
       context.clearRect(0, 0, width, height);
@@ -212,7 +226,7 @@ function ImageParticleField({ active }: { active: boolean }) {
         }
       }
 
-      if (!reducedMotion) {
+      if (shouldAnimate()) {
         raf = window.requestAnimationFrame(draw);
       }
     };
@@ -224,16 +238,34 @@ function ImageParticleField({ active }: { active: boolean }) {
     });
     if (canvas.parentElement) observer.observe(canvas.parentElement);
 
+    const visibilityObserver =
+      typeof IntersectionObserver !== "undefined"
+        ? new IntersectionObserver(([entry]) => {
+            inViewport = entry ? entry.isIntersecting : true;
+            if (inViewport) scheduleNext();
+            else pauseLoop();
+          })
+        : null;
+    visibilityObserver?.observe(canvas);
+
+    const onVisibilityChange = () => {
+      if (document.hidden) pauseLoop();
+      else scheduleNext();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
     if (reducedMotion) {
       draw(0);
     } else {
-      raf = window.requestAnimationFrame(draw);
+      scheduleNext();
     }
 
     return () => {
       disposed = true;
       observer.disconnect();
-      if (raf) window.cancelAnimationFrame(raf);
+      visibilityObserver?.disconnect();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      pauseLoop();
     };
   }, [active, reducedMotion]);
 
@@ -464,12 +496,14 @@ export function ChatStreamPartRenderer({
   interactive = true,
   onAction,
   part,
+  settled,
   siblingParts,
   streaming = false,
 }: {
   interactive?: boolean;
   onAction?: (action: TrustedComponentAction) => void | Promise<void>;
   part: MessagePart;
+  settled?: boolean;
   siblingParts?: MessagePart[];
   streaming?: boolean;
 }) {
@@ -489,6 +523,7 @@ export function ChatStreamPartRenderer({
       interactive={interactive}
       onAction={onAction}
       part={part}
+      settled={settled}
       siblingParts={siblingParts}
       streaming={streaming}
     />

@@ -390,7 +390,7 @@ export const MessageResponse = memo(
               role="presentation"
             >
               <button
-                className="absolute top-4 right-4 rounded-md p-1 text-muted-foreground transition-all hover:bg-muted hover:text-foreground"
+                className="absolute top-4 right-4 rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 onClick={onClose}
                 title="关闭"
                 type="button"
@@ -415,7 +415,7 @@ export const MessageResponse = memo(
               </div>
               <div className="flex gap-2">
                 <button
-                  className="flex flex-1 items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 font-medium text-sm transition-all hover:bg-muted"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 font-medium text-sm transition-colors hover:bg-muted"
                   onClick={() => {
                     void navigator.clipboard?.writeText(url);
                   }}
@@ -424,7 +424,7 @@ export const MessageResponse = memo(
                   复制链接
                 </button>
                 <button
-                  className="flex flex-1 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 font-medium text-primary-foreground text-sm transition-all hover:bg-primary/90"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 font-medium text-primary-foreground text-sm transition-colors hover:bg-primary/90"
                   onClick={() => {
                     onConfirm();
                     onClose();

@@ -116,6 +116,28 @@ export function cacheCreatedSession(client: QueryClient, workspaceId: string, se
   }
 }
 
+export function removeSessionsFromCaches(client: QueryClient, workspaceId: string, sessionIds: Iterable<string>) {
+  const removed = new Set(sessionIds)
+  if (!removed.size) return
+  for (const id of removed) {
+    client.removeQueries({ queryKey: sessionDetailKey(workspaceId, id), exact: true })
+  }
+  client.setQueryData<Session[]>(workspaceQueryKey(workspaceId, 'sessions'), previous =>
+    previous?.filter(item => !removed.has(item.id)))
+  client.setQueryData<SessionSummary[]>(workspaceQueryKey(workspaceId, 'sessions', 'recent-created'), previous =>
+    previous?.filter(item => !removed.has(item.id)))
+  client.setQueriesData<InfiniteData<SessionPage>>({ queryKey: workspaceQueryKey(workspaceId, 'sessions') }, previous => {
+    if (!previous?.pages) return previous
+    let changed = false
+    const pages = previous.pages.map(page => {
+      if (!page.items.some(item => removed.has(item.id))) return page
+      changed = true
+      return { ...page, items: page.items.filter(item => !removed.has(item.id)) }
+    })
+    return changed ? { ...previous, pages } : previous
+  })
+}
+
 export function summaryOf(session: Session, hasChildren = false): SessionSummary {
   const { model_snapshot: _model, context_capsule: _capsule, current_node_id: _node, ...summary } = session
   void _model; void _capsule; void _node

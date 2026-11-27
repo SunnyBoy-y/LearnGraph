@@ -1,28 +1,9 @@
 "use client";
 
 import { cn } from "@/lib/utils";
-import type { MotionProps } from "motion/react";
-import { motion } from "motion/react";
-import type { CSSProperties, ElementType, JSX } from "react";
+import type { CSSProperties, ElementType } from "react";
 import { createElement, memo, useMemo } from "react";
 import { useReducedMotionPreference } from "@/lib/motion-preferences";
-
-type MotionHTMLProps = MotionProps & Record<string, unknown>;
-
-// Cache motion components at module level to avoid creating during render
-const motionComponentCache = new Map<
-  keyof JSX.IntrinsicElements,
-  React.ComponentType<MotionHTMLProps>
->();
-
-const getMotionComponent = (element: keyof JSX.IntrinsicElements) => {
-  let component = motionComponentCache.get(element);
-  if (!component) {
-    component = motion.create(element);
-    motionComponentCache.set(element, component);
-  }
-  return component;
-};
 
 export interface TextShimmerProps {
   children: string;
@@ -40,41 +21,36 @@ const ShimmerComponent = ({
   spread = 2,
 }: TextShimmerProps) => {
   const reducedMotion = useReducedMotionPreference();
-  const MotionComponent = getMotionComponent(
-    Component as keyof JSX.IntrinsicElements
-  );
 
   const dynamicSpread = useMemo(
     () => (children?.length ?? 0) * spread,
     [children, spread]
   );
 
-  if (reducedMotion) return createElement(Component, { className: cn("relative inline-block text-muted-foreground", className) }, children);
+  if (reducedMotion) {
+    return createElement(
+      Component,
+      { className: cn("relative inline-block text-muted-foreground", className) },
+      children
+    );
+  }
 
-  return (
-    <MotionComponent
-      animate={{ backgroundPosition: "0% center" }}
-      className={cn(
-        "relative inline-block bg-[length:250%_100%,auto] bg-clip-text text-transparent",
+  return createElement(
+    Component,
+    {
+      className: cn(
+        "lg-shimmer-text relative inline-block bg-[length:250%_100%,auto] bg-clip-text text-transparent",
         "[--bg:linear-gradient(90deg,#0000_calc(50%-var(--spread)),var(--color-background),#0000_calc(50%+var(--spread)))] [background-repeat:no-repeat,padding-box]",
         className
-      )}
-      initial={{ backgroundPosition: "100% center" }}
-      style={
-        {
-          "--spread": `${dynamicSpread}px`,
-          backgroundImage:
-            "var(--bg), linear-gradient(var(--color-muted-foreground), var(--color-muted-foreground))",
-        } as CSSProperties
-      }
-      transition={{
-        duration,
-        ease: "linear",
-        repeat: Number.POSITIVE_INFINITY,
-      }}
-    >
-      {children}
-    </MotionComponent>
+      ),
+      style: {
+        "--spread": `${dynamicSpread}px`,
+        "--shimmer-duration": `${duration}s`,
+        backgroundImage:
+          "var(--bg), linear-gradient(var(--color-muted-foreground), var(--color-muted-foreground))",
+      } as CSSProperties,
+    },
+    children
   );
 };
 

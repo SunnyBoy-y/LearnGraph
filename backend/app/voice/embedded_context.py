@@ -69,8 +69,11 @@ class VoiceContextAdapter:
                     "role": "system",
                     "content": (
                         "The following is the persisted LearnGraph context for this "
-                        "voice conversation. Follow it unless the live conversation "
-                        f"supersedes it.\n\n{prompt_block}"
+                        "voice conversation (authorized materials, tool policy, and "
+                        "voice-compatible tone preferences). Use it as background "
+                        "context without overriding the voice Tutor's spoken-delivery, "
+                        "plain-speech, brevity, or delegation rules, and let the live "
+                        f"conversation supersede it when they conflict.\n\n{prompt_block}"
                     ),
                 }
             )

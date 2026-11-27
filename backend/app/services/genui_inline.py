@@ -24,6 +24,13 @@ def canonical_inline_document(raw: dict) -> dict:
         # Some models copy catalog metadata rather than the flat-tree spelling.
         if node.get("type") == "document" and node.get("node_type") in RAILS:
             node["type"] = node.pop("node_type")
+        if node.get("type") == "svg" and "svg_markup" in node:
+            markup = node.pop("svg_markup")
+            if not isinstance(markup, str):
+                raise ValueError("Invalid svg_markup")
+            if node.get("svg") and node["svg"] != markup:
+                raise ValueError("Conflicting svg and svg_markup")
+            node["svg"] = markup
         if node.get("type") in VISUALS:
             visual = node.get("visual")
             if visual is None:
