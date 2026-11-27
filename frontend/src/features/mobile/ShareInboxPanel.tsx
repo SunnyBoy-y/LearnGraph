@@ -77,22 +77,34 @@ export function ShareInboxPanel() {
   const [goals, setGoals] = useState<Array<{ id: string; title: string }>>([])
   // 可拖动浮窗：位置（px）持久化到 localStorage
   const [pos, setPos] = useState<{ x: number; y: number }>(() => loadPos() ?? defaultPos())
+  const posRef = useRef(pos)
+  posRef.current = pos
+  const buttonWrapRef = useRef<HTMLDivElement | null>(null)
+  const dragFrameRef = useRef(0)
+  const suppressClickRef = useRef(false)
   const dragRef = useRef<{
     pointerId: number
     originX: number
     originY: number
     startX: number
     startY: number
+    moved: boolean
   } | null>(null)
+
+  useEffect(() => () => {
+    if (dragFrameRef.current) window.cancelAnimationFrame(dragFrameRef.current)
+  }, [])
 
   const handleDragStart = useCallback(
     (event: ReactPointerEvent<HTMLButtonElement>) => {
+      suppressClickRef.current = false
       dragRef.current = {
         pointerId: event.pointerId,
-        originX: pos.x,
-        originY: pos.y,
+        originX: posRef.current.x,
+        originY: posRef.current.y,
         startX: event.clientX,
         startY: event.clientY,
+        moved: false,
       }
       try {
         event.currentTarget.setPointerCapture(event.pointerId)
@@ -100,34 +112,51 @@ export function ShareInboxPanel() {
         /* ignore */
       }
     },
-    [pos],
+    [],
   )
 
   const handleDragMove = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     const drag = dragRef.current
     if (!drag || drag.pointerId !== event.pointerId) return
-    const nextX = drag.originX + (event.clientX - drag.startX)
-    const nextY = drag.originY + (event.clientY - drag.startY)
-    setPos({
-      x: Math.min(Math.max(0, nextX), Math.max(0, window.innerWidth - 64)),
-      y: Math.min(Math.max(0, nextY), Math.max(0, window.innerHeight - 64)),
-    })
+    const dx = event.clientX - drag.startX
+    const dy = event.clientY - drag.startY
+    if (!drag.moved && Math.hypot(dx, dy) > 4) {
+      drag.moved = true
+      suppressClickRef.current = true
+    }
+    const nextX = Math.min(Math.max(0, drag.originX + dx), Math.max(0, window.innerWidth - 64))
+    const nextY = Math.min(Math.max(0, drag.originY + dy), Math.max(0, window.innerHeight - 64))
+    posRef.current = { x: nextX, y: nextY }
+    if (!dragFrameRef.current) {
+      dragFrameRef.current = window.requestAnimationFrame(() => {
+        dragFrameRef.current = 0
+        if (buttonWrapRef.current) {
+          buttonWrapRef.current.style.transform = `translate3d(${posRef.current.x}px, ${posRef.current.y}px, 0)`
+        }
+      })
+    }
   }, [])
 
   const handleDragEnd = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (!dragRef.current) return
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== event.pointerId) return
     dragRef.current = null
+    if (dragFrameRef.current) {
+      window.cancelAnimationFrame(dragFrameRef.current)
+      dragFrameRef.current = 0
+    }
     try {
       event.currentTarget.releasePointerCapture(event.pointerId)
     } catch {
       /* ignore */
     }
+    const next = posRef.current
+    setPos(next)
     window.localStorage.setItem(
       POS_KEY,
-      JSON.stringify({ x: pos.x, y: pos.y }),
+      JSON.stringify({ x: next.x, y: next.y }),
     )
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pos])
+  }, [])
 
   const refresh = useCallback(() => {
     void getInboxItems().then(setItems)
@@ -360,11 +389,21 @@ export function ShareInboxPanel() {
           </div>
         </div>
       )}
-      <div className="fixed z-50" style={{ left: pos.x, top: pos.y }}>
+      <div
+        className="fixed left-0 top-0 z-50"
+        ref={buttonWrapRef}
+        style={{ transform: `translate3d(${pos.x}px, ${pos.y}px, 0)` }}
+      >
         <Button
           aria-label="分享收件箱（可按住拖动）"
         className="relative h-11 w-11 cursor-grab touch-none rounded-full shadow-md active:cursor-grabbing"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false
+            return
+          }
+          setOpen((v) => !v)
+        }}
         onPointerCancel={handleDragEnd}
         onPointerDown={handleDragStart}
         onPointerMove={handleDragMove}

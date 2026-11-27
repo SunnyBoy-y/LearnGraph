@@ -1,176 +1,101 @@
-/**
- * 手机扫码连接二维码：
- *
- * 在电脑浏览器（登录页/设置页）显示「供手机连接」的服务器地址二维码，
- * 手机 APK 连接页点「扫描服务器二维码」扫描后自动填充地址。
- * 仅在非 APK 环境展示（APK 内已在连接页有原生扫码入口）。
- *
- * 地址判定：
- *  - 当前页面是 localhost / 127.0.0.1（用户在电脑本机调试自建服务）：
- *    手机扫码无法连接 localhost，自动探测本机局域网 IPv4 并替换 host，
- *    保留协议与端口 → 如 http://192.168.1.5:18000
- *  - 否则（已用局域网 IP / 域名 / HTTPS 反代访问）：直接用当前地址。
- */
-
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import QRCode from 'qrcode'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 
-function isLoopbackHost(hostname: string): boolean {
-  const h = hostname.trim().toLowerCase()
-  return (
-    h === 'localhost' ||
-    h === '0.0.0.0' ||
-    h === '[::1]' ||
-    h === '::1' ||
-    h.startsWith('127.') ||
-    h === 'localhost.localdomain'
-  )
+function isLocalHost(host: string) {
+  return ['localhost', 'localhost.localdomain', '0.0.0.0', '[::]', '[::1]'].includes(host) || /^127\./.test(host)
 }
 
-/** 通过 WebRTC 候选地址枚举本机局域网 IPv4（仅私网段），探测失败返回 null */
-function detectLanIPv4(timeoutMs = 2500): Promise<string | null> {
-  return new Promise((resolve) => {
-    try {
-      const pc = new RTCPeerConnection({ iceServers: [] })
-      let settled = false
-      const done = (ip: string | null) => {
-        if (settled) return
-        settled = true
-        try {
-          pc.close()
-        } catch {
-          /* ignore */
-        }
-        resolve(ip)
-      }
-      pc.createDataChannel('lg-probe')
-      pc.createOffer()
-        .then((offer) => pc.setLocalDescription(offer))
-        .catch(() => done(null))
+export function isLanIPv4(host: string) {
+  return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host) &&
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) && host.split('.').every(part => Number(part) <= 255 && String(Number(part)) === part)
+}
 
-      const PRIVATE_RE = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/
-      pc.onicecandidate = (event) => {
-        const candidate = event.candidate?.candidate
-        if (!candidate) {
-          done(null)
-          return
-        }
-        const match = /([0-9]{1,3}(\.[0-9]{1,3}){3})/.exec(candidate)
-        const ip = match?.[1]
-        if (ip && PRIVATE_RE.test(ip)) done(ip)
-      }
-      window.setTimeout(() => done(null), timeoutMs)
-    } catch {
-      resolve(null)
+function detectLanIPv4(onResult: (address: string) => void) {
+  let peer: RTCPeerConnection | undefined
+  let done = false
+  const finish = (address = '') => {
+    if (done) return
+    done = true
+    window.clearTimeout(timeout)
+    peer?.close()
+    onResult(address)
+  }
+  const timeout = window.setTimeout(() => finish(), 2500)
+  try {
+    peer = new RTCPeerConnection({ iceServers: [] })
+    const connection = peer
+    connection.onicecandidate = ({ candidate }) => {
+      if (!candidate) return finish()
+      const address = candidate.address || candidate.candidate.split(' ')[4]
+      if (address && isLanIPv4(address)) finish(address)
     }
-  })
+    connection.createDataChannel('lg-probe')
+    void connection.createOffer().then(offer => {
+      if (!done) return connection.setLocalDescription(offer)
+    }).catch(() => finish())
+  } catch {
+    finish()
+  }
+  return () => {
+    window.clearTimeout(timeout)
+    if (!done) peer?.close()
+    done = true
+  }
 }
 
 export function ConnectQrCode({ size = 160 }: { size?: number }) {
-  const [dataUrl, setDataUrl] = useState('')
-  // 解析后的真实二维码内容（host 可能被替换为局域网 IP）
-  const [target, setTarget] = useState('')
-  const [converted, setConverted] = useState(false)
+  const { hostname, origin, protocol, port } = window.location
+  const local = isLocalHost(hostname)
+  const [detected, setDetected] = useState<string | null>(null)
+  const [manual, setManual] = useState('')
+  const [draft, setDraft] = useState('')
+  const [error, setError] = useState('')
+  const [image, setImage] = useState<{ target: string; url: string; failed?: boolean }>()
+  const address = manual || detected
+  const target = local ? (address ? `${protocol}//${address}${port ? `:${port}` : ''}` : '') : origin
 
-  const locationInfo = useMemo(() => {
-    try {
-      return {
-        origin: window.location.origin || '',
-        hostname: window.location.hostname || '',
-        protocol: window.location.protocol || 'http:',
-        port: window.location.port || '',
-      }
-    } catch {
-      return { origin: '', hostname: '', protocol: 'http:', port: '' }
-    }
-  }, [])
-
-  // 决定二维码目标：localhost → 本机 IP；否则当前地址
   useEffect(() => {
-    if (!locationInfo.origin) return
-    let cancelled = false
+    if (local) return detectLanIPv4(setDetected)
+  }, [local])
 
-    const buildQr = (host: string) => {
-      const port = locationInfo.port ? `:${locationInfo.port}` : ''
-      return `${locationInfo.protocol}//${host}${port}`
-    }
-
-    const resolveTarget = async () => {
-      if (!isLoopbackHost(locationInfo.hostname)) {
-        // 非 loopback：直接当前 origin
-        return buildQr(locationInfo.hostname)
-      }
-      // localhost：探测本机局域网 IP
-      const lanIp = await detectLanIPv4()
-      if (!cancelled) {
-        if (lanIp) {
-          setConverted(true)
-          setTarget(buildQr(lanIp))
-        } else {
-          setConverted(false)
-          setTarget(buildQr(locationInfo.hostname)) // 回退，仍给 origin
-        }
-      }
-    }
-
-    resolveTarget()
-    return () => {
-      cancelled = true
-    }
-  }, [locationInfo])
-
-  // 生成二维码
   useEffect(() => {
     if (!target) return
     let cancelled = false
-    QRCode.toDataURL(target, {
-      width: size * 2,
-      margin: 1,
-      errorCorrectionLevel: 'M',
+    QRCode.toDataURL(target, { width: size * 2, margin: 1, errorCorrectionLevel: 'M' }).then(url => {
+      if (!cancelled) setImage({ target, url })
+    }).catch(() => {
+      if (!cancelled) setImage({ target, url: '', failed: true })
     })
-      .then((url) => {
-        if (!cancelled) setDataUrl(url)
-      })
-      .catch(() => {
-        // 生成失败静默
-      })
-    return () => {
-      cancelled = true
-    }
+    return () => { cancelled = true }
   }, [target, size])
 
-  if (!target) return null
-
   return (
-    <div className="flex flex-col items-center gap-2">
-      {dataUrl ? (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          alt={`扫码连接 ${target}`}
-          className="rounded-lg border"
-          style={{ width: size, height: size }}
-          src={dataUrl}
-        />
-      ) : (
-        <div
-          aria-hidden="true"
-          className="rounded-lg border"
-          style={{ width: size, height: size }}
-        />
-      )}
-      <p className="text-center text-xs leading-5 text-muted-foreground">
-        用 LearnGraph 手机 App 扫描
-        <br />
-        {converted ? (
-          <>
-            已自动转换为局域网地址
-            <br />
-            <code className="font-mono text-[11px] text-foreground/70">{target}</code>
-          </>
-        ) : (
-          '即可自动填入服务器地址'
-        )}
-      </p>
+    <div className="flex flex-col items-center gap-3 text-sm">
+      {target ? (
+        <>
+          {image?.target === target && image.url ? <img alt={`扫码连接 ${target}`} className="rounded-lg border" width={size} height={size} src={image.url} />
+            : <p role="status">{image?.target === target && image.failed ? '二维码生成失败，请手动输入下面的地址。' : '正在生成二维码…'}</p>}
+          <p className="text-center text-xs text-muted-foreground">在 LearnGraph 手机 App 内扫码，或手动输入服务器地址。</p>
+          <code className="select-all break-all text-xs">{target}</code>
+        </>
+      ) : <p role="status" className="text-center text-muted-foreground">{detected === null ? '正在查找电脑的局域网地址…' : '未检测到局域网地址。请填写电脑的局域网 IP，并让手机接入同一网络。'}</p>}
+      {local && <form className="grid w-full gap-2" onSubmit={event => {
+        event.preventDefault()
+        const ip = draft.trim()
+        if (!isLanIPv4(ip)) { setError('请输入有效的局域网 IPv4 地址，例如 192.168.1.5。'); return }
+        setManual(ip)
+        setError('')
+      }}>
+        <Label htmlFor="phone-connect-ip">电脑的局域网 IP</Label>
+        <div className="flex gap-2">
+          <Input id="phone-connect-ip" placeholder="192.168.1.5" value={draft} onChange={event => { setDraft(event.target.value); setError('') }} aria-invalid={Boolean(error)} />
+          <Button type="submit" variant="outline">生成二维码</Button>
+        </div>
+        {error && <p role="alert" className="text-destructive">{error}</p>}
+      </form>}
     </div>
   )
 }
