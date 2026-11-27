@@ -1,22 +1,85 @@
 /* LearnGraph Mobile — 移动端单栏 UI */
 
 :root {
-  --bg: #f4f4f1;
+  color-scheme: light;
+  --bg: #f7f7f7;
   --surface: #ffffff;
-  --surface-2: #efeeeb;
-  --text: #20242b;
-  --text-2: #71757d;
-  --accent: #3b6ef6;
-  --accent-soft: #e9effe;
-  --border: #e3e2dd;
-  --danger: #d33a3a;
-  --ok: #1e9e5a;
+  --surface-2: #efefef;
+  --text: #1c1c1e;
+  --text-2: #5c6068;
+  --accent: #222226;
+  --accent-fg: #ffffff;
+  --accent-soft: #e9e9ec;
+  --border: #e4e4e7;
+  --danger: #c42f2f;
+  --danger-soft: #fdecec;
+  --danger-border: #f2bcbc;
+  --danger-fg: #a82424;
+  --ok: #0b7a5e;
+  --ok-soft: #e7f6f0;
+  --ok-fg: #086b54;
+  --code-bg: #1e2229;
+  --code-fg: #e6e9ef;
+  --toast-bg: rgba(24, 24, 28, 0.94);
+  --toast-fg: #ffffff;
   --radius: 14px;
   --radius-sm: 9px;
   --shadow: 0 2px 10px rgba(20, 22, 26, 0.06);
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   font-size: 16px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    color-scheme: dark;
+    --bg: #0e0e10;
+    --surface: #18181c;
+    --surface-2: #24242a;
+    --text: #ededf0;
+    --text-2: #a4a4b0;
+    --accent: #ededf0;
+    --accent-fg: #111315;
+    --accent-soft: #2e2e36;
+    --border: #2c2c34;
+    --danger: #f07670;
+    --danger-soft: #36181a;
+    --danger-border: #6b2b2f;
+    --danger-fg: #f5928d;
+    --ok: #52c99b;
+    --ok-soft: #132d24;
+    --ok-fg: #7ad9b5;
+    --code-bg: #141417;
+    --code-fg: #ededf0;
+    --toast-bg: rgba(36, 36, 42, 0.96);
+    --toast-fg: #ededf0;
+    --shadow: 0 4px 16px rgba(0, 0, 0, 0.36);
+  }
+}
+
+:root.dark {
+  color-scheme: dark;
+  --bg: #0e0e10;
+  --surface: #18181c;
+  --surface-2: #24242a;
+  --text: #ededf0;
+  --text-2: #a4a4b0;
+  --accent: #ededf0;
+  --accent-fg: #111315;
+  --accent-soft: #2e2e36;
+  --border: #2c2c34;
+  --danger: #f07670;
+  --danger-soft: #36181a;
+  --danger-border: #6b2b2f;
+  --danger-fg: #f5928d;
+  --ok: #52c99b;
+  --ok-soft: #132d24;
+  --ok-fg: #7ad9b5;
+  --code-bg: #141417;
+  --code-fg: #ededf0;
+  --toast-bg: rgba(36, 36, 42, 0.96);
+  --toast-fg: #ededf0;
+  --shadow: 0 4px 16px rgba(0, 0, 0, 0.36);
 }
 
 * {
@@ -117,14 +180,14 @@ textarea {
   height: 64px;
   margin: 0 auto;
   border-radius: 18px;
-  background: linear-gradient(135deg, #4f7df9, #2f54d0);
-  color: #fff;
+  background: var(--accent);
+  color: var(--accent-fg);
   font-weight: 800;
   font-size: 1.4rem;
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 6px 18px rgba(47, 84, 208, 0.28);
+  box-shadow: var(--shadow);
 }
 
 .connect-logo.small {
@@ -227,13 +290,13 @@ textarea {
 }
 
 .test-result.ok {
-  background: #e8f7ef;
-  color: #147a45;
+  background: var(--ok-soft);
+  color: var(--ok-fg);
 }
 
 .test-result.fail {
-  background: #fdeeee;
-  color: #a52a2a;
+  background: var(--danger-soft);
+  color: var(--danger-fg);
 }
 
 .btn {
@@ -251,7 +314,7 @@ textarea {
 
 .btn.primary {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-fg);
 }
 
 .btn.primary:not(:disabled):active {
@@ -450,8 +513,8 @@ textarea {
 }
 
 .session-item-del:active {
-  background: #fdeeee;
-  color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger-fg);
 }
 
 .list-state {
@@ -502,7 +565,7 @@ textarea {
 
 .bubble.user {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-fg);
   border-bottom-right-radius: 6px;
 }
 
@@ -668,8 +731,8 @@ textarea {
 }
 
 .md-pre {
-  background: #1e2229;
-  color: #e6e9ef;
+  background: var(--code-bg);
+  color: var(--code-fg);
   border-radius: 10px;
   padding: 12px;
   overflow-x: auto;
@@ -756,8 +819,8 @@ textarea {
 }
 
 .error-part {
-  background: #fdeeee;
-  color: #a52a2a;
+  background: var(--danger-soft);
+  color: var(--danger-fg);
   border-radius: 9px;
   padding: 8px 11px;
   font-size: 0.85rem;
@@ -782,9 +845,9 @@ textarea {
 }
 
 .banner.error {
-  background: #fdeeee;
-  color: #a52a2a;
-  border-bottom: 1px solid #f3d3d3;
+  background: var(--danger-soft);
+  color: var(--danger-fg);
+  border-bottom: 1px solid var(--danger-border);
 }
 
 .banner-btn {
@@ -839,8 +902,8 @@ textarea {
   padding: 10px 18px;
   border-radius: 999px;
   font-size: 0.88rem;
-  color: #fff;
-  background: rgba(32, 36, 43, 0.92);
+  color: var(--toast-fg);
+  background: var(--toast-bg);
   box-shadow: var(--shadow);
   z-index: 100;
   animation: toast-in 0.2s ease-out;
@@ -848,11 +911,14 @@ textarea {
 }
 
 .toast.error {
-  background: rgba(211, 58, 58, 0.94);
+  background: var(--danger-soft);
+  color: var(--danger-fg);
+  border: 1px solid var(--danger-border);
 }
 
 .toast.success {
-  background: rgba(30, 158, 90, 0.94);
+  background: var(--ok-soft);
+  color: var(--ok-fg);
 }
 
 @keyframes toast-in {

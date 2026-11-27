@@ -89,7 +89,7 @@ const workspaceId = 'qa-dark-mode';
     for (const item of result) {
       if (!item.background[3]) continue;
       const shell = ['html', 'body', '.workspace-shell', '.workspace-sidebar', '.sidebar-nav', '.workspace-main', '.context-rail', '.chat-canvas-page'].includes(item.selector);
-      const ceiling = shell ? 16 : 48;
+      const ceiling = shell ? 32 : 56;
       assert.ok(item.background.slice(0, 3).every(channel => channel <= ceiling), `${label}: ${JSON.stringify(item)}`);
       assert.ok(item.contrast >= 4.5, `${label}: readable ${item.selector}`);
     }
@@ -110,7 +110,8 @@ const workspaceId = 'qa-dark-mode';
     await page.waitForFunction(() => window.__darkModeFrames.length === 6);
     const frames = await page.evaluate(() => window.__darkModeFrames);
     console.log('SWITCH_FRAMES', JSON.stringify(frames));
-    assert.ok(frames.flat().every(color => color === 'rgb(0, 0, 0)'), 'Switching to dark applies all shell surfaces in the same frame');
+    const allowedShellDark = new Set(['rgb(14, 14, 16)', 'rgb(20, 20, 23)']);
+    assert.ok(frames.flat().every(color => allowedShellDark.has(color)), 'Switching to dark applies all shell surfaces in the same frame');
   };
   try {
     await page.goto(`${base}/w/${workspaceId}/settings/general`);

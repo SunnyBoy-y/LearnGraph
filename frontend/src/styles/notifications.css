@@ -16,16 +16,31 @@
   display: flex; align-items: center; gap: 8px; width: max-content; max-width: calc(100vw - 32px);
   padding: 8px 12px; border: .5px solid var(--border); border-radius: 8px;
   background: var(--popover); color: var(--popover-foreground); font-size: 13px; line-height: 1.6;
+  box-shadow: 0 3px 8px rgb(0 0 0 / .06);
 }
+.network-status--weak {
+  border-color: color-mix(in srgb, var(--warning-foreground, #b45309) 35%, var(--border));
+}
+.network-status--weak svg { color: var(--warning-foreground, #b45309); }
+.network-status--offline svg { color: var(--danger-foreground, #b91c1c); }
+.network-status--sync svg { color: var(--primary); }
+.network-status__actions { display: inline-flex; align-items: center; gap: 6px; margin-inline-start: 4px; }
+.network-status__action {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border: .5px solid var(--border); border-radius: 6px;
+  background: var(--secondary); color: var(--secondary-foreground);
+  font-size: 12px; line-height: 1.4; cursor: pointer;
+}
+.network-status__action:hover { opacity: .9; }
 .network-status svg { flex-shrink: 0; }
 /* Scoped overrides preserve Sonner's measured stack, focus and lifetime mechanics. */
 .lg-toaster[data-sonner-toaster] {
   --normal-bg: var(--popover);
   --normal-text: var(--popover-foreground);
   --normal-border: var(--border);
-  --notification-warning: #956016;
-  --notification-error: #bd3832;
-  --notification-success: #43735a;
+  --notification-warning: var(--warning-foreground);
+  --notification-error: var(--danger-foreground);
+  --notification-success: var(--success-foreground);
   --notification-shadow: 0 3px 8px rgb(0 0 0 / .04), 0 10px 24px rgb(0 0 0 / .07);
   --border-radius: 12px;
   font-family: var(--font-sans);
@@ -34,9 +49,9 @@
   pointer-events: none;
 }
 .lg-toaster[data-sonner-theme='dark'] {
-  --notification-warning: #e1b76a;
-  --notification-error: #f58f88;
-  --notification-success: #9cc2aa;
+  --notification-warning: var(--warning-foreground);
+  --notification-error: var(--danger-foreground);
+  --notification-success: var(--success-foreground);
   --notification-shadow: 0 3px 8px rgb(0 0 0 / .12), 0 10px 24px rgb(0 0 0 / .2);
 }
 .lg-toaster[data-sonner-toaster] [data-sonner-toast][data-styled='true'] {

@@ -5,6 +5,7 @@
   --primary-foreground: var(--theme-on-primary);
   --ring: var(--theme-primary);
   --focus-ring: var(--theme-primary);
+  --genui-accent: var(--theme-primary);
   --accent: color-mix(in srgb, var(--theme-color) 9%, var(--card));
   --accent-foreground: var(--theme-primary);
   --sidebar: color-mix(in srgb, var(--theme-color) 4%, #fafafa);
@@ -16,19 +17,19 @@
   --lg-green: var(--theme-primary);
   --lg-green-dark: var(--theme-primary);
   --lg-green-soft: var(--accent);
-  --chart-1: var(--theme-primary);
-  --chart-2: color-mix(in srgb, var(--theme-primary) 75%, var(--foreground));
-  --chart-3: color-mix(in srgb, var(--theme-primary) 80%, #bd8a35);
-  --chart-4: color-mix(in srgb, var(--theme-primary) 75%, #32968e);
-  --chart-5: color-mix(in srgb, var(--theme-primary) 70%, #ae668a);
+  --chart-1: var(--theme-chart-1, var(--theme-primary));
+  --chart-2: var(--theme-chart-2, oklch(.56 .13 155));
+  --chart-3: var(--theme-chart-3, oklch(.58 .12 45));
+  --chart-4: var(--theme-chart-4, oklch(.56 .13 285));
+  --chart-5: var(--theme-chart-5, oklch(.56 .13 345));
 }
 
 :root.dark[data-color-mode]:not([data-color-mode='mono']) {
-  --bg-sidebar: color-mix(in srgb, var(--theme-color) 3%, #000000);
-  --bg-selected: color-mix(in srgb, var(--theme-color) 12%, #1a1a1a);
+  --bg-sidebar: color-mix(in srgb, var(--theme-color) 4%, #141417);
+  --bg-selected: color-mix(in srgb, var(--theme-color) 15%, #2e2e36);
   --sidebar: var(--bg-sidebar);
   --sidebar-accent: var(--bg-selected);
-  --accent: color-mix(in srgb, var(--theme-color) 12%, #1a1a1a);
+  --accent: color-mix(in srgb, var(--theme-color) 14%, #26262c);
 }
 
 :root[data-color-mode]:not([data-color-mode='mono']) .workspace-sidebar,
@@ -40,8 +41,8 @@
   color: var(--primary-foreground);
   box-shadow: none;
 }
-:root[data-color-mode]:not([data-color-mode='mono']) .sidebar-nav [data-nav-label] > svg {
-  color: var(--lg-sidebar-nav-icon, var(--primary));
+:root[data-color-mode]:not([data-color-mode='mono']) .sidebar-nav [data-nav-label][aria-current='page'] > svg {
+  color: var(--primary);
 }
 :root[data-color-mode]:not([data-color-mode='mono']) .graph-workbench-split .graph-library__spine {
   background: var(--primary);

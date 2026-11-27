@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { accessibleThemeColor, APPEARANCE_STORAGE_KEY, applyAppearance, COLOR_THEMES, contrastRatio, DEFAULT_APPEARANCE, initializeAppearance, normalizeAppearance, readLocalAppearance } from './appearance'
+import { accessibleOnPrimary, accessibleThemeColor, APPEARANCE_STORAGE_KEY, applyAppearance, COLOR_THEMES, contrastRatio, DEFAULT_APPEARANCE, initializeAppearance, normalizeAppearance, readLocalAppearance, themeChartPalette } from './appearance'
 
 afterEach(() => {
   document.documentElement.classList.remove('dark')
@@ -36,7 +36,19 @@ describe('appearance restoration and contrast', () => {
       expect(contrastRatio(light, '#ffffff')).toBeGreaterThanOrEqual(4.5)
       expect(contrastRatio(dark, '#30343a')).toBeGreaterThanOrEqual(4.5)
       expect(contrastRatio(dark, '#111315')).toBeGreaterThanOrEqual(4.5)
+      expect(contrastRatio(light, accessibleOnPrimary(light))).toBeGreaterThanOrEqual(4.5)
+      expect(contrastRatio(dark, accessibleOnPrimary(dark))).toBeGreaterThanOrEqual(4.5)
     }
+  })
+
+  it('produces five distinct chart swatches anchored on the active theme color', () => {
+    const lightPalette = themeChartPalette(accessibleThemeColor('#2563eb', false), false)
+    const darkPalette = themeChartPalette(accessibleThemeColor('#7c3aed', true), true)
+    expect(new Set(lightPalette).size).toBe(5)
+    expect(new Set(darkPalette).size).toBe(5)
+    applyAppearance({ theme: 'light', colorTheme: 'ocean' })
+    expect(document.documentElement.style.getPropertyValue('--theme-chart-1')).toBe('#2563eb')
+    expect(document.documentElement.style.getPropertyValue('--theme-chart-2')).not.toBe('#2563eb')
   })
 
   it('follows OS changes only in system mode and releases its listeners', () => {

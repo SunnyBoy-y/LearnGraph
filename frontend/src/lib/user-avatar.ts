@@ -1,17 +1,16 @@
-// Keep the original sidebar palette and stable, name-based color selection.
-const AVATAR_TONES = [
-  { backgroundColor: "#ddf4ff", color: "#0969da" },
-  { backgroundColor: "#dafbe1", color: "#1a7f37" },
-  { backgroundColor: "#fbefff", color: "#8250df" },
-  { backgroundColor: "#fff1e5", color: "#bc4c00" },
-  { backgroundColor: "#ddf7f4", color: "#0f766e" },
-];
+// Stable, name-based avatar tone selection. Actual colors live in CSS via
+// `[data-avatar-tone]` so dark mode and theme overrides work without inline-style conflicts.
+const AVATAR_TONE_KEYS = ["blue", "green", "violet", "amber", "teal"] as const;
+
+export type AvatarToneKey = (typeof AVATAR_TONE_KEYS)[number];
 
 export function defaultUserAvatar(name: string) {
   const characters = Array.from(name);
-  const colorIndex = characters.reduce((total, character) => total + character.codePointAt(0)!, 0) % AVATAR_TONES.length;
+  const colorIndex =
+    characters.reduce((total, character) => total + character.codePointAt(0)!, 0) %
+    AVATAR_TONE_KEYS.length;
   return {
     initial: (characters[0] || "U").toUpperCase(),
-    style: AVATAR_TONES[colorIndex],
+    tone: AVATAR_TONE_KEYS[colorIndex] as AvatarToneKey,
   };
 }
